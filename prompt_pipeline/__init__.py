@@ -48,6 +48,14 @@ from .cast_lock import (
     named_cast_beat_violations,
     apply_named_cast_settings,
 )
+from .human_cast import (
+    REAL_HUMAN_CAST_RULE,
+    humanize_cast_entry,
+    humanize_cast_list,
+    humanize_cast_text,
+    humanize_prompt_block,
+    humanize_prompt_text,
+)
 from .mutate import (
     generate_orthogonal_variant,
     ai_diverge_orthogonal_ideas,
@@ -115,7 +123,16 @@ VIDEO_DURATION = 8.0
 # pre-rollout ladder full of local/incremental filler beats.
 # v2（2026-07-26）：过门后第一拍恒为 clearing 清理工序。存量断点里的 Threshold 节拍梯
 # 没有这一拍，续传会绕过新的结构校验产出旧形态整单——只能靠指纹换代逼它重排。
-MILESTONE_POLICY_VERSION = "visible-milestones-v10-sealed-entry-before-crossing"
+# v11（2026-08-30）：机位风格与几何锁解耦。这一次**不是**节拍契约变了，破例换代是因为
+# 改动落在生成 packet 的那段提示词上（多机位示例矩阵、camera_palette 改收完整机位句），
+# 而 packet 是按「指纹 + 梯子哈希」缓存的：指纹不动，重合成时 Step 4 直接命中旧 packet，
+# 提示词逐字重写过、机位句还是老的那一句（clear_compose_caches 的注释把这个形态称作
+# 最难看出来的一种污染）。靠用户记得勾 reset_cache 兜不住，只能靠换代让存量整批失效。
+# v12（2026-08-30，同日第二次）：本体分类新增 demolish_and_rebuild，且构图从机位句里
+# 摘出改走 OBSERVED FRAMING 段。两处又都落在生成 packet 的提示词上，理由与 v11 逐字相同：
+# 不换代的话，「先拆后建」那批存量 packet 仍然带着待拆旧壳的 carrier_envelope 与
+# envelope_signature，改动在产物上一个字都看不出来。
+MILESTONE_POLICY_VERSION = "visible-milestones-v12-demolish-rebuild-origin"
 _MIN_ADAPTIVE_CONSTRUCTION_BEATS = 5
 _MILESTONE_TEXT_FIELDS = (
     'milestone_name', 'before_state', 'after_state', 'completion_extent',
@@ -1443,12 +1460,12 @@ def classify_image_space_layer(config, image_path):
 
     专供首帧的跨层参考守卫（见 frame_generator 的 cover_anchor 分支）。首帧只能以封面图
     做图生图，而封面是"左 before / 右 after 拼接"的营销图、或用户自选的任意一张——它的
-    空间语义会压过文本语义：2026-08-02 那单的 IMAGE 1 写的是空荒原接收基坑的**外景**，
-    封面是**内景**，出图直接变成舱内。跨层复用参考图必须先认出来才能规避。
+    空间语义会压过文本语义：2026-08-02 那单的 IMAGE 1 写的是空荒原接收基坑的外景，
+    封面是内景，出图直接变成舱内。跨层复用参考图必须先认出来才能规避。
 
     'composite' = 拼接/对比/分屏（帧的契约是"一张连续照片"，拼接图同样不是同层参考）。
-    判定异常/关门一律 'unknown'（调用方据此维持原行为，不因为判定挂了就改渲染方式）。"""
-    if qa_gate_level(config) == 'off':
+    判定异常/关门/非严格门禁一律 'unknown'（调用方据此维持原行为，不因为判定挂了就改渲染方式）。"""
+    if qa_gate_level(config) != 'strict':
         return 'unknown'
     try:
         system_prompt = (
@@ -3619,16 +3636,20 @@ def fix_image_clean_frame_proactive(prompt, allow_occupant=False):
 
 def fix_video_opening(i, prompt, first_frame_index=None, profile=None, single_frame=False):
     """first_frame_index overrides which IMAGE the first-frame anchor binds to (defaults to
-    IMAGE i). For Omni and Miniature (or single_frame=True), generates a single starting-frame anchor.
-    For Base/Veo, generates a two-anchor interpolation statement.
+    IMAGE i). single_frame=True generates a single starting-frame anchor; everything else —
+    Base/Veo **and now Omni/Miniature** — generates a two-anchor interpolation statement.
 
-    正文自己已经带着单帧开场句时也按单帧走（与 check_video_opening 同一条自动识别）：
-    profile 不是每个调用点都拿得到 —— rework_milestone_prompt_pair 这类**非 profile 感知**
-    的通路只拿得到一段文本。缺了这条识别，omni 稿子在那里会被改回 base 的双锚点开场，
-    而检查器有识别、双锚点句照样判过，于是修复器与检查器一起静默降级到 base 口径。"""
+    2026-08-29：omni / miniature 不再自动走单锚点。同一批改动把它们从 server.py 的链式
+    视频通路里摘了出来（generate_video_chain_worker → generate_videos_worker），改成跟
+    base 一样完整上传首尾帧，单锚点的前提（"VIDEO 只上首帧、靠上一段尾帧接力"）就不成立
+    了，所以这里按 profile 判单帧的分支、以及"正文带着单帧开场句就按单帧走"的自动识别，
+    两条一起撤掉。check_video_opening 对 omni / miniature 双句都收，正是为这次过渡留的
+    兼容口。
+
+    ⚠️ 别照着旧注释把自动识别加回来：它当年是为"omni 恒为单锚点"服务的，现在那条前提没了，
+    加回来只会让 fix 与 check 又各说各话。真需要单锚点的调用点显式传 single_frame=True。"""
     first_frame_index = i if first_frame_index is None else first_frame_index
-    if (profile in ('omni', 'miniature') or single_frame
-            or "starting composition and environment anchor" in (prompt or '').lower()):
+    if single_frame:
         expected_start = f"Use the provided image as the exact starting composition and environment anchor. Use IMAGE {first_frame_index} as the actual first-frame image; begin from this initial state and naturally progress the work through the multi-shot sequence without inventing extraneous layouts."
     else:
         expected_start = f"Use the provided first frame and last frame as exact composition anchors. Use IMAGE {first_frame_index} as the actual first-frame image and IMAGE {i+1} as the actual last-frame image; every visible action must interpolate between those two frame images without inventing a third layout."
@@ -3659,6 +3680,43 @@ _EVEN_RATE_PHRASE = (
     "sudden step."
 )
 _EVEN_RATE_MARKER = "at an even rate across the entire clip duration"
+
+# 2026-08-30「肢体活动机械不拟人」排查：worker 的动作全程只有 Action-Tool Triad
+# （某个可见变化由某个工具动作造成），EVEN_RATE 治好了「推进跳变」，却也顺带把「节奏该
+# 匀速」写死——模型读出来的是「全程匀速」，而人的真实动作恰恰不是匀速的（发力前的蓄力、
+# 落点的顿挫、重心转移）。cast_action 那套 ACTION-REACTION CAUSAL CHAIN 是有自然力学
+# 措辞的（reverse.py: "a shift of weight"），但只服务旁观者（"apart from the work
+# itself"）——真正在干活、离镜头最近的那个人反而没有一句人体力学的正向要求。
+# 这一句只管身体力学，不碰 EVEN_RATE 管的施工进度节奏：一句说「施工没有停顿」，
+# 一句说「身体不是匀速滑块」，两件事、两句话。
+# 措辞刻意不点名「worker」「leg」「torso」：这一句要在微缩线（施工者是巨手，没有腿也
+# 没有躯干）与真人线之间通用地追加，fix_miniature_video 还会把「worker」正则替换成
+# 「giant hand」——钉进解剖学名词，要么被替换成语义不通的「giant hand's torso」，要么
+# 在真人线里正确、在微缩线里荒谬，两条线没法共用同一句。
+_NATURAL_MOTION_PHRASE = (
+    "This motion carries real physical weight and momentum, not a smooth constant-speed "
+    "glide between two poses: pressure and balance visibly shift before each effort, each "
+    "repeated pass lands at a slightly different angle and pace than the last, and there is "
+    "a brief natural settle between reaching for a tool and making contact."
+)
+_NATURAL_MOTION_MARKER = "not a smooth constant-speed glide between two poses"
+_HUMAN_SUBJECT_RE = re.compile(
+    r'\b(?:workers?|crew|builders?|laborers?|craftsmen?|craftsman|occupants?|residents?|'
+    r'dwellers?|inhabitants?|homeowners?|figurines?|people|persons?)\b', re.IGNORECASE)
+
+
+def fix_natural_body_mechanics(prompt):
+    """出现人体动作时补一句人体力学正向要求（与 _EVEN_RATE 同一模式：fix_pacing_control
+    治「施工跳变」，这一句治「身体像匀速滑块」）。没有人体、或正文已声明画面无人
+    （sterile/no workers）时不动。"""
+    prompt = prompt or ""
+    if not _HUMAN_SUBJECT_RE.search(prompt) or _STERILE_DECLARATION_RE.search(prompt):
+        return prompt
+    if _NATURAL_MOTION_MARKER in prompt.lower():
+        return prompt
+    if not prompt.endswith('.'):
+        prompt += '.'
+    return f"{prompt} {_NATURAL_MOTION_PHRASE}"
 
 
 def fix_pacing_control(prompt, is_threshold_or_reveal):
@@ -3974,16 +4032,73 @@ _EXISTING_ASSET_CUES = re.compile(
     r'retrofit|wreck|ruin)\b', re.I)
 
 
+# 「先拆后建」：起点确实站着一个既存物，但它是**被清掉的对象**，不是要被改造的载体。
+# 2026-08-30 复盘（拆茅屋原地建两层别墅那一单）：这类片子必然同时命中 _GROUND_UP_CUES
+#（开挖、打地基、施工）和 _EXISTING_ASSET_CUES（破旧、旧、ruin），而旧判据写的是
+# 「有既存物线索就不算新建」——ground_up 分支被一票否决，落到兜底的 existing_restoration。
+# 于是整条链把**要拆掉的那间茅屋**当成了最终载体：carrier_envelope 取它的尺寸、
+# envelope_signature 取它的外壳并要求每一张室内帧逐字复述（实测把两层别墅的走廊写成
+#「巴掌大单层破泥屋」）、盲端腔体锁跟着套上（门后既是死胡同黑暗、又是采光走廊）。
+#
+# 判据不能用「两组线索共现」——「废弃巴士改造」+「搭建」也共现，那是货真价实的
+# existing_restoration，会被抢走。真正的分水岭是**主体被拆除**且**重新打了地基**：
+# 修复线永远不会为一个既有载体挖基槽。所以要求两组专用线索同时出现。
+# 拆的必须是**主体**。只认动词会被局部拆除骗过去——修复线里「拆除锈蚀座椅」「拆掉旧地板」
+# 遍地都是，配上一句「浇筑混凝土地面」就会被误判成先拆后建。所以要求「整体名词」与
+# 「清除动词」在同一句里就近共现，两个方向都认（'the old hut structure is cleared away'
+# 是名词在前，'demolish the old shack' 是动词在前）。
+# 整体名词分两档。泛称（结构 / structure / building）单独出现时多半指**零件**
+# ——「移除腐朽结构件」「replace the rotten structure member」是修复线的日常，
+# 把它算成「主体被拆」会把整条修复线抢走。所以泛称必须带「旧/老/整个/entire」这类
+# 限定词才算主体；具体居所名词（茅屋 / hut / shack）本身就够具体，不要求限定词。
+_WHOLE_STRUCTURE_NOUNS = (
+    r'(?:旧|老|原有|原)?(?:茅屋|泥屋|木屋|棚屋|小屋|旧屋|老屋|旧房|老房)'
+    r'|(?:旧|老|原有|原|整个|整座)(?:屋|房|建筑|结构|主体)'
+    r'|(?:old |existing |original |entire |whole )?'
+    r'(?:hut|house|home|shack|cabin|shed|dwelling|cottage)'
+    r'|(?:old|existing|original|entire|whole)\s+(?:\w+\s+)?(?:structure|building)')
+_REMOVAL_VERBS = (r'拆除|拆掉|拆解|推倒|铲平|夷平|清拆|扒掉|清除|移走|移除|清理掉'
+                  r'|demolish\w*|demolition|tear\w* down|torn down|knock\w* down|raze\w*'
+                  r'|clear\w* away|cleared|dismantl\w+|strip\w*|remov\w+')
+_DEMOLITION_CUES = re.compile(
+    r'(?:(?:' + _WHOLE_STRUCTURE_NOUNS + r')[^。.]{0,60}?(?:' + _REMOVAL_VERBS + r')'
+    r'|(?:' + _REMOVAL_VERBS + r')[^。.]{0,60}?(?:' + _WHOLE_STRUCTURE_NOUNS + r'))',
+    re.I)
+_REBUILD_FOUNDATION_CUES = re.compile(
+    r'打地基|地基|基槽|基础槽|开挖|挖槽|放线|垫层|浇筑|原地新建|'
+    r'\b(?:foundation|footing[s]?|excavat(?:e|ed|ion)|trench(?:es)?|screed|'
+    r'slab|rebar|ground[- ]up|new build|from scratch)\b', re.I)
+
+_PROJECT_ORIGIN_MODES = ('existing_restoration', 'carrier_delivery_build',
+                         'ground_up_build', 'demolish_and_rebuild')
+
+
+def _demolish_and_rebuild_context(brief, theme):
+    """判「先拆后建」时看的文本。比其余模式多看一眼节拍清单正文：拆除与打地基是
+    **工序**，它们写在清单条目里，主题句里常常一个字都不提——复刻线尤其如此，主题是
+    从原片标题来的，「Giant Hand Builds a Dream Luxury Villa」里没有「拆」字。
+    """
+    parts = [theme, brief.get('theme'), brief.get('carrier'), brief.get('trauma')]
+    for entry in _outline_normalized_entries(brief.get('beat_outline')):
+        parts.append(entry.get('text'))
+        parts.append(entry.get('en'))
+    return ' '.join(str(x or '') for x in parts)
+
+
 def project_origin_mode(parsed_brief, theme=''):
-    """Normalize whether the story is restoration, delivered-shell build, or ground-up build."""
+    """Normalize whether the story is restoration, delivered-shell build, demolish-and-rebuild,
+    or ground-up build."""
     brief = parsed_brief or {}
     if carrier_arrives_on_camera(brief):
         return 'carrier_delivery_build'
     explicit = str(brief.get('project_origin') or '').strip().lower()
-    if explicit in ('existing_restoration', 'carrier_delivery_build', 'ground_up_build'):
+    if explicit in _PROJECT_ORIGIN_MODES:
         return explicit
     context = ' '.join(str(x or '') for x in (
         theme, brief.get('theme'), brief.get('carrier'), brief.get('trauma')))
+    wide = _demolish_and_rebuild_context(brief, theme)
+    if _DEMOLITION_CUES.search(wide) and _REBUILD_FOUNDATION_CUES.search(wide):
+        return 'demolish_and_rebuild'
     if _GROUND_UP_CUES.search(context) and not _EXISTING_ASSET_CUES.search(context):
         return 'ground_up_build'
     return 'existing_restoration'
@@ -4038,11 +4153,24 @@ def ensure_spatial_contract(parsed_brief):
         'existing_restoration': 'the named existing carrier or room is already present in IMAGE 1',
         'carrier_delivery_build': 'IMAGE 1 is the empty receiving site; Beat 1 visibly delivers the whole carrier',
         'ground_up_build': 'IMAGE 1 is undeveloped ground; excavation and structural creation happen on camera',
+        'demolish_and_rebuild': ('IMAGE 1 shows the old structure still standing on the site; it is '
+                                'demolished and cleared on camera in the early beats, and the NEW '
+                                'structure is then built from its foundations on the same ground'),
     }[origin]
+    # 「不许中途换前提」这条对先拆后建是错的：这类片子的前提本来就换一次，而且换在
+    # 明面上（拆完那一拍）。照抄通用那句，规划器与写手会被要求把拆掉的旧壳一路守到
+    # 末帧——正是 2026-08-30 那一单室内帧被写成「巴掌大单层破泥屋」的由来。
+    _origin_rule = (
+        'the premise switches exactly once, on camera, at the demolition beat: before it the old '
+        'structure is the subject, after it the site is bare ground and everything is newly built. '
+        'Never restate the demolished structure as a standing feature after that beat, and never '
+        'reintroduce it later. Apart from that single declared switch, never change premise.'
+        if origin == 'demolish_and_rebuild' else
+        'never switch between found restoration, delivered-shell build and ground-up build mid-sequence')
     parsed_brief.setdefault('origin_contract', {
         'mode': origin,
         'starting_reality': origin_start,
-        'rule': 'never switch between found restoration, delivered-shell build and ground-up build mid-sequence',
+        'rule': _origin_rule,
     })
     parsed_brief.setdefault('engineering_plan', {
         'required_systems': list(parsed_brief.get('engineering_requirements') or []),
@@ -4656,15 +4784,30 @@ _OBSERVED_CRAFT_LIST_KEYS = (
 # ── 原片观察到的拍摄角度 → 机位 DNA ──────────────────────────────────────────
 #
 # 逐拍的 ANGLE 绑得住 VIDEO，绑不住 IMAGE：每一张 IMAGE 的开场句是**族级**的
-# camera_dna 逐字复述（见 _beat_contract 的 "must OPEN with this exact static camera
-# declaration"），逐拍再写一句「这拍是仰拍」只会和它当场打架，而 fix_camera_dna 会把
+# camera_dna 逐字复述（见 _beat_contract 的 "must OPEN with this camera declaration,
+# word for word"），逐拍再写一句「这拍是仰拍」只会和它当场打架，而 fix_camera_dna 会把
 # 族那句原样顶回去——那正是 worker_scale_percent 当年空转的形状（锁写了、永远注入不
 # 进去、校验器还报绿）。
 #
 # 所以角度必须在**写 camera_dna 的那一刻**就进去。这里把清单里每个空间的主导角度算
 # 出来，交给生成 packet 的那次调用，让族级机位句自己就是原片的角度。
+# bird_eye 必须仍然是"陡俯"，不能被稀释成 high_angle。
+#
+# reverse.py 把 top_down / straight_down / overhead / aerial / plan_view / god_view 全部
+# 归一到 bird_eye——它是"原片确实是俯拍"的唯一出口。这里若把它改写成"elevated high
+# angle"，反推阶段真在爆款原片里看到垂直俯拍时，管线也只写得出高角度俯视，真鸟瞰
+# 从此表达不出来；而 check_beat_consistency 新增的对标规则又会反过来扣"机位偏离爆款
+# 原片、退化为平视"，等于自己跟自己打。而且它会和 high_angle 的措辞几乎重合，两档
+# 之间的区分消失。
+#
+# 真正要杀的是**正交地图化**（90° 顶视 + 无透视，画面退化成一张平面图），不是俯角本身。
+# 所以这里保留陡俯语义，只把"正交投影"那一步显式否掉；"矩形地基被转成 45° 菱形"是朝向
+# 问题，已经由 _BEARING_PROSE 的 front / three_quarter 各自兜住，不在这里重复。
+# 另注：本串会被 observed_camera_setup_prose 用 ", " 和 _BEARING_PROSE 拼成一句，写长了
+# 会把那句话冲成流水账——保持单个从句。
 _ANGLE_PROSE = {
-    'bird_eye': 'straight down from directly overhead, the ground plane filling the frame',
+    'bird_eye': ('steeply overhead looking down at the ground plane, still holding real perspective '
+                 'convergence rather than a flat orthographic plan view'),
     'high_angle': 'clearly above the subject looking down, its top surfaces visible',
     'eye_level': 'at a standing adult\'s eye height, the frame reading level',
     'low_angle': 'clearly below the subject looking up, its undersides visible',
@@ -4681,11 +4824,20 @@ _LENS_PROSE = {
     'macro': 'shot at macro distance — a small subject filling the frame at close focus',
 }
 _BEARING_PROSE = {
-    'front': 'square onto the subject\'s front face',
-    'three_quarter': 'onto a front corner, so a front face and a side face are both visible',
+    'front': 'square onto the subject\'s front face with horizontal baseline aligned parallel to frame bottom',
+    'three_quarter': 'from an elevated three-quarter view showing the front and one side, maintaining primary horizontal ground baseline alignment without diagonal diamond distortion',
     'side': 'onto the subject\'s flank alone, in profile',
     'rear_three_quarter': 'onto a rear corner, from behind and to one side',
     'back': 'onto the subject\'s back',
+}
+
+
+_SCALE_PROSE = {
+    'extreme_wide': 'extreme wide establishing framing',
+    'wide': 'wide framing',
+    'medium': 'medium framing',
+    'close': 'close-up framing',
+    'extreme_close': 'extreme close-up macro framing',
 }
 
 
@@ -4735,10 +4887,18 @@ def observed_camera_setups(parsed_brief):
     这是 observed_camera_angles_by_space 的继任者：那一版按**空间**分组，于是一个空间只
     落得下一个机位——同一个房间里原片换过机位的那几拍，图会按多数派角度出，只有 VIDEO
     还守着自己的角度（_validate_camera_angle_consistency 报的就是这件事）。复刻线的口径
-    是「原片拍了几个机位就是几个机位」，所以分组键从 space 变成 (space, 角度, 方位, 焦段)。
+    是「原片拍了几个机位就是几个机位」，所以分组键从 space 变成
+    (space, 角度, 方位, 焦段, 景别)。
 
-    返回 [{'id','space','angle','bearing','lens','placement','beats'}]，beats 是 1 基下标。
-    构图（placement）在同一个机位下仍会随工序推进而变，取这一组里出现最多的那句。
+    景别（shot_scale）在键里，是因为「同一个角度上推近了」在原片上就是换了一次机位：
+    机器要么走近了，要么换了焦段，两者都会改写这一拍的几何锁（近景没有可钉的地平线，
+    要钉的是主体在画幅里的占高）。不进键的话，同角度的远景与特写会被并成一个机位，
+    特写那几拍按远景那句出图——正是分组键从 space 换成机位前，机位被投票投掉的同一个
+    形状，只是降了一档。景别缺读数（空串）时与其它缺读数栏一样参与分组，不另开机位。
+
+    返回 [{'id','space','angle','bearing','lens','scale','placement','beats'}]，
+    beats 是 1 基下标。构图（placement）在同一个机位下仍会随工序推进而变，取这一组里
+    出现最多的那句。
 
     没有清单、清单没标这几栏时返回 []——与其余 observed_* 通路同一条纪律：宁可不注入，
     也不能拿一个猜出来的机位去改写机位句。
@@ -4750,16 +4910,21 @@ def observed_camera_setups(parsed_brief):
         bearing = str(entry.get('camera_bearing') or '').strip()
         lens = str(entry.get('lens_feel') or '').strip()
         placement = ' '.join(str(entry.get('placement') or '').split())
+        scale = str(entry.get('shot_scale') or '').strip()
+        if scale not in _OBSERVED_SHOT_SCALES:
+            # 闭集之外的景别读数一律当没读到：拿一个写不进闭集的字符串进分组键，
+            # 每个拼写变体都会凭空开一个新机位。
+            scale = ''
         if not (angle or bearing or lens):
-            # 只有构图没有机位读数时不单独成一个机位：机位句写的是「机器站在哪」，
+            # 只有构图/景别没有机位读数时不单独成一个机位：机位句写的是「机器站在哪」，
             # 拿一句构图去开一个新机位，等于凭空多出一台不存在的机器。
             continue
         space = str(entry.get('space') or '').strip() or f'#{idx + 1}'
-        key = (space, angle, bearing, lens)
+        key = (space, angle, bearing, lens, scale)
         if key not in setups:
             order.append(key)
             setups[key] = {'space': space, 'angle': angle, 'bearing': bearing,
-                           'lens': lens, 'placements': {}, 'beats': []}
+                           'lens': lens, 'scale': scale, 'placements': {}, 'beats': []}
         setups[key]['beats'].append(idx + 1)
         if placement:
             setups[key]['placements'][placement] = setups[key]['placements'].get(placement, 0) + 1
@@ -4771,13 +4936,26 @@ def observed_camera_setups(parsed_brief):
         if row['placements']:
             placement = max(row['placements'].items(), key=lambda kv: kv[1])[0]
         out.append({'id': f'SETUP_{n}', 'space': row['space'], 'angle': row['angle'],
-                    'bearing': row['bearing'], 'lens': row['lens'],
+                    'bearing': row['bearing'], 'lens': row['lens'], 'scale': row['scale'],
                     'placement': placement, 'beats': row['beats']})
     return out
 
 
 def observed_camera_setup_prose(setup):
-    """一个机位的散文描述（给 packet 生成调用抄的那句）。全空返回空串。"""
+    """一个机位的**站位**描述（给 packet 生成调用抄的那句）。全空返回空串。
+
+    这里刻意**不带构图**。机位是「机器站在哪」，一个机位跨好几拍复用；构图是「这一拍
+    画面里有什么」，同一个机位下随工序推进而变。两者焊进同一句，句子就会带着过期内容
+    跨拍复述——2026-08-30 实测：SETUP_1 的构图句写着「茅屋与图纸居中」，被复用到第 9 拍
+    （屋面铺瓦）时茅屋早在第 2 拍就拆光了；SETUP_2 的「拆迁场地占中间三分之二」被复用
+    到垫层拍。更坏的是第二层伤害：机位句里既然已经写着构图词，逐拍的
+    fix_subject_placement 就会被 _placement_already_written 判成「已写过」而整段跳过
+    ——那一单 17 拍里有 10 拍的真实构图读数就是这么被自己挡掉的。
+
+    构图仍然逐拍绑定，走 fix_subject_placement（读 beat 自己的 observed_craft.placement）。
+    setup['placement'] 保留在结构里，只作为 packet 生成时的**尺寸依据**发出去，见
+    observed_camera_angle_packet_rule 的 OBSERVED FRAMING 段。
+    """
     bits = []
     if setup.get('angle') in _ANGLE_PROSE:
         bits.append(_ANGLE_PROSE[setup['angle']])
@@ -4788,8 +4966,9 @@ def observed_camera_setup_prose(setup):
         parts.append(f'the camera stands {", ".join(bits)}')
     if setup.get('lens') in _LENS_PROSE:
         parts.append(_LENS_PROSE[setup['lens']])
-    if setup.get('placement'):
-        parts.append(f'composition: {setup["placement"]}')
+    if setup.get('scale') in _SCALE_PROSE:
+        # 景别紧跟焦段：两者一起决定「主体在画幅里多大」，隔开写会被读成两条无关约束。
+        parts.append(_SCALE_PROSE[setup['scale']])
     return '; '.join(parts)
 
 
@@ -4845,16 +5024,48 @@ def observed_camera_angle_packet_rule(parsed_brief):
         lines.append(f'- "{setup["id"]}" (space "{setup["space"]}"; used by {beats}): {prose}.')
     if not lines:
         return ""
+    # 构图另起一段，且明说「不许抄进机位句」。焊进机位句的代价见
+    # observed_camera_setup_prose 的说明：句子跨拍复用，构图会过期，还会把逐拍的
+    # fix_subject_placement 判成「已写过」整段跳过。
+    framings = [f'- "{st["id"]}": {st["placement"]}' for st in setups if st.get('placement')]
+    framing_block = ("""
+OBSERVED FRAMING PER SETUP (sizing input only — NEVER copy any of this into a camera sentence):
+""" + "\n".join(framings) + """
+These are per-beat framing MEASUREMENTS off the reference film. They are bound to each beat separately downstream, so a camera sentence that restates one would freeze that beat's framing onto every other beat sharing the setup. Use them ONLY to make your invented numbers agree with the film: the "z_depth_scale" you assign each primary landmark, and the horizon pinning inside the camera sentences.
+""") if framings else ""
     return ("""
 OBSERVED CAMERA SETUPS (mandatory, measured off the reference film — this project reproduces a real film shot for shot):
-""" + "\n".join(lines) + """
-23. "camera_setups": REQUIRED for this project. A JSON object whose keys are EXACTLY the setup ids listed above and whose values are one camera sentence each (~25-30 words), written to the same spec as "camera_dna" — shot type, lens feel, camera height, perspective axis, boundaries, horizon pinning. Every listed id must appear; invent no other ids.
+""" + "\n".join(lines) + framing_block + """
+23. "camera_setups": REQUIRED for this project. A JSON object whose keys are EXACTLY the setup ids listed above and whose values are one camera sentence each (~25-30 words), written to the same spec as "camera_dna" — shot type, lens feel, camera height, perspective axis, boundaries, horizon pinning. Every listed id must appear; invent no other ids. Each sentence describes WHERE THE CAMERA STANDS and nothing else: it must NOT name what is in the frame for a particular beat, and must NOT restate any framing from the OBSERVED FRAMING list. One setup is reused across several beats whose content differs completely, so a sentence that says "the demolition site occupies the central two thirds" or "the hut sits centred" is wrong on every beat except the one it was measured from.
 Each sentence must PRODUCE the viewpoint measured for that id: state the camera height, the facing and the lens feel that actually give it (a low angle means a low lens height and upward-converging lines; an overhead angle means the ground plane fills the frame and there is no horizon to pin, so pin the subject in the centre of the ground plane instead). Two setups in the same space share that space's geometry — the same walls, the same landmarks, the same distances — and differ ONLY in where the camera stands; never let them describe two different rooms.
 "camera_dna" itself still takes the setup used by the FIRST beat filmed from outside, and each interior camera sentence takes the setup used by its own space's first interior beat, so a project that never changes setup behaves exactly as before.
-Where a composition is given, it is a MEASUREMENT of the reference film's framing, and it governs the numbers you invent elsewhere in this packet: the "z_depth_scale" you assign each primary landmark and the horizon pinning inside the camera sentences must be consistent with it. Those figures have never been measured against the reference film before — this line is the only place they can be.
 This is an observation, not a preference: it OVERRIDES any default or scale rule above that would otherwise push the opening camera to a grounded eye-level wide view. Where they disagree, the observed setup wins, and the framing rules adapt to it.
 Every beat listed against one id shares that one camera sentence, verbatim — this fixes WHERE the tripod stands for each of them, it does not license a new setup per beat.
 """)
+
+
+def micro_traces_channel_enabled(config=None):
+    """这一单要不要把「微观痕迹」喂给写手。只有 miniature 通道要。
+
+    micro_traces 是 Pass A 逐帧量出来的**微距级**痕迹（锯末、粉笔弹线、油漆飞溅、
+    切口毛刺）。miniature 通道整条片子就是 50-85mm 微距镜头贴着模型拍的，这一栏是
+    它的主要画面内容；base / omni 交付的是全尺寸实景，同样的痕迹在它们的景别下一个
+    像素都渲染不出来，进了提示词只会挤掉真正看得见的画面依据（用户 2026-08-30 反馈：
+    非 mini 通道不要送这类微观画面信息，会干扰提示词输出）。
+
+    判据只认 active_skill_profile()——通道就是 profile，在这里按题材关键词再猜一遍
+    就是给同一件事立第二个真相源（与 composers/__init__.get_composer 同一条纪律）。
+
+    三个注入点共用这一个判据：规划提示词（build_outline_plan_block 的 micro_traces）、
+    合成提示词（apply_observed_craft_fields / bind_outline_to_ladder 的 include_micro，
+    数据不落到 beat['observed_craft'] 上，observed_craft_directive 那条 bullet 自然不
+    渲染）、原片事实卡（observed_grounding.build_observed_digests 的 include_micro_traces）。
+    少接一处，那一处就静默恢复投喂。
+
+    反推侧一个字都不删：同一份节拍阶梯会被不同通道复用（换个 videoModel 重新合成一次
+    就是另一条通道），在产出侧删掉等于要求换通道时重跑反推。
+    """
+    return active_skill_profile(config) == 'miniature'
 
 
 def observed_craft_of(beat):
@@ -4895,8 +5106,13 @@ def observed_shot_scale_of(beat):
     return value if value in _OBSERVED_SHOT_SCALES else None
 
 
-def _craft_from_outline_entry(entry):
-    """一条清单条目 → 制作字段字典。全空返回 {}。"""
+def _craft_from_outline_entry(entry, include_micro=True):
+    """一条清单条目 → 制作字段字典。全空返回 {}。
+
+    include_micro=False 时丢掉 micro（微观痕迹）那一栏，见 micro_traces_channel_enabled。
+    在这里丢而不是在 observed_craft_directive 里跳过：这一栏一旦落到
+    beat['observed_craft'] 上就是**数据**，断点会把它连同整拍一起落盘，下游任何一个新
+    读取点都会重新拿到它。"""
     if not isinstance(entry, dict):
         return {}
     craft = {}
@@ -4905,6 +5121,8 @@ def _craft_from_outline_entry(entry):
         if value:
             craft[dst] = value
     for dst, src in _OBSERVED_CRAFT_LIST_KEYS:
+        if dst == 'micro' and not include_micro:
+            continue
         raw = entry.get(src)
         items = ([str(x).strip() for x in raw if str(x).strip()]
                  if isinstance(raw, (list, tuple)) else [])
@@ -4913,7 +5131,7 @@ def _craft_from_outline_entry(entry):
     return craft
 
 
-def apply_observed_craft_fields(beat_ladder, parsed_brief):
+def apply_observed_craft_fields(beat_ladder, parsed_brief, include_micro=True):
     """把原片观察到的逐拍制作字段（工具/音效/光照/物料去向/人数/机位）按下标贴回梯子。
 
     返回贴上的拍数。
@@ -4929,6 +5147,8 @@ def apply_observed_craft_fields(beat_ladder, parsed_brief):
     与那两个函数同一条纪律：清单条数与梯子长度对不上就整段不生效（规划四轮全灭退回
     兜底梯子时，按下标硬贴只会把 A 拍的工具贴到 B 拍上）。只写 observed_craft 这一个
     键，不碰任何施工字段。
+
+    include_micro：微观痕迹只贴给 miniature 通道，见 micro_traces_channel_enabled。
     """
     if not isinstance(beat_ladder, list):
         return 0
@@ -4939,7 +5159,7 @@ def apply_observed_craft_fields(beat_ladder, parsed_brief):
     for beat, entry in zip(beat_ladder, plan):
         if not isinstance(beat, dict):
             continue
-        craft = _craft_from_outline_entry(entry)
+        craft = _craft_from_outline_entry(entry, include_micro=include_micro)
         if not craft:
             continue
         beat['observed_craft'] = craft
@@ -5278,33 +5498,66 @@ _ANCHOR_RETIRE_CUES = (
     'boxed in', 'box in', 'conceal', 'concealed', 'concealing', 'enclose', 'enclosed',
     'hidden behind', 'buried under', 'plaster over', 'plastered over', 'drywall over',
     'furred over', 'insulated over', 'skinned over', 'wrapped over',
+    # 拆除/清运/推平/扒倒工序词 (Demolition & Clearance cues)
+    'demolish', 'demolished', 'demolishing', 'demolition',
+    'dismantle', 'dismantled', 'dismantling',
+    'tear down', 'torn down', 'tearing down',
+    'strip', 'stripped', 'stripping',
+    'remove', 'removed', 'removing', 'removal',
+    'clear', 'cleared', 'clearing', 'clear out', 'cleared out',
+    'sweep', 'swept', 'swept bare', 'swept clean', 'swept clear',
+    'excavate', 'excavated', 'excavating', 'excavation',
+    'knock down', 'knocked down', 'raze', 'razed',
 )
 _ANCHOR_TRANSFORM_CUES = (
     'converted into', 'converted to', 'convert into', 'converted', 'transformed into',
     'replaced by', 'replaced with', 'replaces', 'reworked into', 'rebuilt as', 'becomes',
     'turned into', 'cut into', 'opened into', 'widened into', 'merged into',
+    'foundation', 'concrete slab', 'brick masonry', 'brickwork', 'two-story', 'two-storey',
+    'villa structure', 'erected', 'built on site',
 )
 
 
+_ANCHOR_MODIFIER_STOPWORDS = {
+    'dilapidated', 'miniature', 'decayed', 'ruined', 'old', 'weathered', 'damaged',
+    'broken', 'existing', 'original', 'intact', 'rough', 'bare', 'stacked',
+}
+
+
 def _anchor_name_keywords(name):
-    """锚点名里用于匹配的实词（去掉泛词，长度 > 3）。'row of original oval passenger
-    portholes' -> ['original', 'oval', 'passenger', 'portholes']。"""
+    """锚点名里用于匹配的实词（去掉泛词与通用修饰词，长度 >= 3）。'row of original oval passenger
+    portholes' -> ['oval', 'passenger', 'portholes']。"""
     words = re.sub(r'[^\w\s]', ' ', str(name or '').lower()).split()
-    return [w for w in words if len(w) > 3 and w not in _MILESTONE_WORD_STOPWORDS]
+    return [w for w in words if len(w) >= 3 and w not in _MILESTONE_WORD_STOPWORDS and w not in _ANCHOR_MODIFIER_STOPWORDS]
+
+
+def _word_matches_haystack_words(word, haystack_words):
+    if word in haystack_words:
+        return True
+    if word.endswith('ed') and len(word) > 4 and word[:-2] in haystack_words:
+        return True
+    if word.endswith('ing') and len(word) > 5 and word[:-3] in haystack_words:
+        return True
+    if word.endswith('s') and len(word) > 3 and word[:-1] in haystack_words:
+        return True
+    if any(hw.startswith(word) for hw in haystack_words if len(hw) >= len(word)):
+        return True
+    return False
 
 
 def _beat_mentions_anchor(beat, name):
-    """这一拍的交付物文本里有没有点到这个锚点。要求命中过半实词（单实词名要求命中它
+    """这一拍的交付物文本里有没有点到这个锚点。要求命中过半核心实词（单实词名要求命中它
     本身），避免 'wall' 这类泛词把所有拍都算成"动了这个锚点"。"""
     keywords = _anchor_name_keywords(name)
     if not keywords:
         return False
     haystack = ' '.join(str(x or '') for x in (
         beat.get('milestone_name'), beat.get('after_state'), beat.get('description'),
-        beat.get('completion_extent'),
+        beat.get('completion_extent'), beat.get('operation'),
         ' '.join(str(x) for x in (beat.get('package_operations') or [])),
     )).lower()
-    hits = sum(1 for k in keywords if k in haystack)
+    haystack_words = set(re.findall(r'\w+', haystack))
+    hits = sum(1 for k in keywords if _word_matches_haystack_words(k, haystack_words))
     return hits >= max(1, (len(keywords) + 1) // 2)
 
 
@@ -5332,7 +5585,10 @@ def _inferred_anchor_transition(beat, name):
     if not _beat_mentions_anchor(beat, name):
         return None
     after = ' '.join(str(x or '') for x in (
-        beat.get('after_state'), beat.get('milestone_name'), beat.get('description'))).lower()
+        beat.get('after_state'), beat.get('milestone_name'), beat.get('description'),
+        beat.get('operation'),
+        ' '.join(str(x) for x in (beat.get('package_operations') or [])),
+    )).lower()
     for cue in _ANCHOR_TRANSFORM_CUES:
         if cue in after:
             # 继任锚的名字取自本拍里程碑，但要去掉里程碑惯用的完成态后缀——锚点句写的是
@@ -5493,6 +5749,98 @@ _INTERIOR_IMAGE_CAMERA_DNA = (
 )
 
 
+# camera_palette 里放得下两种东西：一种是**镜头族的短标签**（"entrance detail"、
+# "shaft axis"，兜底 palette 与旧 packet 里就是这一种），一种是**完整机位句**。只有后者
+# 能当 camera_dna 用——前者没有焦段、没有机高、没有消失轴、没有地平线钉位，拿它顶替
+# 族级机位句等于把几何锁整把摘掉，比"所有图都是同一个平视三脚架"坏得多。所以每一个
+# 出口都过这道守卫：不像一句机位声明就返回 None，逐字回落到族级 camera_dna。
+_PALETTE_SENTENCE_MIN_WORDS = 12
+
+
+def _palette_camera_sentence(value):
+    """palette 里的一项 → 可用的机位句；不够格返回空串。"""
+    sentence = _flatten_to_text(value or '').strip()
+    if len(sentence.split()) < _PALETTE_SENTENCE_MIN_WORDS:
+        return ''
+    if not _CAMERA_SUBJECT_RE.search(sentence):
+        return ''
+    return sentence
+
+
+def _resolve_palette_camera_dna(beat, palette, base_camera_dna, family):
+    """从 camera_palette 中按拍解析或轮转机位声明（原创线镜头族轮转）。
+
+    只返回过了 _palette_camera_sentence 的完整机位句；palette 里装的是短标签时整段
+    不生效，逐字回落到改动前的行为。
+    """
+    if not palette:
+        return None
+
+    if isinstance(palette, dict):
+        # 1. 显式字段直接匹配
+        for k in ('camera_family', 'shot_family', 'camera_setup', 'camera_angle', 'angle'):
+            val = beat.get(k) if isinstance(beat, dict) else None
+            if val and str(val).strip() in palette:
+                sentence = _palette_camera_sentence(palette[str(val).strip()])
+                if sentence:
+                    return sentence
+
+        # 2. 施工阶段与工序映射轮转 (establish -> groundwork -> structure -> detail -> reverse)
+        op = str((beat or {}).get('operation') or (beat or {}).get('work_type') or '').lower()
+        idx = (beat or {}).get('index') or 0
+        if isinstance(idx, str) and idx.isdigit():
+            idx = int(idx)
+
+        stage_key = None
+        if op in ('clearing', 'demolition', 'survey', 'layout', 'groundwork', 'earthwork', 'marking', 'excavation', 'drainage') or idx in (1, 2, 3):
+            for candidate in ('groundwork', 'high_angle', 'overhead', 'shaft_axis', 'entrance_detail', 'establish', 'three_quarter_oblique'):
+                if candidate in palette:
+                    stage_key = candidate
+                    break
+        elif op in ('framing', 'structure', 'columns', 'roofing', 'truss', 'flooring', 'subfloor', 'piles') or idx in (4, 5, 6, 7):
+            for candidate in ('structure', 'low_angle', 'floor_low_angle', 'rail/floor low angle', 'three_quarter_oblique', 'hero'):
+                if candidate in palette:
+                    stage_key = candidate
+                    break
+        elif op in ('drywall', 'paneling', 'wall', 'wiring', 'plumbing', 'glazing', 'insulation', 'finish') or idx in (8, 9):
+            for candidate in ('wall_graze', 'side wall graze', 'detail', 'close_up'):
+                if candidate in palette:
+                    stage_key = candidate
+                    break
+        elif op in ('reward', 'reveal', 'furnishing', 'final') or (idx and idx >= 10):
+            for candidate in ('reverse', 'far_wall_reverse', 'far-wall reverse', 'reveal', 'three_quarter_oblique', 'establish'):
+                if candidate in palette:
+                    stage_key = candidate
+                    break
+
+        if stage_key and stage_key in palette:
+            sentence = _palette_camera_sentence(palette[stage_key])
+            if sentence:
+                return sentence
+
+        # 3. 空间族匹配
+        if family and family in palette:
+            sentence = _palette_camera_sentence(palette[family])
+            if sentence:
+                return sentence
+        if 'default' in palette:
+            sentence = _palette_camera_sentence(palette['default'])
+            if sentence:
+                return sentence
+
+    elif isinstance(palette, (list, tuple)):
+        # 只收完整机位句，短分类名（"entrance detail"）一律不收
+        full_sentences = [x for x in (_palette_camera_sentence(v) for v in palette) if x]
+        if full_sentences:
+            idx = (beat or {}).get('index') or 0
+            if isinstance(idx, str) and idx.isdigit():
+                idx = int(idx)
+            chosen = full_sentences[(idx - 1) % len(full_sentences)] if idx > 0 else full_sentences[0]
+            return chosen
+
+    return None
+
+
 def select_camera_dna(beat, base_camera_dna, packet=None, family=None):
     """Camera DNA sentence for the IMAGE a beat produces. IMAGEs are still frames, so every
     family gets a STATIC declaration — bridge motion language belongs in the VIDEO prompts only.
@@ -5519,6 +5867,14 @@ def select_camera_dna(beat, base_camera_dna, packet=None, family=None):
             sentence = _flatten_to_text(setups.get(setup_id) or '').strip()
             if sentence:
                 return sentence
+
+    # 原创线 / 无 setup_id 时：优先查询并激活 camera_palette 镜头族
+    palette = (packet or {}).get('camera_palette')
+    if palette:
+        palette_sentence = _resolve_palette_camera_dna(beat, palette, base_camera_dna, family)
+        if palette_sentence:
+            return palette_sentence
+
     if family == 'interior':
         interior = _flatten_to_text((packet or {}).get('interior_camera_dna') or '').strip()
         return interior or _INTERIOR_IMAGE_CAMERA_DNA
@@ -5627,28 +5983,43 @@ def fix_camera_dna(prompt, camera_dna, required_markers=None):
     """Inject the camera DNA when missing. `required_markers`: presence-check tokens that
     decide 'already has the right family DNA' — used for interior frames whose DNA is
     injected AFTER the stale pre-crossing camera line has been stripped (the generic
-    'tripod'/'lens feel' prefix sniff would false-positive on that stale line)."""
+    prefix sniff would false-positive on that stale line)."""
+    if not prompt:
+        return prompt or ''
     if required_markers:
         low = prompt.lower()
         if any(m.lower() in low for m in required_markers):
             return prompt
-        return f"{camera_dna} {prompt}"
+        # 标记词不在，不等于机位句不在。这条分支原先无条件前置，于是正文明明已经
+        # 逐字开着这句机位、只是还没写到 'pitch locked' 那几个词，就被又前置了一遍——
+        # 两句之间没有句号，粘成一句长句，dedupe_camera_declaration 按句号切句也切不开，
+        # 于是整句机位声明在交付正文里出现两遍（2026-08-30 实测图 12）。老毛病，是
+        # camera_setups 让模型开始逐字照抄机位句之后才暴露出来的。
+        if camera_dna and camera_dna.lower() in low:
+            return prompt
+        return f"{camera_dna} {prompt}" if camera_dna else prompt
     prefix = prompt[:300].lower()
-    keywords = ['tripod', 'lens feel', 'camera height']
-    if any(kw in prefix for kw in keywords):
+    if _CAMERA_SUBJECT_RE.search(prefix):
+        tokens = {t for t in _CAMERA_DNA_TOKENS_RE.findall(prefix) if t in _CAMERA_RESTATEMENT_TOKENS}
+        if len(tokens) >= 2:
+            return prompt
+    if camera_dna and camera_dna.lower() in prompt.lower():
         return prompt
-    if camera_dna.lower() not in prompt.lower():
-        return f"{camera_dna} {prompt}"
-    return prompt
+    if not camera_dna:
+        return prompt
+    return f"{camera_dna} {prompt}"
 
 
-_CAMERA_DNA_TOKENS_RE = re.compile(r'[a-z]{4,}')
+_CAMERA_DNA_TOKENS_RE = re.compile(r'[a-z]{3,}')
 # 数字/拼写两种写法要能互认：契约里的开场句是 "24mm lens feel, camera height 1.6m"，
 # 模型在正文里复述成 "twenty-four millimeter lens feel, camera height one point six meters"。
 # 逐字比对认不出它们是同一句，只能按"构图约束词的集合"来认。
 _CAMERA_RESTATEMENT_TOKENS = (
     'tripod', 'lens', 'feel', 'camera', 'height', 'perspective', 'eye', 'level', 'locked',
     'static', 'millimeter', 'millimetre', 'framing', 'vanishing', 'axis', 'pitch', 'wide',
+    'angle', 'overhead', 'oblique', 'elevation', 'horizon', 'macro', 'close', 'view',
+    'viewpoint', 'bearing', 'shot', 'setup', 'ground', 'high', 'low', 'steep', 'bird',
+    'worm', 'dutch', 'profile', 'scale',
 )
 _CAMERA_SUBJECT_RE = re.compile(r'\b(camera|shot|lens|framing|perspective|viewpoint)\b',
                                 re.IGNORECASE)
@@ -6205,7 +6576,9 @@ _EXACT_FRACTION_PROSE = {
 }
 _BARE_PERCENT_RE = re.compile(
     r'\b((?:\d{1,3})|(?:[a-z]+(?:[-\s][a-z]+)?))\s*(?:-|\s)?(?:percent|%)'
-    r'(?!\s*of\s+(?:total\s+)?frame\s+height)(\s+of\s+)?',
+    # 冠词也吃进来：'the entire' 自带限定词，不吃就写出 'the entire the floor'
+    # （注释里的意图是 'the entire floor'，2026-08-30 才发现从来没实现）。
+    r'(?!\s*of\s+(?:total\s+)?frame\s+height)(\s+of\s+(?:the\s+|a\s+|an\s+)?)?',
     re.IGNORECASE)
 
 
@@ -6311,8 +6684,13 @@ def scrub_spatial_notation(text):
         trailing_of = m.group(2) or ''
         if prose == 'the entire':
             # '100 percent of the floor' -> 'the entire floor'（吃掉 of，否则留下悬空介词）
-            return 'the entire ' if trailing_of else 'all of it'
+            # 后面没跟 'of' 时，这个百分比几乎总是在**副词位**上（'the trenches are
+            # 100 percent excavated'），译成名词短语 'all of it' 会把句子插断：
+            # 'all foundation footing trenches all of it excavated'（2026-08-30 实测
+            # 图 5/6/8）。'fully' 在副词位上通顺，在谓语位上也读得通。
+            return 'the entire ' if trailing_of else 'fully'
         if trailing_of and prose.endswith(' of it'):
+            # 其余档位保留 'of ...' 原样（冠词一并还回去）：'about half of the floor'
             return prose[:-len(' of it')] + trailing_of
         return prose + trailing_of
 
@@ -6397,6 +6775,21 @@ def _adapt_landmarks_to_completed_surfaces(landmarks, body):
         if any(w in name_low for w in ('unglazed', 'window aperture reveal', 'porthole reveal', 'raw window hole', 'unframed window')):
             if any(win in low for win in ('glazed window', 'casement window', 'divided-lite', 'fitted window', 'installed window', 'window frame')):
                 new_lm['name'] = 'the fitted circular divided-lite window'
+
+        # Demolished / Cleared / Rebuilt structure adaptation:
+        if any(w in name_low for w in ('dilapidated', 'mud hut', 'ruined hut', 'decayed hut', 'straw thatch', 'old hut', 'decayed facade', 'cracked earthen')):
+            if any(w in low for w in ('two-story', 'two-storey', 'villa', 'brick building', 'house facade', 'second-story', 'second floor')):
+                new_lm['name'] = 'the two-story brick villa structure'
+            elif any(w in low for w in ('brick masonry', 'brick wall', 'running-bond', 'ten courses', 'red perforated brick')):
+                new_lm['name'] = 'the ground floor brick masonry walls'
+            elif any(w in low for w in ('cast-concrete slab', 'concrete slab', 'concrete foundation', 'solid cast-concrete')):
+                new_lm['name'] = 'the solid cast-concrete slab foundation'
+            elif any(w in low for w in ('foundation trench', 'gravel aggregate', 'pea gravel', 'excavated trench')):
+                new_lm['name'] = 'the gravel-lined foundation trench sub-base'
+            elif any(w in low for w in ('chalk layout', 'chalked', 'corner pegs', 'building footprint', 'chalk lines')):
+                new_lm['name'] = 'the white chalk foundation layout grid'
+            elif any(w in low for w in ('dismantled', 'demolished', 'swept bare', 'cleared site', 'swept clean', 'cleared dirt footprint')):
+                new_lm['name'] = 'the cleared and swept foundation dirt pad'
 
         adapted.append(new_lm)
     return adapted
@@ -6653,6 +7046,7 @@ def apply_proactive_fixes(i, video_prompt, image_prompt, packet, mode, is_last, 
         image_prompt, allow_occupant=beat_requires_occupant(beat))
     video_prompt = fix_video_opening(i, video_prompt)
     video_prompt = fix_pacing_control(video_prompt, is_threshold_or_reveal)
+    video_prompt = fix_natural_body_mechanics(video_prompt)
     video_prompt = fix_out_and_in(video_prompt, is_threshold_or_reveal, beat=beat, packet=packet)
     video_prompt = fix_sound_design(video_prompt, family=family)
 
@@ -6695,7 +7089,8 @@ def apply_proactive_fixes(i, video_prompt, image_prompt, packet, mode, is_last, 
     if is_last and ladder_gloss_floor_milestone(beat_ladder, i) == '':
         video_prompt = strip_unearned_gloss_floor(video_prompt)
     image_prompt = fix_horizon_line(image_prompt, family=family)
-    image_prompt = fix_primary_landmarks(image_prompt, packet, family=family)
+    active_packet = packet_with_anchor_lifecycle(packet, beat_ladder, i, family=family)
+    image_prompt = fix_primary_landmarks(image_prompt, active_packet, family=family)
 
     # 「双空间一比一复刻」的第一拍从空场地吊入整只载体。只锁“广角看全场”时，模型很容易
     # 把山谷/采石场当主角，把真正的壳体缩成远处的一粒；而 IMAGE 1 与 IMAGE 2 又共用静态
@@ -6756,6 +7151,13 @@ def apply_proactive_fixes(i, video_prompt, image_prompt, packet, mode, is_last, 
     # 一律在送去渲染之前剥掉。
     video_prompt = scrub_planning_annotations(video_prompt)
     image_prompt = scrub_planning_annotations(image_prompt)
+
+    # 同一道收口的第三条：活物一律真人（见 prompt_pipeline.human_cast）。整条链路的
+    # 词汇表是从微缩线长出来的，模板、写手、合成后的对帧订正三处都会把画面里的活人
+    # 写成 figurine —— 生图模型照着这个词渲，人就成了蜡像。词从哪条路进来都出不了
+    # 这个函数。只做等长/更短的改写，不追加句子：IMAGE 有字数硬顶。
+    video_prompt = humanize_prompt_text(video_prompt)
+    image_prompt = humanize_prompt_text(image_prompt)
 
     return video_prompt, image_prompt
 
@@ -6885,11 +7287,20 @@ def check_video_opening(i, prompt, first_frame_index=None, profile=None, single_
     first_frame_index = i if first_frame_index is None else first_frame_index
     errors = []
     low = (prompt or '').strip().lower()
-    if profile in ('omni', 'miniature') or single_frame or "starting composition and environment anchor" in low:
+    if single_frame or ("starting composition and environment anchor" in low and "first frame and last frame" not in low):
         if not low.startswith("use the provided image as the exact starting composition and environment anchor."):
             errors.append(f"VIDEO {i} missing required opening sentence 'Use the provided image as the exact starting composition and environment anchor.'")
         binding = f"use image {first_frame_index} as the actual first-frame image".lower()
         if binding not in low:
+            errors.append(f"VIDEO {i} opening must bind IMAGE {first_frame_index} as the starting frame")
+    elif profile in ('omni', 'miniature'):
+        # Omni / Miniature 兼容首尾双锚点与单锚点起始帧
+        has_dual = low.startswith("use the provided first frame and last frame as exact composition anchors.")
+        has_single = low.startswith("use the provided image as the exact starting composition and environment anchor.")
+        if not (has_dual or has_single):
+            errors.append(f"VIDEO {i} missing required opening sentence ('Use the provided first frame and last frame as exact composition anchors.' or 'Use the provided image as the exact starting composition and environment anchor.')")
+        binding_single = f"use image {first_frame_index} as the actual first-frame image".lower()
+        if binding_single not in low:
             errors.append(f"VIDEO {i} opening must bind IMAGE {first_frame_index} as the starting frame")
     else:
         if not low.startswith("use the provided first frame and last frame as exact composition anchors."):
@@ -6911,6 +7322,21 @@ def check_pacing_control(prompt, is_threshold_or_reveal):
                           "transformation advances continuously and at an even rate across the "
                           "entire duration, with no static interval and no deferred single step")
     return errors
+
+
+def check_natural_body_mechanics(prompt):
+    """Mirrors check_pacing_control, for the counterpart _NATURAL_MOTION_PHRASE clause: a
+    prompt with a human subject in frame and no sterile-of-people declaration must carry the
+    natural-body-mechanics clause, or the delivered motion reads as a robotic constant-speed
+    glide between two poses (see fix_natural_body_mechanics)."""
+    prompt = prompt or ""
+    if not _HUMAN_SUBJECT_RE.search(prompt) or _STERILE_DECLARATION_RE.search(prompt):
+        return []
+    if _NATURAL_MOTION_MARKER not in prompt.lower():
+        return ["VIDEO has a human subject in frame but is missing the natural-body-mechanics "
+                "clause (weight shift, torso lean, non-uniform pace) — without it the delivered "
+                "motion reads as a robotic constant-speed glide between two poses"]
+    return []
 
 
 def check_out_and_in(prompt, is_threshold_or_reveal=False):
@@ -7035,6 +7461,11 @@ def check_stylistic_repetition(curr_prompt, prev_prompt, packet, is_video=True):
             "at every moment something is visibly progressing",
             "no interval of the clip is static or paused",
             "no part of the change is deferred and then delivered as a single sudden step",
+            # _NATURAL_MOTION_PHRASE：跟 EVEN_RATE 一样是逐拍固定追加的确定性兜底句，不是
+            # 写手每拍各自写的正文，出现在每一个带人体的拍里是设计如此，不能算复读。
+            "this motion carries real physical weight and momentum",
+            "pressure and balance visibly shift before each effort",
+            "a brief natural settle between reaching for a tool and making contact",
             # omni 的结构件（逐字复用是契约要求，见 omni-multishot-language.md §Phrasing Variation）
             "edited construction time-lapse assembled from multiple camera setups, not real-time footage",
             "the only compressions in the clip fall exactly on the listed cut marks",
@@ -7374,6 +7805,152 @@ def check_cast_in_frame(video_prompt, image_prompt, beat):
                 f"and write the one micro-motion they make this beat."
             )
     return errors
+
+
+_REPETITIVE_POSITION_PATTERNS = [
+    (re.compile(r'\b(?:at|in|near)\s+the\s+(?:lower[- ]left|bottom[- ]left)\b', re.IGNORECASE), 'lower-left corner'),
+    (re.compile(r'\b(?:at|in|near)\s+the\s+(?:lower[- ]right|bottom[- ]right)\b', re.IGNORECASE), 'lower-right corner'),
+    (re.compile(r'\b(?:at|along|near)\s+the\s+(?:circular\s+)?(?:diorama\s+edge|boundary\s+edge|outer\s+edge)\b', re.IGNORECASE), 'diorama outer edge'),
+    (re.compile(r'\b(?:stand|standing)\s+(?:patiently\s+|attentively\s+)?(?:on\s+the\s+ground\s+)?(?:below|at\s+the\s+lower\s+left)\s+(?:looking\s+up|gazing\s+upward|watching|observing)\b', re.IGNORECASE), 'ground below looking up'),
+]
+
+
+def check_repetitive_cast_positioning(image_prompts):
+    """Rule 13 & Rule 15: 检查连续两帧及以上是否把人物/人偶固定在同一个角落或重复静态站桩。"""
+    errors = []
+    if not image_prompts:
+        return errors
+
+    if isinstance(image_prompts, dict):
+        ordered_keys = sorted(image_prompts.keys())
+        prompts = [image_prompts[k] for k in ordered_keys]
+    else:
+        prompts = list(image_prompts)
+        ordered_keys = list(range(1, len(prompts) + 1))
+
+    prev_pos_tags = set()
+    prev_idx = None
+
+    for idx, prompt in zip(ordered_keys, prompts):
+        text = str(prompt or '')
+        curr_tags = set()
+        for pat, tag in _REPETITIVE_POSITION_PATTERNS:
+            if pat.search(text):
+                curr_tags.add(tag)
+
+        has_cast = any(cue in text.lower() for cue in _LIVING_ANCHOR_CUES)
+        if has_cast and curr_tags and prev_pos_tags:
+            overlap = curr_tags.intersection(prev_pos_tags)
+            if overlap:
+                tag_names = ', '.join(sorted(overlap))
+                errors.append(
+                    f"IMAGE {idx} repeats the same cast position '{tag_names}' as IMAGE {prev_idx}. "
+                    "Rule 13 & Rule 15 mandate dynamic spatial migration across diorama zones."
+                )
+
+        if has_cast:
+            prev_pos_tags = curr_tags
+            prev_idx = idx
+        else:
+            prev_pos_tags = set()
+            prev_idx = None
+
+    return errors
+
+
+def _get_dynamic_cast_phrase_for_milestone(stage, index, total=17):
+    """根据当拍工序智能生成与当拍建筑结构深度咬合的活物交互与迁移位置。"""
+    stg = str(stage or '').lower()
+    if index == 1 or stg in ('demolition', 'clearing'):
+        return "crouched on the dry alluvial mud near the site boundary, attentively examining the unfolded blueprint"
+    elif index == 2 or stg in ('clearing', 'pad'):
+        return "standing patiently at the perimeter margin, clearing loose debris beside the composted humus pile"
+    elif index == 3 or stg in ('grid', 'survey'):
+        return "standing along the outer chalk survey line, inspecting the red-topped boundary stakes"
+    elif index == 4 or stg in ('excavation', 'footing'):
+        return "leaning over the front footing pit, peering down at the gravel drainage bed"
+    elif index == 5 or stg in ('column', 'pillar'):
+        return "stepping beside the front-left column, reaching out to touch the polished brass shoe collar"
+    elif index == 6 or stg in ('deck', 'platform'):
+        return "standing on the ground beneath the open stilt platform, looking up through the breathable slatted woodwork"
+    elif index == 7 or stg in ('balcony', 'veranda', 'attic'):
+        return "standing on the elevated veranda deck, leaning against the teak balustrade handrail"
+    elif index == 8 or stg in ('truss', 'rafter', 'roof_frame'):
+        return "standing under the cantilevered eaves, looking up admiringly at the bamboo rafter network"
+    elif index == 9 or stg in ('roof', 'slate', 'tiles'):
+        return "standing on the outer terrace, gazing up with delight at the overlapping blue-grey slate roof"
+    elif index == 10 or stg in ('wall', 'facade', 'screen'):
+        return "standing beside the exterior wall, admiring the delicate herringbone woven bamboo screen"
+    elif index == 11 or stg in ('threshold', 'door', 'entrance'):
+        return "standing joyfully on either side of the open entrance threshold, welcoming the cool breeze"
+    elif index == 12 or stg in ('floor', 'fixtures', 'mat'):
+        return "standing inside on the seamless woven bamboo floor mat, examining the gravity rainwater filter"
+    elif index == 13 or stg in ('interior', 'hallway', 'sanctuary'):
+        return "standing in the center of the furnished living sanctuary, joyfully raising their arms in celebration"
+    elif index == 14 or stg in ('paint', 'stain', 'lacquer'):
+        return "standing together on the stilt veranda landing, looking out over the landscape with warm smiles"
+    elif index == 15 or stg in ('lawn', 'garden', 'landscape'):
+        return "standing on the elevated veranda, looking down in wonder at the thriving green tidal garden"
+    elif index == 16 or stg in ('walkway', 'boardwalk', 'path'):
+        return "walking hand-in-hand along the gently curving teak boardwalk toward the riverbank"
+    elif index >= 17 or stg in ('reveal', 'estate'):
+        return "standing proudly together at the boardwalk entrance, holding hands and waving cheerfully in celebration"
+    return "stepping dynamically across the diorama, actively interacting with the newly completed milestone"
+
+
+def fix_repetitive_cast_positioning(image_prompts, beats_list=None):
+    """自动修复连续帧中重复的左下角/边缘站桩，重置为随工序迁移的动态交互位置。"""
+    if not image_prompts:
+        return image_prompts
+
+    is_dict = isinstance(image_prompts, dict)
+    if is_dict:
+        ordered_keys = sorted(image_prompts.keys())
+        prompts = {k: str(image_prompts[k] or '') for k in ordered_keys}
+    else:
+        ordered_keys = list(range(1, len(image_prompts) + 1))
+        prompts = {i: str(p or '') for i, p in zip(ordered_keys, image_prompts)}
+
+    total = len(ordered_keys)
+    seen_corner_tags = set()
+
+    for idx_pos, k in enumerate(ordered_keys):
+        prompt = prompts[k]
+        curr_tags = set()
+        for pat, tag in _REPETITIVE_POSITION_PATTERNS:
+            if pat.search(prompt):
+                curr_tags.add(tag)
+
+        has_cast = any(cue in prompt.lower() for cue in _LIVING_ANCHOR_CUES)
+        if has_cast and curr_tags:
+            # 若非首帧且命中了重复角落，立即修复为与当前工序咬合的新动态
+            if idx_pos > 0 and (curr_tags.intersection(seen_corner_tags) or len(curr_tags) > 0):
+                beat = beats_list[idx_pos] if (beats_list and idx_pos < len(beats_list)) else {}
+                stage = beat.get('stage') if isinstance(beat, dict) else ''
+                new_action = _get_dynamic_cast_phrase_for_milestone(stage, k, total)
+
+                fixed = re.sub(
+                    r'(?i)\b(?:stand|standing)\s+(?:patiently\s+|attentively\s+|quietly\s+|distressed\s+)?(?:on\s+the\s+ground\s+)?(?:at|in|by|near)\s+the\s+(?:bottom[- ]left|lower[- ]left|diorama\s+edge|circular\s+boundary\s+edge|outer\s+edge|ground\s+below)[^.;,]*',
+                    new_action,
+                    prompt
+                )
+                if fixed == prompt:
+                    fixed = re.sub(
+                        r'(?i)\bstand\s+on\s+the\s+ground\s+(?:at\s+the\s+lower\s+left|below)[^.;,]*',
+                        new_action,
+                        prompt
+                    )
+                if fixed == prompt:
+                    fixed = re.sub(
+                        r'(?i)\b(?:at|in|near)\s+the\s+(?:lower[- ]left|bottom[- ]left)\b[^.;,]*',
+                        new_action,
+                        prompt
+                    )
+                prompts[k] = fixed
+            else:
+                seen_corner_tags.update(curr_tags)
+
+    return prompts if is_dict else [prompts[k] for k in ordered_keys]
 
 
 def check_anchor_scale_lock(image_prompt, packet, family='exterior'):
@@ -10048,6 +10625,7 @@ def validate_beat_prompts(i, video_prompt, image_prompt, packet, mode, is_last, 
     errors.extend(check_worker_scale_lock(video_prompt, packet))
     errors.extend(check_transition_shortcuts(video_prompt))
     errors.extend(check_pacing_control(video_prompt, is_threshold_or_reveal))
+    errors.extend(check_natural_body_mechanics(video_prompt))
 
     # Check camera contradictions
     op = beat.get('operation', '').lower() if beat else ''
@@ -10261,6 +10839,7 @@ Required JSON keys:
    - "existing_restoration": the named damaged carrier/room already exists in IMAGE 1 and is repaired in place.
    - "carrier_delivery_build": IMAGE 1 is an empty receiving site and the complete carrier is visibly delivered in Beat 1.
    - "ground_up_build": IMAGE 1 is undeveloped ground and excavation plus structural creation are shown before fit-out.
+   - "demolish_and_rebuild": IMAGE 1 shows an OLD structure still standing, that structure is demolished and cleared on camera, and a DIFFERENT new structure is then built from its foundations on the same ground. Choose this — never "existing_restoration" — whenever the thing standing in IMAGE 1 is torn down rather than repaired. The old structure is the subject only until it is cleared; it is not the carrier, and its shell, size and openings must never be used to describe the finished build.
    The value must describe physical starting reality, not merely copy a marketing word such as BUILD.
 """
     # 「双空间重置兑现」多问三项：第二空间在哪、和第一空间之间隔着什么、怎么过去。
@@ -10351,8 +10930,7 @@ Required JSON keys:
     # 再把视觉状态归零到从未施工的室内。这不能由 brief LLM 自由改成 coaxial/pan，
     # 否则会悄然退回原单线骨架。激发层只会把该骨架分配给有可读外门面+独立内部的载体。
     _declared_origin = str(parsed_brief.get('project_origin') or '').strip().lower()
-    parsed_brief['_project_contract_enforced'] = _declared_origin in (
-        'existing_restoration', 'carrier_delivery_build', 'ground_up_build')
+    parsed_brief['_project_contract_enforced'] = _declared_origin in _PROJECT_ORIGIN_MODES
     parsed_brief = apply_pacing_skeleton_to_brief(parsed_brief, pacing_skeleton_id)
     parsed_brief = apply_project_contract(parsed_brief, theme)
     ensure_spatial_contract(parsed_brief)
@@ -10592,8 +11170,13 @@ Required JSON keys:
     _shot_composer = get_composer(active_skill_profile(config))
     _shot_composer.begin_run(config, parsed_brief)
     _is_multishot = hasattr(_shot_composer, 'ladder_for_kind')
+    # 微观痕迹只喂微缩通道（见 micro_traces_channel_enabled）。算一次，规划提示词与
+    # 下面的制作字段回贴共用同一个判据——两处各判一次就等于给「本单是不是 mini 通道」
+    # 立两个会各自漂移的真相源。
+    _micro_ok = micro_traces_channel_enabled(config)
     _outline_plan, _outline_plan_block = build_outline_plan_block(
-        dimensions.get('beat_outline'), max_total_beats, multishot=_is_multishot)
+        dimensions.get('beat_outline'), max_total_beats, multishot=_is_multishot,
+        micro_traces=_micro_ok)
     if _outline_plan:
         # Keep the authoritative card plan on the parsed brief so planning fallbacks and
         # checkpoints can compile it without reaching back into the request object.
@@ -10762,7 +11345,7 @@ Each beat object in the JSON array must have:
 
 General Rules:
 - OBJECT LIFECYCLE RULE (mandatory): every beat declares "introduced_objects" and "removed_objects", even as empty arrays. An object cannot be removed in a beat before some earlier beat introduced it (or it was part of the original trauma/found state) — never invent an object's removal without its prior introduction, and never let an object you removed reappear later without a fresh, separate introduction.
-- PROJECT ORIGIN CONTRACT (mandatory): this project is "{project_origin_mode(parsed_brief)}". Keep that physical premise from IMAGE 1 through reward. existing_restoration starts with the named damaged asset already present; carrier_delivery_build starts with an empty receiving site and visibly delivers the whole shell; ground_up_build starts from ground and must show excavation, structural shell/arch assembly and end-wall/portal closure before interior fit-out. Never borrow the rusty pre-existing room of a restoration story for a ground-up build.
+- PROJECT ORIGIN CONTRACT (mandatory): this project is "{project_origin_mode(parsed_brief)}". Keep that physical premise from IMAGE 1 through reward. existing_restoration starts with the named damaged asset already present; carrier_delivery_build starts with an empty receiving site and visibly delivers the whole shell; ground_up_build starts from ground and must show excavation, structural shell/arch assembly and end-wall/portal closure before interior fit-out; demolish_and_rebuild starts with an OLD structure standing, tears it down and clears the ground on camera, then builds a DIFFERENT new structure from fresh foundations on that same ground — after the demolition beat the old structure is gone for good and must never be restated, and the finished build's size, shell and openings are never described from it. Never borrow the rusty pre-existing room of a restoration story for a ground-up build.
 - ENGINEERING SYSTEM CONTRACT (mandatory): the required visible systems are {', '.join(parsed_brief.get('engineering_requirements') or []) or 'none beyond the selected workflow'}. Give every listed system a legible installation/rough-in and test state before drywall, panel closure, finished flooring, practical-light activation or furnishing conceals it. Underground work must visibly resolve water through drainage plus waterproofing and enclosed habitable work must visibly resolve ventilation and a traceable power source/feed.
 - SURFACE-STATE MONOTONICITY (mandatory): track floor, walls, ceiling, entrance and utilities separately inside each registered space. Once a surface reaches a finished material, it cannot revert to raw substrate, framing, rough-in or a different finish material unless a dedicated on-camera removal/replacement beat explicitly earns that rollback. Switching to a registered second room changes the space queue, not the completed first room.
 - TEMPORARY EQUIPMENT IS NOT A MILESTONE: moving or switching on a portable tripod work light, extension lead, cable reel or loose tool cannot occupy its own beat. It must accompany a real construction operation, inherit in the site ledger while needed, then be visibly carried out.
@@ -11295,7 +11878,8 @@ Space Type: {space_type}
         # 与上面两条同一条纪律与同一个位置——都是「不增删拍、只覆盖字段」的确定性
         # 收口。缺了它，这六件事就只在规划提示词里出现过一次，写手（Phase 2）看到的
         # 是规划器的转述而不是观测值（见 apply_observed_craft_fields 的说明）。
-        _craft_applied = apply_observed_craft_fields(beat_ladder, parsed_brief)
+        _craft_applied = apply_observed_craft_fields(beat_ladder, parsed_brief,
+                                                     include_micro=_micro_ok)
         # 机位编号（2026-08-25）。必须排在 packet 生成之前：packet 生成调用要按
         # observed_camera_setups 发几句机位，合成期再按这里钉下的编号取句。两边同一个
         # 函数算编号，钉不上（清单条数对不上梯子）时两边一起整段不生效。
@@ -11495,6 +12079,16 @@ OPENING ENVIRONMENT TYPE (binding): {_opening_env}. Use exactly the matching sce
 {_opening_env_packet}
 OPENING SUBJECT SCALE LOCK (mandatory): compose this exterior camera around the carrier's EMPTY receiving footprint, not around the whole valley, neighbourhood, forest, quarry, or skyline. Use a grounded wide view, never an ultra-wide, aerial, high-angle, or distant panorama. The empty footprint must fill the central majority of IMAGE 1 so that, without any later camera move or crop, the delivered carrier can be fully visible in the near midground and its longest visible dimension can span roughly two-thirds of the frame. The selected surrounding setting is secondary edge context only. Keep the three site landmarks readable around that dominant central footprint rather than pushing the footprint into the distance.
 """
+        elif project_origin_mode(parsed_brief) == 'demolish_and_rebuild':
+            # 外壳族（carrier_envelope / envelope_signature / aperture_*）在这条线上必须
+            # 取**建成后的新建筑**。取起始物的话，那份签名会被要求在每一张室内帧里逐字
+            # 复述，而起始物在第二拍就被拆光了——实测把两层别墅的走廊锁成了「巴掌大
+            # 单层破泥屋」。锚点同理：登记一个待拆物，等于要求后面每一拍复述一个已经
+            # 不存在的东西。
+            _delivered_carrier_packet_rule = """
+DEMOLISH-AND-REBUILD ANCHOR RULE (mandatory for this project): IMAGE 1 shows an OLD structure still standing, but that structure is demolished and cleared on camera in the early beats and a DIFFERENT new building is then raised from fresh foundations on the same ground. Therefore all three "primary_landmarks" (and the exterior "frame_boundaries") MUST be permanent features of the SITE that SURVIVE the demolition — terrain, background trees or hills, a rock/earth bank, the clearing perimeter. NEVER register the old structure being demolished, any part of it (its walls, roof, thatch, doorway, rubble), the new build, or any construction product as an exterior primary landmark: an anchor is restated in every later frame, so registering something that gets torn down forces every later prompt to describe a thing that no longer exists.
+DEMOLISH-AND-REBUILD ENVELOPE RULE (mandatory): "carrier_envelope", "envelope_signature", "aperture_ledger" and "aperture_denylist" all describe the FINISHED NEW BUILDING — its clear width, its clear height, its storeys, its openings — never the old structure that is demolished. "envelope_signature" is restated word for word inside every interior frame, and every interior frame in this project is inside the NEW building, so a signature copied off the demolished structure locks each of those frames to a building that no longer exists. Size the envelope from the new build shown in the reference material, not from what stands in IMAGE 1.
+"""
         elif project_origin_mode(parsed_brief) == 'ground_up_build':
             _delivered_carrier_packet_rule = """
 GROUND-UP BUILD ANCHOR RULE (mandatory for this project): IMAGE 1 is undeveloped raw ground before any construction, and the carrier structure is excavated and built from scratch on camera. Therefore all three "primary_landmarks" (and the exterior "frame_boundaries") MUST be permanent natural features of the SITE/TERRAIN that exist before construction (e.g. background trees, natural rock/earth bank, ground clearing perimeter). NEVER register the unbuilt shelter/carrier itself, any part of it (doorway, entrance rim, roof apex, deck platform), or the marker powder line as an exterior primary landmark. Do not hallucinate collapsed rotted structures or ruins in IMAGE 1 unless explicitly specified.
@@ -11506,7 +12100,12 @@ Your job is to generate a comprehensive Drift Lock & SCUP Packet for the project
 You must output ONLY a valid JSON object matching the keys below, with no other text, no markdown, and no code fences.
 
 Required JSON keys:
-1. "camera_dna": A single camera sentence (~25-30 words) describing shot type, lens feel, camera height, perspective axis, and boundaries. Include horizon pinning (e.g., "horizon line remains perfectly level at exactly half the frame height; all optical flow lines radiate symmetrically from the optical center of Grid B2").
+1. "camera_dna": A single camera sentence (~25-30 words) describing shot type, lens feel, camera height, perspective axis, and boundaries, plus the pinning that makes it reproducible frame after frame. Choose the setup this subject actually wants — a grounded eye-level tripod view is ONE option among several, not the default, and picking it for a subject that reads better from above or from the floor wastes the only camera decision this project gets. Write every position in plain words ("centred", "across the lower third", "in the upper right"): NEVER use grid cells such as "Grid B2" or a "B2-C2" span inside a camera sentence. A camera sentence is delivered word for word into every frame that uses it, and grid tokens are translated to prose on the way out — a token sitting right after a position word comes back doubled and ungrammatical ("pinned firmly across lower at the centre of the frame and across the lower centre of the frame"). Examples of the required shape at four different setups (write one, in this style, for THIS project):
+   - eye level: "static tripod shot, ultra-wide 14mm lens feel, camera height 1.6m, locked eye-level perspective; horizon line remains perfectly level at exactly half the frame height; all optical flow lines radiate symmetrically from the centre of the frame"
+   - elevated three-quarter: "static elevated three-quarter shot, 24mm lens feel, camera height 3.2m looking down about 25 degrees onto a front corner; horizon line pinned high at three-quarter frame height; both the front face and one side face stay fully inside frame"
+   - low angle: "static low-angle shot, 20mm lens feel, camera height 0.4m looking up about 20 degrees; horizon line pinned low at one-fifth frame height; vertical members converge upward toward the top edge and their undersides stay visible"
+   - steep overhead: "static steeply overhead shot, 28mm lens feel, camera 6m above the ground plane looking down about 70 degrees; NO horizon is visible, so instead the subject footprint is pinned centred in the frame at 60-percent frame width, with real perspective convergence rather than a flat orthographic plan view"
+   Horizon pinning is mandatory ONLY when a horizon is actually in frame; a steeply overhead or fully enclosed setup pins the subject in the ground plane instead. Whatever you choose, it must be a single sentence that another artist could reproduce exactly.
 2. "geometry_lock": A description of structural facts that cannot change. Qualitative wording ("same wall lines") is unusable — an image model cannot draw to it. Every clause must be a RELATIVE MEASURE against a feature that is visible in the frame, so write it as prose covering all of: (a) clear width in door widths ("the interior runs about two and a half door widths wall to wall"); (b) clear height in door heights ("about three door heights from floor to ridge"); (c) depth in countable facade features ("four rafter pairs deep", "three bays deep"); (d) ONE roof form, at the SAME pitch as the exterior silhouette, stated as a fact that never changes; (e) the same wall material inside and out; (f) the exact opening shape/proportions of every door or archway as established in IMAGE 1. The roofline and the door proportions are the two that get silently redrawn between beats, because no operation ever declares them as its target — name their concrete shape here, e.g. "gabled roof holds its triangular ridge and its shallow exterior pitch unchanged, with no second roof form anywhere; the arched doorway keeps its current width-to-height ratio and curvature".
 2a. "aperture_ledger": An EXHAUSTIVE list of strings naming every opening the shell has — every door, window, hatch, vent, and hole, including the entry itself. If it is not on this list it does not exist. Example: ["the single plank entry door in the gable end", "two small square vents under the eaves"].
 2b. "aperture_denylist": A list of strings naming the openings and shapes this shell explicitly does NOT have, chosen from what an image model most wants to invent in an enclosed space — skylights, roof lights, clerestory glazing, vaulted or domed ceilings, rear-wall arched windows, extra side doors. Stating what exists does not constrain a generative model; naming the absent thing does. Never leave this empty. Example: ["skylight", "roof light", "vaulted ceiling", "rear-wall arched window", "second doorway"].
@@ -11528,7 +12127,7 @@ Required JSON keys:
 17. "carrier_envelope": External dimensions/proportions, orientation, maximum interior clear volume, and the boundary no room may exceed.
 18. "entrance_topology": Opening plane, main/auxiliary role, leaf/cover, hinges, latch/lock, gasket, first rung/tread, shaft or steps, landing, turn, depth, gravity, drainage and ventilation.
 19. "space_graph": Registered site/primary/secondary nodes and every visible connecting edge. No unregistered room is permitted.
-20. "camera_palette": The 9:16 shot families: entrance detail, shaft axis, landed partial, three-quarter oblique establish, floor/rail low angle, wall graze and far-wall reverse. A centered one-point view is reserved for one establish or final payoff.
+20. "camera_palette": A JSON object of the 9:16 shot families this project may cut between. Keys must be exactly: "establish", "entrance_detail", "shaft_axis", "structure", "wall_graze", "detail", "reverse", "default". Each VALUE is a COMPLETE camera sentence written to the same spec as "camera_dna" above — shot type, lens feel, camera height, angle, and the pinning that makes it reproducible. A bare family label ("entrance detail") is NOT acceptable and will be discarded: a label carries no lens, no camera height and no pinning, so it cannot lock geometry. All of these sentences describe the SAME built space from different standpoints — same walls, same landmarks, same distances — and differ ONLY in where the camera stands and how tight it frames; never let two of them read as two different places. "establish" and "reverse" are the wide ends of the range, "detail" the tight end. A centred one-point view is reserved for one establish or the final payoff.
 21. "origin_contract": Copy the authoritative project_origin, starting reality and no-premise-switch rule from Scene Variables. Do not reinterpret it from style words.
 22. "engineering_plan": Copy every required system from Scene Variables and state where it is roughed in, tested and later concealed. Drainage, waterproofing, ventilation and power may never be replaced by generic loose cable clutter.
 {_delivered_carrier_packet_rule}{_observed_angle_packet_rule}
@@ -11860,6 +12459,41 @@ def is_legacy_hard_cut_placeholder(body):
     return str(body or '').strip().upper().startswith(HARD_CUT_PLACEHOLDER_PREFIX)
 
 
+# ── 逐帧逐字锁的登记表 ────────────────────────────────────────────────────────
+#
+# 「把一个 packet 字段钉进每一帧、要求逐字复述」是这条链上最有杀伤力的一种约束，也是
+# 这个仓库反复栽的那个形状：字段一旦是**会随时间变的读数**而不是**时不变的常量**，
+# 逐字复述就会把一个过期状态复读到序列末尾，而且没有任何东西会响。
+#   · worker_scale_percent 空转（2026-08-16）
+#   · 机位被按空间投票投掉（2026-08-25）
+#   · 构图被焊进机位句、跨拍复用时过期（2026-08-30）
+#   · envelope_signature 取了待拆的旧壳，把两层别墅的走廊锁成「巴掌大单层破泥屋」（2026-08-30）
+#
+# 所以每加一条逐帧逐字锁，都必须在这里登记，并说清它锁的字段**为什么是时不变的**。
+# tests/test_per_frame_verbatim_locks.py 会核对：_beat_contract 里 "word for word"
+# 的出现次数必须与本表条数一致——新加一条而不登记，测试直接失败。
+_PER_FRAME_VERBATIM_LOCKS = (
+    {
+        'marker': 'must OPEN with this camera declaration, word for word',
+        'packet_field': 'camera_setups[beat.camera_setup_id] / camera_dna',
+        'time_invariant': True,
+        'why': ('机位句只描述「机器站在哪」——焦段、机高、俯角、消失轴、地平线钉位。'
+                '这些在一个机位的整个存续期里不变，所以逐字复述是安全的。逐拍才变的构图'
+                '**不在这句里**（见 observed_camera_setup_prose），它走 fix_subject_placement '
+                '逐拍绑；焊回来就会跨拍过期，并把逐拍注入判成「已写过」而跳过。'),
+    },
+    {
+        'marker': 'must carry this clause word for word',
+        'packet_field': 'envelope_signature',
+        'time_invariant': True,
+        'why': ('外壳签名在一个建筑的存续期里不变。先拆后建的项目里它一度不是——签名取了'
+                '要拆掉的旧壳，而每一张室内帧都在新建物里。2026-08-30 的 demolish_and_rebuild '
+                '模式把取值口径改成「建成后的新建筑」（见 DEMOLISH-AND-REBUILD ENVELOPE RULE），'
+                '室内帧从此都落在新建物存在之后，这条锁才重新成立。'),
+    },
+)
+
+
 def _beat_contract(i, total_beats, beat_ladder, mode, packet, templates_raw, parsed_brief=None):
     """All the deterministic (no-LLM-call), beat-specific rendering fragments and
     metadata for beat i: shot family lock, camera DNA, cropped template exemplars,
@@ -12095,8 +12729,19 @@ def _beat_contract(i, total_beats, beat_ladder, mode, packet, templates_raw, par
                 "the primary-space return light, and one shared floor rail/utility run visible. The doorway "
                 "may not be placed behind the camera until secondary_establish is complete.")
     if family_camera_dna:
+        # 「exact」管的是几何锁（焦段/机高/消失轴/地平线钉位），不是「所有图都得是同一个
+        # 平视三脚架」。这一句原先写死 static camera declaration：当这一拍选出的机位句
+        # 本身就是仰拍、俯拍或特写时，那个形容词会把写手往回拽向通用平视机位，而
+        # fix_camera_dna 又只做注入不做纠偏，偏回去没有任何东西会响。所以形容词去掉，
+        # 改为显式点明「这是本拍自己的机位」，同时保留静帧口径——IMAGE 是静止画面，
+        # 运镜词属于 VIDEO，写进来会被 fix_camera_contradictions 整句删掉，删完这张图
+        # 就一句机位声明都不剩了（见 select_camera_dna 的注释）。
         family_contract_lines.append(
-            f"- IMAGE {i+1} must OPEN with this exact static camera declaration: \"{family_camera_dna}\"")
+            f"- IMAGE {i+1} must OPEN with this camera declaration, word for word: "
+            f"\"{family_camera_dna}\". This is THIS beat's own camera setup, not a house "
+            f"default: reproduce the height, angle, lens feel and framing it states even when "
+            f"they differ from the other beats, and never normalise it back to a level "
+            f"eye-level wide view. It describes a still frame, so add no camera-move language.")
     if family == 'interior':
         family_contract_lines.append(
             "- Enclosed/post-crossing frame: never mention a horizon, sky, or clouds; write "
@@ -12944,19 +13589,47 @@ TEMPLATE EXEMPLARS FOR THIS BEAT:
 """
 
 
-def _build_batch_user_message(beats, contracts, first_anchor_image):
+def _build_batch_user_message(beats, contracts, first_anchor_image, observed_digests=None):
     """Assembles the full user message for a batched beat-generation call: the fixed
     starting-point IMAGE (the only real cross-beat text anchor needed — everything
     after it, the model carries forward itself within its own single response), followed
-    by each beat's own block in order."""
+    by each beat's own block in order.
+
+    `observed_digests`（复刻线专用，见 prompt_pipeline.observed_grounding）在每一拍的
+    合同后面追加一张「原片实拍事实卡」——那一拍 coverage 帧的逐帧读数压缩版。写手此前
+    从头到尾看不到任何一帧原片，机位/景别/三区布局/植被只能凭一句动作描述空想
+    （2026-08-30 复盘）。只发本拍那一张：整份按拍数乘一遍会撑爆上下文，还会让写手在写
+    第 3 拍时读到第 14 拍的画面。非复刻线不传这个参数，行为一字不变。"""
     parts = [f"""==================== STARTING POINT ====================
 Before the first beat below, the environment is already established in this state (do not restate it — just continue forward from it):
 {first_anchor_image}
 """]
     for i in beats:
         parts.append(_beat_block_text(i, contracts[i]))
+        observed = _observed_block_for_beat(observed_digests, i)
+        if observed:
+            parts.append(observed)
     parts.append(f"Generate all {len(beats)} beat(s) above, in order, now.")
     return "\n".join(parts)
+
+
+def _observed_block_for_beat(observed_digests, i):
+    """把第 i 拍的原片实拍事实卡渲成一段。没有事实卡时返回空串。
+
+    导入放在函数内：observed_grounding 反过来 `import prompt_pipeline as pp`，
+    模块顶层互引会在导入期成环。
+    """
+    if not observed_digests:
+        return ''
+    try:
+        from .observed_grounding import beat_digest_block
+    except Exception:
+        return ''
+    block = beat_digest_block(observed_digests, i)
+    if not block:
+        return ''
+    return ('==================== OBSERVED ORIGINAL FOOTAGE (BEAT %d) ====================\n%s\n'
+            % (i, block))
 
 
 # 英雄展示视频（[HERO]）的总开关。2026-07-31 关闭，理由见
@@ -13172,6 +13845,14 @@ Hard vetoes to check against these two images:
 - MANDATORY CLIMAX VIDEO (only applies if this is the final beat, this beat's VIDEO): must depict the actual physical kinetic movement of the mechanism (e.g. the bed rolling smoothly forward, the glass door sliding open), not a static hold.
 - NLVTR Text Lock: No '%' symbol, numeric ranges, colons in variable strings, or acronyms (HAL, DKP, VMFP, RPL, RCE, SCUP, NGCS, OSPL, RHMA, PBISP, HCL, NLVTR) in prompt bodies.
 - EXTERIOR WORK VISIBILITY: if this beat's declared operation is exterior work (e.g. exterior insulation, roofing, facade) but the camera is positioned inside looking out, the work must still be visible from that camera position — flag it if the rendered IMAGE contradicts this.
+- SINGLE HORIZONTAL GROUND BASELINE & ANTI-ISOMETRIC SKEWING: Building foundation and ground-level works must keep a strict horizontal baseline parallel to the bottom of the frame. Flag any corner-on 45-degree isometric diamond rotation or flat orthographic 90-degree blueprint view that destroys vertical depth and horizon.
+- LIVING CAST ACTION-REACTION TRIAD: In diorama/workshop scenes with figurines or animals, subjects are reactive actors with dynamic perception, eye tracking, or settling stance. Flag any static hold or unchanged posture across beats.
+- THREE-LAYER DEEP ENVIRONMENTAL STAGING & DESTITUTE CAST IDENTITY: Diorama scenes must preserve 3-layer deep environmental perspective (sky with soft drifting clouds, distant rolling hills, midground structure, tactile foreground). Impoverished/refugee characters in early beats must wear weathered, grimy, coarse clothing, never clean luxury attire.
+
+[Benchmark & Ground-Truth Alignment (applies when IMAGE REF is provided)]
+- BENCHMARK CAMERA SETUP MISMATCH: When IMAGE REF (the ground-truth keyframe extracted from the viral benchmark video for this beat) is provided, compare IMAGE B against IMAGE REF. Check camera pitch/yaw angle, camera elevation, framing height, and focal perspective. If IMAGE REF has a dynamic perspective (e.g. steep downward, high-angle, low-angle, close-up oblique, 24mm wide angle) but IMAGE B is flattened into a generic eye-level shot (or vice-versa), report: "机位偏离爆款原片：原片为[具体机位/俯仰角]，生成图退化为平视".
+- BENCHMARK STAGE DELTA EQUIVALENCE: When IMAGE REF is provided, compare IMAGE B against IMAGE REF. Even if style/materials differ for a creative mutation, the physical milestone and completed volume must be equal in scope (e.g. if IMAGE REF shows the entire space cleared/framed, IMAGE B must not merely clear a small patch). Report: "工序交付量级偏离原片：原片已交付[具体工序量级]，生成图仅完成局部".
+- BENCHMARK SPATIAL DNA FIDELITY: When IMAGE REF is provided, compare IMAGE B against IMAGE REF. The carrier's spatial envelope proportions, boundary topology, and structural openings must remain faithful to the benchmark established in IMAGE REF. Report: "空间骨架偏离原片：空间比例与载体结构与原片失真".
 
 The user turn tells you this beat's real 1-based number and therefore the real names of the two images. In your violation descriptions ALWAYS refer to the frames by those real names (e.g. "IMAGE 6"), never by the A/B aliases used above — a human reads these descriptions next to the numbered frame grid.
 
@@ -13213,6 +13894,8 @@ Check only these cross-frame rules:
 - Ghost Clause: Occluded landmarks must be preserved (not silently dropped) once established, even while hidden behind another object.
 - CARRIER IDENTITY: post-crossing interior frames must still read as the inside of THIS specific carrier — its fixed identity features (e.g. a bus's side window band, ribbed roof curve, wheel arches; a boat's rib frames and portholes) stay visible unless a declared beat explicitly covers or removes them on camera. An interior that has degraded into a generic room/box with no carrier-specific feature visible is a violation.
 - ASYMMETRIC LANDMARKS & DLSP 5-LAYER DEPTH PERSISTENCE: Asymmetric boundary structures (e.g. left solid wall vs right raw rock/root face) and depth layering (Layer 1 foreground ladder/hatch <1m, Layer 2 midground staging floor 1-4m, Layer 3 longitudinal wall boundaries, Layer 4 background wall closure >4m) must maintain consistent spatial ordering and coordinates without sudden perspective teleportation, mirroring, or mutating into symmetrical tunnels.
+- SINGLE BASELINE & ROTATION LOCK: Exterior foundation and structural builds must maintain a continuous horizontal orientation across frames without unmotivated 45-degree isometric diamond skewing or flipping orientation.
+- THREE-LAYER ENVIRONMENTAL HORIZON PRESERVATION: Natural sky, drifting clouds, and distant terrain horizons must remain continuous and unsevered by dense artificial studio bokeh walls.
 - NO INVENTED OPENINGS: interior frames must not grow windows, skylights, doors, or other openings that the carrier does not physically have and that no earlier beat installed on camera; the interior's light must come from the carrier's own established openings, an installed practical light, or entry daylight from behind the camera.
 - ENVELOPE SEAL PERSISTENCE (cross-view, cross-frame): the roof/ceiling, exterior walls or shell, windows/glazing, doors, and floor/deck slabs are each ONE physical element with an outside face and an inside face. Once ANY earlier frame shows such an element sealed, re-clad, glazed, or completed, every later frame — including ones shot from the opposite side, after a threshold crossing or a hard cut — must still show it closed. Sky, clouds, a distant ridge, treetops, rain, snow, or a daylight shaft coming through a roof or wall that an earlier frame already sealed is a violation, and so is a hole, gap, breach, missing section, or collapse reappearing in it. A raw, unfinished INNER face (bare decking, exposed rafters or ribs, fastener rows, unpainted new material) is correct and is NOT a violation — only reopening is. Report it against the beat index where the sealed element first appears open again, naming both the frame that sealed it and the frame that reopened it.
 
@@ -13506,18 +14189,90 @@ def _merge_outline_frame_verdicts(per_beat):
     return merged
 
 
+def check_anchor_consistency(config, prompt_block, anchor_image_path, ref_frame_path=None,
+                             cover_path=None, timeout=60):
+    """首帧（锚点帧 / IMAGE 1）基准与对标一致性审查：
+    评估生成的 IMAGE 1 是否忠实还原了初始毛坯/待工状态、提示词空间维度与机位视角，
+    并与爆款原片首帧关键帧（IMAGE REF）或封面（COVER）进行硬碰硬比对。
+    返回中文违规描述 list（空 list = 判定为干净）；None = 审查未完成。"""
+    if not anchor_image_path or not os.path.exists(anchor_image_path):
+        return None
+
+    system_prompt = (
+        "You are an expert film director and visual consistency auditor for a video restoration pipeline. "
+        "You are auditing the foundational ANCHOR FRAME (IMAGE 1) of a time-lapse sequence.\n\n"
+        "Attached images:\n"
+        "- IMAGE 1 (first image): The newly rendered initial anchor frame.\n"
+    )
+    images_to_send = [anchor_image_path]
+    has_ref = bool(ref_frame_path and os.path.exists(ref_frame_path))
+    has_cover = bool(cover_path and os.path.exists(cover_path))
+
+    if has_ref:
+        system_prompt += "- IMAGE REF (second image): The ground-truth benchmark initial frame extracted from the viral video.\n"
+        images_to_send.append(ref_frame_path)
+    elif has_cover:
+        system_prompt += "- COVER (second image): The project cover reference image.\n"
+        images_to_send.append(cover_path)
+
+    system_prompt += (
+        "\nRules to enforce:\n"
+        "1. RAW INITIAL STATE FIDELITY: IMAGE 1 must represent the true, unstarted raw/derelict/initial state "
+        "as described in the IMAGE 1 prompt. No premature construction or finished elements should appear.\n"
+        "2. BENCHMARK CAMERA SETUP & COMPOSITION: If IMAGE REF is provided, IMAGE 1 must reproduce the "
+        "benchmark's CAMERA FAMILY — viewpoint elevation band (aerial / high-angle / eye-level / low-angle), "
+        "interior vs exterior, and shot scale (establishing wide / medium / close). "
+        "Do NOT flatten high-angle/low-angle shots into standard eye-level, and do not collapse an "
+        "establishing wide into a close-up.\n"
+        "   TOLERANCE (important — do not report these): IMAGE 1 is a re-creation, not a re-shoot of the "
+        "benchmark. Report a camera violation ONLY when the shot reads as a DIFFERENT camera family per the "
+        "band list above. An imperfect match of exact pitch degrees, camera height, focal-length feel, "
+        "framing offset or negative-space ratio, while staying inside the same band, is ACCEPTABLE and must "
+        "NOT be reported — every downstream frame inherits the viewpoint this anchor establishes, so a "
+        "slightly different but self-consistent viewpoint costs nothing.\n"
+        "3. SPATIAL TOPOLOGY & ENVELOPE SCALE: IMAGE 1 must match the spatial boundaries, rafter/beam orientation, "
+        "and metric envelope scale (strict ceiling clearance, width, depth). Prevent cavernous hall expansion.\n"
+        "4. LIGHTING & ATMOSPHERE: Lighting should establish the initial atmospheric tone accurately.\n\n"
+        "Output STRICT JSON only: a flat JSON array of concrete Chinese violation descriptions. "
+        "If IMAGE 1 satisfies all criteria, return []."
+    )
+
+    _review_images, _ = _parse_prompt_slots(prompt_block)
+    _anchor_item = _review_images.get(1) or {}
+    user_text = (
+        f"Prompt for IMAGE 1:\n{_anchor_item.get('body', prompt_block)}\n\n"
+        f"Audit IMAGE 1 against the prompt and benchmark reference. Respond with a JSON array."
+    )
+    try:
+        response = _multimodal_chat(config, system_prompt, user_text, images_to_send,
+                                    max_tokens=600, timeout=timeout)
+        data = json.loads(_strip_code_fences(response))
+        if isinstance(data, list):
+            return [str(x).strip() for x in data if str(x).strip()]
+        return []
+    except Exception as e:
+        _reraise_if_cancelled(e)
+        if sys.stdout:
+            print(f"[ANCHOR REVIEW] 首帧审查未完成: {e}")
+        return None
+
+
 def check_beat_consistency(config, prompt_block, beat_index, total_beats, image_before_path,
-                            image_after_path, timeout=60, outline_items=None, outline_out=None):
-    """局部逐拍一致性审查：只看该拍自己的两张锚点帧，规则见
-    _local_beat_review_system_prompt 顶部注释。返回该拍的中文违规描述 list（可能为
-    空 list = 判定为干净）；**None = 本拍审查没跑成**（超时/网关异常/响应不可解析），
-    调用方不能把 None 当"干净"处理。
+                            image_after_path, timeout=60, outline_items=None, outline_out=None,
+                            ref_frame_path=None):
+    """局部逐拍一致性审查：只看该拍自己的两张锚点帧（若提供爆款原片对应参考关键帧，则同时做
+    对标保真度与机位/量级审查），规则见 _local_beat_review_system_prompt 顶部注释。
+    返回该拍的中文违规描述 list（可能为空 list = 判定为干净）；**None = 本拍审查没跑成**
+    （超时/网关异常/响应不可解析），调用方不能把 None 当"干净"处理。
 
     outline_items: 这一拍认领的卡片工序（原文 + 英文复述，来自 manifest 里的交付总账）。
     非空时 user turn 追加一段「卡片工序交付」审查要求（outline_frame_review_block）。
     outline_out: 传进来的 dict 会被写入本拍的逐条判定（工序号 → visible/missing）。
     灰度期（_OUTLINE_FRAME_GATE_ENFORCING=False）这些判定**只**进这个出参，不混进
-    返回的违规列表，因此不会流向 failures / quality_gate。"""
+    返回的违规列表，因此不会流向 failures / quality_gate。
+
+    ref_frame_path: 爆款原片中对应本拍完成时刻抽出来的客观关键帧。传入且存在时，作为
+    第三张附件（IMAGE REF）送入 VLM，用于硬性比对机位俯仰角/焦段、工程工序量级与空间骨架。"""
     system_prompt = _local_beat_review_system_prompt()
     # 拍号只出现在 user turn：system prompt 因此在所有拍之间完全一致、可被 prompt
     # 缓存复用（见 _local_beat_review_system_prompt 的 2026-07-25 说明）。
@@ -13536,20 +14291,33 @@ def check_beat_consistency(config, prompt_block, beat_index, total_beats, image_
         f"ARRIVAL IMAGE {beat_index + 1}: {_arrival_item.get('body', '')}\n"
         f"Treat any permanent visible result outside this record as a candidate phase overshoot."
     )
+    has_ref = bool(ref_frame_path and os.path.exists(ref_frame_path))
+    ref_desc = ""
+    if has_ref:
+        ref_desc = (
+            f"\n\nIMAGE REF (the third attached image) is the ACTUAL benchmark keyframe "
+            f"extracted from the viral source video for beat {beat_index}. "
+            f"Compare IMAGE B against IMAGE REF for camera angle, physical stage scope, and spatial DNA fidelity.\n"
+        )
     user_text = (
         f"Here is the complete generated prompt set for the whole sequence (for context only):\n{prompt_block}\n\n"
         f"You are judging beat {beat_index} of {total_beats} (VIDEO {beat_index}). "
         f"IMAGE A (the first attached image) is the ACTUAL rendered IMAGE {beat_index}; "
         f"IMAGE B (the second attached image) is the ACTUAL rendered IMAGE {beat_index + 1}. "
-        f"This {'IS' if is_final else 'is NOT'} the final beat of the sequence. "
+        + (f"IMAGE REF (the third attached image) is the viral benchmark keyframe for beat {beat_index}. " if has_ref else "")
+        + f"This {'IS' if is_final else 'is NOT'} the final beat of the sequence. "
         f"Name the frames as IMAGE {beat_index} / IMAGE {beat_index + 1} in your descriptions. "
         f"Judge only this beat and report violations as a JSON list."
         + _declared_delta
         + outline_frame_review_block(outline_items)
+        + ref_desc
     )
+    chat_images = [image_before_path, image_after_path]
+    if has_ref:
+        chat_images.append(ref_frame_path)
     try:
         response = _multimodal_chat(config, system_prompt, user_text,
-                                    [image_before_path, image_after_path],
+                                    chat_images,
                                     max_tokens=1500, timeout=timeout)
         data = json.loads(_strip_code_fences(response))
         if isinstance(data, dict):
@@ -13778,9 +14546,230 @@ def _verify_review_violation(config, violation_text, image_paths, timeout=30):
         return None
 
 
+def check_collage_macro_alignment(config, source_collage_path, rendered_collage_path, timeout=90):
+    """全局宏观拼图对齐审查：输入爆款 5 列拼图与新生成的 5 列拼图（full_collage.jpg），
+    对比全剧节奏曲线、光影演变以及空间阶段演化。
+    返回中文违规/偏差描述 list；空 list = 宏观对齐通过；None = 审查未完成。"""
+    if not source_collage_path or not rendered_collage_path:
+        return []
+    if not os.path.exists(source_collage_path) or not os.path.exists(rendered_collage_path):
+        return []
+    system_prompt = (
+        "You are a master time-lapse video director and pacing auditor. "
+        "You are shown two 5-column contact sheet collages of time-lapse sequences:\n"
+        "COLLAGE A (first image): the ground-truth viral benchmark video collage (5 columns).\n"
+        "COLLAGE B (second image): the newly generated sequence collage (5 columns).\n"
+        "Compare the macro evolution across both collages:\n"
+        "1. Pacing & Phase Distribution: Do the major phases (demolition/clearing -> framing/rough-in -> "
+        "finishing/flooring -> furniture/reward) follow the same proportional progression curve across the frames?\n"
+        "2. Lighting & Color Temperature Evolution: Does the lighting transition smoothly (e.g. dark raw state -> "
+        "task lighting -> warm ambient illumination) matching the benchmark's mood arc?\n"
+        "3. Spatial Topology Evolution: Does the spatial depth and camera progression open up coherently like the benchmark?\n\n"
+        "Only report major macro discrepancies (e.g. premature phase completion, inverted pacing, total lighting discontinuity). "
+        "Ignore minor material/color differences if they belong to an intentional aesthetic variant.\n"
+        "Respond with STRICT JSON only: a flat list of short Chinese macro violation descriptions, each citing concrete observations. "
+        "If macro progression is well-aligned, respond with []."
+    )
+    user_text = (
+        "Attached are the benchmark collage (COLLAGE A) and the generated collage (COLLAGE B). "
+        "Audit macro pacing, lighting evolution, and spatial progression alignment. Respond with a JSON list."
+    )
+    try:
+        response = _multimodal_chat(config, system_prompt, user_text,
+                                    [source_collage_path, rendered_collage_path],
+                                    max_tokens=1000, timeout=timeout)
+        data = json.loads(_strip_code_fences(response))
+        if isinstance(data, list):
+            return [str(x).strip() for x in data if str(x).strip()]
+        return []
+    except Exception as e:
+        _reraise_if_cancelled(e)
+        if sys.stdout:
+            print(f"[COLLAGE REVIEW] 拼图宏观对齐审查未完成: {e}")
+        return None
+
+
+def find_reference_frames_for_project(project_dir, total_beats=None):
+    """根据 project_dir（或其绑定的 replica_job_id）自动检索爆款原片抽出来的关键帧
+    映射表 {beat: ref_frame_path} 以及 5 列多宫格拼图路径 (source_collage_path)。
+    支持自动从目录名提取 job_id 并递归解析 video_overview.json 溯源上游抽帧目录。
+    纯只读探测，找不到返回 ({}, None)。"""
+    if not project_dir or not os.path.exists(project_dir):
+        return {}, None
+    manifest = {}
+    manifest_path = os.path.join(project_dir, 'manifest.json')
+    if os.path.exists(manifest_path):
+        try:
+            with open(manifest_path, 'r', encoding='utf-8') as f:
+                manifest = json.load(f)
+        except Exception:
+            manifest = {}
+    dims = manifest.get('dimensions') or {}
+    job_id = str(dims.get('replica_job_id') or manifest.get('replica_job_id') or manifest.get('source_job_id') or '').strip()
+
+    # 尝试从目录名中提取 replica_job_id (如 run_replica_293c50b9c953_...)
+    if not job_id:
+        m_job = re.search(r'replica_([a-f0-9]{12})', os.path.basename(project_dir))
+        if m_job:
+            job_id = f"replica_{m_job.group(1)}"
+
+    cand_dirs = [os.path.abspath(project_dir)]
+    if job_id:
+        try:
+            from replica_pipeline import job_dir, validate_job_id
+            if validate_job_id(job_id):
+                j_dir = job_dir(job_id)
+                if os.path.isdir(j_dir) and j_dir not in cand_dirs:
+                    cand_dirs.insert(0, j_dir)
+        except Exception:
+            pass
+
+    # 递归查找 parent_baseline_id / variant_of / source_job_id 以及 video_overview.json 指向的溯源目录
+    try:
+        from replica_pipeline import job_dir as get_replica_job_dir, validate_job_id
+    except Exception:
+        get_replica_job_dir = None
+        validate_job_id = None
+
+    seen_dirs = set(cand_dirs)
+    queue = list(cand_dirs)
+    while queue:
+        cdir = queue.pop(0)
+        # 1. 检查 .summary.json / .replica_pipeline.json / manifest.json 中的 parent 关系
+        for meta_name in ('.summary.json', '.replica_pipeline.json', 'manifest.json'):
+            mpath = os.path.join(cdir, meta_name)
+            if os.path.exists(mpath):
+                try:
+                    with open(mpath, 'r', encoding='utf-8') as f:
+                        mdata = json.load(f)
+                    for k in ('parent_baseline_id', 'variant_of', 'source_job_id', 'parent_job_id', 'replica_job_id'):
+                        p_job = str(mdata.get(k) or '').strip()
+                        if p_job and validate_job_id and validate_job_id(p_job) and get_replica_job_dir:
+                            pj_dir = os.path.abspath(get_replica_job_dir(p_job))
+                            if os.path.isdir(pj_dir) and pj_dir not in seen_dirs:
+                                seen_dirs.add(pj_dir)
+                                cand_dirs.append(pj_dir)
+                                queue.append(pj_dir)
+                except Exception:
+                    pass
+
+        # 2. 检查 video_overview.json
+        vo_path = os.path.join(cdir, 'video_overview.json')
+        if os.path.exists(vo_path):
+            try:
+                with open(vo_path, 'r', encoding='utf-8') as f:
+                    vo = json.load(f)
+                sv = vo.get('source_video') or ''
+                if sv:
+                    sv_parent = os.path.dirname(sv) if os.path.isabs(sv) else os.path.abspath(os.path.join(cdir, os.path.dirname(sv)))
+                    if os.path.isdir(sv_parent) and sv_parent not in seen_dirs:
+                        seen_dirs.add(sv_parent)
+                        cand_dirs.append(sv_parent)
+                        queue.append(sv_parent)
+            except Exception:
+                pass
+
+    source_collage_path = None
+    ref_frames_by_beat = {}
+
+    # 1. 寻找爆款原片 5 列拼图（排查 *_collage.jpg，排除自身渲染生成的 full_collage.jpg 与缩略图）
+    for cdir in cand_dirs:
+        if not os.path.isdir(cdir):
+            continue
+        for fn in sorted(os.listdir(cdir)):
+            if fn.endswith('_collage.jpg') and fn != 'full_collage.jpg' and not fn.endswith('_collage_thumb.jpg'):
+                source_collage_path = os.path.join(cdir, fn)
+                break
+        if source_collage_path:
+            break
+
+    # 2. 寻找抽帧目录与关键帧，优先从 timelapse_beats.json 精准提取每拍交付帧
+    tb_data = None
+    for cdir in cand_dirs:
+        tb_path = os.path.join(cdir, 'timelapse_beats.json')
+        if os.path.exists(tb_path):
+            try:
+                with open(tb_path, 'r', encoding='utf-8') as f:
+                    tb_data = json.load(f)
+                if tb_data and tb_data.get('beats'):
+                    break
+            except Exception:
+                pass
+
+    rf_dir = None
+    for cdir in cand_dirs:
+        for sub in ('review_frames', 'storyboard', 'keyframes'):
+            p = os.path.join(cdir, sub)
+            if os.path.isdir(p):
+                rf_dir = p
+                break
+        if rf_dir:
+            break
+
+    if tb_data and tb_data.get('beats') and rf_dir:
+        beats = tb_data.get('beats', [])
+        # IMG 1: Beat 1 起始锚点 (初始毛坯状态)
+        b1 = beats[0]
+        cov1 = b1.get('coverage_frames') or []
+        evi1 = b1.get('evidence_frames') or []
+        start_f = cov1[0]['frame'] if cov1 else (evi1[0] if evi1 else 'review_001.png')
+        p1 = os.path.join(rf_dir, start_f)
+        if not os.path.exists(p1):
+            # 兼容 storyboard/scene_001_start.png
+            alt_p1 = os.path.join(rf_dir, 'scene_001_start.png')
+            if os.path.exists(alt_p1):
+                p1 = alt_p1
+        ref_frames_by_beat[1] = p1
+
+        # IMG k+1: Beat k 的终点交付状态 (k from 1 to len(beats))
+        for idx, b in enumerate(beats, start=1):
+            cov = b.get('coverage_frames') or []
+            evi = b.get('evidence_frames') or []
+            end_f = cov[-1]['frame'] if cov else (evi[-1] if evi else None)
+            if end_f:
+                p_end = os.path.join(rf_dir, end_f)
+                if not os.path.exists(p_end):
+                    alt_end = os.path.join(rf_dir, f'scene_{idx:03d}_end.png')
+                    if os.path.exists(alt_end):
+                        p_end = alt_end
+                    else:
+                        alt_end2 = os.path.join(rf_dir, f'scene_{idx:03d}.png')
+                        if os.path.exists(alt_end2):
+                            p_end = alt_end2
+                ref_frames_by_beat[idx + 1] = p_end
+    else:
+        # Fallback: 扫描目录文件进行比例映射
+        keyframe_paths = []
+        for cdir in cand_dirs:
+            if not os.path.isdir(cdir):
+                continue
+            for sub in ('storyboard', 'review_frames', 'keyframes'):
+                sdir = os.path.join(cdir, sub)
+                if os.path.isdir(sdir):
+                    files = [os.path.join(sdir, f) for f in os.listdir(sdir)
+                             if f.lower().endswith(('.png', '.jpg', '.jpeg', '.webp')) and not f.startswith('.') and not f.startswith('contact_sheet')]
+                    if files:
+                        files.sort(key=lambda x: [int(c) if c.isdigit() else c for c in re.split(r'(\d+)', os.path.basename(x))])
+                        keyframe_paths = files
+                        break
+            if keyframe_paths:
+                break
+
+        if keyframe_paths:
+            n_keyframes = len(keyframe_paths)
+            n_targets = (total_beats + 1) if (total_beats and total_beats > 0) else n_keyframes
+            for b in range(1, n_targets + 1):
+                idx = min(n_keyframes - 1, max(0, int(round(((b - 1) / max(1, n_targets - 1)) * (n_keyframes - 1)))))
+                ref_frames_by_beat[b] = keyframe_paths[idx]
+
+    return ref_frames_by_beat, source_collage_path
+
+
 def check_full_sequence_consistency(config, prompt_block, frame_image_paths, degraded=False,
                                     only_beats=None, skip_global=False, on_progress=None,
-                                    global_only_beats=None, outline_items=None):
+                                    global_only_beats=None, outline_items=None,
+                                    ref_frame_paths=None, source_collage_path=None,
+                                    rendered_collage_path=None):
     """整套序列渲染完成后的一致性审查，取代原来盲文本的逐轮全量审核（见
     prompt_pipeline_refactor 里去掉的 validate_and_repair / 审核表)。
 
@@ -13789,11 +14778,12 @@ def check_full_sequence_consistency(config, prompt_block, frame_image_paths, deg
     像 UNEXPLAINED ANCHOR DELTA 这类主观规则把真实照片里的琐碎细节乱扣一条（硬塞
     问题）：
       1. check_beat_consistency 逐拍局部审查——每拍只看自己的两张锚点帧 + "仅凭两张
-         图就能判"的规则子集，图片和规则都不再被稀释；
+         图就能判"的规则子集（若有爆款参考关键帧，则同时做对标保真度审查），图片和规则都不再被稀释；
       2. check_global_sequence_consistency 全局稀疏审查——只查场景/材质/地标/载体身份
          这几条真正需要跨帧比较的规则（6条，而非30余条），面对全套帧图单独查一次；
       3. _verify_review_violation 二次复核——每条候选违规计入最终结果前单独复核一遍
-         "这条具体问题是否清楚存在"，复核明确否决的丢弃，不计入 sequence_review_flagged。
+         "这条具体问题是否清楚存在"，复核明确否决的丢弃，不计入 sequence_review_flagged；
+      4. check_collage_macro_alignment 拼图宏观对齐——若存在爆款原片 5 列拼图，比对全剧节奏曲线与光影演变。
 
     frame_image_paths: {sequence(int): image_path}。
 
@@ -13802,7 +14792,9 @@ def check_full_sequence_consistency(config, prompt_block, frame_image_paths, deg
        'unreviewed_beats': [beat_index, ...],        # 本轮没能拿到判定的拍
        'global_unreviewed_beats': [beat_index, ...], # 其中因跨帧窗口没跑成而漏的
        'global_reviewed': bool,                      # 跨帧层是否跑成（哪怕只有部分窗口）
-       'global_attempted': bool}                     # 本轮有没有跑跨帧层（skip_global 的反面）
+       'global_attempted': bool,                     # 本轮有没有跑跨帧层（skip_global 的反面）
+       'outline_frame_verdicts': {...},              # 卡片工序交付判定
+       'collage_macro_issues': [...]}                # 拼图宏观对齐违规
     **None = 一拍都没审成且跨帧层也没跑成**（整轮彻底没跑起来）。
 
     global_unreviewed_beats 与 global_attempted 是给降级重试用的：跨帧层部分窗口失败
@@ -13829,7 +14821,11 @@ def check_full_sequence_consistency(config, prompt_block, frame_image_paths, deg
     整段审查因此不再是几分钟的静默黑洞；回调抛异常（取消）会立刻中止剩余的拍。
     outline_items: {拍号: [卡片工序, ...]}（来自 manifest 的交付总账，键可为字符串）。
     给出时逐拍层追加一条「卡片工序交付」审查，结论按工序号收进返回值的
-    outline_frame_verdicts——灰度期它是这一层判定的**唯一**去处。"""
+    outline_frame_verdicts——灰度期它是这一层判定的**唯一**去处。
+    ref_frame_paths: {帧号: 爆款原片同阶段关键帧路径}。给出时逐拍层同时做对标保真度
+    与机位审查（见 check_beat_consistency 的 ref_frame_path）。
+    source_collage_path / rendered_collage_path: 爆款原片与本单各自的 5 列拼图。两张
+    都在时追加第 4 层 check_collage_macro_alignment（宏观节奏/光影演变对齐）。"""
     if not prompt_block or not frame_image_paths:
         return _empty_review_result()
     total_beats = len(frame_image_paths) - 1
@@ -13860,14 +14856,18 @@ def check_full_sequence_consistency(config, prompt_block, frame_image_paths, deg
         def _run(beat, pair):
             before, after = pair
             items = outline_by_beat.get(beat)
+            ref_path = (ref_frame_paths or {}).get(beat + 1) or (ref_frame_paths or {}).get(str(beat + 1)) or (ref_frame_paths or {}).get(beat) or (ref_frame_paths or {}).get(str(beat))
+            extra = {'ref_frame_path': ref_path} if ref_path else {}
             if not items:
                 # 没有卡片工序（老单/未绑定的梯子）：调用形状与改造前逐字相同
                 return check_beat_consistency(config, prompt_block, beat, total_beats,
-                                              before, after, timeout=local_timeout)
+                                              before, after, timeout=local_timeout,
+                                              **extra)
             return check_beat_consistency(config, prompt_block, beat, total_beats,
                                           before, after, timeout=local_timeout,
                                           outline_items=items,
-                                          outline_out=outline_out.get(beat))
+                                          outline_out=outline_out.get(beat),
+                                          **extra)
 
         def _emit(beat, issues):
             if on_progress:
@@ -13946,13 +14946,36 @@ def check_full_sequence_consistency(config, prompt_block, frame_image_paths, deg
         if verdict is False:
             continue
         failures.setdefault(beat, []).append(cand['text'])
+
+    # 4. 双拼图宏观对标审查（若有爆款原片 5 列拼图）
+    collage_macro_issues = []
+    if source_collage_path and rendered_collage_path and os.path.exists(source_collage_path) and os.path.exists(rendered_collage_path):
+        if on_progress:
+            on_progress('sequence_review', {
+                'message': '正在执行爆款原片 5 列拼图与生成拼图宏观对标审查...',
+            })
+        macro_res = check_collage_macro_alignment(config, source_collage_path, rendered_collage_path,
+                                                  timeout=150 if degraded else 90)
+        if macro_res:
+            collage_macro_issues = macro_res
+            for m_issue in macro_res:
+                issues.append({
+                    'beat': 1,
+                    'layer': 'collage_macro',
+                    'text': m_issue,
+                    'frames': [1, total_beats + 1],
+                    'verified': True,
+                    'severity': 'cosmetic',
+                })
+
     return {'failures': failures, 'issues': issues,
             # 去重：一拍可能既在逐拍层没审成、又落在没跑成的跨帧窗口里
             'unreviewed_beats': sorted(set(unreviewed_beats)),
             'global_unreviewed_beats': sorted(set(global_unreviewed)),
             'global_reviewed': global_reviewed,
             'global_attempted': not skip_global,
-            'outline_frame_verdicts': _merge_outline_frame_verdicts(outline_out.values())}
+            'outline_frame_verdicts': _merge_outline_frame_verdicts(outline_out.values()),
+            'collage_macro_issues': collage_macro_issues}
 
 
 def merge_review_results(first, second):
@@ -13992,6 +15015,10 @@ def merge_review_results(first, second):
         # 仍然坏消息优先——拆到两拍的工序只要一拍说没看见就是没看见
         'outline_frame_verdicts': _merge_outline_frame_verdicts(
             [first.get('outline_frame_verdicts'), second.get('outline_frame_verdicts')]),
+        # 拼图宏观对标是整单一次的结论，跟"重跑哪几拍"无关：哪一轮跑出来了就留哪一轮的，
+        # 不在返回值里带上它，降级重试一合并就把第一轮的结论静默抹掉了。
+        'collage_macro_issues': (list(second.get('collage_macro_issues') or [])
+                                 or list(first.get('collage_macro_issues') or [])),
     }
 
 
@@ -14031,7 +15058,8 @@ def _empty_review_result():
     """空序列（没有提示词/没有帧/只有一帧）的"无事可审"结果：没有违规、没有漏审。"""
     return {'failures': {}, 'issues': [], 'unreviewed_beats': [],
             'global_unreviewed_beats': [], 'global_reviewed': True,
-            'global_attempted': True, 'outline_frame_verdicts': {}}
+            'global_attempted': True, 'outline_frame_verdicts': {},
+            'collage_macro_issues': []}
 
 
 def frame_review_status(sequences, review_result):
@@ -14449,6 +15477,30 @@ def _missing_prompt_slots(images, videos, image_range, video_range):
     return sorted(expected_images - set(images)), sorted(expected_videos - set(videos))
 
 
+# 规划期标注的**最终**收口。挂在这里而不是只挂在 apply_proactive_fixes 末尾：
+# _format_prompt_block 是所有图片/视频正文出去的唯一一道门（合成、兜底梯子、断点恢复、
+# 采纳重排、服务端重写，七个调用方全走它），而 apply_proactive_fixes 只在其中一条合成
+# 路径的末尾。2026-08-30 实测一单：交付正文里留下 17 处「（工序：…）」和 18 处「→」，
+# 拿同一段文本单独跑 scrub_planning_annotations 完全有效——不是正则漏了，是那条路
+# 压根没走到那道收口（这一单还退到了兜底梯子，preserve_state 直接由 milestone_name
+# 拼出来，标注就是从那里进的正文）。挂到门上，任何路径、任何新增合成器都躲不掉。
+#
+# 只挪 scrub_planning_annotations，**不挪 scrub_spatial_notation**：后者末尾的
+# `\s{2,}` 含换行，会把锚点正文里「Spatial layout:」那种分行结构压成一行；它仍然留在
+# apply_proactive_fixes 里，对走那条路的正文照常生效。这一道用的是 `[ \t]`，换行安全。
+def _delivery_scrub(text):
+    """交付正文的最后一道：剥掉规划期标注 + 活物一律真人。空值原样返回。
+
+    真人化为什么也挂在这道门上而不是只挂在 apply_proactive_fixes 末尾：那是**一条**
+    合成路径的末尾（极速直通、微缩线的后处理、合成后的对帧订正都不走它），而
+    `_format_prompt_block` 是所有正文出去的唯一一道门——规划期标注当初就是因为
+    同一个理由挪过来的。两处都做，幂等，谁先到都一样。
+    """
+    if not text:
+        return text
+    return humanize_prompt_text(scrub_planning_annotations(text))
+
+
 def _format_prompt_block(images, videos):
     image_lines = ["图片提示词"]
     for idx in sorted(images):
@@ -14456,9 +15508,10 @@ def _format_prompt_block(images, videos):
         body = item['body'] if isinstance(item, dict) else item
         meta = item.get('meta', '') if isinstance(item, dict) else ''
         summary = item.get('summary', '') if isinstance(item, dict) else ''
-        summary_str = f"（{summary}）" if summary else ""
+        summary_str = f"（{_delivery_scrub(summary)}）" if summary else ""
         meta_str = f" [{meta}]" if meta else ""
-        image_lines.extend([f"图片 {idx}{summary_str}{meta_str}:", body.strip(), ""])
+        image_lines.extend([f"图片 {idx}{summary_str}{meta_str}:",
+                            _delivery_scrub(body).strip(), ""])
 
     video_lines = ["视频提示词"]
     for idx in sorted(videos):
@@ -14466,9 +15519,10 @@ def _format_prompt_block(images, videos):
         body = item['body'] if isinstance(item, dict) else item
         meta = item.get('meta', '') if isinstance(item, dict) else ''
         summary = item.get('summary', '') if isinstance(item, dict) else ''
-        summary_str = f"（{summary}）" if summary else ""
+        summary_str = f"（{_delivery_scrub(summary)}）" if summary else ""
         meta_str = f" [{meta}]" if meta else ""
-        video_lines.extend([f"视频 {idx}{summary_str}{meta_str}:", body.strip(), ""])
+        video_lines.extend([f"视频 {idx}{summary_str}{meta_str}:",
+                            _delivery_scrub(body).strip(), ""])
 
     return ("\n".join(image_lines).rstrip() + "\n\n" + "\n".join(video_lines).rstrip()).strip()
 
@@ -16060,7 +17114,8 @@ def outline_space_crossings(plan):
     return [i for i in range(2, len(labels) + 1) if labels[i - 1] != labels[i - 2]]
 
 
-def build_outline_plan_block(beat_outline, max_total_beats, multishot=False):
+def build_outline_plan_block(beat_outline, max_total_beats, multishot=False,
+                             micro_traces=True):
     """把卡片的节拍简介渲染成送进规划器的「强制工序清单 + 一比一绑定契约」段落。
 
     返回 (归一后的清单条目列表, 提示词段落)。清单为空时段落是空串——老任务/老断点/
@@ -16083,6 +17138,12 @@ def build_outline_plan_block(beat_outline, max_total_beats, multishot=False):
     ——单镜链路的一拍就是一条不间断的镜头，给它一条「让插入镜拍这个」的规则，等于让
     写手去写一个它的语法根本切不出来的镜头。观察到的**镜头数**则一律不渲染：镜头梯是
     合成期确定性排的，规划器不参与，把那个数给它只会诱导它自己写分镜。
+
+    micro_traces：本单是不是 miniature 通道（见 micro_traces_channel_enabled）。只有
+    它为真时才渲染 MICRO TRACES 行与 FORENSIC DETAIL 里说 micro 的那半句——微距级
+    痕迹在 base / omni 的景别下渲染不出来，写进规划提示词只会挤掉真看得见的画面依据。
+    MAT SPECS 与 FASTENING 不受它影响：那两栏是工程规格，全尺寸实景一样用得上。
+    默认 True 保持老调用点（测试、独立调用）改动前的行为。
     """
     plan = _outline_normalized_entries(beat_outline)
     if not plan:
@@ -16111,7 +17172,7 @@ def build_outline_plan_block(beat_outline, max_total_beats, multishot=False):
             rendered.append(f'     FASTENING: {", ".join(entry["fasteners"])}')
         if entry.get('trace'):
             rendered.append(f'     LEAVES: {entry["trace"]}')
-        if entry.get('micro'):
+        if micro_traces and entry.get('micro'):
             rendered.append(f'     MICRO TRACES: {", ".join(entry["micro"])}')
         if entry.get('state_before'):
             rendered.append(f'     STATE BEFORE: {entry["state_before"]}')
@@ -16171,8 +17232,13 @@ def build_outline_plan_block(beat_outline, max_total_beats, multishot=False):
     has_macro = any(e.get('macro_environment') for e in plan)
     # 微观取证（2026-08-24）。三栏合成一个守卫：它们同源（Pass A 的逐帧取证）、
     # 同一条规则说完，拆成三条守卫只会让规划提示词多出两段说同一件事的散文。
-    has_micro_forensics = any(e.get('mat_specs') or e.get('fasteners') or e.get('micro')
+    has_micro_forensics = any(e.get('mat_specs') or e.get('fasteners')
+                              or (micro_traces and e.get('micro'))
                               for e in plan)
+    # MICRO TRACES 那半句的门控与上面的渲染同一个开关：清单行没渲染出来却还留着一条
+    # 「照抄清单里的 MICRO TRACES」，规划器就会自己编几条微观痕迹填进去——这正是
+    # has_* 守卫存在的理由。
+    has_micro_line = bool(micro_traces) and any(e.get('micro') for e in plan)
     observed_crossings = outline_space_crossings(plan)
     rich_block = ""
     if (has_scope or has_zone or has_trace or has_state or observed_crossings
@@ -16313,7 +17379,9 @@ def build_outline_plan_block(beat_outline, max_total_beats, multishot=False):
                 "contact and the traces it leaves, and you must not invent a cut-in subject for it.")
         if has_micro_forensics:
             rules.append(
-                "FORENSIC DETAIL: an entry's \"MAT SPECS\", \"FASTENING\" and \"MICRO TRACES\" were "
+                "FORENSIC DETAIL: an entry's \"MAT SPECS\", \"FASTENING\""
+                + (" and \"MICRO TRACES\"" if has_micro_line else "")
+                + " were "
                 "measured off the reference film frame by frame — they are the difference between "
                 "reproducing THIS film's work and reproducing a generic version of the same trade. "
                 "MAT SPECS is the material's thickness, grade, section and surface: carry those "
@@ -16321,11 +17389,13 @@ def build_outline_plan_block(beat_outline, max_total_beats, multishot=False):
                 "(\"sheathing\" for \"9mm OSB, raw matte face\" throws away the only thing that made "
                 "it this film's board). FASTENING is how that beat's joints are actually made: name "
                 "it, and keep that beat's tool and sound consistent with it — a screwed joint does "
-                "not make a nail-gun crack. MICRO TRACES are the fine marks the work leaves; they "
-                "belong in that beat's own description alongside its persistent traces, and they "
-                "are NOT required to survive into later beats the way persistent traces are. Where "
-                "an entry gives none of the three, that beat had nothing readable in the frames — "
-                "invent nothing to fill the gap.")
+                "not make a nail-gun crack. "
+                + ("MICRO TRACES are the fine marks the work leaves; they "
+                   "belong in that beat's own description alongside its persistent traces, and they "
+                   "are NOT required to survive into later beats the way persistent traces are. "
+                   if has_micro_line else "")
+                + "Where an entry gives none of these, that beat had nothing readable in the "
+                  "frames — invent nothing to fill the gap.")
         if has_tool:
             rules.append(
                 "TOOL: an entry's \"TOOL\" is the actual implement that delivers that beat's work "
@@ -16923,6 +17993,7 @@ def bind_outline_to_ladder(config, outline, beat_ladder, violations=None):
          （见 beat_requires_occupant / check_occupant_delivered）。
     """
     entries = _outline_normalized_entries(outline)
+    _include_micro = micro_traces_channel_enabled(config)
     contract = outline_milestone_contract(outline, beat_ladder)
     if isinstance(config, dict) and contract['declared']:
         config['_outline_contract'] = contract
@@ -16966,7 +18037,8 @@ def bind_outline_to_ladder(config, outline, beat_ladder, violations=None):
         if not observed_craft_of(beat):
             merged = {}
             for n in refs:
-                for key, value in _craft_from_outline_entry(entries[n - 1]).items():
+                for key, value in _craft_from_outline_entry(
+                        entries[n - 1], include_micro=_include_micro).items():
                     if isinstance(value, list):
                         merged.setdefault(key, [])
                         merged[key].extend(v for v in value if v not in merged[key])

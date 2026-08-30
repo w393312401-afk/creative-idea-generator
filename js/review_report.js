@@ -17,7 +17,7 @@
    3. openFrameIssuePop：点徽标展开可复制的详情弹层，title= 那边只留摘要。
    ===================================================================== */
 
-const REVIEW_LAYER_LABELS = { global: '跨帧', local: '本拍', manual: '人工' };
+const REVIEW_LAYER_LABELS = { global: '跨帧', local: '本拍', manual: '人工', collage_macro: '拼图对标', anchor: '首帧对标' };
 
 /** 判定为"这一格有待处理问题"的 quality_gate（与 slot_model.frameIsFixable 同源）。 */
 const ISSUE_GATES = ['sequence_review_flagged', 'vlm_qa_failed', 'frame_continuity_failed'];
@@ -52,7 +52,7 @@ function collectReviewIssues(frameRun) {
             // verified===false 的违规后端本来就不落盘（复核否决）；万一老 manifest
             // 里留着，这里也不展示——展示已被推翻的指控比不展示更糟。
             if (i.verified === false) return;
-            const layer = (i.layer === 'global' || i.layer === 'manual') ? i.layer : 'local';
+            const layer = (i.layer === 'global' || i.layer === 'manual' || i.layer === 'collage_macro' || i.layer === 'anchor') ? i.layer : 'local';
             const key = `${layer}|${i.beat}|${i.text}`;
             let entry = byKey.get(key);
             if (!entry) {
@@ -197,7 +197,9 @@ function reviewIssueRow(entry) {
     layerEl.title = entry.layer === 'global'
         ? '跨帧层检出：拿整段序列互相比出来的问题（施工顺序、空间拓扑）'
         : (entry.layer === 'manual' ? '人工标记：你自己写下的问题描述，尚未修复'
-                                    : '本拍检出：相邻两帧之间比出来的问题');
+        : (entry.layer === 'collage_macro' ? '拼图对标检出：与爆款 5 列大拼图相比的宏观阶段/光影演变偏差'
+        : (entry.layer === 'anchor' ? '首帧对标检出：首帧与爆款首帧/封面的机位、空间与初始状态对标偏差'
+                                    : '本拍检出：相邻两帧之间比出来的问题（含爆款原片关键帧对标）')));
     li.appendChild(layerEl);
 
     const textEl = document.createElement('span');
@@ -424,6 +426,24 @@ function openFrameIssuePop(cardEl, seq) {
         ul.appendChild(li);
     });
     pop.appendChild(ul);
+
+    const curIdea = typeof currentIdea !== 'undefined' ? currentIdea : null;
+    const refFrames = (curIdea && (curIdea.ref_frames || (curIdea.frameRun && curIdea.frameRun.ref_frames))) || {};
+    const refUrl = refFrames[seq] || refFrames[String(seq)];
+    if (refUrl) {
+        const foot = document.createElement('div');
+        foot.style.cssText = 'padding: 8px 12px; background: rgba(245,158,11,0.08); border-top: 1px solid rgba(245,158,11,0.25); display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 11.5px;';
+        foot.innerHTML = `
+            <div style="display:flex; align-items:center; gap:8px;">
+                <img src="${escapeHtml(refUrl)}" style="width:28px; height:50px; object-fit:cover; border-radius:3px; border:1px solid #f59e0b; cursor:pointer;" onclick="if(window.openLightbox) openLightbox('${escapeHtml(refUrl)}')" title="点击放大爆款原片抽帧" />
+                <span style="color:#f59e0b; font-weight:600;">🎯 爆款原片基准抽帧</span>
+            </div>
+            <button type="button" class="action-btn text-btn mini-btn" style="color:#f59e0b; border-color:rgba(245,158,11,0.5); font-size:11px; padding:2px 8px;" onclick="if(typeof openBenchmarkCompare==='function') openBenchmarkCompare({ seq: ${seq} }); else if(typeof openCollageViewer==='function') openCollageViewer({ idea: typeof currentIdea !== 'undefined' ? currentIdea : null, initialMode: 'compare', compareType: 'benchmark', initialFrameSeq: ${seq} })">
+                ⇄ 分屏对标
+            </button>
+        `;
+        pop.appendChild(foot);
+    }
 
     document.body.appendChild(pop);
     _issuePopEl = pop;

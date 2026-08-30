@@ -91,7 +91,10 @@
       <div class="header-logo">
         <div class="logo-icon">💻</div>
         <div class="logo-text">
-          <h1>SPARK DevPortal</h1>
+          <div style="display: flex; align-items: center; gap: 8px;">
+            <h1>SPARK DevPortal</h1>
+            <span id="spark-version-badge" class="version-badge-pill" title="查看版本详情" style="display: none;"></span>
+          </div>
           <span>Developer Center</span>
         </div>
       </div>
@@ -124,6 +127,11 @@
           <!-- Mode Status -->
           <div class="status-badge" id="managed-mode-badge">
             <span id="managed-mode-text">获取模式中...</span>
+          </div>
+          <!-- Version Status -->
+          <div class="status-badge" id="spark-version-status-console" title="版本与策略信息" style="cursor: pointer; display: none;">
+            <span class="status-dot online" style="background:#8b5cf6; box-shadow: 0 0 8px #8b5cf6;"></span>
+            <span><span class="status-label">版本: </span><span id="spark-version-text-console">--</span></span>
           </div>
         </div>
         <button id="theme-toggle-btn" class="icon-btn" title="切换暗夜模式">

@@ -525,19 +525,24 @@ GATE_SETTINGS = (
     },
     {
         'key': 'chainGuardMode', 'type': 'enum', 'default': 'autofix',
-        'options': ('off', 'report', 'halt', 'autofix'),
+        'options': ('off', 'report', 'halt', 'autofix', 'autofix_soft'),
         'section': 'frame', 'label': '生成期链上逐拍守卫',
         'option_labels': {
             'off': 'off（关闭）',
             'report': 'report（只记账不阻断）',
             'halt': 'halt（结构级问题停链等人）',
             'autofix': 'autofix（默认，结构级问题就地自动修复后继续）',
+            'autofix_soft': 'autofix_soft（自动修复，修不好也不停链、只记账）',
         },
         'hint': '生成循环中每渲完一帧立即执行逐拍一致性审查与分级。'
                 'autofix 档检出结构级问题时就地走一遍「修复此帧问题」（定向重写提示词 + '
                 '4选1 重渲），复审通过就接着往下渲，连修 2 次仍不过才停链等人；'
                 'halt 档一检出就停链；report 档仅记录留痕不停链。'
-                '错误顺着 i2i 往下传的代价是整条链，所以默认不放行。',
+                '错误顺着 i2i 往下传的代价是整条链，所以默认不放行。'
+                'autofix_soft 与 autofix 只差最后一步：修满次数仍不过时不停链，'
+                '照旧往下渲，问题帧仍会被标成「一致性审查未过」并汇进收尾的质量风险'
+                '清单。要「一趟渲完整条序列、事后人工挑着修」时用它——代价是问题'
+                '确实会顺着 i2i 传给下游帧。',
     },
     {
         'key': 'frameContinuityMode', 'type': 'enum', 'default': 'balanced',
@@ -1218,18 +1223,36 @@ OMNI_VIDEO_RESOLUTIONS = ('360p', '720p')
 OMNI_DEFAULT_VIDEO_RESOLUTION = '720p'
 
 
-def resolve_video_duration(config=None):
+def resolve_video_duration(config=None, fallback_hint=None):
     """本次生成的单段视频时长（秒，int）。永远返回一个确定的数，不返回 None。
 
-    非 Omni 系列模型一律 8 秒（面板固定，不可调）；Omni 系列模型取 videoDuration/video_duration，
-    缺失/非法值回落到 10 秒。"""
-    cfg = config if isinstance(config, dict) else SERVER_CONFIG
+    非 Omni 系列模型一律 8 秒（面板固定，不可调）；Omni 系列模型按优先级取三档：
+    1) 这次请求自己带来的 videoDuration/video_duration（用户当次会话里主动选的）；
+    2) 调用方传入的 fallback_hint——按本批待生成拍子的实际内容量（拍重）推算出的
+       档位，composers.base._infer_batch_duration_hint（合成阶段）与
+       video_generator._infer_batch_omni_duration（生成阶段）各自算一遍，两边
+       必须吃同一份 beat_ladder/PACE 数据，保证是同一个数；
+    3) 服务端持久化的默认值（server_config.json 的 videoDuration），最终兜底 10 秒。
+
+    2026-08-30 调整：第 3 档以前和第 1 档同优先级——server_config.json 里的
+    videoDuration 自那次"不能留空"的改动后恒有值，等于让 fallback_hint 永远排不上号，
+    这批档位推算形同虚设。现在把它降到 fallback_hint 之后：只要用户没有在这次请求里
+    主动选时长，就该让内容量推算生效；用户主动选过，则仍以用户选择为准。"""
+    cfg = config if isinstance(config, dict) else {}
     model = str(cfg.get('videoModel') or cfg.get('video_model') or SERVER_CONFIG.get('videoModel') or '').strip().lower()
     if 'omni' not in model:
         return FIXED_VIDEO_DURATION
     raw = cfg.get('videoDuration') if 'videoDuration' in cfg else cfg.get('video_duration')
-    if raw in (None, ''):
-        raw = SERVER_CONFIG.get('videoDuration')
+    if raw not in (None, ''):
+        try:
+            value = int(float(str(raw).strip()))
+        except (TypeError, ValueError):
+            value = None
+        if value in OMNI_VIDEO_DURATIONS:
+            return value
+    if fallback_hint in OMNI_VIDEO_DURATIONS:
+        return fallback_hint
+    raw = SERVER_CONFIG.get('videoDuration')
     try:
         value = int(float(str(raw).strip()))
     except (TypeError, ValueError):
@@ -1644,6 +1667,10 @@ def apply_google_fx_runtime_overrides(config):
     ads_headless = config.get('adsPowerHeadless')
     if ads_headless is not None:
         os.environ['ADSPOWER_HEADLESS'] = '1' if str(ads_headless).lower() in ('1', 'true', 'yes', 'on') else '0'
+    # macOS 专用窗口抑制模式：hide / focus / off（非法值交给 config 侧兜底成 hide）
+    ads_mac_window = str(config.get('adsPowerMacWindowMode') or '').strip().lower()
+    if ads_mac_window:
+        os.environ['ADSPOWER_MACOS_WINDOW_MODE'] = ads_mac_window
     browser_user_id = str(config.get('googleFxUserId') or '').strip()
     if browser_user_id:
         os.environ['ADSPOWER_DEFAULT_USER_ID'] = browser_user_id
@@ -1737,8 +1764,21 @@ def failover_and_select_next_account(config, pool, failed_user_id: str, reason: 
     if failed_user_id and pool:
         try:
             r_low = str(reason or '').lower()
-            if any(k in r_low for k in ("quota", "credit", "积分", "额度")):
-                pool.mark_exhausted(failed_user_id)
+            # 图片单日配额的判据统一走 google_fx_credit.is_image_quota_message：
+            # 这里曾自己抄一份 token 清单，其中 "try using a different model" 是个
+            # 模糊短语（模型不可用时也会说），单独当判据会把好账号打进 24 小时冷却。
+            try:
+                from integrations.google_fx.services.google_fx_credit import is_image_quota_message
+                image_capped = is_image_quota_message(r_low)
+            except Exception:
+                image_capped = any(k in r_low for k in ("daily limit", "daily_limit", "单日上限", "单日配额", "图片余额超限", "image_quota"))
+            if image_capped:
+                if hasattr(pool, "mark_image_quota_exceeded"):
+                    pool.mark_image_quota_exceeded(failed_user_id, error_detail="图片余额超限")
+                else:
+                    pool.mark_exhausted(failed_user_id, reason="image_quota_exceeded")
+            elif any(k in r_low for k in ("quota", "credit", "积分", "额度", "配额")):
+                pool.mark_exhausted(failed_user_id, reason="quota_exhausted")
             elif any(k in r_low for k in ("login", "登录", "sign in", "auth")):
                 pool.mark_login_required(failed_user_id)
             else:
@@ -2446,8 +2486,14 @@ def _cover_candidate_path(raw):
     if not isinstance(raw, str) or not raw.strip():
         return None
     rel = raw.strip().split('?', 1)[0]
-    if rel.startswith('data:') or '://' in rel:
+    if rel.startswith('data:'):
         return None
+    if '://' in rel:
+        m = re.search(r'/(outputs[/\\].*)$', rel)
+        if m:
+            rel = m.group(1)
+        else:
+            return None
     root = os.path.dirname(os.path.abspath(__file__))
     outputs_dir = os.path.abspath(OUTPUT_ROOT if os.path.isabs(OUTPUT_ROOT) else os.path.join(root, OUTPUT_ROOT))
     clean_rel = rel.lstrip('/\\')
@@ -2516,7 +2562,8 @@ def resolve_cover_reference(config, title, project_key=None):
 
     found = []
 
-    project_dir = _get_project_dir(project_key or title)
+    p_key = project_key or ((config.get('_project_key') if isinstance(config, dict) else None)) or title
+    project_dir = _get_project_dir(p_key)
     project_dir = (project_dir if os.path.isabs(project_dir)
                    else os.path.join(root, project_dir))
     if os.path.isdir(project_dir):
@@ -2525,6 +2572,16 @@ def resolve_cover_reference(config, title, project_key=None):
             return registered
         found += [os.path.join(project_dir, name) for name in os.listdir(project_dir)
                   if _is_cover_filename(name)]
+
+    if title and title != p_key:
+        alt_dir = _get_project_dir(title)
+        alt_dir = alt_dir if os.path.isabs(alt_dir) else os.path.join(root, alt_dir)
+        if os.path.isdir(alt_dir) and alt_dir != project_dir:
+            registered = manifest_cover_role(alt_dir, 'frame1', 'active_cover')
+            if registered:
+                return registered
+            found += [os.path.join(alt_dir, name) for name in os.listdir(alt_dir)
+                      if _is_cover_filename(name)]
 
     legacy_dir = os.path.abspath(os.path.join(outputs_dir, LEGACY_COVERS_DIRNAME))
     if os.path.isdir(legacy_dir):
@@ -3760,28 +3817,78 @@ def delete_library_item(item_id, library_dir=None):
     按 id 删天然带着"确有意图"的证据，不吃缩量闸门——与创意台账的
     delete_ledger_entries 同一个道理（见 write_ledger 的说明）。
     """
+    deleted = delete_library_items([item_id], library_dir=library_dir)
+    return bool(deleted)
+
+
+def delete_library_items(item_ids, library_dir=None):
+    """按 id 集合批量删除（正文文件 + 一次性写索引）。返回实际删除的 id 列表。"""
+    if not item_ids:
+        return []
     with LIBRARY_LOCK:
         _ensure_library_split(library_dir)
         index = _read_library_index(library_dir)
         if index is None:
             raise RuntimeError('创意库索引损坏，已停止删除（请从 library.json.pre-split 恢复）')
-        ident = str(item_id)
-        remaining = [r for r in index if not (isinstance(r, dict) and str(r.get('id')) == ident)]
-        removed = len(remaining) != len(index)
-        if removed:
+        id_set = {str(iid).strip() for iid in item_ids if iid not in (None, '')}
+        if not id_set:
+            return []
+        remaining = [r for r in index if not (isinstance(r, dict) and str(r.get('id') or '').strip() in id_set)]
+        removed_from_index = [str(r.get('id') or '').strip() for r in index if isinstance(r, dict) and str(r.get('id') or '').strip() in id_set]
+        if len(remaining) != len(index):
             _write_library_index(remaining, library_dir)
-        try:
-            path = _library_item_path(item_id, library_dir)
-        except ValueError:
-            return removed
-        if os.path.exists(path):
+        deleted_ids = list(set(removed_from_index))
+        for iid in id_set:
             try:
-                os.remove(path)
-                removed = True
-            except OSError as e:
+                path = _library_item_path(iid, library_dir)
+            except ValueError:
+                continue
+            if os.path.exists(path):
+                try:
+                    os.remove(path)
+                    if iid not in deleted_ids:
+                        deleted_ids.append(iid)
+                except OSError as e:
+                    if sys.stdout:
+                        print(f"[WARN] 删除创意正文 {path} 失败: {e}")
+        return deleted_ids
+
+
+def clear_regular_library(library_dir=None):
+    """清空所有常规点子库条目（100% 永久保留爆款复刻创意条目）。
+    返回被删除的常规点子库 id 列表。
+    """
+    with LIBRARY_LOCK:
+        _ensure_library_split(library_dir)
+        index = _read_library_index(library_dir)
+        if index is None:
+            raise RuntimeError('创意库索引损坏，已停止清空')
+
+        kept_index = []
+        regular_ids = []
+        for r in index:
+            if not isinstance(r, dict):
+                continue
+            if is_replica_library_item(r):
+                kept_index.append(r)
+            else:
+                iid = str(r.get('id') or '').strip()
+                if iid:
+                    regular_ids.append(iid)
+
+        if len(kept_index) != len(index):
+            _write_library_index(kept_index, library_dir)
+
+        deleted_ids = list(regular_ids)
+        for iid in regular_ids:
+            try:
+                path = _library_item_path(iid, library_dir)
+                if os.path.exists(path):
+                    os.remove(path)
+            except Exception as e:
                 if sys.stdout:
-                    print(f"[WARN] 删除创意正文 {path} 失败: {e}")
-        return removed
+                    print(f"[WARN] 清理常规创意正文 {iid} 失败: {e}")
+        return deleted_ids
 
 
 def _ensure_library_split(library_dir=None, db_file=None):

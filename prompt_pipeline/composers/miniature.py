@@ -2,7 +2,7 @@
 
 微缩模型与巨人手建造专属 Composer:
 - 施工主体: Oversized Human Hands / Macro Fingers 从画幅边缘伸入，使用微型工具进行精密装配。
-- 居住与观察: Two cast-resin miniature figurines (1:24 dollhouse scale) 处于微缩场景中。
+- 居住与观察: Two cast-resin miniature-scale residents (1:24 dollhouse scale) 处于微缩场景中。
 - 光学摄影: 50mm-85mm macro lens feel, shallow depth of field, creamy background bokeh, model eye-level height.
 - 室内机位: Open-front Cutaway Dollhouse View (娃娃屋敞开立面/剖面), 彻底废除走入式进门 (Walk-in Threshold).
 - 负向过滤: 白名单放行 miniature / dollhouse，针对性压制 full-size human room 与全尺寸建筑广角.
@@ -96,7 +96,7 @@ _MINIATURE_METRIC_BLOCK = """- MINIATURE SCALE CONSERVATION & MACRO ERGONOMICS (
   1. Tabletop Envelope: state the model's size with centimetres or an everyday comparison (about the width of a spread hand, roughly two palms tall). NEVER declare architectural metric dimensions such as ceiling clearance or room diameter — they make the model render as a real building.
   2. Craft Prop Scale: every fitting inside the shell is a miniature made from craft stock (basswood, card, resin, brass rod). Forbid full-size furniture vocabulary; name the miniature version instead.
   3. Camera Normalization: default to a macro lens feel at model eye-level (just above the tabletop) or a thirty-to-forty-five degree oblique, with shallow depth of field and creamy background bokeh. NEVER a wide-angle architectural lens at human chest height. The close-up inserts go closer on the same model with the same macro optics; they never become another place.
-  4. Video Actor Scale Figure: the opening macro working shot of VIDEO {i} must declare the giant hand's scale against the model (e.g. 'one oversized human hand reaching in from the upper frame margin, its palm spanning roughly the height of one storey of the model'), plus the resident figurines' scale (roughly a thumb tall). NEVER declare a human worker's body height.
+  4. Video Actor Scale Figure: the opening macro working shot of VIDEO {i} must declare the giant hand's scale against the model (e.g. 'one oversized human hand reaching in from the upper frame margin, its palm spanning roughly the height of one storey of the model'), plus the resident people's scale (roughly a thumb tall). NEVER declare a human worker's body height.
 """
 
 
@@ -298,6 +298,12 @@ def check_miniature_cutaway_framing(prompt_text):
             "Use cutaway dollhouse framing."
         )
     return errors
+
+
+# 「画面里那两个活人」在正文里可能长成的样子。活物一律真人（human_cast）之后
+# 写手写的是 residents / people，老稿与外部粘贴进来的仍是 figurines——静止姿态
+# 清洗器两种都要认，只认一种等于对另一种彻底失效。
+_CAST_NOUN = r'(?:figurines?|residents?|people|persons?)'
 
 
 class MiniatureComposer(OmniComposer):
@@ -540,7 +546,7 @@ CAST IN FRAME（活物即时应激与动作-反应咬合）：人偶是画面中
 Rewrite rules (additive — do not lose content):
 - Keep the opening anchor sentence ("Use the provided image as the exact starting composition and environment anchor. ...") VERBATIM as the first sentence.
 - Express the multi-shot sequence using pure natural language cinematic transitions (e.g. 'The scene opens with...', 'The camera then cuts into a tight close-up insert on...', 'Shifting to an extreme close-up insert...', 'Finally, the camera cuts back to the primary locked diorama setup...'). Do NOT output numeric timestamps, seconds marks, or robotic cut mark tables.
-- Keep every concrete detail already in the draft: the same giant hands and their entry margin, the same named micro-tool, the same operation, the same craft traces, the same figurines, the same audio description, the same lighting. Redistribute them across the shots instead of inventing new ones.
+- Keep every concrete detail already in the draft: the same giant hands and their entry margin, the same named micro-tool, the same operation, the same craft traces, the same residents, the same audio description, the same lighting. Redistribute them across the shots instead of inventing new ones.
 - Restructure the body into exactly {len(ladder)} shots IN THIS ORDER, naming each one in prose exactly as written here: {scales}. Join them with clean cuts or match cuts.
 - The first and the last shot are the SAME locked macro camera setup, framing, and focal length, differing only in how far the build has progressed; say so explicitly in the last shot ("the same locked macro setup as the opening macro working shot"). The insert(s) move closer on that same model and cut back at the same completion level. The camera itself never pans, tracks, pushes, or pulls back, and it never enters the model.
 - The builder is an OVERSIZED REAL HUMAN HAND (giant fingers) reaching in from a frame margin with a precision micro-tool — never a full-scale worker, never a person inside the model. One hand is already making effective tool contact from the opening instant in the opening macro working shot; that shot carries this beat's whole visible advance up to roughly three quarters; the insert(s) carry tool contact, material physics, and the persistent craft traces without advancing the state; the returning macro shot compresses the remaining repetitions the same way, and the hands withdraw clear of frame before the last moment so the final frame is clean.
@@ -561,16 +567,37 @@ Rewrite rules (additive — do not lose content):
         if has_cast:
             return text
 
-        # 若正文未提及人偶，自动在末段切回镜前或结尾注入微缩人偶的动态响应
-        cast_phrase = (
-            "Down by the diorama edge, the two miniature couple figurines tilt their heads up in awe "
-            "to track the giant hand as it works, shifting their stance and nodding approvingly as the stage settles."
-        )
+        # 若正文未提及人偶，根据工序阶段与空间动态派发与场景互动的动作与位置，严禁机械固定于 "Down by the diorama edge"
+        stg = str((beat or {}).get('stage') or '').lower()
+        if stg in ('demolition', 'clearing'):
+            cast_phrase = "Near the site boundary, the miniature-scale resident couple lean in with curiosity, their gaze tracking the clearing and layout."
+            cutback_phrase = "Near the site boundary, the miniature-scale resident couple lean in with curiosity, their gaze tracking the final layout before nodding in relief."
+        elif stg == 'structural':
+            cast_phrase = "By the rising columns, the miniature-scale resident couple step forward in wonder, actively tracking the heavy joinery and smiling as the frame locks in place."
+            cutback_phrase = "By the rising columns, the miniature-scale resident couple step forward, their gaze actively tracking the final micro-adjustments before admiring the sturdy frame."
+        elif stg in ('enclosure', 'rough_in'):
+            cast_phrase = "Along the exterior perimeter, the curious miniature-scale residents tilt their heads up in awe, tracking the wall and roof installation before nodding approvingly."
+            cutback_phrase = "Along the exterior perimeter, the miniature-scale residents tilt their heads up, tracking the final panel adjustments with rising hope."
+        elif stg in ('floor', 'fixtures'):
+            cast_phrase = "On the newly assembled platform, the miniature-scale residents walk across the floor, shifting stance and examining the craft details with joyful smiles."
+            cutback_phrase = "On the newly assembled platform, the miniature-scale residents walk along the fresh floor, tracking the final fixture mounting with pure joy."
+        elif stg in ('transition', 'hallway'):
+            cast_phrase = "Gathering at the open doorway, the miniature-scale resident couple step across the threshold, eagerly admiring the breezy interior space."
+            cutback_phrase = "At the open doorway, the miniature-scale resident couple step across the threshold, their gaze admiring the finished interior."
+        elif stg in ('surface', 'finishing'):
+            cast_phrase = "Strolling along the newly paved pathway, the miniature-scale residents admire the fresh landscaping and touch the smooth woodwork."
+            cutback_phrase = "Along the paved walkway, the miniature-scale resident couple walk side by side, admiring the lush garden and finished woodwork."
+        elif stg in ('reveal', 'furnishing'):
+            cast_phrase = "Standing proudly together at the entrance landing, the miniature-scale resident couple celebrate and wave cheerfully, admiring the finished masterpiece."
+            cutback_phrase = "Standing proudly together at the entrance landing, the miniature-scale resident couple wave cheerfully, celebrating the finished estate."
+        else:
+            cast_phrase = "Moving across the workspace, the miniature-scale resident couple actively shift their stance, their gaze tracking the micro-tool movements before admiring the completed milestone."
+            cutback_phrase = "Moving across the workspace, the miniature-scale resident couple lean in with curiosity, tracking the final adjustments before admiring the finished milestone."
 
         if 'finally, the camera cuts back' in low:
             text = re.sub(
                 r'(?i)(finally,\s+the\s+camera\s+cuts\s+back\s+to\s+[^.;]+?[.;])',
-                r'\1 Down by the diorama edge, the miniature couple figurines lean in with curiosity, their gaze actively tracking the final micro-adjustments before standing side by side to admire the finished work.',
+                rf'\1 {cutback_phrase}',
                 text,
                 count=1
             )
@@ -635,18 +662,23 @@ Rewrite rules (additive — do not lose content):
 
         # 3. 强力清洗假人/静止人偶词汇并转化为动态应激
         res = re.sub(
-            r'(?i)\b(?:unmoving|motionless|static|frozen|still)\s+miniature\s+(?:bystander\s+)?figurines?\s+stand\s+watching\s+quietly\b',
-            'the curious miniature figurines tilt their heads and shift stance, attentively tracking the micro-tool movements',
+            r'(?i)\b(?:unmoving|motionless|static|frozen|still)\s+miniature(?:[-\s]scale)?\s+(?:bystander\s+)?' + _CAST_NOUN + r'\s+stand(?:s)?\s+watching\s+quietly\b',
+            'the curious miniature-scale residents tilt their heads and shift stance, attentively tracking the micro-tool movements',
             res
         )
         res = re.sub(
-            r'(?i)\b(?:unmoving|motionless|static|frozen)\s+miniature\s+figurines?\b',
-            'miniature figurines',
+            r'(?i)\b(?:unmoving|motionless|static|frozen)\s+miniature(?:[-\s]scale)?\s+' + _CAST_NOUN + r'\b',
+            'miniature-scale residents',
             res
         )
         res = re.sub(
-            r'(?i)\bminiature\s+(?:couple\s+)?figurines?\s+(?:remain|stay\s+put|stand\s+still|stand\s+quietly|are\s+unchanged)\b',
-            'miniature figurines shift their posture and turn their gaze',
+            r'(?i)\b(?:miniature(?:[-\s]scale)?\s+)?(?:couple\s+)?' + _CAST_NOUN + r'\s+stand(?:s)?\s+(?:patiently\s+|attentively\s+|quietly\s+)?(?:at|in|by)\s+the\s+(?:bottom[- ]left|lower[- ]left|diorama\s+edge|corner|outer\s+edge)\s+(?:observing|watching|looking\s+up|gazing\s+upward)\b',
+            'the miniature-scale residents dynamically shift stance and turn their gaze, actively tracking the craft progress',
+            res
+        )
+        res = re.sub(
+            r'(?i)\bminiature(?:[-\s]scale)?\s+(?:couple\s+)?' + _CAST_NOUN + r'\s+(?:remain|stay\s+put|stand\s+still|stand\s+quietly|are\s+unchanged)\b',
+            'miniature-scale residents shift their posture and turn their gaze',
             res
         )
 
@@ -772,12 +804,12 @@ PRIORITY & WORLDVIEW OVERRIDE:
    - NEVER describe a 1.78m human worker, neon safety vests, hard hats, or people walking inside the miniature structure.
 
 2. THE RESIDENTS (Tiny Figurines) — they are LIVING CAST, not static props:
-   - Two cast-resin painted miniature figurines (one to twenty-four dollhouse scale couple, roughly a thumb tall) inhabit or observe the model from foreground edges. They watch; they never build.
+   - Two cast-resin painted miniature-scale residents (one to twenty-four dollhouse scale couple, roughly a thumb tall) inhabit or observe the model from foreground edges. They watch; they never build.
    - ACTION-REACTION CAUSAL INTERLOCK: They are ALIVE in every beat and actively respond to the craftsman:
-     * When hands/tools enter from margins, figurines immediately react with head/gaze shifts (tilting heads up in awe, turning to look).
+     * When hands/tools enter from margins, the residents immediately react with head/gaze shifts (tilting heads up in awe, turning to look).
      * During active craft work, they track the tool motions with slight shifts of weight, steps closer, or pointing gestures.
      * When work completes and hands withdraw, they settle into their final observing stance facing the new work.
-    - What is LOCKED is their identity, costume and scale (same two figurines, same attire, thumb-tall height, never touching a tool, never leaving the frame). What is FREE is their pose, orientation and micro-actions dynamically reacting to the work.
+    - What is LOCKED is their identity, costume and scale (same two residents, same attire, thumb-tall height, never touching a tool, never leaving the frame). What is FREE is their pose, orientation and micro-actions dynamically reacting to the work.
    - NEVER write them as unchanged ("the two figurines remain where they were") or isolate their motion as a passive afterthought at the very end of the clip.
 
 3. MACRO OPTICS & DEPTH OF FIELD:

@@ -232,14 +232,47 @@ function renderSteppedReviewPanel(container, state) {
     
     if (stage === 'review_anchor') {
         const imgUrl = steppedImageUrl(state.anchor_image_path);
+        const refPath = state.ref_frames && (state.ref_frames[1] || state.ref_frames['1']);
+        const refUrl = refPath ? steppedImageUrl(refPath) : null;
+        
+        let previewHtml = '';
+        if (refUrl) {
+            previewHtml = `
+                <div class="stepped-dual-preview-grid">
+                    <div class="stepped-dual-preview-col">
+                        <span class="stepped-dual-preview-badge gen-badge">🌟 生成锚点帧 (IMG 001)</span>
+                        <div class="review-image-wrapper" onclick="typeof openLightbox === 'function' ? openLightbox('${imgUrl}') : null" title="点击单独放大查看生成锚点帧">
+                            <img src="${imgUrl}" alt="Generated Anchor Frame" onerror="this.src='${STEPPED_FRAME_PLACEHOLDER}'" />
+                            <span class="stepped-thumb-zoom-badge">🔍 放大生成帧</span>
+                        </div>
+                    </div>
+                    <div class="stepped-dual-preview-col">
+                        <span class="stepped-dual-preview-badge ref-badge">🎯 原片基准抽帧 (REF 001)</span>
+                        <div class="review-image-wrapper ref-wrapper" onclick="typeof openLightbox === 'function' ? openLightbox('${refUrl}') : null" title="点击单独放大查看原片基准抽帧">
+                            <img src="${refUrl}" alt="Benchmark Ref Frame" onerror="this.src='${STEPPED_FRAME_PLACEHOLDER}'" />
+                            <span class="stepped-thumb-zoom-badge" style="color: #f59e0b; border-color: rgba(245, 158, 11, 0.4);">🎯 放大原片帧</span>
+                        </div>
+                    </div>
+                </div>
+                <div class="stepped-toolbar-actions">
+                    <button type="button" class="stepped-mini-tool-btn" onclick="openSteppedCollageViewerFromState(1, 'compare')" title="打开左右分屏对比滑块">⇄ 原片基准分屏滑块对标</button>
+                </div>
+            `;
+        } else {
+            previewHtml = `
+                <div class="review-image-wrapper" onclick="typeof openLightbox === 'function' ? openLightbox('${imgUrl}') : null" title="点击单独放大查看锚点帧">
+                    <img src="${imgUrl}" alt="Anchor Frame" onerror="this.src='${STEPPED_FRAME_PLACEHOLDER}'" />
+                    <span class="stepped-thumb-zoom-badge">🔍 放大锚点帧</span>
+                </div>
+            `;
+        }
+
         container.innerHTML = `
             <div class="review-panel-glass anchor-review-panel stepped-review-container">
                 <div class="review-header">
-                    <h3 class="review-title">审核锚点帧 (Frame 1)</h3>
+                    <h3 class="review-title">审核锚点帧 (Frame 1)${refUrl ? ' · 原片基准对标' : ''}</h3>
                 </div>
-                <div class="review-image-wrapper" onclick="typeof openLightbox === 'function' ? openLightbox('${imgUrl}') : null" title="点击单独放大查看锚点帧">
-                    <img src="${imgUrl}" alt="Anchor Frame" onerror="this.src='data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIxMDAlIiBoZWlnaHQ9IjEwMCUiPjxyZWN0IHdpZHRoPSIxMDAlIiBoZWlnaHQ9IjEwMCUiIGZpbGw9IiNlZWVlZWUiLz48dGV4dCB4PSI1MCUiIHk9IjUwJSIgZm9udC1mYW1pbHk9InNhbnMtc2VyaWYiIGZvbnQtc2l6ZT0iMjAiIGZpbGw9IiM5OTk5OTkiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGR5PSIuM2VtIj5JbWFnZSBOb3QgRm91bmQ8L3RleHQ+PC9zdmc+'" />
-                </div>
+                ${previewHtml}
                 <div class="review-actions">
                     <button class="review-btn review-btn-approve" onclick="onSteppedApprove()">
                         ✅ Approve (通过)
@@ -255,15 +288,24 @@ function renderSteppedReviewPanel(container, state) {
         const batchInfo = (state.batches && state.batches[currentBatch]) || {};
         const imgUrl = steppedImageUrl(batchInfo.collage);
         const totalBatches = state.batches ? state.batches.length : 1;
+        const hasRefs = !!(state.ref_frames && Object.keys(state.ref_frames).length);
+        const hasSrcCollage = !!state.source_collage;
+        const firstSeqInBatch = (batchInfo.sequences && batchInfo.sequences[0]) || 2;
         
         container.innerHTML = `
             <div class="review-panel-glass batch-review-panel stepped-review-container">
                 <div class="review-header">
-                    <h3 class="review-title">批次审核 · 多宫格与单帧检视</h3>
+                    <h3 class="review-title">批次审核 · 多宫格与单帧检视${hasRefs ? ' (含原片对标)' : ''}</h3>
                     <div class="batch-counter-badge">批次 ${currentBatch + 1}/${totalBatches}</div>
                 </div>
                 <div class="review-image-wrapper" onclick="typeof openLightbox === 'function' ? openLightbox('${imgUrl}') : null" title="点击放大多宫格拼图大图">
                     <img src="${imgUrl}" alt="Batch Collage" />
+                    <span class="stepped-thumb-zoom-badge">🔍 放大批次拼图</span>
+                </div>
+                <div class="stepped-toolbar-actions">
+                    <button type="button" class="stepped-mini-tool-btn" onclick="openSteppedCollageViewerFromState(${firstSeqInBatch}, 'compare')" title="打开左右分屏对比滑块">⇄ 交互式滑块对比${hasRefs ? ' (支持原片对标)' : ''}</button>
+                    ${hasSrcCollage ? `<button type="button" class="stepped-mini-tool-btn" onclick="openSteppedCollageViewerFromState(null, 'collage')" title="打开多宫格拼图检查器">⊞ 原片/生成 5 列拼图对标</button>` : ''}
+                    <button type="button" class="stepped-mini-tool-btn" onclick="openSteppedTriptychModal('${state.title}', ${firstSeqInBatch}, ${state.total_beats || 12})" title="打开三联屏审查门禁">📐 三联屏连续性审查 (K-1 ⇄ K ⇄ K+1)</button>
                 </div>
                 ${renderSteppedBatchFrameThumbsHtml(state, batchInfo)}
                 <div class="review-actions">
@@ -281,13 +323,22 @@ function renderSteppedReviewPanel(container, state) {
         `;
     } else if (stage === 'final_review') {
         const imgUrl = steppedImageUrl(state.final_collage);
+        const hasRefs = !!(state.ref_frames && Object.keys(state.ref_frames).length);
+        const hasSrcCollage = !!state.source_collage;
+        
         container.innerHTML = `
             <div class="review-panel-glass final-review-panel stepped-review-container">
                 <div class="review-header">
-                    <h3 class="review-title">最终审查 · 全局连贯性与单帧快检</h3>
+                    <h3 class="review-title">最终审查 · 全局连贯性与单帧快检${hasRefs ? ' (全量原片对标)' : ''}</h3>
                 </div>
                 <div class="review-image-wrapper" onclick="typeof openLightbox === 'function' ? openLightbox('${imgUrl}') : null" title="点击放大完整 5 列多宫格大图">
                     <img src="${imgUrl}" alt="Final Collage" />
+                    <span class="stepped-thumb-zoom-badge">🔍 放大 5 列大图</span>
+                </div>
+                <div class="stepped-toolbar-actions">
+                    <button type="button" class="stepped-mini-tool-btn" onclick="openSteppedCollageViewerFromState(1, 'collage')" title="打开交互式 5 列拼图检查器">🖼️ 交互式多宫格检查器</button>
+                    <button type="button" class="stepped-mini-tool-btn" onclick="openSteppedCollageViewerFromState(1, 'compare')" title="打开分屏对比滑块">⇄ 逐拍分屏滑块对标${hasRefs ? ' (原片/生成)' : ''}</button>
+                    <button type="button" class="stepped-mini-tool-btn" onclick="openSteppedTriptychModal('${state.title}', 2, ${state.total_beats || 12})" title="打开三联屏审查门禁">📐 三联屏连续性审查</button>
                 </div>
                 ${renderSteppedFinalAllFramesThumbsHtml(state)}
                 <div class="review-actions">
@@ -326,14 +377,10 @@ function renderSteppedLoading(container, text) {
     `;
 }
 
-// 缩略图加载失败时的占位图。原先这里是一段把 `${seq}` 直接拼进 base64 中段的字符串
-// （…Ij5JTUcg${seq}</dGV4dD48L3N2Zz4=），既不是合法 base64 也含裸 `<`，浏览器一律解不出来，
-// 于是"加载失败"最终显示的还是碎图标。改成一段固定的、真的能解码的 SVG。
+// 缩略图加载失败时的占位图
 const STEPPED_FRAME_PLACEHOLDER = 'data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIxMDAlIiBoZWlnaHQ9IjEwMCUiPjxyZWN0IHdpZHRoPSIxMDAlIiBoZWlnaHQ9IjEwMCUiIGZpbGw9IiMyMjIiLz48dGV4dCB4PSI1MCUiIHk9IjUwJSIgZm9udC1mYW1pbHk9InNhbnMtc2VyaWYiIGZvbnQtc2l6ZT0iMTQiIGZpbGw9IiM4ODgiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGR5PSIuM2VtIj5JTUc8L3RleHQ+PC9zdmc+';
 
-// 把一个值序列化成能安全塞进 HTML 内联事件属性的 JS 字面量。
-// escapeHtml(title) 不够：属性值会被 HTML 解析器先解码回 `'`，标题里带撇号就把 onclick
-// 的 JS 字符串截断了。JSON.stringify 负责 JS 层引号，escapeHtml 负责 HTML 属性层。
+// 把一个值序列化成能安全塞进 HTML 内联事件属性的 JS 字面量
 function steppedAttrArg(value) {
     const json = JSON.stringify(value === undefined ? null : value);
     return typeof escapeHtml === 'function' ? escapeHtml(json) : json;
@@ -343,20 +390,48 @@ function renderSteppedBatchFrameThumbsHtml(state, batchInfo) {
     const sequences = batchInfo && Array.isArray(batchInfo.sequences) ? batchInfo.sequences : [];
     if (!sequences.length) return '';
     const title = state.title || '';
+    const refFrames = state.ref_frames || {};
+    const hasAnyRef = sequences.some(seq => refFrames[seq] || refFrames[String(seq)]);
     
     return `
         <div class="stepped-batch-frame-section">
-            <div class="stepped-batch-frame-title">📸 批次单帧明细 (共 ${sequences.length} 帧 · 点击任一帧可单独放大)：</div>
+            <div class="stepped-batch-frame-title">
+                <span>📸 批次单帧明细 (共 ${sequences.length} 帧${hasAnyRef ? ' · 🌟生成帧 / 🎯原片抽帧配对' : ''})：</span>
+            </div>
             <div class="stepped-batch-frame-strip">
                 ${sequences.map((seq, idx) => {
                     const frameUrl = steppedImageUrl(`/outputs/${title}/frames/img_${String(seq).padStart(3, '0')}.webp`);
+                    const refPath = refFrames[seq] || refFrames[String(seq)];
+                    const refUrl = refPath ? steppedImageUrl(refPath) : null;
+                    
+                    if (refUrl) {
+                        return `
+                            <div class="stepped-paired-thumb-card" onclick="openSteppedSequencesLightbox(${steppedAttrArg(title)}, ${steppedAttrArg(sequences)}, ${idx})" title="点击单独放大查看第 ${seq} 拍 (含原片对照)">
+                                <div class="stepped-paired-thumb-split">
+                                    <div class="stepped-paired-box gen-box">
+                                        <img src="${frameUrl}" alt="IMG ${seq}" onerror="this.src='${STEPPED_FRAME_PLACEHOLDER}'" />
+                                        <span class="stepped-paired-tag tag-gen">IMG ${seq}</span>
+                                    </div>
+                                    <div class="stepped-paired-box ref-box">
+                                        <img src="${refUrl}" alt="REF ${seq}" onerror="this.src='${STEPPED_FRAME_PLACEHOLDER}'" />
+                                        <span class="stepped-paired-tag tag-ref">REF ${seq}</span>
+                                    </div>
+                                </div>
+                                <div class="stepped-paired-meta">
+                                    <span class="seq-title">第 ${seq} 拍</span>
+                                    <span class="diff-hint" onclick="event.stopPropagation(); openSteppedTriptychModal('${title}', ${seq}, ${state.total_beats || 12})" title="打开第 ${seq} 拍三联屏动态审查">📐 三联屏</span>
+                                </div>
+                            </div>
+                        `;
+                    }
+                    
                     return `
                         <div class="stepped-frame-thumb-card" onclick="openSteppedSequencesLightbox(${steppedAttrArg(title)}, ${steppedAttrArg(sequences)}, ${idx})" title="点击单独放大查看第 ${seq} 帧">
                             <div class="stepped-frame-thumb-box">
                                 <img src="${frameUrl}" alt="Frame ${seq}" onerror="this.src='${STEPPED_FRAME_PLACEHOLDER}'" />
                                 <span class="stepped-frame-zoom-tag">🔍</span>
                             </div>
-                            <span class="stepped-frame-seq-name">IMG ${String(seq).padStart(3, '0')}</span>
+                            <span class="stepped-frame-seq-name" onclick="event.stopPropagation(); openSteppedTriptychModal('${title}', ${seq}, ${state.total_beats || 12})" title="点击打开三联屏审查">IMG ${String(seq).padStart(3, '0')} 📐</span>
                         </div>
                     `;
                 }).join('')}
@@ -371,24 +446,51 @@ function renderSteppedFinalAllFramesThumbsHtml(state) {
     batches.forEach(b => {
         if (Array.isArray(b.sequences)) sequences.push(...b.sequences);
     });
-    // 去重并升序排序
     sequences = Array.from(new Set(sequences)).sort((a, b) => a - b);
     if (!sequences.length) return '';
     const title = state.title || '';
+    const refFrames = state.ref_frames || {};
+    const hasAnyRef = sequences.some(seq => refFrames[seq] || refFrames[String(seq)]);
     
     return `
         <div class="stepped-batch-frame-section">
-            <div class="stepped-batch-frame-title">📸 全套关键帧单帧列表 (共 ${sequences.length} 帧 · 点击任一帧可单独放大)：</div>
+            <div class="stepped-batch-frame-title">
+                <span>📸 全套关键帧单帧列表 (共 ${sequences.length} 帧${hasAnyRef ? ' · 🌟生成帧 / 🎯原片抽帧配对' : ''})：</span>
+            </div>
             <div class="stepped-batch-frame-strip">
                 ${sequences.map((seq, idx) => {
                     const frameUrl = steppedImageUrl(`/outputs/${title}/frames/img_${String(seq).padStart(3, '0')}.webp`);
+                    const refPath = refFrames[seq] || refFrames[String(seq)];
+                    const refUrl = refPath ? steppedImageUrl(refPath) : null;
+                    
+                    if (refUrl) {
+                        return `
+                            <div class="stepped-paired-thumb-card" onclick="openSteppedSequencesLightbox(${steppedAttrArg(title)}, ${steppedAttrArg(sequences)}, ${idx})" title="点击单独放大查看第 ${seq} 拍 (含原片对照)">
+                                <div class="stepped-paired-thumb-split">
+                                    <div class="stepped-paired-box gen-box">
+                                        <img src="${frameUrl}" alt="IMG ${seq}" onerror="this.src='${STEPPED_FRAME_PLACEHOLDER}'" />
+                                        <span class="stepped-paired-tag tag-gen">IMG ${seq}</span>
+                                    </div>
+                                    <div class="stepped-paired-box ref-box">
+                                        <img src="${refUrl}" alt="REF ${seq}" onerror="this.src='${STEPPED_FRAME_PLACEHOLDER}'" />
+                                        <span class="stepped-paired-tag tag-ref">REF ${seq}</span>
+                                    </div>
+                                </div>
+                                <div class="stepped-paired-meta">
+                                    <span class="seq-title">第 ${seq} 拍</span>
+                                    <span class="diff-hint" onclick="event.stopPropagation(); openSteppedTriptychModal('${title}', ${seq}, ${state.total_beats || 12})" title="打开第 ${seq} 拍三联屏动态审查">📐 三联屏</span>
+                                </div>
+                            </div>
+                        `;
+                    }
+                    
                     return `
                         <div class="stepped-frame-thumb-card" onclick="openSteppedSequencesLightbox(${steppedAttrArg(title)}, ${steppedAttrArg(sequences)}, ${idx})" title="点击单独放大查看第 ${seq} 帧">
                             <div class="stepped-frame-thumb-box">
                                 <img src="${frameUrl}" alt="Frame ${seq}" onerror="this.src='${STEPPED_FRAME_PLACEHOLDER}'" />
                                 <span class="stepped-frame-zoom-tag">🔍</span>
                             </div>
-                            <span class="stepped-frame-seq-name">IMG ${String(seq).padStart(3, '0')}</span>
+                            <span class="stepped-frame-seq-name" onclick="event.stopPropagation(); openSteppedTriptychModal('${title}', ${seq}, ${state.total_beats || 12})" title="点击打开三联屏审查">IMG ${String(seq).padStart(3, '0')} 📐</span>
                         </div>
                     `;
                 }).join('')}
@@ -399,15 +501,204 @@ function renderSteppedFinalAllFramesThumbsHtml(state) {
 
 function openSteppedSequencesLightbox(title, sequences, activeIdx = 0) {
     if (!sequences || !sequences.length) return;
-    const items = sequences.map((seq, i) => ({
-        type: 'image',
-        url: steppedImageUrl(`/outputs/${title}/frames/img_${String(seq).padStart(3, '0')}.webp`),
-        caption: `<strong>第 ${seq} 拍关键帧 (IMG ${String(seq).padStart(3, '0')})</strong> [${i + 1}/${sequences.length}] · ${title}`
-    }));
+    const refFrames = (steppedState && steppedState.ref_frames) || {};
+    const items = [];
+    let initialItemIdx = 0;
+    
+    sequences.forEach((seq, i) => {
+        const isCurrentTarget = (i === activeIdx);
+        if (isCurrentTarget) {
+            initialItemIdx = items.length;
+        }
+        
+        // 1. 生成图
+        items.push({
+            type: 'image',
+            url: steppedImageUrl(`/outputs/${title}/frames/img_${String(seq).padStart(3, '0')}.webp`),
+            caption: `<strong>第 ${seq} 拍关键帧 (IMG ${String(seq).padStart(3, '0')})</strong> [${i + 1}/${sequences.length}] · ${title}`
+        });
+        
+        // 2. 原片基准抽帧（若有）
+        const refPath = refFrames[seq] || refFrames[String(seq)];
+        if (refPath) {
+            items.push({
+                type: 'image',
+                url: steppedImageUrl(refPath),
+                caption: `<strong>第 ${seq} 拍原片基准抽帧 (REF ${String(seq).padStart(3, '0')})</strong> [爆款对标基准] · ${title}`
+            });
+        }
+    });
+    
     if (typeof openLightbox === 'function') {
-        openLightbox(items, activeIdx);
+        openLightbox(items, initialItemIdx);
     }
 }
+
+function openSteppedCollageViewerFromState(initialSeq = 1, initialMode = 'collage') {
+    if (!steppedState) return;
+    const state = steppedState;
+    const currentBatch = state.current_batch_index || 0;
+    const batchInfo = (state.batches && state.batches[currentBatch]) || {};
+    const collageUrl = state.final_collage || batchInfo.collage || '';
+    
+    const idea = {
+        id: state.pipeline_id || 'stepped',
+        title: state.title,
+        collage_url: collageUrl,
+        ref_frames: state.ref_frames || {},
+        source_collage: state.source_collage || '',
+        image_count: state.total_beats || 0,
+    };
+    
+    if (typeof openCollageViewer === 'function') {
+        openCollageViewer({
+            idea,
+            collageUrl: steppedImageUrl(collageUrl),
+            sourceCollageUrl: steppedImageUrl(state.source_collage || ''),
+            refFrames: state.ref_frames || {},
+            initialFrameSeq: initialSeq || 1,
+            initialMode: initialMode || 'collage',
+            compareType: (initialMode === 'compare' && state.ref_frames && Object.keys(state.ref_frames).length) ? 'benchmark' : 'adjacent',
+        });
+    }
+}
+
+function openSteppedTriptychModal(title, currentSeq, totalBeats = null) {
+    if (!title || !currentSeq) return;
+    const existing = document.getElementById('stepped-triptych-modal');
+    if (existing) existing.remove();
+
+    const maxBeats = totalBeats || (steppedState && steppedState.total_beats) || 12;
+    const prevSeq = currentSeq > 1 ? currentSeq - 1 : null;
+    const nextSeq = currentSeq < maxBeats ? currentSeq + 1 : null;
+
+    const prevUrl = prevSeq ? steppedImageUrl(`/outputs/${title}/frames/img_${String(prevSeq).padStart(3, '0')}.webp`) : null;
+    const curUrl = steppedImageUrl(`/outputs/${title}/frames/img_${String(currentSeq).padStart(3, '0')}.webp`);
+    const nextUrl = nextSeq ? steppedImageUrl(`/outputs/${title}/frames/img_${String(nextSeq).padStart(3, '0')}.webp`) : null;
+
+    const modal = document.createElement('div');
+    modal.className = 'stepped-triptych-modal active';
+    modal.id = 'stepped-triptych-modal';
+
+    const escapeStr = (s) => (typeof escapeHtml === 'function' ? escapeHtml(s) : String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'));
+
+    modal.innerHTML = `
+        <div class="stepped-triptych-content glass-panel">
+            <div class="triptych-header">
+                <div class="triptych-title-group">
+                    <span style="font-size: 20px;">📐</span>
+                    <div>
+                        <h3>三联屏审查门禁 (3-Frame Triptych Gate) · 第 ${currentSeq} 拍</h3>
+                        <span style="font-size: 12px; color: var(--text-muted);">双向夹具约束比对：[Frame ${prevSeq || '起帧'} ⚓] ← [Frame ${currentSeq} 🎯] → [Frame ${nextSeq || '收尾'} 🔒]</span>
+                    </div>
+                </div>
+                <button type="button" class="close-btn triptych-close-btn">&times;</button>
+            </div>
+            
+            <div class="triptych-body">
+                <div class="triptych-grid">
+                    <!-- Col 1: K-1 前向基底 -->
+                    <div class="triptych-col-card">
+                        <div class="triptych-col-header">
+                            <span class="triptych-badge badge-prev">${prevSeq ? `IMG ${String(prevSeq).padStart(3, '0')}` : '初始锚点'}</span>
+                            <span style="font-size: 12px; color: var(--text-muted);">前向物理基底 (K-1)</span>
+                        </div>
+                        <div class="triptych-img-wrap" onclick="typeof openLightbox === 'function' && '${prevUrl}' ? openLightbox('${prevUrl}') : null">
+                            ${prevUrl ? `<img src="${prevUrl}" alt="Frame ${prevSeq}" onerror="this.src='${STEPPED_FRAME_PLACEHOLDER}'" />` : '<div class="triptych-empty-slot"><span>⚓ 序列首帧</span><span>（以原景地貌/锚点为基底）</span></div>'}
+                        </div>
+                        <div class="triptych-col-meta">
+                            <b>前向锚定约束：</b>第 ${currentSeq} 帧必须 100% 物理继承本帧的硬装结构、地面平整度与机位透视。
+                        </div>
+                    </div>
+
+                    <!-- Col 2: K 当前审查帧 -->
+                    <div class="triptych-col-card is-current">
+                        <div class="triptych-col-header">
+                            <span class="triptych-badge badge-current">IMG ${String(currentSeq).padStart(3, '0')}</span>
+                            <span style="font-size: 12px; font-weight: 700; color: #60a5fa;">当前审查/交付物 (K)</span>
+                        </div>
+                        <div class="triptych-img-wrap" onclick="typeof openLightbox === 'function' ? openLightbox('${curUrl}') : null">
+                            <img src="${curUrl}" alt="Frame ${currentSeq}" onerror="this.src='${STEPPED_FRAME_PLACEHOLDER}'" />
+                        </div>
+                        <div class="triptych-col-meta">
+                            <b>当拍交付成果：</b>100% 全量体现当拍施工产物，零凭空变化，施工废料与物料守恒。
+                        </div>
+                    </div>
+
+                    <!-- Col 3: K+1 后向承接 -->
+                    <div class="triptych-col-card">
+                        <div class="triptych-col-header">
+                            <span class="triptych-badge badge-succ">${nextSeq ? `IMG ${String(nextSeq).padStart(3, '0')}` : '最终揭示'}</span>
+                            <span style="font-size: 12px; color: var(--text-muted);">后向承接通道 (K+1)</span>
+                        </div>
+                        <div class="triptych-img-wrap" onclick="typeof openLightbox === 'function' && '${nextUrl}' ? openLightbox('${nextUrl}') : null">
+                            ${nextUrl ? `<img src="${nextUrl}" alt="Frame ${nextSeq}" onerror="this.src='${STEPPED_FRAME_PLACEHOLDER}'" />` : '<div class="triptych-empty-slot"><span>🏁 最终揭示帧</span><span>（通往收尾与全貌定格）</span></div>'}
+                        </div>
+                        <div class="triptych-col-meta">
+                            <b>后向通道锁：</b>当前帧交付物必须是通往下一阶段的自然且唯一前置条件，无冲突多余道具。
+                        </div>
+                    </div>
+                </div>
+
+                <!-- 审查三大检查点 -->
+                <div class="triptych-checklist-panel">
+                    <div class="triptych-checklist-title">📋 连续性三联屏快检清单 (Continuity Gate Checklist)：</div>
+                    <div class="triptych-check-items">
+                        <div class="triptych-check-item">
+                            <span>🔍</span>
+                            <div><b>1. 空间与透视连续性</b>：后墙水渍线、梁架走向、窗洞位置及地平线基准严格连续，无 45° 菱形旋转或管道拉伸。</div>
+                        </div>
+                        <div class="triptych-check-item">
+                            <span>🪵</span>
+                            <div><b>2. 材质单调与零回退</b>：已铺地板保持温润哑光实木质感（无湿水镜面化），已修破损零回退。</div>
+                        </div>
+                        <div class="triptych-check-item">
+                            <span>⚖️</span>
+                            <div><b>3. 全域差量与物料守恒</b>：顶/中/底/边际物理差量 100% 具备工具与动作因果链，物料与废料守恒。</div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- 三级差量修复通道 -->
+                <div class="triptych-remediation-bar">
+                    <div style="font-size: 12px; color: var(--text-muted);">
+                        <b>🛠️ 差量分级修复方案：</b>发现瑕疵时，请按严重程度选择修复通道（严禁脱离上下文单帧盲抽）：
+                    </div>
+                    <div class="remediation-level-btns">
+                        <button type="button" class="remediation-btn" onclick="alert('【Level 1 局部蒙版修复建议】\\n建议在生图画布中针对瑕疵区域（如人偶手势/多余小工具）绘制 Mask 局部重绘，锁定背景 3D 空间像素 100% 不动。')" title="适用于局部小瑕疵、人物微调">
+                            🖌️ Level 1 局部蒙版重绘
+                        </button>
+                        <button type="button" class="remediation-btn" onclick="alert('【Level 2 图生图定向重渲建议】\\n必须以 Frame ${prevSeq || 1} 为图生图 (I2I) 底图并施加深度图/线稿控制，严禁使用文生图 (T2I) 盲抽。')" title="适用于光照/视角微调">
+                            🧬 Level 2 I2I定向重绘
+                        </button>
+                        <button type="button" class="remediation-btn" onclick="alert('【Level 3 连锁重构预警】\\n若第 ${currentSeq} 帧必须做结构级重构，将触发连带连锁预警，自动从本帧起向后链式同步修正下游提示词。')" title="适用于结构级变更">
+                            ⚡ Level 3 三明治连锁修复
+                        </button>
+                    </div>
+                </div>
+            </div>
+
+            <div class="triptych-footer">
+                <button type="button" class="action-btn text-btn secondary triptych-close-action">关闭</button>
+                <button type="button" class="action-btn text-btn" onclick="document.getElementById('stepped-triptych-modal').remove(); typeof switchTab === 'function' ? switchTab('editor') : null;">✏️ 前往提示词编辑器微调</button>
+            </div>
+        </div>
+    `;
+
+    document.body.appendChild(modal);
+
+    const close = () => {
+        modal.classList.remove('active');
+        setTimeout(() => modal.remove(), 200);
+    };
+
+    modal.querySelector('.triptych-close-btn').addEventListener('click', close);
+    modal.querySelector('.triptych-close-action').addEventListener('click', close);
+    modal.addEventListener('click', (e) => {
+        if (e.target === modal) close();
+    });
+}
+
 
 /* --- Button Click Handlers --- */
 function onSteppedApprove() {

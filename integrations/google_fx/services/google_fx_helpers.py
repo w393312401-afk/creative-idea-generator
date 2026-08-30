@@ -1285,14 +1285,14 @@ def _inspect_all_pending_tiles(page, tile_ids, prompts_map=None, slices_map=None
             const progressMatch = (tile.innerText || '').match(/(\\d{1,3})\\s*%/);
             const hasProgress = progressMatch !== null;
             const hasCreditExhaustedText = (
-                /\b(out of credits?|insufficient credits?|not enough credits?|credits? exhausted|credits? depleted|no credits? left|resource_exhausted|quota_exhausted|quota exceeded)\b/i.test(text)
-                || /\b(out of (google )?flow credits?|insufficient (google )?flow credits?|not enough (google )?flow credits?|get (ai|flow) credits?)\b/i.test(text)
-                || /\b(?:insufficient|out of|not enough|run out of)\s+(?:\w+\s+){0,3}credits?\b/i.test(text)
-                || /\bget\s+(?:more\s+)?(?:ai\s+|flow\s+|google\s+flow\s+)?credits?\b/i.test(text)
-                || /(?<!\d)0\s*(?:(?:google\s+)?flow\s+|ai\s+)?credits?\b/i.test(text)
-                || /(?:credits?|credit\s+balance|flow\s+credits?|ai\s+credits?|积分|点数|额度|配额|余额)[:：=为是]\s*0(?!\d)/i.test(text)
-                || /(积分不足|没有足够的积分|积分已用完|积分已耗尽|积分耗尽|积分用尽|点数不足|点数已用完|点数已耗尽|点数耗尽|额度不足|额度已用完|额度耗尽|配额不足|配额已用完|配额耗尽|无可用积分|无可用点数|没有可用积分|0\s*积分|0\s*点数)/.test(text)
-                || /(?<!\d)0\s*(?:积分|点数)(?!\d)/.test(text)
+                /\\b(out of credits?|insufficient credits?|not enough credits?|credits? exhausted|credits? depleted|no credits? left|resource_exhausted|quota_exhausted|quota exceeded)\\b/i.test(text)
+                || /\\b(out of (google )?flow credits?|insufficient (google )?flow credits?|not enough (google )?flow credits?|get (ai|flow) credits?)\\b/i.test(text)
+                || /\\b(?:insufficient|out of|not enough|run out of)\\s+(?:\\w+\\s+){0,3}credits?\\b/i.test(text)
+                || /\\bget\\s+(?:more\\s+)?(?:ai\\s+|flow\\s+|google\\s+flow\\s+)?credits?\\b/i.test(text)
+                || /(?<!\\d)0\\s*(?:(?:google\\s+)?flow\\s+|ai\\s+)?credits?\\b/i.test(text)
+                || /(?:credits?|credit\\s+balance|flow\\s+credits?|ai\\s+credits?|积分|点数|额度|配额|余额)[:：=为是]\\s*0(?!\\d)/i.test(text)
+                || /(积分不足|没有足够的积分|积分已用完|积分已耗尽|积分耗尽|积分用尽|点数不足|点数已用完|点数已耗尽|点数耗尽|额度不足|额度已用完|额度耗尽|配额不足|配额已用完|配额耗尽|无可用积分|无可用点数|没有可用积分|0\\s*积分|0\\s*点数)/.test(text)
+                || /(?<!\\d)0\\s*(?:积分|点数)(?!\\d)/.test(text)
             );
             const hasFailText = text.includes('failed') || text.includes('something went wrong')
                              || text.includes('unusual activity') || text.includes('help center')
@@ -1841,15 +1841,33 @@ def _switch_video_submode(page, target_suffix, scope=None):
     """
     root = scope or page
 
-    # ── 优先级 0: aria-controls 尾值精确匹配 (最稳定) ──
-    for _sel in [
+    # ── 优先级 0: aria-controls / data-value 尾值精确匹配 (最稳定) ──
+    cand_selectors = [
         f"[aria-controls$='-{target_suffix}']",
         f"[aria-controls*='-{target_suffix}']",
         f"button[role='tab'][aria-controls$='-{target_suffix}']",
-    ]:
+    ]
+    if target_suffix == 'VIDEO_FRAMES':
+        cand_selectors.extend([
+            "[aria-controls$='-FRAMES']",
+            "[aria-controls*='-FRAMES']",
+            "[aria-controls$='-START_END']",
+            "[aria-controls*='-START_END']",
+            "[data-value$='FRAMES']",
+            "[data-value$='VIDEO_FRAMES']",
+        ])
+    elif target_suffix == 'VIDEO_REFERENCES':
+        cand_selectors.extend([
+            "[aria-controls$='-REFERENCES']",
+            "[aria-controls*='-REFERENCES']",
+            "[data-value$='REFERENCES']",
+            "[data-value$='VIDEO_REFERENCES']",
+        ])
+
+    for _sel in cand_selectors:
         try:
             _btn = root.locator(_sel).first
-            if _btn.is_visible(timeout=2000):
+            if _btn.is_visible(timeout=1500):
                 # 检查是否已经选中
                 if _btn.get_attribute("data-state") == "active" or _btn.get_attribute("aria-selected") == "true":
                     log(f"  ✅ 视频子模式已是 {target_suffix}，无需切换", "GoogleFX")
@@ -1859,20 +1877,28 @@ def _switch_video_submode(page, target_suffix, scope=None):
                 log(f"  ✅ 视频子模式切换成功 (sel={_sel!r})", "GoogleFX")
                 return True
         except Exception as _e:
-            log(f"  ⚠️ _switch_video_submode sel={_sel!r}: {type(_e).__name__}", "GoogleFX")
+            pass
 
     # ── 优先级 1: 文字标签匹配 ──
     _label_map = {
-        "VIDEO_FRAMES": ["帧", "Frames", "frames"],
-        "VIDEO_REFERENCES": ["素材", "References", "references"],
+        "VIDEO_FRAMES": [
+            "帧", "Frames", "frames", "首尾帧", "首尾", "起始与结束", "起始和结束",
+            "Start & End", "Start & end", "First & Last", "First & last",
+            "Start and End", "First and Last", "Frames (Start & End)", "首尾帧模式"
+        ],
+        "VIDEO_REFERENCES": ["素材", "References", "references", "参考素材", "素材参考"],
     }
     for _lbl in _label_map.get(target_suffix, []):
         try:
-            _tab = root.locator("button[role='tab']").filter(
-                has_text=re.compile(f"^.*{re.escape(_lbl)}.*$", re.I)
+            _tab = root.locator("button[role='tab'], button, div[role='tab']").filter(
+                has_text=re.compile(rf"^\s*{re.escape(_lbl)}\s*$", re.I)
             ).first
-            if _tab.is_visible(timeout=1500):
-                if _tab.get_attribute("data-state") == "active":
+            if not _tab.is_visible(timeout=500):
+                _tab = root.locator("button[role='tab'], button, div[role='tab']").filter(
+                    has_text=re.compile(f"^.*{re.escape(_lbl)}.*$", re.I)
+                ).first
+            if _tab.is_visible(timeout=1000):
+                if _tab.get_attribute("data-state") == "active" or _tab.get_attribute("aria-selected") == "true":
                     log(f"  ✅ 视频子模式已是 {_lbl}，无需切换", "GoogleFX")
                     return True
                 _tab.click(force=True)
@@ -1885,13 +1911,21 @@ def _switch_video_submode(page, target_suffix, scope=None):
     # ── 优先级 2: JS 兜底 ──
     try:
         clicked = page.evaluate("""(suffix) => {
-            const tabs = Array.from(document.querySelectorAll("[role='tab'], button"));
+            const tabs = Array.from(document.querySelectorAll("[role='tab'], button, [data-tab]"));
             const target = tabs.find(t => {
-                const ac = t.getAttribute('aria-controls') || '';
+                const ac = ((t.getAttribute('aria-controls') || '') + ' ' + (t.getAttribute('data-value') || '')).toUpperCase();
+                const txt = (t.textContent || '').trim().toLowerCase();
+                if (suffix === 'VIDEO_FRAMES') {
+                    if (ac.includes('VIDEO_FRAMES') || ac.includes('FRAMES') || ac.includes('START_END')) return true;
+                    if (txt === '帧' || txt === '首尾帧' || txt.includes('frames') || txt.includes('first & last') || txt.includes('start & end')) return true;
+                } else if (suffix === 'VIDEO_REFERENCES') {
+                    if (ac.includes('VIDEO_REFERENCES') || ac.includes('REFERENCES')) return true;
+                    if (txt === '素材' || txt.includes('references')) return true;
+                }
                 return ac.endsWith('-' + suffix) || ac.includes('-' + suffix);
             });
             if (!target || target.offsetParent === null) return false;
-            if (target.getAttribute('data-state') === 'active') return 'already';
+            if (target.getAttribute('data-state') === 'active' || target.getAttribute('aria-selected') === 'true') return 'already';
             target.click();
             return true;
         }""", target_suffix)
@@ -3137,9 +3171,37 @@ def wait_out_manual_intervention(page, context_label="Google FX", cancel_check=N
         f"暂停等待人工在 AdsPower 浏览器窗口处理，最长 {max_wait_secs}s", "GoogleFX")
     _emit("detected")
 
+    # ── macOS：把静默隐藏的浏览器窗口翻出来（2026-08-29）─────────────
+    # 常规任务下浏览器是被 app 级隐藏的（见 utils/macos_window），人看不见窗口就没法
+    # 处理登录/验证码，只能白等满 max_wait_secs。这里是全流程里唯一"该抢焦点"的时刻。
+    # 注意隐藏是 app 级的，不是重启浏览器，所以 page 对象在整个过程中始终有效。
+    _mac_prev_app = ""
+    _mac_revealed = 0
+    try:
+        from ..utils.browser import reveal_hidden_browser_windows
+        from ..utils.macos_window import frontmost_app
+        _mac_prev_app = frontmost_app()
+        _mac_revealed = reveal_hidden_browser_windows()
+        if _mac_revealed:
+            log(f"👁 已将 {_mac_revealed} 个静默浏览器窗口切到最前，请在窗口内处理", "GoogleFX")
+    except Exception as e:
+        log(f"⚠️ 恢复浏览器窗口显示失败（请手动切到 AdsPower 窗口）: "
+            f"{type(e).__name__}: {e}", "GoogleFX")
+
+    def _rehide():
+        """人工环节结束后藏回去，别让窗口继续占着屏幕。"""
+        if not _mac_revealed:
+            return
+        try:
+            from ..utils.browser import rehide_browser_windows
+            rehide_browser_windows(_mac_prev_app)
+        except Exception:
+            pass
+
     deadline = time.time() + max_wait_secs
     while time.time() < deadline:
         if cancel_check and cancel_check():
+            _rehide()
             raise ConnectionError("用户已取消（等待人工处理期间）")
         # 没有 cancel_check 的调用方（图片批量链路就是）也必须能被取消：不然人工拦截
         # 一旦命中，取消要等满 max_wait_secs（默认 20 分钟）才生效。
@@ -3149,6 +3211,7 @@ def wait_out_manual_intervention(page, context_label="Google FX", cancel_check=N
         # 再等下去只是把整批任务多压 20 分钟，直接按超时处置。
         if _page_is_gone(page):
             log(f"⛔ {context_label}等待人工处理期间浏览器/标签页已关闭，停止等待", "Error")
+            _rehide()
             _emit("timeout")
             return False
         try:
@@ -3160,11 +3223,13 @@ def wait_out_manual_intervention(page, context_label="Google FX", cancel_check=N
             continue
         if not still_blocked:
             log(f"✅ {context_label}人工处理已完成，继续执行", "GoogleFX")
+            _rehide()
             _emit("cleared")
             return True
         code, reason = still_blocked
 
     log(f"⛔ {context_label}等待人工处理超时 ({max_wait_secs}s)，放弃", "Error")
+    _rehide()
     try:
         from ..utils.forensics import capture
         capture(page, "manual_intervention_timeout",
@@ -4475,10 +4540,13 @@ def _classify_failure_for_switch(reason):
     # 积分/配额耗尽也是账号自身状态，必须先于自动化类（如 timeout）判断，
     # 避免"超时未捕获到 URL（积分耗尽）"被 timeout 拦截而拒绝换号。
     from .google_fx_credit import is_credit_exhausted_message
-    if is_credit_exhausted_message(text) or any(tok in text for tok in (
-        "insufficient_credits", "quota_exhausted", "resource_exhausted", "quota_exceeded"
+    # 单日上限类短语统一由 is_image_quota_message 判（它对 "try using a different
+    # model" 这种模糊短语要求配额锚点同现，避免把模型不可用误判成换号）
+    from .google_fx_credit import is_image_quota_message
+    if is_credit_exhausted_message(text) or is_image_quota_message(text) or any(tok in text for tok in (
+        "insufficient_credits", "quota_exhausted", "resource_exhausted", "quota_exceeded",
     )):
-        return True, "账号积分/配额耗尽（命中积分耗尽特征）"
+        return True, "账号积分/配额耗尽或达到单日上限（命中配额/单日限制特征）"
     # 自动化类先判：'timeout'/'not found' 这类词在两边都可能出现，
     # 但"UI 元素超时/找不到"远比风控类超时常见，误判成换号的代价更大。
     for token in _AUTOMATION_ERROR_TOKENS:

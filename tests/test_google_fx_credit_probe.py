@@ -68,7 +68,12 @@ def test_is_credit_exhausted_message():
     assert credit.is_credit_exhausted_message("积分已用完，请充值") is True
     assert credit.is_credit_exhausted_message("0 积分") is True
     assert credit.is_credit_exhausted_message("无可用积分") is True
-    assert credit.is_credit_exhausted_message("额度耗尽") is True
+    # 单日上限 / 配额限制短语
+    assert credit.is_credit_exhausted_message("You've reached the daily limit for 🍌 Nano Banana 2 generations. Try using a different model.") is True
+    assert credit.is_credit_exhausted_message("Reached the daily limit") is True
+    assert credit.is_credit_exhausted_message("Daily generation limit reached") is True
+    assert credit.is_credit_exhausted_message("今日生成次数已达上限") is True
+    assert credit.is_credit_exhausted_message("单日配额已用完") is True
     # 正常带额度/宣传文案不应误判
     assert credit.is_credit_exhausted_message("100 Google Flow credits") is False
     assert credit.is_credit_exhausted_message("1500 monthly Google Flow credits") is False

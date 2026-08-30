@@ -60,17 +60,34 @@ class TestFirstFrameUsesImageOnePrompt(unittest.TestCase):
         self.assertEqual(first['prompt'], 'untouched first frame')
         self.assertEqual(first['anchor_reference'], 'cover')
 
-    def test_missing_cover_rejects_frame_generation_without_calling_t2i(self):
+    def test_missing_cover_falls_back_to_text_only_anchor(self):
+        """封面缺失不再是硬闸。
+
+        以前这里会 raise「必须先生成或选择封面图」，链头只能图生图。那道闸已经
+        撤掉（同一批改动也删了 server.py 两个下单接口上的同款前置校验），无封面
+        时链头一律退化为纯文生图——但**只有链头**：第 2 帧起仍必须挂上一帧图参考，
+        否则等于每帧各画各的，血统断在第一拍。
+        """
         os.remove(self.cover)
-        prompt_block = "图片 1:\nuntouched first frame\n"
 
-        with patch('frame_generator._generate_text_image') as text_image, \
-             patch('frame_generator._generate_image_edit') as image_edit:
-            with self.assertRaisesRegex(RuntimeError, '必须先生成或选择封面图'):
-                generate_frame_sequence({}, 'project_without_cover', prompt_block)
+        def fake_text(config, prompt, target_path, *args, **kwargs):
+            self.text_calls.append(prompt)
+            self._write(target_path)
 
-        text_image.assert_not_called()
-        image_edit.assert_not_called()
+        def fake_edit(config, prompt, reference_path, target_path, **kwargs):
+            self.edit_calls.append((prompt, reference_path))
+            self._write(target_path)
+
+        prompt_block = "图片 1:\nuntouched first frame\n\n图片 2:\nfirst construction stage\n"
+        with patch('frame_generator._generate_text_image', side_effect=fake_text), \
+             patch('frame_generator._generate_image_edit', side_effect=fake_edit):
+            manifest = generate_frame_sequence({}, 'project_without_cover', prompt_block)
+
+        self.assertEqual(self.text_calls, ['untouched first frame'])
+        self.assertEqual(len(self.edit_calls), 1)
+        self.assertTrue(self.edit_calls[0][1].endswith('img_001.webp'))
+        first = next(frame for frame in manifest['frames'] if frame['sequence'] == 1)
+        self.assertIsNone(first['reference'])
 
     def test_stepped_anchor_may_render_text_only_without_cover(self):
         """分步任务渲首帧时封面还写不出来（见 text_only_anchor_allowed）：

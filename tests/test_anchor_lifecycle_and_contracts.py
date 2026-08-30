@@ -89,6 +89,33 @@ class TestAnchorLifecycle(unittest.TestCase):
         view = pp.packet_with_anchor_lifecycle(packet, _ladder(), 4, 'exterior')
         self.assertEqual(view['primary_landmarks'], packet['primary_landmarks'])
 
+    def test_demolition_and_clearing_retires_anchor(self):
+        """拆除与清场工序（dismantle/demolish/clear）必须正确将老结构标记为 retired。"""
+        packet = {
+            'primary_landmarks': [
+                {'name': 'dilapidated miniature mud hut with thatched twig roof', 'grid': 'Grid B2', 'z_depth_scale': '50%'},
+                {'name': 'miniature couple figurines', 'grid': 'Grid B1', 'z_depth_scale': '20%'},
+            ]
+        }
+        ladder = [
+            {'index': 1, 'operation': 'unfold blueprint', 'milestone_name': 'blueprint on ground', 'after_state': 'blueprint unfolded'},
+            {'index': 2, 'operation': 'dismantle dilapidated hut', 'milestone_name': 'demolish old mud hut', 'after_state': 'mud hut demolished and site cleared bare', 'package_operations': ['strip thatch', 'demolish walls', 'clear debris']},
+        ]
+        state = pp.anchor_lifecycle(packet, ladder, 3, 'exterior')
+        self.assertIn('dilapidated miniature mud hut with thatched twig roof', state['retired'])
+        self.assertEqual(len(state['active']), 1)
+        self.assertEqual(state['active'][0]['name'], 'miniature couple figurines')
+
+    def test_adapt_landmarks_to_new_construction(self):
+        """正文进入地基与砖墙施工后，地标中的老破泥屋自动演进为新主体或退役。"""
+        landmarks = [
+            {'name': 'dilapidated miniature mud hut with thatched twig roof', 'grid': 'Grid B2', 'z_depth_scale': '50%'},
+            {'name': 'miniature couple figurines', 'grid': 'Grid B1', 'z_depth_scale': '20%'},
+        ]
+        body = "The entire foundation footprint is now fully cast and screeded, presenting a solid cast-concrete slab foundation."
+        adapted = pp._adapt_landmarks_to_completed_surfaces(landmarks, body)
+        self.assertEqual(adapted[0]['name'], 'the solid cast-concrete slab foundation')
+
 
 class TestOutlineMilestoneContract(unittest.TestCase):
     """大纲是给人看的，milestone 是给图用的，中间必须有 1:1 契约校验。"""

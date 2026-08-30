@@ -8,6 +8,12 @@ from unittest.mock import patch, MagicMock
 import candidate_selection_pipeline as csp
 
 
+def _full_subscores(**overrides):
+    scores = {key: maximum for _, key, maximum in csp._CANDIDATE_SCORE_FIELDS}
+    scores.update(overrides)
+    return scores
+
+
 @pytest.fixture
 def temp_project(monkeypatch):
     temp_dir = tempfile.mkdtemp()
@@ -110,7 +116,84 @@ def test_evaluate_and_select_best_candidate_fallback(temp_project):
 
     assert res["best_index"] == 1
     assert len(res["candidates"]) == 4
+    assert all(candidate["score"] is None for candidate in res["candidates"])
+    assert all(candidate["score_source"] == "evaluation_unavailable" for candidate in res["candidates"])
     assert "默认采纳候选 #1" in res["selection_reason"]
+
+
+def test_structured_scores_are_summed_and_winner_is_chosen_server_side(temp_project):
+    cand_paths = []
+    for i in range(1, 3):
+        path = os.path.join(temp_project["frames_dir"], f"candidate_{i}.webp")
+        with open(path, "wb") as f:
+            f.write(b"fake")
+        cand_paths.append(path)
+
+    response = json.dumps({
+        "best_index": 1,
+        "selection_reason": "模型偏好候选1",
+        "candidates": [
+            {
+                "index": 1,
+                "subscores": _full_subscores(),
+                "hard_flags": ["plastic_human"],
+                "strengths": "构图完整",
+                "defects": "人物像塑料",
+            },
+            {
+                "index": 2,
+                "subscores": _full_subscores(core_milestone=8, camera_fidelity=6),
+                "hard_flags": [],
+                "strengths": "人物真实",
+                "defects": "工序略少",
+            },
+        ],
+    })
+    with patch.object(csp, "_multimodal_chat", return_value=response):
+        result = csp.evaluate_and_select_best_candidate(
+            {}, "prompt", None, cand_paths, 1
+        )
+
+    first, second = result["candidates"]
+    assert first["raw_score"] == 100
+    assert first["score"] == 69
+    assert first["score_cap"] == 69
+    assert second["score"] == 94
+    assert result["best_index"] == 2
+    assert result["model_best_index"] == 1
+    assert result["scoring_version"] == "structured-16-v1"
+
+
+def test_disqualified_candidate_cannot_win_even_with_higher_score():
+    result = csp._normalize_candidate_evaluation({
+        "best_index": 1,
+        "candidates": [
+            {"index": 1, "subscores": _full_subscores(),
+             "hard_flags": ["ghost_structure_revival"]},
+            {"index": 2, "subscores": _full_subscores(core_milestone=4),
+             "hard_flags": []},
+        ],
+    }, 2)
+
+    assert result["candidates"][0]["disqualified"] is True
+    assert result["best_index"] == 2
+    assert result["all_candidates_disqualified"] is False
+
+
+def test_subscores_are_bounded_before_totaling():
+    result = csp._normalize_candidate_evaluation({
+        "candidates": [{
+            "index": 1,
+            "subscores": _full_subscores(core_milestone=999, physical_delta=-5),
+            "hard_flags": ["unknown_flag"],
+        }],
+    }, 1)
+
+    candidate = result["candidates"][0]
+    assert candidate["subscores"]["core_milestone"] == 12
+    assert candidate["subscores"]["physical_delta"] == 0
+    assert candidate["score"] == 92
+    assert candidate["hard_flags"] == []
 
 
 def test_run_candidate_selection_frame_sequence(temp_project):
@@ -1035,3 +1118,64 @@ def test_empty_fx_batch_still_falls_back_to_api(temp_project):
 
     assert api_gen.call_count == 4
     assert len(cands) == 4
+
+
+def test_frame_1_never_uses_history_as_reference_in_candidate_selection(temp_project):
+    """验证当 img_001.webp 已存在且重渲第1帧时，绝不能把历史 img_001.webp 误作为参考图传入。"""
+    from PIL import Image
+    frames_dir = temp_project["frames_dir"]
+    img_1_path = os.path.join(frames_dir, "img_001.webp")
+    Image.new("RGB", (64, 64), color="blue").save(img_1_path, "WEBP")
+    assert os.path.exists(img_1_path) and os.path.getsize(img_1_path) > 0
+
+    prompt_block = "IMAGE 1:\nPrompt: Fresh frame 1 prompt.\nNegative: blur."
+
+    passed_references = []
+    def fake_gen_candidates(config, title, item, reference, seq, candidate_count=4, **kwargs):
+        passed_references.append((seq, reference))
+        cand_dir = os.path.join(frames_dir, "candidates", f"frame_{seq:03d}")
+        os.makedirs(cand_dir, exist_ok=True)
+        paths = []
+        for i in range(1, candidate_count + 1):
+            p = os.path.join(cand_dir, f"candidate_{i}.webp")
+            Image.new("RGB", (64, 64), color="green").save(p, "WEBP")
+            paths.append(p)
+        return paths
+
+    def fake_eval(config, prompt_text, reference_path, candidate_paths, seq, on_progress=None):
+        return {
+            "best_index": 1,
+            "selection_reason": "AI picked candidate 1",
+            "candidates": [{"index": i + 1, "score": 90, "strengths": "", "defects": ""} for i in range(len(candidate_paths))]
+        }
+
+    # 1. 测试 API 后端重渲第 1 帧 (target_sequences=[1])
+    with patch.object(csp, "generate_frame_candidates", side_effect=fake_gen_candidates), \
+         patch.object(csp, "evaluate_and_select_best_candidate", side_effect=fake_eval), \
+         patch.object(csp, "_generate_full_collage_from_frames", return_value="frames/collage.jpg"):
+        csp.run_candidate_selection_frame_sequence(
+            config={"imageBackend": "api"},
+            title=temp_project["project_name"],
+            prompt_block=prompt_block,
+            target_sequences=[1]
+        )
+
+    assert len(passed_references) == 1
+    assert passed_references[0][0] == 1
+    assert passed_references[0][1] is None, f"第 1 帧重渲时 reference 必须为 None，实际为: {passed_references[0][1]}"
+
+    # 2. 测试 Google FX 后端重渲第 1 帧
+    passed_references.clear()
+    with patch.object(csp, "generate_frame_candidates", side_effect=fake_gen_candidates), \
+         patch.object(csp, "evaluate_and_select_best_candidate", side_effect=fake_eval), \
+         patch.object(csp, "_generate_full_collage_from_frames", return_value="frames/collage.jpg"):
+        csp.run_candidate_selection_frame_sequence(
+            config={"imageBackend": "google_fx"},
+            title=temp_project["project_name"],
+            prompt_block=prompt_block,
+            target_sequences=[1]
+        )
+
+    assert len(passed_references) == 1
+    assert passed_references[0][0] == 1
+    assert passed_references[0][1] is None, f"Google FX 第 1 帧重渲时 reference 必须为 None，实际为: {passed_references[0][1]}"

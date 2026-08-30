@@ -201,6 +201,161 @@ const PROMPT_LINTER_RULES = [
             }
             return null;
         }
+    },
+    {
+        id: 'RULE_METRIC_SPACE_ENVELOPE',
+        name: '公制空间尺寸与防透视畸变',
+        severity: 'warning',
+        autoFixable: false,
+        test: (slot) => {
+            const text = (slot.body || '').toLowerCase();
+            const bannedPerspective = [
+                'vanishing point', 'one-point perspective', 'long corridor',
+                'endless narrow tunnel', 'bowling alley effect', 'train carriage perspective'
+            ];
+            const foundPerspective = bannedPerspective.filter(p => text.includes(p));
+            if (foundPerspective.length) {
+                return {
+                    message: `检测到易引发空间拉伸管道化的高危透视词（${foundPerspective.join('、')}）。建议使用 3/4 对角斜透视（3/4 diagonal oblique perspective）与显式公制尺寸，避免 AI 将紧凑空间拉伸为 15 米保龄球道。`,
+                    matched: foundPerspective.join('、'),
+                    fixSuggestion: '替换为 3/4 diagonal oblique perspective，并声明公制三维包络（如 3.8m wide, 5.5m deep, 2.2m clearance）'
+                };
+            }
+
+            const cavernousWords = ['cavernous hall', 'oversized room', 'giant space', 'cathedral-scale', 'two-tier bunk bed', 'double bunk bed'];
+            const isCompactOrDiorama = /diorama|miniature|subterranean|excavation|bunker|container|pit|cellar|niche/i.test(text);
+            if (isCompactOrDiorama) {
+                const foundCavernous = cavernousWords.filter(c => text.includes(c));
+                if (foundCavernous.length) {
+                    return {
+                        message: `在紧凑/微缩/地穴空间中检测到可能引发空间无序膨胀的词汇或超大人机道具（${foundCavernous.join('、')}）。AI 会为了容纳大件家具而将空间拉伸为巨大礼堂。`,
+                        matched: foundCavernous.join('、'),
+                        fixSuggestion: '降级为紧凑型人机工程道具（如 low-profile single timber platform daybed 或 recessed wall berth），并在负向词中加入 (cavernous hall, oversized room:1.4)'
+                    };
+                }
+            }
+            return null;
+        }
+    },
+    {
+        id: 'RULE_SINGLE_GROUND_BASELINE',
+        name: '单向基准轴线与防菱形旋转',
+        severity: 'warning',
+        autoFixable: false,
+        test: (slot) => {
+            const text = (slot.body || '').toLowerCase();
+            const skewWords = [
+                'isometric diamond grid', 'tilted rotated layout', '45 degree oblique angle',
+                'corner-on skewed perspective', 'rotated 45 degrees'
+            ];
+            const foundSkew = skewWords.filter(s => text.includes(s));
+            if (foundSkew.length) {
+                return {
+                    message: `检测到易引发地基斜偏与整楼旋转的菱形视角描述（${foundSkew.join('、')}）。建筑主体与室外工序必须严格保持与画幅底边平行的水平横向基准线。`,
+                    matched: foundSkew.join('、'),
+                    fixSuggestion: '改为 horizontal baseline parallel to frame bottom，并注入负向词 (isometric diamond grid, tilted rotated layout:1.8)'
+                };
+            }
+
+            const zenithWords = ['90 degree bird eye', 'vertical aerial map', 'flat orthographic plan', 'overhead blueprint view'];
+            const foundZenith = zenithWords.filter(z => text.includes(z));
+            if (foundZenith.length) {
+                return {
+                    message: `检测到 90° 纯垂直平面顶视描述（${foundZenith.join('、')}）。纯垂直正交视学会导致地平线与立体纵深丢失，室外工序应采用 45°~60° 高角度俯拍并保留天际地平线。`,
+                    matched: foundZenith.join('、'),
+                    fixSuggestion: '改为 elevated high-angle 45-60 degree perspective preserving distant horizon'
+                };
+            }
+            return null;
+        }
+    },
+    {
+        id: 'RULE_LIVING_CAST_STATIC',
+        name: '活物动态应激与防静态假人',
+        severity: 'warning',
+        autoFixable: false,
+        test: (slot) => {
+            const text = (slot.body || '').toLowerCase();
+            const isDioramaOrWorkshop = /diorama|miniature|figurine|craftsman|workshop|sandtable/i.test(text);
+            if (isDioramaOrWorkshop) {
+                const staticPhrases = [
+                    'remain standing', 'stay put', 'static in place', 'unchanged in place',
+                    'standing at bottom-left observing', 'standing at bottom-right observing',
+                    'static posture'
+                ];
+                const foundStatic = staticPhrases.filter(p => text.includes(p));
+                if (foundStatic.length) {
+                    return {
+                        message: `检测到人偶/活物静态描述（${foundStatic.join('、')}）。在微缩沙盘与工坊中，活物是场景唯一生命体，严禁全序列钉死不动，必须随着施工动作产生入场应激、作业追踪或定格注视。`,
+                        matched: foundStatic.join('、'),
+                        fixSuggestion: '赋予人偶具体因果动态（如 eye tracking, leaning in to observe, shifting weight, raising hand in awe）'
+                    };
+                }
+            }
+            return null;
+        }
+    },
+    {
+        id: 'RULE_DESTITUTE_CAST_CLEANLINESS',
+        name: '流浪落魄人偶与天地大景深',
+        severity: 'warning',
+        autoFixable: false,
+        test: (slot) => {
+            const text = (slot.body || '').toLowerCase();
+            const isInitialOrDiorama = /diorama|miniature|refugee|vagrant|destitute|abandoned|ruin|excavation|earth/i.test(text) && slot.index <= 4;
+            if (isInitialOrDiorama) {
+                const cleanPhrases = ['clean royal blue shirt', 'crisp modern clothing', 'brand new floral dress', 'glossy shoes', 'neat luxury attire'];
+                const foundClean = cleanPhrases.filter(c => text.includes(c));
+                if (foundClean.length) {
+                    return {
+                        message: `在初期破旧/受助阶段检测到衣着光鲜描述（${foundClean.join('、')}）。流浪受助人偶初始应呈现做旧、尘土磨损的粗糙麻布/工装与沧桑憔悴神态。`,
+                        matched: foundClean.join('、'),
+                        fixSuggestion: '改为 distressed, dust-caked, grimy worn-out coarse clothing with weary realistic gaze'
+                    };
+                }
+            }
+
+            if (/diorama|miniature/i.test(text)) {
+                const denseBokeh = ['creamy dense bokeh wall cutting off sky', 'dense studio bokeh wall', 'cutting off distant horizon'];
+                const foundBokeh = denseBokeh.filter(b => text.includes(b));
+                if (foundBokeh.length) {
+                    return {
+                        message: `检测到切断天际线的致密虚化墙描述（${foundBokeh.join('、')}）。微缩沙盘必须保持天地山水三层真实大景深（天际云层 + 中景主体 + 近景地表）。`,
+                        matched: foundBokeh.join('、'),
+                        fixSuggestion: '保留 3-Layer Environmental Depth: open daylight sky with drifting clouds, distant rolling hills, midground build, foreground mineral textures'
+                    };
+                }
+            }
+            return null;
+        }
+    },
+    {
+        id: 'RULE_CINEMATOGRAPHY_HEADER',
+        name: '机位景别显式声明',
+        severity: 'warning',
+        autoFixable: false,
+        test: (slot) => {
+            if (slot.type !== 'image') return null;
+            const text = (slot.body || '').trim();
+            if (!text) return null;
+            
+            const firstSentence = text.split(/[.\n]/)[0].toLowerCase();
+            const validCameraKeywords = [
+                'shot', 'view', 'angle', 'perspective', 'camera', 'macro',
+                'close-up', 'bird\'s-eye', 'bird-eye', 'high-angle', 'low-angle',
+                'wide-angle', 'wide', 'oblique', 'panoramic', 'hero perspective',
+                'tripod', 'eye level', 'eye-level', 'over-the-shoulder'
+            ];
+            const hasCameraHeader = validCameraKeywords.some(kw => firstSentence.includes(kw));
+            if (!hasCameraHeader) {
+                return {
+                    message: `当前 IMAGE 提示词开篇第一句未显式声明具体的摄影机位与景别。根据电影级多机位调度铁律，每一拍开头应明确摄影角度（如 A high-angle 3/4 oblique shot, A low-angle dramatic upward-looking shot, A tight macro close-up 等），避免出图模型视角模糊漂移。`,
+                    matched: firstSentence.slice(0, 45) + (firstSentence.length > 45 ? '...' : ''),
+                    fixSuggestion: '在句首补充机位景别声明（如 "A dynamic high-angle 3/4 oblique shot..."）'
+                };
+            }
+            return null;
+        }
     }
 ];
 

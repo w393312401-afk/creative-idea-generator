@@ -104,6 +104,7 @@ def _reference_mount_error(message):
 
 from .google_fx_credit import (
     is_credit_exhausted_message,
+    is_image_quota_message,
     detect_page_credit_exhaustion,
 )
 
@@ -144,6 +145,13 @@ def _is_quota_failure(reason):
     ))
 
 
+def _is_image_quota_failure(reason):
+    """图片单日配额（≠ 账号积分耗尽）。判据收在 google_fx_credit 里统一维护——
+    这里、server_common.failover_and_select_next_account、helpers
+    ._classify_failure_for_switch 三处此前各抄一份 token 清单，改一处漏两处。"""
+    return is_image_quota_message(reason)
+
+
 def _record_current_generation_failure(reason):
     user_id = account_binding.resolve_account(fallback=get_runtime_default_user_id())
     if not user_id:
@@ -151,8 +159,10 @@ def _record_current_generation_failure(reason):
     try:
         from ..utils.account_pool import AccountPool
         pool = AccountPool()
-        if _is_quota_failure(reason):
-            pool.mark_exhausted(user_id)
+        if _is_image_quota_failure(reason):
+            pool.mark_image_quota_exceeded(user_id, error_detail=str(reason)[:200] or "图片余额超限")
+        elif _is_quota_failure(reason):
+            pool.mark_exhausted(user_id, reason="quota_exhausted", error_detail=str(reason)[:200])
         else:
             pool.record_generation_failure(user_id, reason)
         return user_id
@@ -948,10 +958,10 @@ def _generate_images_batch_google_fx_single_attempt(req: ImageBatchRequest):
                             if (failed) continue;
                             const t = (tile.innerText || '').toLowerCase();
                             const hasCreditExhaustedText = (
-                                /\\b(out of credits?|insufficient credits?|not enough credits?|credits? exhausted|credits? depleted|no credits? left|resource_exhausted|quota_exhausted|quota exceeded)\\b/i.test(t)
+                                /\\b(out of credits?|insufficient credits?|not enough credits?|credits? exhausted|credits? depleted|no credits? left|resource_exhausted|quota_exhausted|quota exceeded|daily limit|reached (?:the )?daily limit|daily generation limit)\\b/i.test(t)
                                 || /(?<!\\d)0\\s*(?:(?:google\\s+)?flow\\s+)?credits?\\b/i.test(t)
                                 || /(?:credits?|credit\\s+balance|积分|点数|额度|配额|余额)[:：=为是]\\s*0(?!\\d)/i.test(t)
-                                || /(积分不足|没有足够的积分|积分已用完|积分已耗尽|积分耗尽|点数不足|点数已用完|点数已耗尽|额度不足|额度已用完|额度耗尽|配额不足|配额已用完|配额耗尽|无可用积分|无可用点数)/.test(t)
+                                || /(积分不足|没有足够的积分|积分已用完|积分已耗尽|积分耗尽|点数不足|点数已用完|点数已耗尽|额度不足|额度已用完|额度耗尽|配额不足|配额已用完|配额耗尽|无可用积分|无可用点数|单日上限|单日配额已用完|今日生成次数已达上限|已达单日上限)/.test(t)
                                 || /(?<!\\d)0\\s*(?:积分|点数)(?!\\d)/.test(t)
                             );
                             const hasFailText = t.includes('failed') || t.includes('something went wrong')
@@ -1151,10 +1161,10 @@ def _generate_images_batch_google_fx_single_attempt(req: ImageBatchRequest):
                                 if (failed) continue;
                                 const t = (tile.innerText || '').toLowerCase();
                                 const hasCreditExhaustedText = (
-                                    /\\b(out of credits?|insufficient credits?|not enough credits?|credits? exhausted|credits? depleted|no credits? left|resource_exhausted|quota_exhausted|quota exceeded)\\b/i.test(t)
+                                    /\\b(out of credits?|insufficient credits?|not enough credits?|credits? exhausted|credits? depleted|no credits? left|resource_exhausted|quota_exhausted|quota exceeded|daily limit|reached (?:the )?daily limit|daily generation limit)\\b/i.test(t)
                                     || /(?<!\\d)0\\s*(?:(?:google\\s+)?flow\\s+)?credits?\\b/i.test(t)
                                     || /(?:credits?|credit\\s+balance|积分|点数|额度|配额|余额)[:：=为是]\\s*0(?!\\d)/i.test(t)
-                                    || /(积分不足|没有足够的积分|积分已用完|积分已耗尽|积分耗尽|点数不足|点数已用完|点数已耗尽|额度不足|额度已用完|额度耗尽|配额不足|配额已用完|配额耗尽|无可用积分|无可用点数)/.test(t)
+                                    || /(积分不足|没有足够的积分|积分已用完|积分已耗尽|积分耗尽|点数不足|点数已用完|点数已耗尽|额度不足|额度已用完|额度耗尽|配额不足|配额已用完|配额耗尽|无可用积分|无可用点数|单日上限|单日配额已用完|今日生成次数已达上限|已达单日上限)/.test(t)
                                     || /(?<!\\d)0\\s*(?:积分|点数)(?!\\d)/.test(t)
                                 );
                                 const hasFailText = t.includes('failed') || t.includes('something went wrong')

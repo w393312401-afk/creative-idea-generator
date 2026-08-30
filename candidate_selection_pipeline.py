@@ -49,63 +49,232 @@ _AI_DISCRIMINATION_SYSTEM_PROMPT = """你是一名好莱坞级电影视觉总监
 你的核心任务：
 对全部 4 张候选图进行严格对比评审与多维度打分，选出最优秀、最连贯、最写实的唯一 1 张图作为本帧的官方采用图。被选中的帧将作为后续所有帧的基准参考图。
 
-严格围绕以下 4 大核心维度进行评分（总分 100 分）：
+严格围绕以下 16 个细分项逐项评分。每项只能给 0 至该项满分的数值；不得直接臆造总分，
+总分由服务端对细分项求和并应用硬伤规则：
 1. 提示词与工序差量准确性 (0-30 分)：
-   - 是否准确呈现提示词要求的全新物理施工节点（如龙骨已安装、地板已铺设、混凝土已浇筑等）？
-   - 声明的道具、建材和施工动作是否到位，无漏做工序或提前超纲完成？
+   - core_milestone 核心施工节点完成度 (0-12)
+   - physical_delta 本帧新增物理差量准确性 (0-8)
+   - state_progression 无漏做、提前施工或状态倒退 (0-6)
+   - actions_materials 人物动作、工具与材料匹配 (0-4)
 
 2. 空间锚点与前后双向连续性 (0-30 分)：
+   - camera_fidelity 机位、焦段、俯仰与构图符合提示词 (0-8)
+   - anchor_stability 门窗、梁柱、洞口等空间锚点稳定 (0-8)
+   - scale_depth 景深、空间尺度与人物比例合理 (0-6)
+   - previous_continuity 与前一帧状态连续 (0-5)
+   - next_reachability 与后一帧目标物理可衔接 (0-3)
    - 镜头与机位一致性：严格按照提示词声明的机位视角（俯仰角、方位、焦段及构图比例，如俯拍、仰拍、平视、特写或三七开等）进行评估；同一机位下的连续帧必须保持透视与地平线高度稳定，跨机位切换时必须忠实呈现提示词要求的全新视角，严禁因非平视广角而误判扣分。
    - DLSP 五层绝对景深协议：严格检查近景锚点（门框/爬梯 <1m）、中景开阔通廊（1-4m）、侧翼实虚墙体边界与后景收口（>4m），严禁保龄球道式管道拉伸（Bowling alley effect）。
    - 双向咬合（若提供后续目标参考图）：所选候选图必须能够作为连接【前序基准图】与【后续目标图】的自然桥梁，严禁破坏通往后一帧的物理可达性，绝不允许环境格局断层（如门窗突变、后墙消失、透视颠覆等引起后续帧整体报废的硬伤）。
    - 地标锁定与非对称特征：天花板梁架走向、后背景墙（无凭空立柱）、门框/洞口边界、左右非对称地标结构维持物理一致。
    - 严防空间膨胀：紧凑空间/坑穴（如直径 3.0m、净高 2.2m 空间）严禁异常拉伸为巨大礼堂或洞穴大厅（Cavernous expansion），工人人体比例尺（1.78m 占画面高度约 35%）自然协调。
-   - 零凭空变化：已完成的区域绝无莫名变动或无故复原破损。
+   - 零凭空变化与严防已拆除结构死而复生：已完成的区域绝无莫名变动或无故复原破损；在拆除/清场工序完成之后（如破旧泥屋被拆除、旧墙被推倒），后续帧（放线、开挖、地梁、砌砖、二层、精装等）严禁在背景或周边再次出现已被拆除销毁的旧结构残体（Ghost structure）。若候选图出现旧破烂结构复活，属于 P0 级严重状态倒退穿帮，直接大幅扣分（分数应 < 70 分）并一票否决！
 
 3. 材质真实感与光影一致性 (0-25 分)：
+   - material_realism 主体材质真实 (0-8)
+   - lighting_consistency 光照、阴影与色温一致 (0-6)
+   - human_realism 真人皮肤、服装与动作真实 (0-6)
+   - physical_reference_fidelity 施工物理合理，且在提供原片时忠实对标 (0-5)
    - 真实物理质感（温润哑光/半哑光实木纹理、粗糙混凝土/天然石材、自然漫反射光）。
    - 严禁违规：成品展示帧严禁出现假反光镜面或湿水面效果；灯光必须自然，严禁产生杂乱网状荧光灯带。
 
-4. 瑕疵与违规物过滤 (0-15 分)：
+4. 瑕疵与违规物过滤 (0-15 分；分数越高表示瑕疵越少)：
+   - anatomy_integrity 无肢体、面部、人物融合或重影问题 (0-5)
+   - image_integrity 清晰且无融化、重复纹理等 AI 伪影 (0-5)
+   - lifecycle_composition_integrity 工具生命周期正确，且无黑边、底座等构图穿帮 (0-5)
    - 严禁多肢/融化/肢体畸变或工人克隆多体重影。
    - 工具生命周期：已完工/软装展示阶段必须彻底撤除三脚架、裸露电缆与破坏性重型工具。
    - 画面清晰，无模糊失真或 AI 伪影。
 
+【爆款原片对标参考图 (IMAGE REF) 权威基准规则】：
+- 若提供了【爆款原片对标参考图 (IMAGE REF)】，它是本拍客观真实画面的最高权威基准（Ground Truth）。
+- 取景与构图保真：必须以原片参考图的真实取景为准。例如原片若为自然露天微缩场景，绝不允许候选图凭空出现黑色管道圆环、望远镜黑边、圆形隧道框景等画框伪影；带有此类多余画框伪影的候选图属于严重幻觉，必须大幅扣分！
+- 道具与主体比例：人物形象、服装、场景结构与原片对标保持高度吻合者优先胜出。
+- 活物一律真人（硬性）：画面里的人必须是真人——真实皮肤质感、真实毛发、真实布料垂坠与自然发力体态。凡是渲成蜡像、树脂/塑料人偶、玩偶、假人模特者，一律判为严重瑕疵大幅扣分，不得以「与原片人偶风格一致」为由给高分；微缩场景同样适用——那里的人只是**小**，不是塑料的，尺寸对不对由比例判，材质像不像真人单独判。
+
+【评分标尺校准原则（Score Calibration & Tiering）- 严禁无端给出压抑性低分】：
+- 基础基准分（Baseline 80分）：画面完整、主体清晰、大致符合施工提示词要求的合格候选，基准分应在 80-85 分区间，切忌因微小 AI 瑕疵盲目扣至 60 几分。
+- 90 - 98 分（卓越 / 极力推荐）：完全契合核心机位与原片构图对标、人物比例真实自然且渲染为有血有肉的真人、材质与光影极佳、无破绽穿帮。
+- 82 - 89 分（良好 / 合格次选）：主体和工序正确，但存在轻微构图偏差（如局部阴影生硬、轻微边缘暗化）或轻微背景小瑕疵，整体依然可用。
+- 70 - 81 分（中等 / 明显瑕疵）：存在较明显的构图穿帮（如凭空出现多余黑边画框/管道圈、漏出微缩模型木质底座台面、视角偏差过大）或局部质感失真。
+- < 70 分（不合格 / 严重违规）：存在严重肢体畸变、空间坍塌膨胀、提示词核心工序完全缺失等硬伤。
+
+【硬伤代码（hard_flags）】：
+- ghost_structure_revival：已拆除结构死而复生；直接淘汰。
+- wrong_scene_or_carrier：主体场景或载体身份错误；直接淘汰。
+- core_process_missing：核心工序完全缺失；总分最高 69。
+- severe_spatial_collapse：严重空间坍塌或异常膨胀；总分最高 65。
+- severe_anatomy：严重人物肢体/面部畸变；总分最高 59。
+- plastic_human：真人被渲染成塑料、树脂、蜡像或玩偶；总分最高 69。
+没有硬伤必须输出空数组，不要发明近义代码。未提供前帧、后帧或原片参考时，对应细分项按本帧
+自身可验证内容正常评分，不得仅因参考缺失而扣分。
+
 【输出语言强制要求】：
 必须全量严格使用【简体中文】输出所有评分、优势（strengths）、缺陷（defects）与最终优选理由（selection_reason）。语言简练、专业、切中要点。
 
-请严格输出符合以下结构的合法 JSON 格式：
+请严格输出符合以下结构的合法 JSON 格式。必须为每张候选图输出完整的 16 项 subscores：
 {
   "candidates": [
     {
       "index": 1,
-      "score": 85,
+      "subscores": {
+        "core_milestone": 10,
+        "physical_delta": 7,
+        "state_progression": 5,
+        "actions_materials": 4,
+        "camera_fidelity": 7,
+        "anchor_stability": 7,
+        "scale_depth": 5,
+        "previous_continuity": 4,
+        "next_reachability": 3,
+        "material_realism": 7,
+        "lighting_consistency": 5,
+        "human_realism": 5,
+        "physical_reference_fidelity": 4,
+        "anatomy_integrity": 5,
+        "image_integrity": 4,
+        "lifecycle_composition_integrity": 4
+      },
+      "hard_flags": [],
       "strengths": "简述候选1的核心优势（中文，不超过35字）",
       "defects": "简述候选1的不足或偏差（中文，不超过35字）"
-    },
-    {
-      "index": 2,
-      "score": 92,
-      "strengths": "简述候选2的核心优势（中文，不超过35字）",
-      "defects": "简述候选2的不足或偏差（中文，无明显缺陷可写'无明显缺陷'）"
-    },
-    {
-      "index": 3,
-      "score": 78,
-      "strengths": "简述候选3的核心优势（中文，不超过35字）",
-      "defects": "简述候选3的不足或偏差（中文，不超过35字）"
-    },
-    {
-      "index": 4,
-      "score": 88,
-      "strengths": "简述候选4的核心优势（中文，不超过35字）",
-      "defects": "简述候选4的不足或偏差（中文，不超过35字）"
     }
   ],
-  "best_index": 2,
-  "selection_reason": "综合评估结论：清晰阐述为何选择该候选图作为最佳官方采用帧（中文，不超过60字）"
+  "best_index": 1,
+  "selection_reason": "综合评估结论：清晰阐述为何推荐该候选图（中文，不超过60字）"
 }
+上例只展示候选1的字段形状；实际必须按相同形状返回收到的全部候选图。best_index 仅为模型建议，
+服务端会自行求和、应用淘汰/封顶规则并确定最终采用图。
 """
+
+
+_CANDIDATE_SCORE_FIELDS = (
+    ('process', 'core_milestone', 12),
+    ('process', 'physical_delta', 8),
+    ('process', 'state_progression', 6),
+    ('process', 'actions_materials', 4),
+    ('continuity', 'camera_fidelity', 8),
+    ('continuity', 'anchor_stability', 8),
+    ('continuity', 'scale_depth', 6),
+    ('continuity', 'previous_continuity', 5),
+    ('continuity', 'next_reachability', 3),
+    ('realism', 'material_realism', 8),
+    ('realism', 'lighting_consistency', 6),
+    ('realism', 'human_realism', 6),
+    ('realism', 'physical_reference_fidelity', 5),
+    ('defects', 'anatomy_integrity', 5),
+    ('defects', 'image_integrity', 5),
+    ('defects', 'lifecycle_composition_integrity', 5),
+)
+
+_CANDIDATE_HARD_FLAG_RULES = {
+    'ghost_structure_revival': {'disqualify': True},
+    'wrong_scene_or_carrier': {'disqualify': True},
+    'core_process_missing': {'cap': 69},
+    'severe_spatial_collapse': {'cap': 65},
+    'severe_anatomy': {'cap': 59},
+    'plastic_human': {'cap': 69},
+}
+
+
+def _bounded_candidate_score(value, maximum):
+    """Turn an untrusted VLM subscore into a bounded, stable numeric value."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        number = 0.0
+    if not math.isfinite(number):
+        number = 0.0
+    number = max(0.0, min(float(maximum), number))
+    return int(number) if number.is_integer() else round(number, 1)
+
+
+def _normalize_candidate_evaluation(result_data, candidate_count):
+    """Validate VLM output, calculate totals server-side, and select the winner."""
+    raw_candidates = result_data.get('candidates') if isinstance(result_data, dict) else []
+    raw_candidates = raw_candidates if isinstance(raw_candidates, list) else []
+    by_index = {}
+    for position, candidate in enumerate(raw_candidates, 1):
+        if not isinstance(candidate, dict):
+            continue
+        try:
+            index = int(candidate.get('index', position))
+        except (TypeError, ValueError):
+            index = position
+        if 1 <= index <= candidate_count and index not in by_index:
+            by_index[index] = candidate
+
+    normalized = []
+    for index in range(1, candidate_count + 1):
+        candidate = by_index.get(index, {})
+        raw_subscores = candidate.get('subscores')
+        has_structured_scores = isinstance(raw_subscores, dict)
+        subscores = {}
+        group_scores = {'process': 0, 'continuity': 0, 'realism': 0, 'defects': 0}
+        if has_structured_scores:
+            for group, key, maximum in _CANDIDATE_SCORE_FIELDS:
+                value = _bounded_candidate_score(raw_subscores.get(key), maximum)
+                subscores[key] = value
+                group_scores[group] += value
+            raw_score = round(sum(group_scores.values()), 1)
+            raw_score = int(raw_score) if float(raw_score).is_integer() else raw_score
+            score_source = 'server_subscore_sum'
+        else:
+            raw_score = _bounded_candidate_score(candidate.get('score'), 100)
+            score_source = 'legacy_model_total'
+
+        raw_flags = candidate.get('hard_flags')
+        raw_flags = raw_flags if isinstance(raw_flags, list) else []
+        hard_flags = []
+        for flag in raw_flags:
+            flag = str(flag or '').strip()
+            if flag in _CANDIDATE_HARD_FLAG_RULES and flag not in hard_flags:
+                hard_flags.append(flag)
+        disqualified = any(_CANDIDATE_HARD_FLAG_RULES[f].get('disqualify') for f in hard_flags)
+        caps = [_CANDIDATE_HARD_FLAG_RULES[f].get('cap') for f in hard_flags]
+        caps = [cap for cap in caps if cap is not None]
+        score_cap = min(caps) if caps else 100
+        score = min(raw_score, score_cap)
+
+        normalized.append({
+            'index': index,
+            'score': score,
+            'raw_score': raw_score,
+            'score_cap': score_cap,
+            'score_source': score_source,
+            'subscores': subscores,
+            'group_scores': group_scores if has_structured_scores else {},
+            'hard_flags': hard_flags,
+            'disqualified': disqualified,
+            'strengths': str(candidate.get('strengths') or ''),
+            'defects': str(candidate.get('defects') or ''),
+        })
+
+    eligible = [candidate for candidate in normalized if not candidate['disqualified']]
+    ranking_pool = eligible or normalized
+    winner = max(
+        ranking_pool,
+        key=lambda candidate: (
+            candidate['score'],
+            candidate['group_scores'].get('continuity', 0),
+            candidate['group_scores'].get('process', 0),
+            candidate['group_scores'].get('realism', 0),
+            candidate['group_scores'].get('defects', 0),
+            -candidate['index'],
+        ),
+    ) if ranking_pool else {'index': 1}
+    try:
+        model_best_index = int(result_data.get('best_index', 1))
+    except (TypeError, ValueError, AttributeError):
+        model_best_index = 1
+    if not 1 <= model_best_index <= candidate_count:
+        model_best_index = 1
+    return {
+        'candidates': normalized,
+        'best_index': winner['index'],
+        'model_best_index': model_best_index,
+        'all_candidates_disqualified': bool(normalized and not eligible),
+    }
 
 
 _DEFAULT_CANDIDATE_CONCURRENCY = 4
@@ -198,6 +367,229 @@ def fx_media_exclusions(project_dir, frames_dir):
     return sorted(uuids), paths
 
 
+def sync_frame_candidates_pool(frames_dir, seq, current_frame=None, target_path=None, auto_archive_current=True, project_url=None):
+    """
+    Synchronizes, recovers, and normalizes the full candidate pool for a given sequence `seq`.
+    - Scans `candidates/frame_{seq:03d}/` on disk for existing webp/jpg files and `candidates_meta.json`.
+    - If `img_{seq:03d}.webp` exists on disk and is not yet in candidate pool, safely archives it as a candidate.
+    - Resolves and maintains contiguous, collision-free candidate indices (1..N).
+    - Preserves model, model_display, fx_uuid, raw_src, scores, and chosen flags.
+    - Writes updated `candidates_meta.json`.
+    - Returns `(candidates_for_manifest, chosen_candidate_index, meta_payload)`.
+    """
+    workspace_root = os.path.dirname(os.path.abspath(__file__))
+    candidates_dir = os.path.join(frames_dir, 'candidates', f'frame_{seq:03d}')
+    os.makedirs(candidates_dir, exist_ok=True)
+    meta_file = os.path.join(candidates_dir, 'candidates_meta.json')
+
+    # 1. Load existing candidates_meta.json if present
+    meta_dict = {}
+    stored_project_url = project_url
+    if os.path.exists(meta_file):
+        try:
+            with open(meta_file, 'r', encoding='utf-8') as f:
+                payload = json.load(f)
+                if isinstance(payload, dict):
+                    if payload.get('project_url') and not stored_project_url:
+                        stored_project_url = payload['project_url']
+                    raw_cands = payload.get('candidates')
+                    if isinstance(raw_cands, list):
+                        for c in raw_cands:
+                            if isinstance(c, dict):
+                                try:
+                                    c_idx = int(c.get('index') or 0)
+                                    if c_idx > 0:
+                                        meta_dict[c_idx] = dict(c)
+                                except (TypeError, ValueError):
+                                    pass
+        except Exception:
+            pass
+
+    # 2. Discover physical candidate files on disk
+    if os.path.isdir(candidates_dir):
+        for fname in os.listdir(candidates_dir):
+            m = re.match(r'^candidate_(\d+)(?:_([a-zA-Z0-9_-]+))?\.webp$', fname)
+            if m:
+                try:
+                    c_idx = int(m.group(1))
+                    fpath = os.path.join(candidates_dir, fname)
+                    if c_idx not in meta_dict:
+                        raw_src = fpath
+                        cand_uuid = _fx_extract_uuid(fname)
+                        prefix = f'candidate_{c_idx}_'
+                        for jname in os.listdir(candidates_dir):
+                            if jname.startswith(prefix) and jname.lower().endswith('.jpg'):
+                                raw_src = os.path.join(candidates_dir, jname)
+                                cand_uuid = _fx_extract_uuid(jname) or cand_uuid
+                                break
+                        meta_dict[c_idx] = {
+                            'index': c_idx,
+                            'path': fpath,
+                            'raw_src': raw_src,
+                            'fx_uuid': cand_uuid,
+                        }
+                    else:
+                        if not meta_dict[c_idx].get('path') or not os.path.exists(meta_dict[c_idx]['path']):
+                            meta_dict[c_idx]['path'] = fpath
+                except ValueError:
+                    pass
+
+    # 3. Check and archive existing authoritative frame if not yet in pool
+    authoritative_frame_path = target_path or os.path.join(frames_dir, f'img_{seq:03d}.webp')
+    pool_is_empty = (len(meta_dict) == 0)
+    should_archive = (auto_archive_current or pool_is_empty)
+    if should_archive and os.path.exists(authoritative_frame_path) and os.path.getsize(authoritative_frame_path) > 0:
+        already_archived = False
+        auth_size = os.path.getsize(authoritative_frame_path)
+        try:
+            with open(authoritative_frame_path, 'rb') as f:
+                auth_bytes = f.read()
+        except Exception:
+            auth_bytes = None
+
+        if auth_bytes:
+            for c_idx, c_item in meta_dict.items():
+                c_p = c_item.get('path')
+                if c_p and os.path.exists(c_p) and os.path.getsize(c_p) == auth_size:
+                    try:
+                        with open(c_p, 'rb') as cf:
+                            if cf.read() == auth_bytes:
+                                already_archived = True
+                                break
+                    except Exception:
+                        pass
+
+        if not already_archived:
+            new_idx = (max(meta_dict.keys()) if meta_dict else 0) + 1
+            dest_cand_path = os.path.join(candidates_dir, f'candidate_{new_idx}.webp')
+            try:
+                if not os.path.exists(dest_cand_path):
+                    shutil.copy2(authoritative_frame_path, dest_cand_path)
+            except Exception:
+                pass
+
+            c_m = (current_frame.get('model') if current_frame else None) or 'gemini-3.1-flash-image'
+            c_m_disp = (current_frame.get('model_display') if current_frame else None) or ('手动上传' if c_m == 'manual_upload' else ('GPT-2' if 'gpt' in str(c_m).lower() else ('Google FX' if ('google_fx' in str(c_m).lower() or (current_frame and current_frame.get('fx_uuid'))) else 'Gemini')))
+            meta_dict[new_idx] = {
+                'index': new_idx,
+                'path': dest_cand_path,
+                'raw_src': dest_cand_path,
+                'fx_uuid': current_frame.get('fx_uuid') if current_frame else None,
+                'model': c_m,
+                'model_display': c_m_disp,
+            }
+
+    # 4. Resolve chosen index
+    chosen_idx = None
+    if current_frame and current_frame.get('chosen_candidate_index'):
+        try:
+            chosen_idx = int(current_frame['chosen_candidate_index'])
+        except (TypeError, ValueError):
+            pass
+
+    if chosen_idx not in meta_dict and os.path.exists(authoritative_frame_path):
+        auth_size = os.path.getsize(authoritative_frame_path)
+        try:
+            with open(authoritative_frame_path, 'rb') as f:
+                auth_bytes = f.read()
+            for c_idx, c_item in meta_dict.items():
+                c_p = c_item.get('path')
+                if c_p and os.path.exists(c_p) and os.path.getsize(c_p) == auth_size:
+                    with open(c_p, 'rb') as cf:
+                        if cf.read() == auth_bytes:
+                            chosen_idx = c_idx
+                            break
+        except Exception:
+            pass
+
+    if chosen_idx not in meta_dict:
+        chosen_idx = min(meta_dict.keys()) if meta_dict else 1
+
+    # 5. Build clean, sorted candidate list
+    sorted_meta = []
+    manifest_cands = []
+    
+    existing_eval_map = {}
+    if current_frame and isinstance(current_frame.get('candidates'), list):
+        for ec in current_frame['candidates']:
+            if isinstance(ec, dict) and ec.get('index'):
+                existing_eval_map[ec['index']] = ec
+
+    for c_idx in sorted(meta_dict.keys()):
+        cm = meta_dict[c_idx]
+        c_path = cm.get('path') or os.path.join(candidates_dir, f'candidate_{c_idx}.webp')
+        rel_path = os.path.relpath(c_path, workspace_root).replace('\\', '/')
+        url = '/' + rel_path if not rel_path.startswith('/') else rel_path
+        
+        c_model = cm.get('model') or (existing_eval_map.get(c_idx, {}).get('model')) or (current_frame.get('model') if current_frame else None) or 'gemini-3.1-flash-image'
+        c_model_display = cm.get('model_display') or (existing_eval_map.get(c_idx, {}).get('model_display')) or ('手动上传' if c_model == 'manual_upload' else ('GPT-2' if 'gpt' in str(c_model).lower() else ('Google FX' if ('google_fx' in str(c_model).lower() or cm.get('fx_uuid')) else 'Gemini')))
+        
+        # 评分/评语只认真的评过的那一份，**绝不编**。两条规矩：
+        #
+        # 1. 调用方传进来的 current_frame 优先于落盘的 candidates_meta.json。前者是本次
+        #    刚跑出来的 AI 鉴别结论，后者是上一次的快照；反过来取会让新评分永远盖不进去
+        #    ——一旦某个 index 在 meta 里有过分，后面再评多少次都以第一次为准。
+        # 2. 没评过就留 None / ''，不要塞 85 分和"基础主帧"。前端 (app.js) 对 score==null
+        #    本来就渲染成"-- 分"，占位分只会让一张从没被鉴别过的图，在弹层里跟真评过的
+        #    候选并排显示同一种分数徽标；更糟的是它会被下面几行写回 meta 落盘，从此变成
+        #    一个永久的假分，再也分不出哪些是真评过的。
+        eval_info = existing_eval_map.get(c_idx, {})
+        score = eval_info.get('score')
+        if score is None:
+            score = cm.get('score')
+        strengths = eval_info.get('strengths') or cm.get('strengths') or ''
+        defects = eval_info.get('defects') or cm.get('defects') or ''
+        scoring_details = {}
+        for detail_key in ('raw_score', 'score_cap', 'score_source', 'subscores',
+                           'group_scores', 'hard_flags', 'disqualified'):
+            if detail_key in eval_info:
+                scoring_details[detail_key] = eval_info[detail_key]
+            elif detail_key in cm:
+                scoring_details[detail_key] = cm[detail_key]
+
+        is_chosen = (c_idx == chosen_idx)
+
+        cm['model'] = c_model
+        cm['model_display'] = c_model_display
+        # 只把真有值的写回落盘，别把"没评过"固化成一条假记录
+        if score is not None:
+            cm['score'] = score
+        if strengths:
+            cm['strengths'] = strengths
+        if defects:
+            cm['defects'] = defects
+        cm.update(scoring_details)
+        sorted_meta.append(cm)
+
+        manifest_cands.append({
+            'index': c_idx,
+            'file': rel_path,
+            'url': url,
+            'fx_uuid': cm.get('fx_uuid'),
+            'model': c_model,
+            'model_display': c_model_display,
+            'is_chosen': is_chosen,
+            'score': score,
+            'strengths': strengths,
+            'defects': defects,
+            **scoring_details,
+        })
+
+    meta_payload = {
+        'sequence': seq,
+        'project_url': stored_project_url,
+        'candidates': sorted_meta,
+    }
+
+    try:
+        with open(meta_file, 'w', encoding='utf-8') as f:
+            json.dump(meta_payload, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+    return manifest_cands, chosen_idx, meta_payload
+
+
 def generate_frame_candidates(config, title, item, reference_path, seq, candidate_count=4, on_progress=None, is_bridge=False, is_cut_head=False, is_turn=False, project_url=None, frames_dir=None, canvas_state=None):
     """
     Generate `candidate_count` candidate images for a given sequence step.
@@ -220,6 +612,9 @@ def generate_frame_candidates(config, title, item, reference_path, seq, candidat
         frames_dir = os.path.join(project_dir, 'frames')
     candidates_dir = os.path.join(frames_dir, 'candidates', f'frame_{seq:03d}')
     os.makedirs(candidates_dir, exist_ok=True)
+
+    # 检查并同步已有候选池与落盘图片，确保历史生成帧（含先前单张生成或老批次）安全归档，不被覆盖
+    sync_frame_candidates_pool(frames_dir, seq, auto_archive_current=True, project_url=project_url)
 
     # 检查池中已有候选图与元数据，实现全量累积追加而非覆盖
     existing_meta = []
@@ -388,6 +783,8 @@ def generate_frame_candidates(config, title, item, reference_path, seq, candidat
                             'path': cand_dest,
                             'raw_src': cand_raw_jpg or cand_dest,
                             'fx_uuid': cand_uuid,
+                            'model': fx_model if backend == 'google_fx' else (config.get('imageModel') or 'gemini-3.1-flash-image'),
+                            'model_display': 'Google FX' if backend == 'google_fx' else 'Gemini',
                         })
         except Exception as e:
             # 这里静默退回 API 会同时丢掉画布与 UUID 续链（后续帧再也挂不上参考图
@@ -439,12 +836,16 @@ def generate_frame_candidates(config, title, item, reference_path, seq, candidat
             if var_num > 1:
                 p_variant = f"{prompt_text}\n\n[Variation #{var_num}]"
             _generate_single_api_candidate(config, p_variant, reference_path, cand_path, is_text_only, ctrl_prompt)
+            c_model = config.get('imageModel') or 'gemini-3.1-flash-image'
+            c_model_disp = 'GPT-2' if 'gpt' in str(c_model).lower() else ('Google FX' if 'google_fx' in str(c_model).lower() else 'Gemini')
             if os.path.exists(cand_path) and os.path.getsize(cand_path) > 0:
                 return {
                     'index': c_idx,
                     'path': cand_path,
                     'raw_src': cand_path,
                     'fx_uuid': None,
+                    'model': c_model,
+                    'model_display': c_model_disp,
                 }
             raise RuntimeError(f"Candidate #{c_idx} image file is missing or empty")
 
@@ -550,7 +951,11 @@ def generate_frame_candidates(config, title, item, reference_path, seq, candidat
 
     # Save candidates metadata for easy recovery/switch (accumulate with existing_meta)
     try:
-        all_candidates_meta = existing_meta + candidates_meta
+        combined_meta_map = {c['index']: c for c in existing_meta if isinstance(c, dict) and c.get('index')}
+        for cm in candidates_meta:
+            if isinstance(cm, dict) and cm.get('index'):
+                combined_meta_map[cm['index']] = cm
+        all_candidates_meta = [combined_meta_map[k] for k in sorted(combined_meta_map.keys())]
         meta_payload = {
             'sequence': seq,
             'project_url': returned_project_url,
@@ -564,10 +969,11 @@ def generate_frame_candidates(config, title, item, reference_path, seq, candidat
     return candidate_paths
 
 
-def evaluate_and_select_best_candidate(config, prompt_text, reference_path, candidate_paths, seq, on_progress=None, succeeding_path=None, succeeding_prompt=None):
+def evaluate_and_select_best_candidate(config, prompt_text, reference_path, candidate_paths, seq, on_progress=None, succeeding_path=None, succeeding_prompt=None, ref_frame_path=None):
     """
     Calls multimodal VLM (Gemini 3.7 / 3.5 / Flash) to evaluate all candidates and choose the best one.
     Supports succeeding_path and succeeding_prompt for bidirectional sandwich context binding during frame repair.
+    Supports ref_frame_path for ground-truth viral benchmark keyframe alignment.
     Returns:
     {
         "candidates": [
@@ -578,11 +984,11 @@ def evaluate_and_select_best_candidate(config, prompt_text, reference_path, cand
         "selection_reason": str
     }
     """
-    if len(candidate_paths) == 1:
+    if not candidate_paths:
         return {
-            "candidates": [{"index": 1, "score": 90, "strengths": "唯一生成候选图", "defects": "无对比候选"}],
+            "candidates": [{"index": 1, "score": 90, "strengths": "无生成候选图", "defects": ""}],
             "best_index": 1,
-            "selection_reason": "单候选直选"
+            "selection_reason": "无候选"
         }
 
     if on_progress:
@@ -592,11 +998,21 @@ def evaluate_and_select_best_candidate(config, prompt_text, reference_path, cand
             'message': f"IMG {seq:03d} {len(candidate_paths)}张候选图已就绪，AI 模型正在多模态鉴别与打分...",
         })
 
+    # 只清理**送进鉴别模型的这份副本**：老单落盘的提示词正文里可能还留着
+    # `(cavernous hall, giant space:1.6)` 这类权重标注（合成器与 AGENTS 规则现已一律
+    # 改用自然语句，见 fast_composer 规则 8/9），带着它去问 VLM"这张图符不符合提示词"
+    # 会让它把负向词当成正向要求去找。
+    #
+    # ⚠️ 这里**不是**提示词正文的收口点。交付正文的唯一出口仍是
+    # apply_proactive_fixes 末尾那一处——别把清洗逻辑往这边搬，两个出口就意味着
+    # 两套口径。本函数改的是 clean_prompt 这个局部变量，绝不回写 item/manifest。
+    clean_prompt = re.sub(r'\s*\([a-zA-Z0-9_,\s\-:]+:[0-9\.]+\)\s*$', '', prompt_text).strip()
+
     # Prepare multimodal message
     user_text_parts = [
         f"--- 当前帧施工与画面要求 (IMG {seq:03d}) ---",
         f"【本帧施工节点与提示词要求】:",
-        prompt_text,
+        clean_prompt,
         "",
     ]
     
@@ -606,6 +1022,11 @@ def evaluate_and_select_best_candidate(config, prompt_text, reference_path, cand
         image_paths_to_send.append(reference_path)
     else:
         user_text_parts.append("本帧为【第 1 帧 / 锚点基准帧】，无前序参考图，请重点评估提示词还原度、透视构图与画面质感。")
+
+    if ref_frame_path and os.path.exists(ref_frame_path) and os.path.getsize(ref_frame_path) > 0:
+        ref_img_idx = len(image_paths_to_send) + 1
+        user_text_parts.append(f"附带的第 {ref_img_idx} 张图片为【爆款原片对标参考图 (IMAGE REF)】（来自爆款视频同阶段真实关键帧，用于对标机位视角、构图留白、道具尺度与交付量级）。【绝对基准注意】：所有候选图必须以原片参考图的真实视角与场景形态为准。若原片无圆形管道/隧道黑色画框，候选图绝不可凭空出现黑圈暗角/管道伪影，违者直接大幅扣分！")
+        image_paths_to_send.append(ref_frame_path)
 
     if succeeding_path and os.path.exists(succeeding_path) and os.path.getsize(succeeding_path) > 0:
         succ_img_idx = len(image_paths_to_send) + 1
@@ -631,7 +1052,9 @@ def evaluate_and_select_best_candidate(config, prompt_text, reference_path, cand
             system=_AI_DISCRIMINATION_SYSTEM_PROMPT,
             user_text=user_text,
             image_paths=image_paths_to_send,
-            max_tokens=2000,
+            # 4 candidates × 16 subscores plus Chinese findings no longer fits the old
+            # 2k ceiling reliably; truncating this JSON would incorrectly trigger fallback.
+            max_tokens=4000,
             timeout=120,
         )
         
@@ -646,16 +1069,30 @@ def evaluate_and_select_best_candidate(config, prompt_text, reference_path, cand
                 clean_json = m2.group(1)
 
         result_data = json.loads(clean_json)
-        best_idx = int(result_data.get('best_index', 1))
-        if best_idx < 1 or best_idx > len(candidate_paths):
-            best_idx = 1
-        
-        cands_meta = result_data.get('candidates') or []
-        selection_reason = result_data.get('selection_reason') or f"AI 鉴别选出最佳候选 #{best_idx}"
+        normalized = _normalize_candidate_evaluation(result_data, len(candidate_paths))
+        best_idx = normalized['best_index']
+        model_best_idx = normalized['model_best_index']
+        cands_meta = normalized['candidates']
+        model_reason = result_data.get('selection_reason') or ''
+        if normalized['all_candidates_disqualified']:
+            selection_reason = (
+                f"全部候选均命中淘汰级硬伤；暂按后端得分采用候选 #{best_idx}，必须人工复核。"
+            )
+        elif best_idx != model_best_idx:
+            selection_reason = (
+                f"后端按细分项汇总与硬伤规则选中候选 #{best_idx}"
+                + (f"；模型原建议 #{model_best_idx}。{model_reason}" if model_reason else
+                   f"；模型原建议 #{model_best_idx}。")
+            )
+        else:
+            selection_reason = model_reason or f"后端汇总评分选出最佳候选 #{best_idx}"
 
         return {
             "candidates": cands_meta,
             "best_index": best_idx,
+            "model_best_index": model_best_idx,
+            "scoring_version": "structured-16-v1",
+            "all_candidates_disqualified": normalized['all_candidates_disqualified'],
             "selection_reason": selection_reason,
             "raw_response": response_text[:500],
         }
@@ -663,8 +1100,20 @@ def evaluate_and_select_best_candidate(config, prompt_text, reference_path, cand
         log('WARN', 'CANDIDATE_AI', f"IMG {seq:03d} AI 多模态鉴别调用异常 ({e})，默认采纳第 1 张候选")
         # Fallback to candidate 1
         return {
-            "candidates": [{"index": i + 1, "score": 80, "strengths": "默认采纳", "defects": ""} for i in range(len(candidate_paths))],
+            "candidates": [{
+                "index": i + 1,
+                "score": None,
+                "score_source": "evaluation_unavailable",
+                "subscores": {},
+                "group_scores": {},
+                "hard_flags": [],
+                "disqualified": False,
+                "strengths": "未评分",
+                "defects": "鉴别服务不可用",
+            } for i in range(len(candidate_paths))],
             "best_index": 1,
+            "model_best_index": 1,
+            "scoring_version": "unavailable",
             "selection_reason": f"AI鉴别服务暂不可用 ({e})，已默认采纳候选 #1",
         }
 
@@ -782,6 +1231,7 @@ def run_candidate_selection_frame_sequence(config, title, prompt_block, on_progr
     # 这一趟哪怕从断点顺利渲到底，返回的 manifest 里仍挂着 halted_at_beat，前端会
     # 一直把这单报成「已暂停」。这一趟停没停，只由这一趟自己写。
     manifest.pop('halted_at_beat', None)
+    manifest.pop('halted_at_sequence', None)
 
     manifest_frames_by_seq = {
         int(f.get('sequence') or f.get('slot')): f
@@ -885,11 +1335,10 @@ def run_candidate_selection_frame_sequence(config, title, prompt_block, on_progr
 
         if backend == 'google_fx':
             if seq == 1:
+                _fx_clear_frame_reference(frames_dir, 1)
                 cover_ref = resolve_cover_reference(config, title)
                 if cover_ref:
                     reference = _fx_cover_ref_jpg(cover_ref, frames_dir)
-                elif target_sequences is not None and os.path.exists(target_path) and os.path.getsize(target_path) > 0:
-                    reference = _fx_local_frame_ref_jpg(target_path, frames_dir, 1)
                 else:
                     reference = None
             else:
@@ -897,14 +1346,11 @@ def run_candidate_selection_frame_sequence(config, title, prompt_block, on_progr
         else:
             cover_ref = (resolve_cover_reference(config, title) if seq == 1 else None)
             cover_anchor = bool(cover_ref)
-            reference = cover_ref if cover_anchor else previous_path
-            if not reference:
-                if seq > 1:
-                    durable_parent = os.path.join(frames_dir, f'img_{seq - 1:03d}.webp')
-                    if os.path.exists(durable_parent) and os.path.getsize(durable_parent) > 0:
-                        reference = durable_parent
-                elif seq == 1 and target_sequences is not None and os.path.exists(target_path) and os.path.getsize(target_path) > 0:
-                    reference = target_path
+            reference = cover_ref if cover_anchor else (previous_path if seq > 1 else None)
+            if not reference and seq > 1:
+                durable_parent = os.path.join(frames_dir, f'img_{seq - 1:03d}.webp')
+                if os.path.exists(durable_parent) and os.path.getsize(durable_parent) > 0:
+                    reference = durable_parent
 
         if on_progress:
             on_progress('frame_start', {
@@ -974,7 +1420,18 @@ def run_candidate_selection_frame_sequence(config, title, prompt_block, on_progr
                 succeeding_frame_path = potential_succ
                 succeeding_prompt_text = prompts_by_seq.get(seq + 1, {}).get('prompt')
 
+        # 爆款原片对标参考关键帧
+        ref_frame_path = None
+        try:
+            from prompt_pipeline import find_reference_frames_for_project
+            ref_dict, _ = find_reference_frames_for_project(project_dir, len(prompts_by_seq) - 1)
+            ref_frame_path = ref_dict.get(seq)
+        except Exception:
+            ref_frame_path = None
+
         eval_kw = {'on_progress': on_progress}
+        if ref_frame_path and os.path.exists(ref_frame_path):
+            eval_kw['ref_frame_path'] = ref_frame_path
         if succeeding_frame_path:
             eval_kw['succeeding_path'] = succeeding_frame_path
         if succeeding_prompt_text:
@@ -985,7 +1442,7 @@ def run_candidate_selection_frame_sequence(config, title, prompt_block, on_progr
                 config, item.get('prompt', ''), reference, candidate_paths, seq, **eval_kw
             )
         except TypeError as te:
-            if 'succeeding_path' in str(te) or 'unexpected keyword' in str(te):
+            if 'succeeding_path' in str(te) or 'unexpected keyword' in str(te) or 'ref_frame_path' in str(te):
                 eval_result = evaluate_and_select_best_candidate(
                     config, item.get('prompt', ''), reference, candidate_paths, seq, on_progress=on_progress
                 )
@@ -1037,42 +1494,48 @@ def run_candidate_selection_frame_sequence(config, title, prompt_block, on_progr
 
         # ── Step 4: Record into Manifest (全量保留候选池所有批次候选) ──
         existing_frame = manifest_frames_by_seq.get(seq, {})
-        existing_cands = existing_frame.get('candidates', []) if isinstance(existing_frame.get('candidates'), list) else []
-
-        updated_existing_cands = []
-        seen_cand_indices = set()
-        for ec in existing_cands:
-            if not isinstance(ec, dict):
-                continue
-            ec_idx = ec.get('index')
-            seen_cand_indices.add(ec_idx)
-            ec_copy = dict(ec)
-            ec_copy['is_chosen'] = (ec_idx == best_actual_idx)
-            updated_existing_cands.append(ec_copy)
-
-        new_rel_candidates = []
+        
+        # Build evaluation mapping for the newly evaluated candidates
+        eval_cands_list = eval_result.get('candidates') or []
+        temp_manifest_cands = []
         for i, cp in enumerate(candidate_paths):
             c_idx = cand_path_indices[i]
-            if c_idx in seen_cand_indices:
-                continue
             c_meta = cand_meta_map.get(c_idx, {})
-            eval_c = (eval_result.get('candidates') or [{}])[i] if i < len(eval_result.get('candidates') or []) else {}
+            eval_c = eval_cands_list[i] if i < len(eval_cands_list) else {}
             c_model = c_meta.get('model') or (backend if backend == 'google_fx' else (config.get('imageModel') or 'gemini-3.1-flash-image'))
             c_model_display = 'Google FX' if ('google_fx' in str(c_model).lower() or backend == 'google_fx') else ('GPT-2' if 'gpt' in str(c_model).lower() else 'Gemini')
-            new_rel_candidates.append({
+            temp_manifest_cands.append({
                 'index': c_idx,
-                'file': os.path.relpath(cp, workspace_root).replace('\\', '/'),
-                'url': os.path.relpath(cp, workspace_root).replace('\\', '/'),
                 'fx_uuid': c_meta.get('fx_uuid'),
                 'model': c_model,
                 'model_display': c_model_display,
-                'is_chosen': (c_idx == best_actual_idx),
-                'score': eval_c.get('score', 80),
+                'score': eval_c.get('score'),
                 'strengths': eval_c.get('strengths', ''),
                 'defects': eval_c.get('defects', ''),
+                'raw_score': eval_c.get('raw_score'),
+                'score_cap': eval_c.get('score_cap'),
+                'score_source': eval_c.get('score_source'),
+                'subscores': eval_c.get('subscores') or {},
+                'group_scores': eval_c.get('group_scores') or {},
+                'hard_flags': eval_c.get('hard_flags') or [],
+                'disqualified': bool(eval_c.get('disqualified')),
             })
 
-        full_candidates = updated_existing_cands + new_rel_candidates
+        # Merge existing candidates with newly evaluated candidates
+        merged_cands_feed = (existing_frame.get('candidates', []) if isinstance(existing_frame.get('candidates'), list) else []) + temp_manifest_cands
+
+        full_candidates, _, _ = sync_frame_candidates_pool(
+            frames_dir, seq,
+            current_frame={
+                'chosen_candidate_index': best_actual_idx,
+                'candidates': merged_cands_feed,
+                'model': existing_frame.get('model'),
+                'fx_uuid': best_uuid,
+            },
+            target_path=target_path,
+            auto_archive_current=False,
+            project_url=project_url
+        )
         rel_target_path = os.path.relpath(target_path, workspace_root).replace('\\', '/')
 
         frame_data = {
@@ -1120,12 +1583,21 @@ def run_candidate_selection_frame_sequence(config, title, prompt_block, on_progr
                 'scores': [c.get('score') for c in full_candidates],
                 'message': f"IMG {seq:03d} AI 鉴别选中候选 #{best_actual_idx}：{selection_reason}",
             })
+            # guard_pending：这一帧落盘后还有一道链上守卫要审（见下面的守卫分支）。
+            # frame_data 里的 quality_gate 恒为 'auto_approved'（4选1 优选的结论），
+            # 前端拿它打的"完成（质检通过）"跟一致性审查毫无关系——不声明还有后续
+            # 审查，用户就会先看到一行绿的、过一会儿卡片突然变红。
+            _guard_pending = (
+                (chain_guard_mode(config) if chain_guard_review else 'off') != 'off'
+                and (seq == 1 or os.path.exists(os.path.join(frames_dir, f'img_{seq - 1:03d}.webp')))
+            )
             on_progress('frame', {
                 'sequence': seq,
                 'slot': seq,
                 'current': len([f for f in manifest['frames'] if f.get('file')]),
                 'total': total_to_generate,
                 'frame': frame_data,
+                'guard_pending': bool(_guard_pending),
             })
 
         # 链上逐拍守卫审查
@@ -1135,17 +1607,12 @@ def run_candidate_selection_frame_sequence(config, title, prompt_block, on_progr
         # 立刻对同一拍、同一对图再跑一次 guard_beat 拿停链结论，这里再审一遍是纯重复
         # 的一整套 check + 逐条复核 + 分级，而且两次判定还可能互相打架。
         guard_mode = chain_guard_mode(config) if chain_guard_review else 'off'
-        if seq >= 2 and guard_mode != 'off':
-            beat = seq - 1
-            prev_seq = seq - 1
-            prev_file = os.path.join(frames_dir, f'img_{prev_seq:03d}.webp')
-            if os.path.exists(prev_file):
+        if guard_mode != 'off':
+            if seq == 1:
                 try:
-                    from chain_guard import guard_beat
+                    from chain_guard import run_anchor_guard
 
                     def _resync_from_disk():
-                        """守卫与自动修复都是隔着磁盘改 manifest 的，改完必须把这一份
-                        内存副本追上去——否则本函数收尾那次整份写盘会把它们全盖掉。"""
                         updated_manifest = read_manifest(project_dir)
                         if updated_manifest and 'frames' in updated_manifest:
                             manifest['frames'] = updated_manifest['frames']
@@ -1154,112 +1621,169 @@ def run_candidate_selection_frame_sequence(config, title, prompt_block, on_progr
                                     manifest_frames_by_seq[seq] = f_entry
                                     break
 
-                    # 定向重渲（单帧重试 / fix_frame_issue 的连带重渲）只审不停也不自动修：
-                    # 那一趟的下游帧本来就要被重新盖掉，中途停链会留下一条修了一半的链
-                    # （上游新图 + 下游旧血统），正是 cascade_downstream 要消灭的
-                    # stale_lineage；而自动修复本身就是靠调 fix_frame_issue 实现的，
-                    # 在它内部再触发一次就是无限递归。停与修都只在向前建链时才成立。
                     forward_build = (target_sequences is None)
-                    guard_res = guard_beat(
-                        config, title, prompt_block, beat, project_dir,
+                    anchor_res = run_anchor_guard(
+                        config, title, prompt_block, project_dir,
+                        guard_mode=guard_mode, forward_build=forward_build,
                         on_progress=on_progress,
-                        allow_halt=forward_build,
+                        on_manifest_dirty=_resync_from_disk,
+                        autofix_attempts=_CHAIN_GUARD_AUTOFIX_ATTEMPTS,
                     )
-                    _resync_from_disk()
+                    new_block = anchor_res.get('prompt_block')
+                    if new_block and new_block != prompt_block:
+                        prompt_block = new_block
+                        autofixed_prompt_block = new_block
+                    # 首帧判废就停在这里：它是整条 i2i 链的地基，接着往下渲等于让
+                    # 一张已知歪掉的图当所有下游帧的底图（与逐拍守卫同一口径）。
+                    if anchor_res.get('halt'):
+                        manifest['halted_at_beat'] = 0
+                        manifest['halted_at_sequence'] = 1
+                        break
+                except GenerationCancelled:
+                    # 自动修复途中用户点了取消：必须原样抛出去，被下面的兜底吞掉
+                    # 就成了"点了取消还在接着渲"。
+                    raise
+                except Exception as e:
+                    log('WARN', 'CHAIN_GUARD', f"IMG 001 锚点审查异常: {e}")
+            elif seq >= 2:
+                beat = seq - 1
+                prev_seq = seq - 1
+                prev_file = os.path.join(frames_dir, f'img_{prev_seq:03d}.webp')
+                if os.path.exists(prev_file):
+                    try:
+                        from chain_guard import (
+                            guard_beat, guard_autofix_enabled, guard_halt_enabled)
 
-                    # autofix：就地走一遍「修复此帧问题」，复审过了就接着往下渲。
-                    if guard_res.get('halt') and guard_mode == 'autofix' and forward_build:
-                        from pipeline_orchestrator import fix_frame_issue
-                        for attempt in range(1, _CHAIN_GUARD_AUTOFIX_ATTEMPTS + 1):
-                            texts = '；'.join(
-                                i.get('text') or '' for i in (guard_res.get('issues') or [])
-                                if i.get('severity') == 'chain') or '结构级链式问题'
-                            if on_progress:
-                                on_progress('chain_guard_autofix', {
-                                    'beat': beat, 'sequence': seq,
-                                    'attempt': attempt, 'max_attempts': _CHAIN_GUARD_AUTOFIX_ATTEMPTS,
-                                    'issues': guard_res.get('issues', []),
-                                    'message': f"🔧 第 {beat} 拍检出结构级问题，正在就地自动修复 "
-                                               f"IMG {seq:03d}（第 {attempt}/{_CHAIN_GUARD_AUTOFIX_ATTEMPTS} 次）：{texts}",
-                                })
-                            # 下游此刻还不存在，没有血统要清 → 不必连带重渲。
-                            # suppress_chain_guard：重渲内部不必再审这一拍，下面几行
-                            # 立刻就会拿 allow_halt=True 亲自再判一次。
-                            try:
-                                fix_res = fix_frame_issue(
-                                    config, title, prompt_block, seq,
-                                    on_progress=on_progress, cascade_downstream=False,
-                                    suppress_chain_guard=True,
-                                )
-                            except GenerationCancelled:
-                                raise
-                            except Exception as fix_err:
-                                # 修复本身没跑成（网关异常/没有可修的记录）≠ 这帧没问题。
-                                # 此刻 guard_res 仍是 halt，跳出去让下面的停链分支接管——
-                                # 绝不能吞掉异常继续往下渲，那等于拿一张已知有结构问题的
-                                # 图当所有下游帧的 i2i 基底。
-                                log('WARN', 'CHAIN_GUARD',
-                                    f"IMG {seq:03d} 自动修复第 {attempt} 次未跑成，转为停链: {fix_err}")
-                                break
-                            # 三联屏门禁判这次修复把画面改坏了 → 已经自动退回上一版，
-                            # 帧图与提示词都回到了修复前。再修一次只会拿同样的输入跑出
-                            # 同样的结果，每一轮还要白烧一整套守卫复审。当场转停链，让
-                            # 人来看：修后那一版留档在 .frame_fixes/<seq>_rejected，
-                            # 门禁误判的话可以在帧网格「采用修后版」。
-                            if (fix_res or {}).get('rolled_back'):
-                                log('WARN', 'CHAIN_GUARD',
-                                    f"IMG {seq:03d} 自动修复第 {attempt} 次被三联屏门禁退回"
-                                    f"（画面已还原），转为停链等人处理")
+                        def _resync_from_disk():
+                            """守卫与自动修复都是隔着磁盘改 manifest 的，改完必须把这一份
+                            内存副本追上去——否则本函数收尾那次整份写盘会把它们全盖掉。"""
+                            updated_manifest = read_manifest(project_dir)
+                            if updated_manifest and 'frames' in updated_manifest:
+                                manifest['frames'] = updated_manifest['frames']
+                                for f_entry in manifest['frames']:
+                                    if f_entry.get('sequence') == seq:
+                                        manifest_frames_by_seq[seq] = f_entry
+                                        break
+
+                        # 定向重渲（单帧重试 / fix_frame_issue 的连带重渲）只审不停也不自动修：
+                        # 那一趟的下游帧本来就要被重新盖掉，中途停链会留下一条修了一半的链
+                        # （上游新图 + 下游旧血统），正是 cascade_downstream 要消灭的
+                        # stale_lineage；而自动修复本身就是靠调 fix_frame_issue 实现的，
+                        # 在它内部再触发一次就是无限递归。停与修都只在向前建链时才成立。
+                        forward_build = (target_sequences is None)
+                        guard_res = guard_beat(
+                            config, title, prompt_block, beat, project_dir,
+                            on_progress=on_progress,
+                            allow_halt=forward_build,
+                        )
+                        _resync_from_disk()
+
+                        # autofix：就地走一遍「修复此帧问题」，复审过了就接着往下渲。
+                        if guard_res.get('halt') and guard_autofix_enabled(guard_mode) and forward_build:
+                            from pipeline_orchestrator import fix_frame_issue
+                            for attempt in range(1, _CHAIN_GUARD_AUTOFIX_ATTEMPTS + 1):
+                                texts = '；'.join(
+                                    i.get('text') or '' for i in (guard_res.get('issues') or [])
+                                    if i.get('severity') == 'chain') or '结构级链式问题'
                                 if on_progress:
-                                    on_progress('chain_guard_autofix_rolled_back', {
-                                        'beat': beat, 'sequence': seq, 'attempt': attempt,
-                                        'triptych': (fix_res or {}).get('triptych'),
-                                        'rejected_fix': (fix_res or {}).get('rejected_fix'),
-                                        'message': f"↩️ IMG {seq:03d} 第 {attempt} 次自动修复被三联屏门禁退回，"
-                                                   f"画面已还原为修复前，转为停链等人处理",
+                                    on_progress('chain_guard_autofix', {
+                                        'beat': beat, 'sequence': seq,
+                                        'attempt': attempt, 'max_attempts': _CHAIN_GUARD_AUTOFIX_ATTEMPTS,
+                                        'issues': guard_res.get('issues', []),
+                                        'message': f"🔧 第 {beat} 拍检出结构级问题，正在就地自动修复 "
+                                                   f"IMG {seq:03d}（第 {attempt}/{_CHAIN_GUARD_AUTOFIX_ATTEMPTS} 次）：{texts}",
                                     })
+                                # 下游此刻还不存在，没有血统要清 → 不必连带重渲。
+                                # suppress_chain_guard：重渲内部不必再审这一拍，下面几行
+                                # 立刻就会拿 allow_halt=True 亲自再判一次。
+                                try:
+                                    fix_res = fix_frame_issue(
+                                        config, title, prompt_block, seq,
+                                        on_progress=on_progress, cascade_downstream=False,
+                                        suppress_chain_guard=True,
+                                    )
+                                except GenerationCancelled:
+                                    raise
+                                except Exception as fix_err:
+                                    # 修复本身没跑成（网关异常/没有可修的记录）≠ 这帧没问题。
+                                    # 此刻 guard_res 仍是 halt，跳出去让下面的停链分支接管——
+                                    # 绝不能吞掉异常继续往下渲，那等于拿一张已知有结构问题的
+                                    # 图当所有下游帧的 i2i 基底。
+                                    log('WARN', 'CHAIN_GUARD',
+                                        f"IMG {seq:03d} 自动修复第 {attempt} 次未跑成，转为停链: {fix_err}")
+                                    break
+                                # 三联屏门禁判这次修复把画面改坏了 → 已经自动退回上一版，
+                                # 帧图与提示词都回到了修复前。再修一次只会拿同样的输入跑出
+                                # 同样的结果，每一轮还要白烧一整套守卫复审。当场转停链，让
+                                # 人来看：修后那一版留档在 .frame_fixes/<seq>_rejected，
+                                # 门禁误判的话可以在帧网格「采用修后版」。
+                                if (fix_res or {}).get('rolled_back'):
+                                    log('WARN', 'CHAIN_GUARD',
+                                        f"IMG {seq:03d} 自动修复第 {attempt} 次被三联屏门禁退回"
+                                        f"（画面已还原），转为停链等人处理")
+                                    if on_progress:
+                                        on_progress('chain_guard_autofix_rolled_back', {
+                                            'beat': beat, 'sequence': seq, 'attempt': attempt,
+                                            'triptych': (fix_res or {}).get('triptych'),
+                                            'rejected_fix': (fix_res or {}).get('rejected_fix'),
+                                            'message': f"↩️ IMG {seq:03d} 第 {attempt} 次自动修复被三联屏门禁退回，"
+                                                       f"画面已还原为修复前，转为停链等人处理",
+                                        })
+                                    _resync_from_disk()
+                                    break
+
+                                new_block = (fix_res or {}).get('prompt_block')
+                                if new_block:
+                                    # 这一拍的 IMAGE/VIDEO 正文被改写过了。后续帧的提示词
+                                    # 没变（prompts 不用重解析），但之后每一拍的守卫都要
+                                    # 拿着改写后的全文当上下文，否则它对着旧文本判新画面。
+                                    prompt_block = new_block
+                                    autofixed_prompt_block = new_block
                                 _resync_from_disk()
-                                break
 
-                            new_block = (fix_res or {}).get('prompt_block')
-                            if new_block:
-                                # 这一拍的 IMAGE/VIDEO 正文被改写过了。后续帧的提示词
-                                # 没变（prompts 不用重解析），但之后每一拍的守卫都要
-                                # 拿着改写后的全文当上下文，否则它对着旧文本判新画面。
-                                prompt_block = new_block
-                                autofixed_prompt_block = new_block
-                            _resync_from_disk()
+                                guard_res = guard_beat(
+                                    config, title, prompt_block, beat, project_dir,
+                                    on_progress=on_progress, allow_halt=True,
+                                )
+                                _resync_from_disk()
+                                if not guard_res.get('halt'):
+                                    if on_progress:
+                                        on_progress('chain_guard_autofix_done', {
+                                            'beat': beat, 'sequence': seq, 'attempt': attempt,
+                                            'message': f"✅ IMG {seq:03d} 自动修复后复审通过（第 {attempt} 次），继续往下生成",
+                                        })
+                                    break
 
-                            guard_res = guard_beat(
-                                config, title, prompt_block, beat, project_dir,
-                                on_progress=on_progress, allow_halt=True,
-                            )
-                            _resync_from_disk()
-                            if not guard_res.get('halt'):
-                                if on_progress:
-                                    on_progress('chain_guard_autofix_done', {
-                                        'beat': beat, 'sequence': seq, 'attempt': attempt,
-                                        'message': f"✅ IMG {seq:03d} 自动修复后复审通过（第 {attempt} 次），继续往下生成",
-                                    })
-                                break
-
-                    # halt 档一检出就停；autofix 档修满次数仍不过才停——继续往下渲
-                    # 等于让一张已知有结构问题的图当所有下游帧的 i2i 基底。
-                    if guard_res.get('halt') and guard_mode in ('halt', 'autofix'):
-                        manifest['halted_at_beat'] = beat
-                        if on_progress:
-                            tail = ('' if guard_mode == 'halt'
-                                    else f"（已自动修复 {_CHAIN_GUARD_AUTOFIX_ATTEMPTS} 次仍未通过）")
-                            on_progress('chain_guard_halt', {
+                        # halt 档一检出就停；autofix 档修满次数仍不过才停——继续往下渲
+                        # 等于让一张已知有结构问题的图当所有下游帧的 i2i 基底。
+                        # autofix_soft 是明确接受这笔代价的那一档：只记账，不停链。
+                        still_flagged = bool(guard_res.get('halt'))
+                        if still_flagged and guard_halt_enabled(guard_mode):
+                            manifest['halted_at_beat'] = beat
+                            manifest['halted_at_sequence'] = seq
+                            if on_progress:
+                                tail = ('' if guard_mode == 'halt'
+                                        else f"（已自动修复 {_CHAIN_GUARD_AUTOFIX_ATTEMPTS} 次仍未通过）")
+                                on_progress('chain_guard_halt', {
+                                    'beat': beat,
+                                    'sequence': seq,
+                                    'issues': guard_res.get('issues', []),
+                                    'autofix_exhausted': guard_autofix_enabled(guard_mode),
+                                    'message': f"第 {beat} 拍（IMG {prev_seq:03d}→{seq:03d}）检出结构级链式问题{tail}，生成已自动暂停，请检查并修复此帧问题。",
+                                })
+                            break
+                        if still_flagged and guard_mode == 'autofix_soft' and on_progress:
+                            on_progress('chain_guard_soft_continue', {
                                 'beat': beat,
                                 'sequence': seq,
                                 'issues': guard_res.get('issues', []),
-                                'autofix_exhausted': guard_mode == 'autofix',
-                                'message': f"第 {beat} 拍（IMG {prev_seq:03d}→{seq:03d}）检出结构级链式问题{tail}，生成已自动暂停，请检查并修复此帧问题。",
+                                'autofix_exhausted': True,
+                                'message': f"⚠️ 第 {beat} 拍（IMG {prev_seq:03d}→{seq:03d}）仍有结构级问题"
+                                           f"（已自动修复 {_CHAIN_GUARD_AUTOFIX_ATTEMPTS} 次），软档不停链——"
+                                           f"已记入待复核清单，继续往下渲。",
                             })
-                        break
-                except Exception as guard_err:
-                    log('WARN', 'CHAIN_GUARD', f"拍 {beat} 链上守卫执行异常: {guard_err}")
+                    except Exception as guard_err:
+                        log('WARN', 'CHAIN_GUARD', f"拍 {beat} 链上守卫执行异常: {guard_err}")
 
     # Finalize stale status & capability stamping
     try:
@@ -1354,10 +1878,15 @@ def switch_frame_candidate(title, seq, new_candidate_index):
                 frame['vlm_qa_reason'] = f"人工切换为候选 #{new_candidate_index}"
                 if new_uuid:
                     frame['fx_uuid'] = new_uuid
-                for cand in frame.get('candidates', []):
-                    is_this = (cand.get('index') == new_candidate_index)
-                    cand['is_chosen'] = is_this
-                    if is_this and cand.get('model'):
+                full_cands, _, _ = sync_frame_candidates_pool(
+                    frames_dir, seq,
+                    current_frame=frame,
+                    target_path=target_frame_path,
+                    auto_archive_current=False
+                )
+                frame['candidates'] = full_cands
+                for cand in full_cands:
+                    if cand.get('index') == new_candidate_index and cand.get('model'):
                         frame['model'] = cand['model']
                 break
 

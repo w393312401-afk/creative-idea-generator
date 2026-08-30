@@ -214,6 +214,21 @@ const SLOT_ACTION_HANDLERS = {
     'undo-fix': seq => undoFrameFix(seq),
     'adopt-fix': seq => adoptRejectedFix(seq),
     'describe-frame': seq => describeFrameIssue(seq, currentFrameManualIssue(seq)),
+    'compare-benchmark': seq => {
+        if (typeof openBenchmarkCompare === 'function') {
+            openBenchmarkCompare({
+                idea: typeof currentIdea !== 'undefined' ? currentIdea : null,
+                seq,
+            });
+        } else if (typeof openCollageViewer === 'function') {
+            openCollageViewer({
+                idea: typeof currentIdea !== 'undefined' ? currentIdea : null,
+                initialMode: 'compare',
+                compareType: 'benchmark',
+                initialFrameSeq: seq,
+            });
+        }
+    },
     'view-candidates': seq => {
         if (typeof openCandidateSelectionModal === 'function') {
             openCandidateSelectionModal(seq);
@@ -245,7 +260,8 @@ function currentFrameManualIssue(seq) {
  * 当前内容（旧实现用的是渲染时刻的闭包快照）。
  */
 function openSlotLightbox(type, seq) {
-    const run = (typeof currentIdea !== 'undefined' && currentIdea && currentIdea.frameRun) || null;
+    const idea = typeof currentIdea !== 'undefined' ? currentIdea : null;
+    const run = (idea && idea.frameRun) || null;
     if (!run) return;
     if (type === 'video') {
         const valid = (run.videos || []).filter(v => v.url || v.file);
@@ -262,13 +278,33 @@ function openSlotLightbox(type, seq) {
     }
     const valid = (run.frames || []).filter(f => f.url || f.file);
     if (!valid.length) return;
-    const mediaList = valid.map(f => ({
-        type: 'image',
-        url: f.url || f.file,
-        caption: `<strong>第 ${f.sequence} 帧 / 共 ${valid.length} 帧</strong>`,
-    }));
-    const idx = valid.findIndex(f => Number(f.sequence) === Number(seq));
-    openLightbox(mediaList, idx >= 0 ? idx : 0);
+
+    const refFrames = (idea && (idea.ref_frames || (idea.frameRun && idea.frameRun.ref_frames))) || {};
+    const mediaList = [];
+    let targetIdx = 0;
+
+    valid.forEach((f, i) => {
+        const seqNum = Number(f.sequence);
+        const isCurrent = (seqNum === Number(seq));
+        if (isCurrent) {
+            targetIdx = mediaList.length;
+        }
+        mediaList.push({
+            type: 'image',
+            url: f.url || f.file,
+            caption: `<strong>🌟 第 ${seqNum} 拍生成关键帧 (IMG ${String(seqNum).padStart(3, '0')})</strong> [${i + 1}/${valid.length}]`,
+        });
+        const refUrl = refFrames[seqNum] || refFrames[String(seqNum)];
+        if (refUrl) {
+            mediaList.push({
+                type: 'image',
+                url: refUrl,
+                caption: `<strong>🎯 第 ${seqNum} 拍爆款原片基准抽帧 (REF ${String(seqNum).padStart(3, '0')})</strong> [爆款对标基准]`,
+            });
+        }
+    });
+
+    openLightbox(mediaList, targetIdx);
 }
 
 /**

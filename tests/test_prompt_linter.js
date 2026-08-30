@@ -134,4 +134,84 @@ Teak wood plank flooring complete, with wet floor and high glossy mirror reflect
     assert.strictEqual(issue.severity, 'error');
 }
 
+// 8. 测试公制空间尺寸与防透视畸变 (RULE_METRIC_SPACE_ENVELOPE)
+{
+    const perspectiveBlock = `图片提示词
+图片 1:
+Static shot looking down an endless narrow tunnel with one-point perspective and vanishing point at center.
+`;
+    const res = ctx.lintPromptBlock(perspectiveBlock);
+    assert.strictEqual(res.passed, false, '单点透视/狭长隧道高危词应拦截');
+    const issue = res.issues.find(i => i.ruleId === 'RULE_METRIC_SPACE_ENVELOPE');
+    assert.ok(issue, '应触发 RULE_METRIC_SPACE_ENVELOPE');
+    assert.ok(issue.matchedText.includes('vanishing point'));
+
+    const cavernousBlock = `图片提示词
+图片 1:
+A miniature diorama excavation pit with a cavernous hall and two-tier bunk bed inside.
+`;
+    const resCavern = ctx.lintPromptBlock(cavernousBlock);
+    assert.strictEqual(resCavern.passed, false, '紧凑地穴沙盘塞入大礼堂/双层床应拦截');
+    const issueCav = resCavern.issues.find(i => i.ruleId === 'RULE_METRIC_SPACE_ENVELOPE');
+    assert.ok(issueCav, '应触发 RULE_METRIC_SPACE_ENVELOPE');
+}
+
+// 9. 测试单向基准轴线与防菱形旋转 (RULE_SINGLE_GROUND_BASELINE)
+{
+    const skewBlock = `图片提示词
+图片 1:
+High-angle perspective showing foundation trench on an isometric diamond grid with 45 degree oblique angle.
+`;
+    const res = ctx.lintPromptBlock(skewBlock);
+    assert.strictEqual(res.passed, false, '菱形轴线与斜向网格应拦截');
+    const issue = res.issues.find(i => i.ruleId === 'RULE_SINGLE_GROUND_BASELINE');
+    assert.ok(issue, '应触发 RULE_SINGLE_GROUND_BASELINE');
+
+    const zenithBlock = `图片提示词
+图片 1:
+A vertical aerial map top-down view of the ground excavation layout.
+`;
+    const resZen = ctx.lintPromptBlock(zenithBlock);
+    assert.strictEqual(resZen.passed, false, '90° 纯正交顶视应拦截');
+    const issueZen = resZen.issues.find(i => i.ruleId === 'RULE_SINGLE_GROUND_BASELINE');
+    assert.ok(issueZen, '应触发 RULE_SINGLE_GROUND_BASELINE');
+}
+
+// 10. 测试活物动态应激与防静态假人 (RULE_LIVING_CAST_STATIC)
+{
+    const staticCastBlock = `图片提示词
+图片 1:
+A miniature diorama craft site, two small figurines remain standing unchanged in place at bottom-left observing.
+`;
+    const res = ctx.lintPromptBlock(staticCastBlock);
+    assert.strictEqual(res.passed, false, '人偶静态钉死不动应拦截');
+    const issue = res.issues.find(i => i.ruleId === 'RULE_LIVING_CAST_STATIC');
+    assert.ok(issue, '应触发 RULE_LIVING_CAST_STATIC');
+}
+
+// 11. 测试流浪落魄人偶做旧与天地大景深 (RULE_DESTITUTE_CAST_CLEANLINESS)
+{
+    const cleanCastBlock = `图片提示词
+图片 1:
+A miniature diorama earth shelter with destitute refugees wearing clean royal blue shirt and crisp modern clothing.
+`;
+    const res = ctx.lintPromptBlock(cleanCastBlock);
+    assert.strictEqual(res.passed, false, '初期受助灾民衣着崭新光鲜应拦截');
+    const issue = res.issues.find(i => i.ruleId === 'RULE_DESTITUTE_CAST_CLEANLINESS');
+    assert.ok(issue, '应触发 RULE_DESTITUTE_CAST_CLEANLINESS');
+}
+
+// 12. 测试机位景别开篇显式声明 (RULE_CINEMATOGRAPHY_HEADER)
+{
+    const noCameraBlock = `图片提示词
+图片 1:
+The wooden cabin sits on a dry hillside with morning sun shining from the left.
+`;
+    const res = ctx.lintPromptBlock(noCameraBlock);
+    assert.strictEqual(res.passed, false, '开篇第一句缺失摄影机位景别声明应拦截');
+    const issue = res.issues.find(i => i.ruleId === 'RULE_CINEMATOGRAPHY_HEADER');
+    assert.ok(issue, '应触发 RULE_CINEMATOGRAPHY_HEADER');
+}
+
 console.log('✔ 所有 Pre-flight Prompt Linter 单元测试通过！');
+

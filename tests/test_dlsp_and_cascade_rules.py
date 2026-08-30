@@ -11,16 +11,29 @@ class TestDLSPAndCascadeRules(unittest.TestCase):
         self.assertIn('MATTE FINISH & NO WET GLOSSY REFLECTIONS', prompt)
         self.assertIn('FULL-FIELD DELTA CONSERVATION & MULTI-ZONE MAPPING', prompt)
         self.assertIn('TWO-SHOT DECOUPLED CROSSING', prompt)
+        self.assertIn('SINGLE HORIZONTAL GROUND BASELINE & ANTI-ISOMETRIC SKEWING', prompt)
+        self.assertIn('LIVING CAST ACTION-REACTION TRIAD', prompt)
+        self.assertIn('THREE-LAYER DEEP ENVIRONMENTAL STAGING', prompt)
         self.assertIn('24mm wide-angle', prompt)
         self.assertIn('1.3m chest-level eye height', prompt)
 
     def test_global_prompt_has_dlsp_and_asymmetry(self):
         prompt = pp._global_review_system_prompt()
         self.assertIn('ASYMMETRIC LANDMARKS & DLSP 5-LAYER DEPTH PERSISTENCE', prompt)
+        self.assertIn('SINGLE BASELINE & ROTATION LOCK', prompt)
+        self.assertIn('THREE-LAYER ENVIRONMENTAL HORIZON PRESERVATION', prompt)
         self.assertIn('Layer 1 foreground', prompt)
         self.assertIn('Layer 2 midground', prompt)
         self.assertIn('Layer 3 longitudinal', prompt)
         self.assertIn('Layer 4 background', prompt)
+
+    def test_chain_guard_classifier_has_baseline_and_cast_rules(self):
+        import chain_guard
+        classifier_prompt = chain_guard._CHAIN_CLASSIFIER_SYSTEM_PROMPT
+        self.assertIn('isometric diamond grid skewing', classifier_prompt)
+        self.assertIn('loss of horizontal ground baseline', classifier_prompt)
+        self.assertIn('cavernous hall or narrow tunnel distortion', classifier_prompt)
+        self.assertIn('frozen static mannequin', classifier_prompt)
 
     def test_fix_beat_sandwich_notes_contains_dlsp(self):
         with patch.object(pp, '_chat', return_value='{"video": "v", "image": "i"}') as mock_chat:
@@ -39,3 +52,4 @@ class TestDLSPAndCascadeRules(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+

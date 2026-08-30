@@ -21,6 +21,31 @@ import json
 import sys
 
 import prompt_pipeline as pp
+from server_common import OMNI_VIDEO_DURATIONS
+
+
+# 2026-08-30「僵直时间」排查：Omni 面板时长此前是整批盲选一个默认值（通常是服务端
+# 持久化下来的 10 秒），与本批拍子实际的内容量无关——拍重普遍偏低的一批仍要求生成
+# 10 秒，模型填不满只能在片尾定住不动。这里按整条 beat_ladder 的拍重中位数，反推一个
+# 更贴合内容量的 Omni 档位；只在调用方（resolve_video_duration）没有更高优先级的显式
+# 配置时才会被用上，不会覆盖用户主动选择的时长。
+def _infer_batch_duration_hint(beat_ladder):
+    """按 beat_ladder 的拍重中位数推算一个 Omni 档位（4/6/8/10s 之一）。
+
+    用中位数而不是均值：个别揭示/过门拍的高拍重不该把整批的档位选择拉偏。运镜拍
+    （threshold/reward/bridge/hard_cut，beat_delta_weight 返回 None）不计入统计——它们
+    的时长是叙事设计的一部分，见 beat_clip_speed 的同款排除。beat_ladder 缺失/为空
+    （Phase 1、单镜 base/Veo 链路）或全是运镜拍时返回 None，调用方回落到既有默认值。
+    """
+    weights = [w for w in pp.ladder_delta_weights(beat_ladder) if w]
+    if not weights:
+        return None
+    weights.sort()
+    n = len(weights)
+    mid = n // 2
+    median_weight = weights[mid] if n % 2 else (weights[mid - 1] + weights[mid]) / 2.0
+    implied_seconds = pp.beat_clip_seconds(median_weight)
+    return min(OMNI_VIDEO_DURATIONS, key=lambda d: abs(d - implied_seconds))
 
 
 class BaseComposer:
@@ -33,13 +58,20 @@ class BaseComposer:
         # （例如"用户明确要院线感"），而钩子签名里没有它。
         self.config = None
         self.state = None
+        # Omni 面板时长的内容量提示，同样由 begin_run 填。见 _infer_batch_duration_hint。
+        self._duration_hint = None
 
     # ── 可覆写钩子（默认全部原样委托给 prompt_pipeline 的模块级实现）──────────
 
     def begin_run(self, config, state):
-        """每次 Phase 2 开跑时调用一次，让子类拿到本单的 config/state。base 只记下来。"""
+        """每次 Phase 2 开跑时调用一次，让子类拿到本单的 config/state。base 只记下来。
+
+        顺带按 state['beat_ladder']（有就有，Phase 1 阶段这个键还不存在）推算一个
+        Omni 时长提示，供 OmniComposer.clip_duration() 使用——base/Veo 线不读这个
+        属性，计算了也不影响它。"""
         self.config = config
         self.state = state
+        self._duration_hint = _infer_batch_duration_hint((state or {}).get('beat_ladder'))
 
     def banned_elements_block(self):
         """反推复刻线的负面清单段落。非复刻单返回空串。
@@ -116,7 +148,16 @@ class BaseComposer:
             "or hi-vis vest appears unless the list itself says so), never let a later beat "
             "change ethnicity, skin tone, hair, or clothing colour, and never add a second person "
             "who is not on this list. What changes from beat to beat is only the POSE and the "
-            "action, never the person.\n" if cast else "")
+            "action, never the person.\n"
+            # 活物一律真人（prompt_pipeline.human_cast）：外形锁得再死，只要正文管他们叫
+            # figurine/doll，生图模型就照着渲蜡像。恒常项那一栏已经在落地时归一过措辞，
+            # 这里把同一条要求明说给写手，两头一致。
+            + "Everyone on this list is a REAL HUMAN BEING: real skin, real hair, real fabric "
+              "clothing, natural human posture and weight. Never write them as figurines, dolls, "
+              "mannequins, wax figures, or resin/plastic models, and never describe their skin, "
+              "hair or clothing as resin, plastic, porcelain, vinyl or wax. If the scene is a "
+              "miniature set, they are small people, not toys — their size is governed by the "
+              "scale lock alone.\n" if cast else "")
         # 环境底噪与 motion 是同一件事的两半：那条管「画面里一直在动的」，这条管
         # 「声轨上一直在响的」。它的失效方式是**每条 VIDEO 各编一句**——这一拍林间风、
         # 下一拍城市车流，整片的声场一拍一个样。每拍自己的 sfx 是「这一下活儿的声音」，
@@ -209,7 +250,7 @@ Instructions:
 - VIDEO {i} must start with: "Use the provided first frame and last frame as exact composition anchors. Use IMAGE {i} as the actual first-frame image and IMAGE {i+1} as the actual last-frame image; every visible action must interpolate between those two frame images without inventing a third layout."
 - VIDEO {i} must use progressive (-ing) verbs for ongoing actions, name worker silhouettes (HAL) and tools (MTAL) if workers are present, encapsulate bulk materials in rigid containers (VMFP/RCE), and include pacing control "continuous construction time-lapse, not real-time footage" (unless threshold or reward).
 - EVEN RATE (unless threshold or reward): the clip must also state that the transformation advances continuously and at an even rate across the entire clip duration — at every moment something is visibly progressing, no interval of the clip is static or paused, and no part of the change is deferred and then delivered as a single sudden step. Distribute the beat's work evenly over the whole clip; never describe the scene as holding, settling, or waiting mid-clip, and never save a visible portion of the milestone for the final moment.
-- VIDEO {i} CONCRETENESS (no abstractions): describe the SAME single lone worker every beat, reusing the exact costume from the packet worker_choreography (e.g. "one lone worker in a solid pale shirt, dark pants, and dark cap"); name the ONE specific manual tool used; describe the concrete repeated work cycle in -ing verbs (e.g. scooping, lifting, pressing, fastening). NEVER write vague filler like "transformation progresses" or "the scene transforms" — show observable physical actions only.
+- VIDEO {i} CONCRETENESS (no abstractions): describe the SAME single lone worker every beat, reusing the exact costume from the packet worker_choreography (e.g. "one lone worker in a solid pale shirt, dark pants, and dark cap"); name the ONE specific manual tool used; describe the worker repeatedly performing the work cycle in -ing verbs (e.g. scooping, lifting, pressing, fastening), each pass carrying natural variation in weight, angle, and pace — never an identical robotic loop. NEVER write vague filler like "transformation progresses" or "the scene transforms" — show observable physical actions only.
 - FULL-FIELD DELTA CONSERVATION & MULTI-ZONE ACTION COVERAGE (P0): In VIDEO {i}, all physical differences between IMAGE {i} and IMAGE {i+1} across 4 spatial zones (Top/Roof/Ceiling, Middle/Walls/Openings, Bottom/Floor/Approach, Peripherals/Spoil/Materials) MUST have 100% assigned worker actions, explicit geometric tools, and corresponding audio SFX. If IMAGE {i+1} shows structural demolition (e.g. rotted roof boards/membrane stripped away) or debris cleared alongside ground work, VIDEO {i} MUST explicitly describe the worker dismantling and tossing/stacking those roof elements into designated spoil piles as well as the ground clearing. Zero phantom changes: never leave any changing zone unacted. Material balance: demolition debris must visibly stack/bundle, and installed materials must deplete.
 - VIDEO {i} must end with a PERSISTENT-TRACES clause naming the marks this beat leaves behind (e.g. scrape grooves, end-grain circles, screw heads, nail rows, sawdust trails, trimmed edges, compression tracks), followed by a natural-language description of both the near-field diegetic sound effects (2-4 specific sounds of tools, materials, or footsteps) and the steady room/environment ambient noise. Use varied phrasing for these audio descriptions rather than a single formulaic structure.
 - IMAGE {i+1} must be a clean frame with ZERO workers/machinery. Do NOT use the words 'worker', 'builder', 'carpenter', 'laborer', 'person', 'man', 'woman', or 'people' under any circumstances, even to state that they are absent or not present. Describe only static objects, surfaces, and traces. {contract['anchor_rule']} Then describe this beat's state delta following its own STAGE SCOPE TIER (see the STAGE SCOPE FOR THIS BEAT instruction below). Also include a FEW (2-3, not exhaustive) PERSISTENT physical traces that prove the work happened (scrape marks, fastener heads, sawdust, membrane wrinkles, displaced soil, etc.).
@@ -239,6 +280,7 @@ Instructions:
   1. Zero Frozen Figures: Never describe workers, figurines, characters, or animals as static, holding still, unmoving, or holding their previous posture (FORBIDDEN: 'remain standing', 'stay put', 'static in place', 'unchanged', 'standing still', 'holding position', 'where they were', 'same posture').
   2. Action-Reaction Causal Chain: Every beat's VIDEO must describe active, continuous physical kinetic labor and bodily posture transitions from the starting image's pose to the resulting image's settled pose (e.g. Inception Reflex -> Active Tool/Hand Movement -> Settled Landing Posture).
   3. Identity Locked vs Pose Decoupled: Restate their fixed identity, costume, and scale verbatim, but ensure their pose, action, and physical placement dynamically evolve across every single beat.
+  4. Natural Human Body Mechanics (applies to the working figure too, not only bystanders): the Action-Reaction Causal Chain above is a body's real physical mechanics, not a smooth constant-speed glide between the starting pose and the landing pose — weight shifts onto the working leg or arm before each effort, the torso leans and counter-rotates with the load, each repeated pass lands at a slightly different angle and pace than the last, and there is a brief natural settle between reaching for a tool and gripping it. Describe THIS, not a mechanically identical repeating loop.
 - Output the prompts in the following format:
 ===VIDEO===
 <video prompt body>
@@ -479,6 +521,11 @@ Instructions:
                 config, i, contract, packet, compiled_images, compiled_videos,
                 scup_ref, tbcp_ref_i)
             beat_user = f"Generate prompts for Beat {i}: {beat.get('operation', '')} - {beat.get('description', '')}."
+            # 单拍兜底也要吃到原片实拍事实卡：批量那一窗失败退到这里的拍，如果反而看不见
+            # 画面依据，同一单里就会出现"多数拍照着原片写、少数拍凭空想"的花斑。
+            _observed = pp._observed_block_for_beat(config.get('_observed_digests'), i)
+            if _observed:
+                beat_user = f"{beat_user}\n\n{_observed}"
 
             vid_prompt = ""
             img_prompt = ""
@@ -750,7 +797,9 @@ Instructions:
             任何传输层失败都返回空字典 —— 这一窗的拍照旧退回逐拍通路。"""
             batch_system = self.batch_system_prompt(config, packet, scup_ref, tbcp_ref)
             first_anchor_image = compiled_images.get(batch_beats[0], '')
-            batch_user = pp._build_batch_user_message(batch_beats, contracts, first_anchor_image)
+            batch_user = pp._build_batch_user_message(
+                batch_beats, contracts, first_anchor_image,
+                observed_digests=config.get('_observed_digests'))
             markers = []
             for i in batch_beats:
                 markers += [f'===BEAT {i} VIDEO===', f'===BEAT {i} IMAGE===', f'===BEAT {i} TRACES===']

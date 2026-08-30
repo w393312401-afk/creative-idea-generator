@@ -320,8 +320,10 @@ _LLM_MUTATE_BEATS_SYSTEM = """你是一位顶尖的纪录片级视觉短视频�
    - 轴 2 材质工艺 (Material): 将原建筑材质（如红砖、水泥砌块、普通原木等）全部替换为目标新材料（如耐寒炭化木、气凝胶保温层、耐候钢、火山玄武岩等）。
    - 轴 3 功能设施 (Function): 将空间功能与软装全部替换为目标新功能（如防寒壁炉、气闸保暖舱、恒温水窖等）。
    - 轴 4 终极奇观 (Hero Reveal): 将终拍的揭示物替换为目标终极生物/自然奇观。
-3. 【拍摄尺度与活物继承】：
-   - 若母本为微缩沙盘（Miniature Diorama / 巨人手 Craftsman Hands / 微缩人偶 Miniature Figurines），必须严格保留工匠手操作、微距景深与微缩人偶 living cast，但所有建造对象、工具和物料必须完全变成新材质！
+3. 【拍摄尺度与活物/环境纵深继承（Rule 17 铁律）】：
+   - 【天地山云三层大景深环境】：新环境必须显式保留三层大景深（远景天空 + 漂浮自然云层 + 连绵远山地平线；中景微缩建筑；近景真实地表沙石泥土杂草），严禁使用死黑背景或单一贴面虚化切断天地纵深！
+   - 【流浪难民/落魄人偶体貌锁死】：若母本为微缩沙盘且存在常驻人偶（Miniature Figurines），人偶必须维持**落魄流浪者/贫民灾民体态与极其破旧磨损做旧服饰**（严重磨损褪色、沾满泥土尘垢、毛边撕裂粗麻布、面容消瘦憔悴、初始绝望无助），**严禁将人偶描写为衣着光鲜的游客或崭新现代服饰（如 clean royal blue shirt, new floral dress）**！
+   - 【微缩巨人手与操作尺度】：若母本为微缩沙盘（Miniature Diorama / 巨人手 Craftsman Hands），必须严格保留工匠手操作与微缩人偶 living cast，但所有建造对象、工具和物料必须完全变成新材质！
    - 若母本为全尺寸真人施工，保留真人与对应工具。
 4. 【去科幻与真实写实】：所有施工动作、工具与物料必须符合真实物理工序逻辑。
 
@@ -347,6 +349,7 @@ def _llm_mutate_beats(
     effective_axes: Dict[str, Any],
     baseline_doc: Dict[str, Any],
     brief: Optional[str] = None,
+    on_progress: Optional[Any] = None,
 ) -> Optional[List[Dict[str, Any]]]:
     """调用大模型对全量节拍进行四轴正交智能重写。"""
     if not config:
@@ -394,6 +397,15 @@ def _llm_mutate_beats(
         f"请直接输出包含精确 {len(beats_input)} 拍正交重写结果的 JSON 数组。"
     )
 
+    if on_progress:
+        on_progress('replica_stage', {
+            'stage': 'mutate_beats',
+            'action': 'mutate_orthogonal',
+            'message': f'正在调用大模型按四轴正交矩阵重构 {len(beats_input)} 拍工序...',
+            'done': 2,
+            'total': 5,
+        })
+
     try:
         raw = pp._chat(
             config=config,
@@ -418,6 +430,7 @@ def generate_orthogonal_variant(
     preset: Optional[str] = None,
     brief: Optional[str] = None,
     config: Optional[Dict[str, Any]] = None,
+    on_progress: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """通过词槽正交映射与大模型智能重构生成二创变体，严格确保物理骨架零坍塌、零漂移。
 
@@ -427,6 +440,7 @@ def generate_orthogonal_variant(
         preset: 预置名称 (polar / volcano / cyber / cave / custom)
         brief: 用户补充指示
         config: LLM 配置 (可选)
+        on_progress: 进度回调函数 (可选)
 
     返回:
         variant_beats_doc: 派生的变体節拍阶梯数据字典
@@ -439,6 +453,15 @@ def generate_orthogonal_variant(
         source_beats = baseline_doc['beats']
     if not source_beats:
         raise ValueError('母本中未包含有效的節拍列表 (beats)')
+
+    if on_progress:
+        on_progress('replica_stage', {
+            'stage': 'mutate_beats',
+            'action': 'mutate_orthogonal',
+            'message': f'正在解析母本节拍骨架与四轴正交矩阵（共 {len(source_beats)} 拍）...',
+            'done': 1,
+            'total': 5,
+        })
 
     # 合并预置参数
     effective_axes = {}
@@ -464,6 +487,7 @@ def generate_orthogonal_variant(
         effective_axes=effective_axes,
         baseline_doc=baseline_doc,
         brief=brief,
+        on_progress=on_progress,
     )
 
     # 1. 骨架硬冻结 (Skeleton Freeze)
@@ -570,6 +594,15 @@ def generate_orthogonal_variant(
         'beats': variant_beats,
         'validation': [],
     }
+
+    if on_progress:
+        on_progress('replica_stage', {
+            'stage': 'mutate_beats',
+            'action': 'mutate_orthogonal',
+            'message': '正在执行 1:1 骨架硬冻结、ASMR 音效映射与留存痕迹计算...',
+            'done': 3,
+            'total': 5,
+        })
 
     return variant_doc
 

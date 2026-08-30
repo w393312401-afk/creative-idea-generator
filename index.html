@@ -123,7 +123,10 @@
             <div class="header-logo">
                 <div class="logo-icon">⚡</div>
                 <div class="logo-text">
-                    <h1>SPARK</h1>
+                    <div style="display: flex; align-items: center; gap: 8px;">
+                        <h1>SPARK</h1>
+                        <span id="spark-version-badge" class="version-badge-pill" title="查看版本详情" style="display: none;"></span>
+                    </div>
                     <span>创意点子激发中心</span>
                 </div>
             </div>
@@ -477,15 +480,15 @@
                                     <span class="section-icon">🎞️</span>
                                     <h3>连续帧序列生成</h3>
                                     <div class="section-tools">
-                                        <button type="button" class="section-tool-btn" data-pop="frames-settings-pop" title="生成设置：生图模型 / 调试限帧 / 一致性审查">⚙️</button>
+                                        <button type="button" class="section-tool-btn active" data-pop="frames-settings-pop" title="生成设置：生图模型 / 调试限帧 / 一致性审查">⚙️</button>
                                         <button type="button" class="section-tool-btn" data-pop="frames-info-pop" title="说明">ⓘ</button>
                                     </div>
                                 </div>
                                 <!-- 次级控件收进 ⚙ 弹层、常驻说明收进 ⓘ 弹层：两者原本挤在
                                      .frames-controls 一行里，把真正要看的帧网格推到折叠线以下。
                                      控件 id 全部不变（app.js 的 computeDebugTargets / 模型选择器
-                                     初始化照旧按 id 取元素）。 -->
-                                <div class="section-pop" id="frames-settings-pop" hidden>
+                                     初始化照旧按 id 取元素）。默认展开 ⚙ 设置参数。 -->
+                                <div class="section-pop" id="frames-settings-pop">
                                     <div class="frames-model-picker">
                                         <label for="frames-image-model">生图模型</label>
                                         <select id="frames-image-model"></select>
@@ -583,8 +586,8 @@
                                         <button type="button" class="slot-jump-btn" title="滚到第一个有问题的槽位" hidden>⚠ 跳到第一个问题</button>
                                         <!-- 一键重渲已改动帧：自动按帧号依次重新生成所有提示词被改过的帧 -->
                                         <button type="button" class="slot-retry-dirty-btn" title="一键按帧号依次重新生成所有提示词已改动的帧" hidden>⚡ 重渲已改动帧</button>
-                                        <!-- 交互式多宫格检查器：放大镜 / 邻帧对比 / 地平透视对齐 -->
-                                        <button type="button" class="slot-collage-btn" title="打开交互式 5 列多宫格检查器（放大镜 / 邻帧对比 / 地平透视对齐）" hidden>🖼️ 多宫格检查器</button>
+                                        <!-- 爆款原片节拍抽帧对标滑块 -->
+                                        <button type="button" class="slot-benchmark-btn" title="打开爆款原片对标滑块（逐拍滑动比对生成帧 vs 原片基准抽帧）" hidden>🎯 原片对标滑块</button>
                                         <!-- 一键全部修复：把所有画着「修复此帧问题」的格子（一致性审查未过
                                              或人工标记）按帧号依次走一遍定向修复。没有待修帧时自动隐藏。 -->
                                         <button type="button" class="slot-fix-all-btn" title="按帧号依次修复所有带待修问题的帧（一致性审查未过 + 人工标记）：逐帧优化提示词后图生图重渲，并对着新画面复核" hidden>🛠 全部修复</button>
@@ -619,11 +622,11 @@
                                     <span class="section-icon">🎬</span>
                                     <h3>本地 UI 自动化视频生成</h3>
                                     <div class="section-tools">
-                                        <button type="button" class="section-tool-btn" data-pop="videos-settings-pop" title="生成设置：调试限段">⚙️</button>
+                                        <button type="button" class="section-tool-btn active" data-pop="videos-settings-pop" title="生成设置：调试限段">⚙️</button>
                                         <button type="button" class="section-tool-btn" data-pop="videos-info-pop" title="说明">ⓘ</button>
                                     </div>
                                 </div>
-                                <div class="section-pop" id="videos-settings-pop" hidden>
+                                <div class="section-pop" id="videos-settings-pop">
                                     <div class="debug-limit-picker" title="调试模式：只生成前 N 段视频，快速验证提示词是否值得往下做，不用等整单跑完（注意每段视频需要对应的首尾帧已生成）">
                                         <label class="debug-limit-toggle">
                                             <input type="checkbox" id="videos-debug-enabled">
@@ -1551,6 +1554,28 @@
                         <div class="modal-info">
                             <p>💡 <b>服务端托管模式</b>：网关地址与 API 密钥由服务端 <b>server_config.json</b> 统一管理，浏览器无需（也无法）配置。端口永久固定：应用入口 <b>8085</b>，LLM 代理 <b>8046</b>（gpt-5.5 / gpt-image-2 由服务端自动路由）。</p>
                         </div>
+                        <div class="form-group settings-field" id="version-info-group">
+                            <label>版本与运行环境</label>
+                            <div class="version-details-card" id="version-details-card">
+                                <div class="version-row">
+                                    <span class="version-label">策略版本 (Policy):</span>
+                                    <span class="version-val" id="sys-policy-version">-</span>
+                                </div>
+                                <div class="version-row">
+                                    <span class="version-label">Git Commit:</span>
+                                    <span class="version-val" id="sys-git-commit">-</span>
+                                </div>
+                                <div class="version-row">
+                                    <span class="version-label">服务启动时间:</span>
+                                    <span class="version-val" id="sys-start-time">-</span>
+                                </div>
+                                <div class="version-row">
+                                    <span class="version-label">代码生效状态:</span>
+                                    <span class="version-val" id="sys-staleness-status">-</span>
+                                </div>
+                            </div>
+                            <small class="settings-hint">策略版本决定分镜生成与缓存失效策略；Git 状态与启动时间用于排查热重载与环境一致性。</small>
+                        </div>
                         <div class="form-group settings-field" id="cache-group">
                             <label>系统缓存</label>
                             <div class="settings-field-inline">
@@ -1565,6 +1590,7 @@
                                 <button id="clear-logs-btn" class="text-btn danger">🧹 清理运行日志</button>
                                 <span id="logs-size-info">计算中...</span>
                             </div>
+                        </div>
                     </section>
 
                     <!-- ⑤ 任务提醒 -->
@@ -1694,6 +1720,8 @@
                     </div>
                     <p id="candidate-modal-reason" style="font-size:13px; color:var(--text-secondary); margin:0; line-height:1.6;">暂无 AI 鉴别记录</p>
                 </div>
+                <!-- 爆款原片对应节拍对标基准抽帧 -->
+                <div class="candidate-benchmark-box" id="candidate-modal-benchmark-box" style="display:none; margin-bottom: 16px;"></div>
                 <div class="candidate-model-filter-bar" id="candidate-model-filter-bar" style="display:none; align-items:center; gap:8px; margin-bottom:14px; flex-wrap:wrap; padding-bottom:4px;">
                     <!-- Model Filter Tabs rendered dynamically -->
                 </div>

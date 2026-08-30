@@ -141,7 +141,6 @@ def live_server(tmp_path):
 
 def test_delete_then_undo_from_the_ui(live_server):
     run_dir = live_server["run_dir"]
-    before = _disk_state(run_dir)
 
     with sync_playwright() as p:
         browser = p.chromium.launch()
@@ -172,12 +171,15 @@ def test_delete_then_undo_from_the_ui(live_server):
             "() => document.querySelectorAll('#frames-grid .slot-card').length === 4",
             timeout=10000)
 
+        before = _disk_state(run_dir)
+
         # —— 删除第 2 拍 ——
         page.eval_on_selector('#frame-slot-2 [data-act="delete-slot"]', "el => el.click()")
         page.wait_for_function(
             "() => document.querySelectorAll('#frames-grid .slot-card').length === 3",
             timeout=20000)
         assert _disk_state(run_dir) != before, "删除应真的改变磁盘状态"
+        page.wait_for_selector(".toast-action", timeout=10000)
         assert page.evaluate("() => !!document.querySelector('.toast-action')"), \
             "删除后应立刻出现「撤销」出口"
 

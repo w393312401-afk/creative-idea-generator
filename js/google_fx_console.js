@@ -52,6 +52,9 @@
     if (cooling && account.cooldown_reason === 'login_required') {
       return { key: 'login_required', label: '待人工登录', tone: 'bad' };
     }
+    if (cooling && (account.cooldown_reason === 'image_quota_exceeded' || account.cooldown_reason === 'daily_limit_reached' || account.cooldown_reason === 'daily_limit' || account.cooldown_reason === 'image_limit_exceeded' || String(account.last_generation_error || '').includes('图片余额超限'))) {
+      return { key: 'image_limit', label: '图片余额超限', tone: 'bad' };
+    }
     if (cooling) return { key: 'cooling', label: '冷却中', tone: 'warn' };
     if (account && account.last_probe_status === 'failed') {
       return { key: 'probe_failed', label: '探测失败', tone: 'bad' };

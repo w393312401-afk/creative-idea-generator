@@ -1495,33 +1495,34 @@
     transform: translateY(0) scale(0.98);
 }
 
-/* 🖼️ 多宫格检查器 */
-.slot-collage-btn {
+
+/* 🎯 原片对标滑块 */
+.slot-benchmark-btn {
     display: inline-flex;
     align-items: center;
     gap: 4px;
     padding: 3.5px 11px;
     font-size: 11.5px;
     font-weight: 600;
-    color: #00f5d4;
-    background: rgba(0, 245, 212, 0.12);
-    border: 1px solid rgba(0, 245, 212, 0.45);
+    color: #f59e0b;
+    background: rgba(245, 158, 11, 0.12);
+    border: 1px solid rgba(245, 158, 11, 0.45);
     border-radius: 6px;
     cursor: pointer;
     transition: all 0.18s cubic-bezier(0.16, 1, 0.3, 1);
-    box-shadow: 0 0 10px rgba(0, 245, 212, 0.15);
+    box-shadow: 0 0 10px rgba(245, 158, 11, 0.15);
     user-select: none;
 }
 
-.slot-collage-btn:hover {
-    background: rgba(0, 245, 212, 0.24);
-    border-color: #00f5d4;
+.slot-benchmark-btn:hover {
+    background: rgba(245, 158, 11, 0.24);
+    border-color: #f59e0b;
     color: #ffffff;
     transform: translateY(-1px);
-    box-shadow: 0 2px 14px rgba(0, 245, 212, 0.35);
+    box-shadow: 0 2px 14px rgba(245, 158, 11, 0.35);
 }
 
-.slot-collage-btn:active {
+.slot-benchmark-btn:active {
     transform: translateY(0) scale(0.98);
 }
 
@@ -1906,6 +1907,18 @@ body.slot-merged-view .slot-toolbar[data-slot-type="video"] .slot-merge-btn {
 }
 
 .slot-action-btn[data-act="describe-frame"]:hover:not(:disabled) {
+    background: rgba(245, 158, 11, 0.98);
+    border-color: #fbbf24;
+    box-shadow: 0 0 10px rgba(245, 158, 11, 0.45);
+}
+
+.slot-action-btn[data-act="compare-benchmark"] {
+    background: rgba(217, 119, 6, 0.88);
+    border-color: rgba(251, 191, 36, 0.6);
+    color: #ffffff;
+}
+
+.slot-action-btn[data-act="compare-benchmark"]:hover:not(:disabled) {
     background: rgba(245, 158, 11, 0.98);
     border-color: #fbbf24;
     box-shadow: 0 0 10px rgba(245, 158, 11, 0.45);
@@ -2386,6 +2399,18 @@ body.slot-merged-view .slot-toolbar[data-slot-type="video"] .slot-merge-btn {
 .frame-issue-pop-list li[data-layer="manual"] .review-issue-layer {
     background: rgba(245, 158, 11, 0.16);
     color: #f59e0b;
+}
+
+.review-issue[data-layer="collage_macro"] .review-issue-layer,
+.frame-issue-pop-list li[data-layer="collage_macro"] .review-issue-layer {
+    background: rgba(139, 92, 246, 0.16);
+    color: #8b5cf6;
+}
+
+.review-issue[data-layer="anchor"] .review-issue-layer,
+.frame-issue-pop-list li[data-layer="anchor"] .review-issue-layer {
+    background: rgba(14, 165, 233, 0.16);
+    color: #0ea5e9;
 }
 
 .review-issue-text {

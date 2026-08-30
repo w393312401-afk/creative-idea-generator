@@ -1156,7 +1156,7 @@ class TestDeclaredAnchorExtractionAndPlanning(unittest.TestCase):
     }
 
     def test_slot_contract_wins_over_declared_anchors(self):
-        """正文声明的编号不得改选帧：错位的声明必须被拦下，而不是照着执行。"""
+        """正文声明的编号不影响选帧与生成：严格按槽位契约取帧直接生成，不因提示词编号差异拦截。"""
         tmp = tempfile.mkdtemp()
         try:
             videos_dir = os.path.join(tmp, 'videos')
@@ -1165,52 +1165,40 @@ class TestDeclaredAnchorExtractionAndPlanning(unittest.TestCase):
 
             plans = plan_video_slots(dict(self._SHIFTED_SLOTS), frames, {}, videos_dir)
 
-            # slot 5：声明与契约一致，照常生成
+            # slot 5：按契约取 5->6 生成
             self.assertEqual(plans[0]['slot'], 5)
             self.assertEqual(plans[0]['start_anchor_slot'], 5)
             self.assertEqual(plans[0]['end_anchor_slot'], 6)
-            self.assertIsNone(plans[0]['anchor_declaration_mismatch'])
             self.assertEqual(plans[0]['action'], 'generate')
 
-            # slot 6：声明 7->8，契约 6->7。锚点仍按契约，且必须拦下来
+            # slot 6：提示词写 7->8，槽位契约 6->7。严格按契约取 frames[6] -> frames[7] 直接生成，不拦截
             self.assertEqual(plans[1]['slot'], 6)
             self.assertEqual(plans[1]['start_anchor_slot'], 6)
             self.assertEqual(plans[1]['end_anchor_slot'], 7)
             self.assertEqual(plans[1]['start_frame'], frames[6])
             self.assertEqual(plans[1]['end_frame'], frames[7])
-            self.assertEqual(plans[1]['action'], 'blocked')
-            self.assertIn('编号错位', plans[1]['reason'])
-            self.assertEqual(plans[1]['anchor_declaration_mismatch'], {
-                'declared_start': 7, 'declared_end': 8,
-                'contract_start': 6, 'contract_end': 7,
-            })
+            self.assertEqual(plans[1]['action'], 'generate')
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
     def test_declared_mismatch_override_generates_by_contract(self):
-        """确认风险强制生成时：仍按契约取帧，只降级成告警，并把不符留痕。"""
+        """提示词编号被平滑重写为两卡位 IMAGE 1 / IMAGE 2，并按契约生成。"""
         tmp = tempfile.mkdtemp()
         try:
             videos_dir = os.path.join(tmp, 'videos')
             os.makedirs(videos_dir)
             frames = self._eleven_frames(tmp)
 
-            plans = plan_video_slots(dict(self._SHIFTED_SLOTS), frames, {}, videos_dir,
-                                      override_flagged=True)
+            plans = plan_video_slots(dict(self._SHIFTED_SLOTS), frames, {}, videos_dir)
             slot6 = plans[1]
             self.assertEqual(slot6['action'], 'generate')
             self.assertEqual(slot6['start_frame'], frames[6])
             self.assertEqual(slot6['end_frame'], frames[7])
-            self.assertIn('与槽位契约不符', slot6.get('warning', ''))
             # 文案改写按声明的编号做，别在提示词里留下裸的 IMAGE 7 / IMAGE 8
             self.assertIn('IMAGE 1', slot6['prompt'])
             self.assertIn('IMAGE 2', slot6['prompt'])
             self.assertNotIn('IMAGE 7', slot6['prompt'])
             self.assertNotIn('IMAGE 8', slot6['prompt'])
-            # 质检档位关掉时同样只告警不拦
-            off_plans = plan_video_slots(dict(self._SHIFTED_SLOTS), frames, {}, videos_dir,
-                                          gate_level='off')
-            self.assertEqual(off_plans[1]['action'], 'generate')
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 

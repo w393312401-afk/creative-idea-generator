@@ -238,6 +238,14 @@ function frameActions(state, ctx) {
                 busy: false,
             }));
         }
+        if (state.flags.hasBenchmarkRef) {
+            // 对标原片：打开本拍生成帧与爆款原片节拍抽帧的分屏对比滑块
+            list.push(slotAction('compare-benchmark', '🎯 对标原片', {
+                cls: 'compare-benchmark-btn',
+                idle: '打开本拍生成帧与爆款原片节拍抽帧的分屏对比滑块',
+                busy: false,
+            }));
+        }
         if (state.flags.rejectedFix) {
             // 门禁判这次修复把链改坏了 → 已自动退回上一版，但修后那版留了档。
             // 人看得见画面，门禁看不见——判错时这是把那一版拿回来的唯一入口。
@@ -341,6 +349,10 @@ function frameSlotState(frame, ctx) {
     }
 
     const manualIssue = frameManualIssue(frame);
+    const curIdea = typeof currentIdea !== 'undefined' ? currentIdea : null;
+    const refFrames = (curIdea && (curIdea.ref_frames || (curIdea.frameRun && curIdea.frameRun.ref_frames))) || {};
+    const hasBenchmarkRef = !!(refFrames[seq] || refFrames[String(seq)]);
+
     const flags = {
         degraded: frame.quality_gate === 'i2i_fallback_degraded',
         reviewFailed: frameIsReviewFailed(frame),
@@ -351,6 +363,7 @@ function frameSlotState(frame, ctx) {
         manualUpload: frame.source === 'manual_upload',
         swappedFrom: slotSwappedFrom(frame, 'swapped_from_sequence'),
         hasCandidates: !!(frame && frame.candidates && frame.candidates.length > 1),
+        hasBenchmarkRef,
         manualIssue,
     };
     // 「修复此帧问题」的出口条件（判定收口在 frameIsFixable，工具条的「全部修复」

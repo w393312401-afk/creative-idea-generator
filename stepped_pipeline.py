@@ -16,6 +16,7 @@ from prompt_pipeline import (
     prompt_block_from_output,
     prompt_slots_list,
     optimize_video_prompts_for_sequence,
+    find_reference_frames_for_project,
 )
 from pipeline_orchestrator import render_single_frame, _render_videos_with_recovery, persist_outline_delivery_ledger
 from frame_generator import generate_frame_sequence
@@ -54,6 +55,22 @@ def _save_state(title, state):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, 'w', encoding='utf-8') as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
+
+
+def _enrich_state_with_refs(state, project_dir=None):
+    """自动检索项目关联的爆款原片/节拍阶梯抽帧（{seq: path}）及原片5列拼图，注入 state 供前端对标。"""
+    if not state or not isinstance(state, dict) or not state.get('title'):
+        return state
+    pdir = project_dir or _get_project_dir(state['title'])
+    try:
+        ref_frames, src_collage = find_reference_frames_for_project(pdir, state.get('total_beats'))
+        if ref_frames:
+            state['ref_frames'] = {int(k): v for k, v in ref_frames.items()}
+        if src_collage:
+            state['source_collage'] = src_collage
+    except Exception as e:
+        print(f"[STEPPED] Reference frames lookup warning: {e}")
+    return state
 
 
 def _compute_batches(total_beats, batch_size=4):
@@ -244,10 +261,16 @@ def start_stepped_pipeline(config, dimensions, on_progress=None, precomposed=Non
             
         state['stage'] = 'review_anchor'
         state['updated_at'] = datetime.now().isoformat()
+        _enrich_state_with_refs(state, project_dir)
         _save_state(title, state)
         
         if on_progress:
-            on_progress('stepped_stage', {'stage': 'review_anchor', 'message': '首帧渲染完成，请审查并确认（通过后继续，打回则重绘）。'})
+            on_progress('stepped_stage', {
+                'stage': 'review_anchor',
+                'message': '首帧渲染完成，请审查并确认（通过后继续，打回则重绘）。',
+                'ref_frames': state.get('ref_frames'),
+                'source_collage': state.get('source_collage'),
+            })
             
         return state
         
@@ -391,7 +414,7 @@ def advance_stepped_pipeline(title, action='approve', on_progress=None, config=N
                 # User stays at final_review, makes adjustments manually and re-triggers approve
                 pass
                 
-        return state
+        return _enrich_state_with_refs(state)
         
     except Exception as e:
         state['error'] = str(e)
@@ -420,6 +443,7 @@ def _execute_render_batch(state, config, on_progress):
     
     state['stage'] = 'review_batch'
     state['updated_at'] = datetime.now().isoformat()
+    _enrich_state_with_refs(state)
     _save_state(title=state['title'], state=state)
     
     if on_progress:
@@ -428,7 +452,9 @@ def _execute_render_batch(state, config, on_progress):
             'message': f'批次 {idx+1}/{len(state["batches"])} 渲染完成，请审查拼图（通过后继续下一批，打回则重绘本批次）。',
             'batch_index': idx,
             'total_batches': len(state['batches']),
-            'collage_path': collage_path
+            'collage_path': collage_path,
+            'ref_frames': state.get('ref_frames'),
+            'source_collage': state.get('source_collage'),
         })
 
 
@@ -457,13 +483,16 @@ def _finish_rendering_and_full_collage(state, on_progress):
     state['full_collage'] = full_collage
     state['stage'] = 'final_review'
     state['updated_at'] = datetime.now().isoformat()
+    _enrich_state_with_refs(state)
     _save_state(title=state['title'], state=state)
     
     if on_progress:
         on_progress('stepped_stage', {
             'stage': 'final_review', 
             'message': '全序列渲染完成！请审查所有成图并执行最终手动调整（如需重绘单个画面请使用网格面板），确认无误后批准进入视频生成阶段。',
-            'collage_path': full_collage
+            'collage_path': full_collage,
+            'ref_frames': state.get('ref_frames'),
+            'source_collage': state.get('source_collage'),
         })
 
 
@@ -479,7 +508,7 @@ def get_stepped_status(title):
         rendered_count = len(glob.glob(os.path.join(frames_dir, 'img_*.webp')))
     
     state['total_frames_rendered'] = rendered_count
-    return state
+    return _enrich_state_with_refs(state, project_dir)
 
 
 def cancel_stepped_pipeline(title):

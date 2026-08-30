@@ -6,6 +6,7 @@
 """
 
 import json
+import math
 import os
 import re
 import sys
@@ -42,6 +43,26 @@ STAGE_ALIAS_MAP = {
 }
 
 
+def _default_cast_action_for_stage(stage, index, total=17):
+    """根据工序阶段为活物生成贴合场景的动态空间位移与肢体交互，杜绝单一静态占位。"""
+    stg = str(stage or '').lower()
+    if index == 1 or stg in ('demolition', 'clearing'):
+        return "Figurines stand near the damaged site boundary, crouching down to inspect the blueprint with sorrowful yet attentive expressions."
+    elif stg == 'structural':
+        return f"Figurines step forward to examine the rising structural framework at milestone {index}, leaning in with wide-eyed wonder and rising hope."
+    elif stg in ('rough_in', 'enclosure'):
+        return "Figurines shift to the outer perimeter, tilting heads upward to track the wall and roof installation with eager admiration."
+    elif stg in ('floor', 'fixtures'):
+        return "Figurines step onto the newly framed platform, walking along the fresh flooring to touch the installed fixtures with joyful smiles."
+    elif stg in ('transition', 'hallway'):
+        return "Figurines gather at the doorway landing, eagerly stepping across the threshold to explore the breezy interior space."
+    elif stg in ('surface', 'finishing'):
+        return "Figurines stroll along the finished pathways and landscaped gardens, marveling at the clean textures and vibrant greenery."
+    elif stg in ('reveal', 'furnishing') or index >= total:
+        return "Figurines walk hand-in-hand to the center entrance and wave happily, celebrating the completed sanctuary with beaming smiles."
+    return "Figurines dynamically shift position across the workspace, actively tracking the craft progress and interacting with the new milestone."
+
+
 def build_fast_reverse_system_prompt():
     """构建单次视频时序原生反推的系统提示词。"""
     return """You are a world-class time-lapse construction analysis AI.
@@ -54,7 +75,12 @@ Rules:
    - Operations must follow realistic build order: demolition/clearing -> structural -> rough_in -> enclosure -> surface -> floor -> fixtures -> furnishing -> reveal.
    - Never reverse construction state (unless an explicit demolition step is shown).
 
-2. [Exact Schema per Beat]
+2. [Beat Density and Event Coverage — mandatory, this is the single most common failure of this task]
+   - This is a ~2x fast-forward construction time-lapse. No single beat may span more than 6 seconds of source footage. If a milestone naturally spans longer than that, split it into two or more consecutive beats that cover the same physical progress (e.g. split "framing" into rough framing vs joist reinforcement, or split a long "reveal" into interior walkthrough vs exterior hero shot).
+   - The user message lists every distinct change event mechanically detected in this footage (timestamp of start/peak/end for each). That count is a HARD FLOOR on your beat count, not decoration — producing fewer beats than detected events means real, physically-detected progress got silently skipped. A single beat may cover more than one adjacent event only when they are genuinely the same terminal product (e.g. cut+fit+fasten producing one wall) — never merge two events just because they look similar in the sampled thumbnails; the sampling is sparse, the event detection is not.
+   - The user message also states a minimum required beat count computed from this video's duration and event count. Treat it as a hard minimum, never a suggestion to round down. When uncertain whether two adjacent moments are one milestone or two, split them — an over-split ladder is easy to merge by hand later; a collapsed one has already lost the footage's real detail.
+
+3. [Exact Schema per Beat]
    Each item in "beats" array must contain:
    - "id": "B01", "B02", "B03"... (strictly consecutive)
    - "index": 1, 2, 3...
@@ -80,7 +106,7 @@ Rules:
    - "time_treatment": "time_lapse" or "real_time"
    - "worker_count": integer count of active workers (e.g. 1)
    - "material_flow": description of raw material intake and spoil disposal
-   - "cast_action": ACTION-REACTION CAUSAL CHAIN of what all living things (workers, resident miniature figurines, or animals) are doing with their bodies, GAZE, AND FACIAL/EMOTIONAL EXPRESSIONS in response to the work: [Trigger Event] -> [Immediate Reflex / Bodily Reaction & Facial Expression] -> [Engaged Tracking / Motion] -> [Settled Posture & Demeanor]. For miniature dioramas with resident figurines, capture their emotional evolution (e.g. initial beats: haggard, distressed, sorrowful, helpless tearful gaze facing ruined shelter; mid-beats: astonished, leaning in with wide-eyed awe and rising hope; reveal beats: beaming with joyful smiles and relief). NEVER write static placeholders like 'remain', 'stay', 'unchanged'.
+   - "cast_action": ACTION-REACTION CAUSAL CHAIN & DYNAMIC SPATIAL MIGRATION PATH of what all living things (workers, resident miniature figurines, or animals) are doing with their bodies, POSITIONS, GAZE, AND FACIAL/EMOTIONAL EXPRESSIONS in response to the work: [Trigger Event] -> [Immediate Reflex / Bodily Reaction & Facial Expression] -> [Engaged Tracking / Motion & Spatial Displacement] -> [Settled Posture, Location & Demeanor]. MANDATORY SPATIAL TRAJECTORY: As the structure transforms from beat to beat, figurines/residents MUST dynamically migrate through different physical zones (e.g. initial mudflat blueprint -> perimeter chalk line inspection -> stepping up to touch column footing -> standing under raised timber framing -> walking along porch landing -> stepping over threshold into interior -> sitting on finished bench -> walking along dock). STRICTLY FORBID repetitive standing: NEVER repeat the same position (e.g. 'standing at diorama edge' or 'standing at lower-left') across consecutive beats. NEVER write static placeholders like 'remain', 'stay', 'unchanged'.
    - "zh": object containing Chinese translations:
      {
        "visible_action": "中文工人动作与工具描述",
@@ -88,7 +114,7 @@ Rules:
        "headline": "短标题（4-8字）"
      }
 
-3. [Global Metadata]
+4. [Global Metadata]
    Root object must also include:
    - "carrier": The main object/building being restored (e.g. "abandoned bunker", "vintage camper")
    - "env": Surrounding environment
@@ -102,20 +128,55 @@ Rules:
 Output ONLY the valid JSON object, without markdown formatting or introductory text."""
 
 
+def resolve_collage_path(job_dir, overview):
+    """找到这条 job 的全局关键帧拼贴大图（有的话）。"""
+    collage_path = overview.get('keyframe_collage')
+    if collage_path and os.path.exists(collage_path):
+        return collage_path
+    for fname in ('clip_collage.jpg', 'collage.jpg'):
+        candidate = os.path.join(job_dir, fname)
+        if os.path.exists(candidate):
+            return candidate
+    return None
+
+
+def _format_change_events_for_prompt(change_events):
+    """把 change_events 列成带时间戳的清单喂给模型，而不是只报个数。
+
+    此前 user_prompt 只写「Detected Visual Change Events: N events」——只给了个数字，
+    没给任何一个事件发生在哪一刻。模型没有锚点去对照自己想切的拍数够不够，等于让它
+    凭感觉数缩略图。列出每个事件的 start/peak/end，才是能让模型真的按事件密度切拍的
+    信息，不是摆设。
+    """
+    if not change_events:
+        return '  (未机械检测到独立变化事件——按你自己读出的可见进度自行判断节奏)'
+    lines = []
+    for ev in change_events:
+        eid = ev.get('event_id') or '?'
+        lines.append(f"  - {eid}: start={ev.get('start')}s, peak={ev.get('peak')}s, end={ev.get('end')}s")
+    return '\n'.join(lines)
+
+
+def _min_beat_count(duration, change_events):
+    """这条视频至少该切出几拍——不是给模型的建议，是生成时的硬下限。
+
+    与深度通道 Pass B 系统提示词同一套假设（单拍源片段 ≤6 秒、~2 倍速延时片）：
+    按时长能撑住的拍数下限，与实际探测到的事件数，取两者较大值。此前极速通道完全
+    没有这个下限，模型自己感觉切几拍就是几拍，长片/多工序的片子因此被压扁成几拍。
+    """
+    duration = duration or 0
+    by_duration = math.ceil(duration / 6.0) if duration > 0 else 0
+    return max(6, len(change_events), by_duration)
+
+
 def collect_keyframe_images(job_dir, overview, max_frames=24):
     """提取用于单次全景多模态直读的代表性关键帧序列与拼图。"""
     image_paths = []
-    
+
     # 1. 优先将全局拼贴大图作为首图（如有）
-    collage_path = overview.get('keyframe_collage')
-    if collage_path and os.path.exists(collage_path):
+    collage_path = resolve_collage_path(job_dir, overview)
+    if collage_path:
         image_paths.append(collage_path)
-    else:
-        for fname in ('clip_collage.jpg', 'collage.jpg'):
-            candidate = os.path.join(job_dir, fname)
-            if os.path.exists(candidate):
-                image_paths.append(candidate)
-                break
 
     # 2. 收集各独立关键帧
     frames_candidates = []
@@ -195,17 +256,37 @@ def fast_video_native_reverse(config, job_dir, on_progress=None):
             'message': '正在启动视频原生极速直读（单轮多模态时序反推）…',
         })
 
-    keyframe_paths = collect_keyframe_images(job_dir, overview, max_frames=20)
+    # 关键帧池上限原来固定 20，长片/多工序（change_events 多）时会把已经检测到的
+    # 事件挤掉——池子跟着实际探测到的事件数走，短片不多给，长片不再削掉证据。
+    # 上限封在 48：再高整轮送审图片数会失控，模型对位反而更差。
+    target_frames = max(20, min(48, len(change_events) + 6))
+    keyframe_paths = collect_keyframe_images(job_dir, overview, max_frames=target_frames)
     if not keyframe_paths:
         raise ValueError('未找到可用于视觉反推的关键帧图像')
 
-    # 压缩图像以加速网络传输
-    compressed_images = pp._compress_frames_for_review(keyframe_paths, max_side=768, quality=75)
+    # 压缩图像以加速网络传输。拼贴大图和逐张关键帧分开压：_compress_frames_for_review
+    # 的 max_side=768 是给「审查环节的单帧全尺寸帧」设计的，套在一张 5 列、最多 25+ 格的
+    # 拼贴图上会把每一格从原本 360px 宽砸到一百多像素——材料纹理、工具型号这类细节在
+    # 这个分辨率下基本读不出来，这不是极速通道该有的模糊，是纯粹的二次压缩浪费。
+    # 拼贴图单独给更高的分辨率预算，逐帧关键帧仍走原来的 768（那些本来就是单主体全尺寸帧）。
+    collage_path = resolve_collage_path(job_dir, overview)
+    frame_only_paths = [p for p in keyframe_paths if p != collage_path]
+    compressed_images = []
+    if collage_path and collage_path in keyframe_paths:
+        compressed_images.extend(
+            pp._compress_frames_for_review([collage_path], max_side=1600, quality=82))
+    compressed_images.extend(
+        pp._compress_frames_for_review(frame_only_paths, max_side=768, quality=75))
 
+    min_beats = _min_beat_count(duration, change_events)
     system_prompt = build_fast_reverse_system_prompt()
     user_prompt = (
         f"Video Duration: {duration} seconds\n"
-        f"Detected Visual Change Events: {len(change_events)} events\n\n"
+        f"Detected Visual Change Events: {len(change_events)} events (each is a real, mechanically "
+        f"detected state jump, not decoration):\n{_format_change_events_for_prompt(change_events)}\n\n"
+        f"Minimum required beat count for this video: {min_beats}. Do not produce fewer beats than "
+        "this under any circumstances — a beat count below this floor on a video this long/eventful "
+        "means real detected progress got silently skipped, not that the renovation was simple.\n\n"
         "Attached are the chronological representative frame sequence and keyframe collage from this timelapse video.\n"
         "Please analyze the physical transformation and output the complete 1:1 beat ladder (timelapse_beats.json) in STRICT JSON format."
     )
@@ -274,7 +355,7 @@ def fast_video_native_reverse(config, job_dir, on_progress=None):
         b.setdefault('shot_scale', 'wide_shot')
         b.setdefault('camera_angle', b.get('camera_angle') or 'eye_level')
         if not b.get('subject_placement'):
-            bearing = str(b.get('camera_bearing') or 'three_quarter').lower()
+            bearing = str(b.get('camera_bearing') or 'front').lower()
             if 'three_quarter' in bearing:
                 b['subject_placement'] = 'Off-center three-quarter perspective across Grid B1-B3 workspace'
             elif 'side' in bearing:
@@ -284,8 +365,8 @@ def fast_video_native_reverse(config, job_dir, on_progress=None):
         b.setdefault('time_treatment', 'time_lapse')
         b.setdefault('worker_count', 1)
         b.setdefault('light_state', 'worklight_daylight')
-        b.setdefault('material_flow', 'raw materials staged and consumed, debris cleared')
-        b.setdefault('cast_action', 'Worker or resident figurines actively track and react to the construction process')
+        if not b.get('cast_action'):
+            b['cast_action'] = _default_cast_action_for_stage(b.get('stage'), idx, total_n)
 
     beats_doc['beats'] = beats_list
     beats_doc.setdefault('video_duration_sec', duration)

@@ -89,6 +89,7 @@ def page():
             for (let el = document.getElementById('frames-grid'); el; el = el.parentElement) {
                 if (getComputedStyle(el).display === 'none') el.style.display = 'block';
             }
+            document.getElementById('frames-grid')?.scrollIntoView();
         }""", IDEA)
         pg.wait_for_timeout(400)
         pg.__dict__["_page_errors"] = errors

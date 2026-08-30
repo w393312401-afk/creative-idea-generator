@@ -17,6 +17,7 @@ from server_common import (
     read_manifest, write_manifest, manifest_lock, strict_gates_enabled, qa_gate_level, gate_setting,
     _is_cover_filename, _cover_candidate_path,
     resolve_video_duration, resolve_video_resolution,
+    FIXED_VIDEO_DURATION, OMNI_VIDEO_DURATIONS,
     stamp_manifest_capabilities,
     resolve_binary,
     # 号池轮转口径（帧序列与视频序列共用，见 server_common 的「换 IP 已全局关停」注释）
@@ -613,9 +614,6 @@ def _declared_frame_anchors(prompt):
         return None
 
     # 1. 英雄帧/单帧声明：sole starting-frame anchor / sole starting frame
-    #    编号必须取紧挨着这句话的那个（"...reference image (IMAGE 11) as the sole
-    #    starting-frame anchor"），不能取全文第一个 IMAGE ——正文里先出现的往往是
-    #    继承描述里引用的别的帧号。
     hero_m = re.search(r'sole\s+starting[- ]frame', text, re.IGNORECASE)
     if hero_m:
         before = text[:hero_m.start()]
@@ -1005,30 +1003,13 @@ def plan_video_slots(video_slots, slot_to_path, slot_to_quality, videos_dir, tar
         is_hero = 'HERO' in meta
 
         # 槽位契约是唯一权威：视频 slot 绑定 IMAGE slot -> IMAGE slot+1（HERO 只有首帧）。
-        # 2026-08-18：这里一度改成"正文声明优先"，让提示词里写的 IMAGE 编号决定送哪两
-        # 张帧。那条路把组稿阶段的编号错位原样执行了——underwater_container 那单的视频
-        # 6~9 正文整体滑了一格（视频 6 写成 IMAGE 7 -> IMAGE 8），于是 IMAGE 6 -> IMAGE 7
-        # 这一跨根本没有视频、vid_009 首尾同帧变成 8 秒静止，而锚点校验因为拿"声明的
-        # 锚点"去比对全部照过，成片跳帧却没有任何一道门发出声音。声明不能改选帧。
+        # 直接按槽位契约取帧生成，不再校验或拦截提示词正文中的锚点声明。
         start_slot = slot
         end_slot = None if is_hero else (slot + 1)
 
-        # 正文里显式声明的编号只做两件事：把文案改写成 Flow 两卡位的 IMAGE 1/IMAGE 2
-        # （否则 "Use IMAGE 7 ... IMAGE 8" 会留下裸的 IMAGE 8 送进模型），以及在声明与
-        # 契约不符时报警——那说明组稿编号错了，得回上游修，不该在这里将错就错。
         declared = _declared_frame_anchors(prompt)
-        anchor_declaration_mismatch = None
-        if declared is not None and (declared[0] != start_slot or declared[1] != end_slot):
-            anchor_declaration_mismatch = {
-                'declared_start': declared[0],
-                'declared_end': declared[1],
-                'contract_start': start_slot,
-                'contract_end': end_slot,
-            }
-        rewrite_start, rewrite_end = declared if declared is not None else (start_slot, end_slot)
-        # 契约说这一段只上首帧时，正文里声明的尾帧编号一个字也不能改写口径——否则一条
-        # 普通两锚点正文被挂到单图槽位上，会被改写成「IMAGE 1 首帧 / IMAGE 2 尾帧」，
-        # 而 IMAGE 2 根本没上传。同 declared 不改选帧，declared 也不改卡位数。
+        rewrite_start = declared[0] if declared and declared[0] is not None else start_slot
+        rewrite_end = declared[1] if (declared and declared[1] is not None) else end_slot
         prompt = rewrite_prompt_for_two_card_ui(prompt, slot, start_slot=rewrite_start,
                                                 end_slot=rewrite_end, single_frame=(end_slot is None))
         dest_path = os.path.join(videos_dir, f'vid_{slot:03d}.mp4')
@@ -1043,7 +1024,7 @@ def plan_video_slots(video_slots, slot_to_path, slot_to_quality, videos_dir, tar
             'end_frame': end_p,
             'start_anchor_slot': start_slot,
             'end_anchor_slot': end_slot,
-            'anchor_declaration_mismatch': anchor_declaration_mismatch,
+            'anchor_declaration_mismatch': None,
             'delete_existing': False,
             'reason': '',
             'meta': meta,
@@ -1126,36 +1107,11 @@ def plan_video_slots(video_slots, slot_to_path, slot_to_quality, videos_dir, tar
                 f"血统过期），已拦截以防跨链跳变。请顺序重渲 IMAGE {_stale} 及其后续帧，"
                 f"或在确认风险后强制生成。"
             )
-        elif anchor_declaration_mismatch and not override_flagged and gate_level != 'off':
-            # 正文声明的锚点编号与槽位契约不符：几乎总是组稿阶段整段编号错位（最典型
-            # 的是跨 [CUT] 之后整体滑一格）。照契约生成会拿到与文案描述不同的一对帧，
-            # 照声明生成会让中间某一跨没有视频、成片跳帧——两条都不对，唯一的正解是
-            # 回上游把编号修对，所以这里直接拦下来而不是二选一。
-            _d = anchor_declaration_mismatch
-            _decl_end = 'None（无尾帧）' if _d['declared_end'] is None else f"IMAGE {_d['declared_end']}"
-            _con_end = 'None（无尾帧）' if _d['contract_end'] is None else f"IMAGE {_d['contract_end']}"
-            plan['action'] = 'blocked'
-            plan['reason'] = (
-                f"视频 {slot} 的正文声明首尾锚点为 IMAGE {_d['declared_start']} → {_decl_end}，"
-                f"与槽位契约 IMAGE {_d['contract_start']} → {_con_end} 不符。这通常是组稿阶段"
-                f"整段编号错位（例如跨 [CUT] 后整体滑了一格），照此出片会漏掉一整跨画面并在"
-                f"成片里跳帧。请先修正提示词里的 IMAGE 编号；确认无误可强制生成"
-                f"（届时仍按槽位契约取帧）。"
-            )
         else:
             plan['action'] = 'generate'
             warnings = []
             # 锚点帧编号（HERO 没有尾锚，下面所有涉及尾帧的判断都要先过这一关）
             _anchor_slots = [start_slot] + ([] if end_slot is None else [end_slot])
-            if anchor_declaration_mismatch:
-                _d = anchor_declaration_mismatch
-                _decl_end = '无尾帧' if _d['declared_end'] is None else f"IMAGE {_d['declared_end']}"
-                warnings.append(
-                    f"视频 {slot} 的正文声明锚点为 IMAGE {_d['declared_start']} → {_decl_end}，"
-                    f"与槽位契约不符；已按契约取 IMAGE {start_slot} → "
-                    f"IMAGE {end_slot if end_slot is not None else '（无）'} 生成，"
-                    f"画面内容可能与文案描述的工序对不上，请核对组稿编号。"
-                )
             _flagged_quality = _FLAGGED_QUALITY_GATES
             if override_flagged and any(slot_to_quality.get(s) in _flagged_quality for s in _anchor_slots):
                 _bad = next(s for s in _anchor_slots if slot_to_quality.get(s) in _flagged_quality)
@@ -1573,7 +1529,7 @@ def generate_video_sequence(config, title, prompt_block, on_progress=None, targe
     # 切点表，生成时却用了面板上残留的另一个时长，切点表当场作废。两边同走
     # server_common.resolve_video_duration，保证是同一个数。
     if 'omni' in str(video_model).strip().lower():
-        video_duration = str(resolve_video_duration(config))
+        video_duration = str(resolve_video_duration(config, fallback_hint=_infer_batch_omni_duration(videos)))
         video_resolution = resolve_video_resolution(config)
     else:
         video_duration = None
@@ -1970,7 +1926,7 @@ def generate_video_chain_sequence(config, title, prompt_block, on_progress=None,
     google_fx_video, models = _get_google_fx_video_service()
     video_model = config.get('videoModel') or 'Veo 3.1 - Lite [Lower Priority]'
     if 'omni' in str(video_model).strip().lower():
-        video_duration = str(resolve_video_duration(config))
+        video_duration = str(resolve_video_duration(config, fallback_hint=_infer_batch_omni_duration(videos)))
         video_resolution = resolve_video_resolution(config)
     else:
         video_duration = None
@@ -2499,6 +2455,33 @@ def _clip_speed_from_meta(meta):
     if value <= 0:
         return 1.0
     return min(_CLIP_SPEED_MAX, max(_CLIP_SPEED_MIN, value))
+
+
+# 2026-08-30「僵直时间」排查：Omni 时长面板缺省值此前是盲选 10 秒（OMNI_DEFAULT_VIDEO_DURATION），
+# 与本批拍子实际的内容量无关——一批拍重普遍偏低的短平快内容仍会被要求生成 10 秒，模型填不满
+# 只能在片尾定住不动。这里用同一套 PACE 标签（已经代表了每拍相对参考拍重的内容量）反推一个
+# 更贴合本批内容的档位：只在用户没有显式指定 videoDuration 时介入（见 resolve_video_duration
+# 的 fallback_hint 参数），不会覆盖用户的手动选择。
+def _infer_batch_omni_duration(video_slots):
+    """按本批待生成视频槽位的 PACE 标签，推算一个更贴合内容量的 Omni 档位（4/6/8/10s 之一）。
+
+    没有 PACE 标签的槽位按 speed=1.0（参考拍重）计入。取全体槽位隐含秒数的中位数——用
+    中位数而不是均值，是因为个别揭示/过门拍的高拍重不该把整批的档位选择拉偏。槽位为空
+    或全部解析失败时返回 None，调用方回落到既有默认值。
+    """
+    if not video_slots:
+        return None
+    items = video_slots.values() if isinstance(video_slots, dict) else video_slots
+    speeds = [_clip_speed_from_meta(item.get('meta', '') if isinstance(item, dict) else item)
+              for item in items]
+    if not speeds:
+        return None
+    speeds.sort()
+    n = len(speeds)
+    mid = n // 2
+    median_speed = speeds[mid] if n % 2 else (speeds[mid - 1] + speeds[mid]) / 2.0
+    implied_seconds = median_speed * FIXED_VIDEO_DURATION
+    return min(OMNI_VIDEO_DURATIONS, key=lambda d: abs(d - implied_seconds))
 
 
 def _atempo_chain(tempo):

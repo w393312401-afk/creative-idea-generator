@@ -31,6 +31,30 @@ A window.
 
 
 class TestFastComposer(unittest.TestCase):
+    # 两条锚点对齐用例共用的模型直出稿：IMAGE 1 是一份没见过任何像素的文字空想。
+    ANCHOR_OUTPUT = """===TITLE===
+荒原破旧泥屋改造成微缩轻奢庄园
+
+===THEME===
+泥屋
+
+===PROMPTS===
+IMAGE 1 (破旧泥屋初始状态):
+A high-angle close-up macro photograph of a ruined miniature mud hut with a blueprint on the soil.
+
+VIDEO 1 (拆除茅屋):
+IMAGE 1 to IMAGE 2 time-lapse. A giant hand clears the hut. ASMR sound effects: straw rustling.
+
+IMAGE 2 (土台平整):
+A macro photograph of the cleared circular earth platform.
+
+VIDEO 2 (铺设地板):
+IMAGE 2 to IMAGE 3 time-lapse. A giant hand lays plank flooring. ASMR sound effects: wood clicking.
+
+IMAGE 3 (庄园落成):
+A macro reveal of the finished miniature estate.
+"""
+
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
         self.old_root = server_common.OUTPUT_ROOT
@@ -71,6 +95,82 @@ class TestFastComposer(unittest.TestCase):
         self.assertEqual(ladder[0]['operation'], 'clearing')
         self.assertEqual(ladder[1]['bridge_stage'], 1)
         self.assertEqual(ladder[1]['turn_direction'], 'left')
+
+    # 2026-08-30 实测（replica_cf9a445bc52b 微缩草原庄园）：IMG 001 与原片对标帧
+    # 完全对不上。极速链路本来就写了 ground_anchor_on_reference，但它取送审帧名册取的
+    # 是 `state['overview']`——那是给前端看的摘要（path/collage/duration/sampling…），
+    # **不含 review_sampling**。摘要非空，于是「读盘兜底」那条 if 永远进不去，
+    # anchor_reference_frame 拿着空名册返回 None，对齐静默空转，交付的锚点图纯靠文字
+    # 空想。深度链路走 _load_overview（按 job_id 读盘）所以是对的——同一件事两个口径。
+    def _write_job_overview(self, job_id):
+        jd = rp.job_dir(job_id)
+        frames_dir = os.path.join(jd, 'review_frames')
+        os.makedirs(frames_dir, exist_ok=True)
+        first = os.path.join(frames_dir, 'review_001.png')
+        with open(first, 'wb') as f:
+            f.write(b'\x89PNG\r\n\x1a\n')
+        with open(os.path.join(jd, 'video_overview.json'), 'w', encoding='utf-8') as f:
+            json.dump({'review_sampling': {'frames': [
+                {'timestamp': 0.0, 'frame_path': first},
+                {'timestamp': 0.5, 'frame_path': first},
+            ]}}, f)
+        return first
+
+    @staticmethod
+    def _anchor_state(job_id):
+        return {
+            'job_id': job_id,
+            'video_name': 'hut.mp4',
+            # 摘要口径，正是线上那份：没有 review_sampling
+            'overview': {'path': 'x.mp4', 'collage': 'c.webp', 'duration_sec': 80,
+                         'frame_count': 550, 'sampling': {}},
+            'beats': {
+                'carrier': '泥屋', 'destiny_zh': '轻奢庄园',
+                'beats': [
+                    {'visible_action': '拆除茅屋', 'visible_result': '土台平整', 'operation': 'clearing'},
+                    {'visible_action': '铺设地板', 'visible_result': '地板就位', 'operation': 'flooring'},
+                ],
+                'banned_elements': [],
+            },
+        }
+
+    def test_anchor_grounding_reads_overview_from_disk_not_state_summary(self):
+        job_id = 'replica_anchor01'
+        first = self._write_job_overview(job_id)
+        state = self._anchor_state(job_id)
+
+        seen = []
+
+        def fake_ground(config, prompt, frame_path, on_progress=None):
+            seen.append(frame_path)
+            return 'GROUNDED ANCHOR: eye-level macro, figurines in the left zone.'
+
+        with patch('prompt_pipeline._chat', return_value=self.ANCHOR_OUTPUT), \
+             patch('prompt_pipeline.reverse.ground_anchor_on_reference', side_effect=fake_ground):
+            prompt_block, compose_state = compose_replica_one_pass({}, state)
+
+        self.assertEqual(seen, [first], '未按原片真实首帧对齐锚点图（送审帧名册没读到）')
+        self.assertIn('GROUNDED ANCHOR', compose_state['image_1_prompt'])
+        self.assertIn('GROUNDED ANCHOR', compose_state['compiled_images'][1])
+        # 光改 compiled_images 不够：真正送去出图的是 prompt_block。
+        self.assertIn('GROUNDED ANCHOR', prompt_block)
+
+    def test_anchor_grounding_without_reference_warns_instead_of_silently_passing(self):
+        """找不到送审帧不是异常，走不到 except——不出声就等于悄悄交付一份没对齐的锚点图。"""
+        job_id = 'replica_anchor02'
+        os.makedirs(rp.job_dir(job_id), exist_ok=True)  # 不写 video_overview.json
+        state = self._anchor_state(job_id)
+
+        events = []
+        with patch('prompt_pipeline._chat', return_value=self.ANCHOR_OUTPUT), \
+             patch('prompt_pipeline.reverse.ground_anchor_on_reference') as ground:
+            prompt_block, compose_state = compose_replica_one_pass(
+                {}, state, on_progress=lambda kind, payload: events.append((kind, payload)))
+
+        ground.assert_not_called()
+        self.assertTrue(
+            any('未照原片首帧对齐' in ((p or {}).get('message') or '') for _, p in events),
+            '锚点图没做像素对齐却没有任何告警')
 
     def test_compose_replica_one_pass_end_to_end(self):
         mock_output = """===TITLE===
@@ -319,7 +419,55 @@ A macro 9:16 reveal of the finished miniature diorama.
             prompt_block, compose_state = compose_replica_one_pass({'skillProfile': 'miniature'}, state)
 
         v1 = compose_state['compiled_videos'][1]
-        self.assertIn('figurin', v1.lower())
+        # 活物一律真人（2026-08-30）：应激句照旧必须有，但措辞是**真人**——住户，
+        # 不是人偶。判据跟着口径一起改：还断言正文里不许再冒出人偶/蜡像那套词，
+        # 否则这条用例会在下一次词表回潮时继续报绿。
+        self.assertIn('resident', v1.lower())
+        for doll in ('figurine', 'doll', 'mannequin', 'wax figure', 'resin'):
+            self.assertNotIn(doll, v1.lower())
+        # 2026-08-30 复盘：光改 compiled_videos 不够——此前这条修复从未写回 parsed_videos /
+        # prompt_block，真正送去出图的那份文本里应激句从没出现过。
+        self.assertIn('resident', prompt_block.lower())
+        self.assertNotIn('figurine', prompt_block.lower())
+
+    def test_compose_replica_one_pass_worker_gets_natural_body_mechanics(self):
+        """非微缩线没有任何视频后处理保底——排查「肢体活动太机械不拟人」的确定性兜底
+        （pp.fix_natural_body_mechanics）必须真的落进 prompt_block，不能止步于
+        compiled_videos 这份内存影子副本（同一类回写缺口，见上面的人偶应激用例）。"""
+        mock_output = """===TITLE===
+废弃仓库改造成设计工作室
+
+===THEME===
+仓库
+
+===PROMPTS===
+IMAGE 1 (毛坯初始状态):
+A photoreal 9:16 wide shot of an abandoned warehouse with bare concrete walls.
+
+VIDEO 1 (清理地面):
+A lone worker sweeps debris off the concrete floor with a push broom. ASMR sound effects: bristles scraping grit.
+
+IMAGE 2 (地面清理完成):
+A photoreal 9:16 wide shot of the swept, clean concrete floor.
+"""
+        state = {
+            'job_id': 'replica_worker_motion_123',
+            'video_name': 'warehouse.mp4',
+            'beats': {
+                'carrier': '仓库',
+                'destiny_zh': '设计工作室',
+                'beats': [
+                    {'visible_action': '清理地面', 'visible_result': '地面清理完成', 'operation': 'clearing'},
+                ],
+                'banned_elements': [],
+            },
+        }
+        with patch('prompt_pipeline._chat', return_value=mock_output):
+            prompt_block, compose_state = compose_replica_one_pass({}, state)
+
+        v1 = compose_state['compiled_videos'][1]
+        self.assertIn(pp._NATURAL_MOTION_MARKER, v1.lower())
+        self.assertIn(pp._NATURAL_MOTION_MARKER, prompt_block.lower())
 
 
 if __name__ == '__main__':

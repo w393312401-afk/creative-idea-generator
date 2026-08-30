@@ -162,8 +162,11 @@ assert.equal(Math.round(call('replicaProgress.percent')), 68, '没有分子分�
 // ── 3.6 人工卡点上的机器活要有自己的区间和名字 ───────────────────────────────
 //
 // autofix / 工艺精修 / 自动平衡 / 重做中文对照全挂在 review_beats 底下，而它的区间是
-// 零宽的 [68,68]：进度条纹丝不动，chip 上还写着「待人工核对」——界面在说"等你动手"，
-// 其实是机器在跑。这比没有进度条更糟：没有只是不知道，这是给了个错的答案。
+// ── 3.6 人工卡点与二创动作的机器活要有自己的区间和名字 ──────────────────────────
+//
+// autofix / 工艺精修 / 自动平衡 / 重做中文对照 / 二创变体派生全挂在 review_beats 底下，
+// 而它的区间是零宽的 [68,68]：进度条纹丝不动，chip 上还写着「待人工核对」——界面在说"等你动手"，
+// 其实是机器在跑。带 action 的事件必须走一段独立的动作区间，且 chip 必须显示动作名。
 call('replicaResetProgress()');
 call(`replicaHandleStageEvent({ stage: 'review_beats', action: 'refine_craft',
                                message: '工艺精修 3/12', done: 3, total: 12 })`);
@@ -171,6 +174,24 @@ const during = call('replicaProgress.percent');
 assert.ok(during > 68, `动作跑起来之后进度条必须离开 68，实得 ${during}`);
 assert.equal(call('replicaProgress.actionLabel'), '工艺精修',
              'chip 必须显示动作名，不能是「待人工核对」');
+
+// 二创变体正交派生动作 (mutate_orthogonal)
+call('replicaResetProgress()');
+call(`replicaHandleStageEvent({ stage: 'mutate_beats', action: 'mutate_orthogonal',
+                               message: '正在调用大模型按四轴正交矩阵重构工序', done: 2, total: 5 })`);
+const duringMutate = call('replicaProgress.percent');
+assert.ok(duringMutate >= 45 && duringMutate <= 68, `mutate_orthogonal 区间必须落在 [45, 68]，实得 ${duringMutate}`);
+assert.equal(call('replicaProgress.actionLabel'), '⚡ 正交二创变体派生',
+             '二创派生期间 chip 必须显示「⚡ 正交二创变体派生」');
+assert.equal(progressBox.querySelector('#replica-progress-stage').textContent, '⚡ 正交二创变体派生');
+
+// 派生二创变体动作 (variant)
+call('replicaResetProgress()');
+call(`replicaHandleStageEvent({ stage: 'mutate_beats', action: 'variant',
+                               message: '正在沿变异轴派生二创变体阶梯', done: 1, total: 4 })`);
+const duringVariant = call('replicaProgress.percent');
+assert.ok(duringVariant >= 45 && duringVariant <= 68, `variant 区间必须落在 [45, 68]，实得 ${duringVariant}`);
+assert.equal(call('replicaProgress.actionLabel'), '🧬 派生二创变体');
 
 // 峰值帧复核跟逐帧提取同属 review_frames 却发生在它之后：共用区间的话，"只增不减"
 // 的进度条在逐帧提取跑满之后就再也动不了，那几十次强模型调用整段静默。
@@ -185,6 +206,18 @@ assert.ok(call('replicaProgress.percent') > afterPassA,
 // 动作结束、回到普通阶段事件时，chip 要回到阶段名，不能一直挂着动作名。
 call(`replicaHandleStageEvent({ stage: 'review_beats', message: '已停在人工卡点' })`);
 assert.equal(call('replicaProgress.actionLabel'), '', '动作结束后必须交还 chip');
+
+// ── 3.7 AI 智能发散创意动态进度卡片与骨架屏渲染 ─────────────────────────────
+call('replicaDiverging = true; replicaDivergeStep = 2; replicaDivergeStatusText = "正在检索联网爆款趋势...";');
+const divergeHtml = call('replicaRenderAiIdeas({ ai_diverged_ideas: [] })');
+assert.ok(divergeHtml.includes('replica-diverge-progress-card'), '发散中必须渲染动态发散进度卡片');
+assert.ok(divergeHtml.includes('replica-ai-ideas-skeleton-grid'), '发散中必须渲染骨架屏占位网格');
+assert.ok(divergeHtml.includes('正在检索联网爆款趋势...'), '发散中必须显示实时状态文字');
+call('replicaDiverging = false;');
+
+// ── 3.8 发散刺激器内联进度看板渲染 ──────────────────────────────────────────
+const mutatorProgressHtml = call('replicaRenderMutatorProgress()');
+assert.ok(mutatorProgressHtml.includes('replica-mutator-live-progress'), '必须支持渲染发散刺激器内联进度看板');
 
 // ── 4. 推进动作一律先落盘 ─────────────────────────────────────────────────────
 //

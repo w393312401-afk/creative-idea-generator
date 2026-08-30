@@ -48,6 +48,7 @@ from prompt_pipeline import (
     frame_review_status, merge_review_results,
     outline_items_by_beat, outline_delivery_log_line,
     _merge_outline_frame_verdicts,
+    find_reference_frames_for_project,
     compose_anchor_and_packet,
     compose_remaining_beats,
     refine_packet_from_accepted_anchor,
@@ -687,11 +688,30 @@ def _sequence_consistency_review(config, title, prompt_block, project_dir, on_pr
     outline_items = _outline_items_for_review(project_dir)
     if outline_items:
         outline_kw['outline_items'] = outline_items
+
+    # 爆款对标基准：关键帧与 5 列拼图
+    ref_frame_paths, source_collage_path = find_reference_frames_for_project(project_dir, total_beats)
+    rendered_collage_path = os.path.join(project_dir, 'frames', 'full_collage.jpg')
+    if not os.path.exists(rendered_collage_path):
+        c_name = f"{os.path.basename(os.path.normpath(project_dir))}_collage.jpg"
+        alt_c = os.path.join(project_dir, c_name)
+        if os.path.exists(alt_c):
+            rendered_collage_path = alt_c
+
+    benchmark_kw = {}
+    if ref_frame_paths:
+        benchmark_kw['ref_frame_paths'] = ref_frame_paths
+    if source_collage_path and rendered_collage_path and os.path.exists(rendered_collage_path):
+        benchmark_kw['source_collage_path'] = source_collage_path
+        benchmark_kw['rendered_collage_path'] = rendered_collage_path
+
+    review_extra_kw = {**outline_kw, **benchmark_kw}
+
     final_result = check_full_sequence_consistency(
         config, prompt_block, frame_paths, on_progress=on_progress,
         only_beats=(local_beats if (incremental or inline_ok) else None),
         global_only_beats=(beats_to_review if incremental else None),
-        **outline_kw)
+        **review_extra_kw)
     if final_result is None:
         # 整轮彻底没跑起来（超时/网关异常）≠ 审查通过。降级重试一次：帧图压小 +
         # 超时放宽。2026-07-15 事故里这里曾直接 fail-open 放行整单。
@@ -703,7 +723,7 @@ def _sequence_consistency_review(config, title, prompt_block, project_dir, on_pr
             config, prompt_block, frame_paths, degraded=True, on_progress=on_progress,
             only_beats=(local_beats if (incremental or inline_ok) else None),
             global_only_beats=(beats_to_review if incremental else None),
-            **outline_kw)
+            **review_extra_kw)
     elif final_result.get('unreviewed_beats') or not final_result.get('global_reviewed'):
         # 部分没审成：只降级重跑这几拍（外加没跑成的跨帧层），不再把已经审干净的
         # 整批重来一遍——一次网络抖动此前会让整单多烧一遍全部调用。
@@ -723,7 +743,7 @@ def _sequence_consistency_review(config, title, prompt_block, project_dir, on_pr
         retry = check_full_sequence_consistency(config, prompt_block, frame_paths, degraded=True,
                                                 only_beats=retry_beats, skip_global=skip_global,
                                                 global_only_beats=(global_unreviewed or None),
-                                                on_progress=on_progress, **outline_kw)
+                                                on_progress=on_progress, **review_extra_kw)
         final_result = merge_review_results(final_result, retry)
 
     if final_result is not None and inline_ok:
@@ -1525,6 +1545,7 @@ def fix_frame_issue(config, title, prompt_block, sequence, on_progress=None, man
             config, title, new_prompt_block,
             on_progress=on_progress,
             target_sequences=target_sequences,
+            chain_guard_review=not suppress_chain_guard,
         )
 
     # ── 三帧联排硬性审查门禁 ──────────────────────────────────────────────────

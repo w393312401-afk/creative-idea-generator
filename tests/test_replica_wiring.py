@@ -12,6 +12,7 @@
 import inspect
 
 import prompt_pipeline as pp
+from _source_reader import top_level_function_source
 from prompt_pipeline import reverse
 from prompt_pipeline.composers.base import BaseComposer
 
@@ -44,7 +45,7 @@ def test_a_normal_job_gets_no_banned_block():
 
 def test_compose_anchor_and_packet_carries_banned_elements_onto_the_brief():
     """dimensions → parsed_brief 这一跳断了，上面那个 block 就永远是空的。"""
-    src = inspect.getsource(pp.compose_anchor_and_packet)
+    src = top_level_function_source(pp.compose_anchor_and_packet)
     assert "parsed_brief['banned_elements'] = _banned_elements" in src
     # 规划器也要看见：梯子里排进一道原片没有的工序，写手就只能违规或写空话。
     assert '_banned_plan_block' in src

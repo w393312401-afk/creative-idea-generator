@@ -975,14 +975,22 @@ def analyze_video(
 
     analysis_plan = build_analysis_plan(review_entries, change_events, duration)
 
-    # 5-column keyframe collage (milestone downsampled to 15-25 frames, sharp 360px tiles),
-    # written next to the SOURCE VIDEO, not into the job dir.
-    milestone_frames = select_milestone_frames(review_entries, change_events, duration, target_count=20)
+    # 5-column keyframe collage, written next to the SOURCE VIDEO, not into the job dir.
+    #
+    # target_count was a flat 20 regardless of video length or how many milestones were
+    # actually detected. select_milestone_frames always reserves one slot per change-event
+    # peak first and only downsamples afterwards — on a long, multi-stage build with 30+
+    # change events, a flat cap of 20 silently drops entire milestones from the collage
+    # before the model ever sees them. Scale the target with the real event count instead
+    # (each tile stays a sharp fixed 360px wide either way — more milestones just means a
+    # taller collage, not blurrier tiles). Capped at 48 so the image doesn't run away.
+    milestone_target = max(20, min(48, len(change_events) + 6))
+    milestone_frames = select_milestone_frames(review_entries, change_events, duration, target_count=milestone_target)
     collage_path = build_keyframe_collage(
         milestone_frames,
         video_path.with_name(f"{video_path.stem}_collage.jpg"),
         columns=5,
-        max_frames=25,
+        max_frames=milestone_target,
         tile_width=360,
     )
 

@@ -2132,7 +2132,6 @@ details[open] > .replica-jobs-summary {
 
 #replica-sec-uploader,
 #replica-sec-jobs,
-#replica-sec-workbench,
 #replica-sec-current-job,
 #replica-sec-extract,
 #replica-sec-beats,
@@ -2256,9 +2255,36 @@ details[open] > .replica-jobs-summary {
     align-items: center;
     justify-content: space-between;
     flex-wrap: wrap;
-    gap: 8px;
-    padding-bottom: 4px;
+    gap: 10px;
+    padding-bottom: 8px;
     border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.replica-pane-title-group {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.replica-pane-baseline-meta {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    background: rgba(0, 0, 0, 0.35);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 8px;
+    padding: 3px 8px;
+    font-size: 11px;
+    flex-wrap: wrap;
+}
+
+.replica-baseline-meta-text {
+    color: rgba(255, 255, 255, 0.85);
+    font-size: 11px;
+}
+
+.replica-baseline-meta-text strong {
+    color: var(--neon-cyan, #6ee7ff);
 }
 
 .replica-pane-title {
@@ -2697,11 +2723,17 @@ details[open] > .replica-jobs-summary {
 
 .replica-ai-ideas-grid {
     display: grid;
-    grid-template-columns: repeat(2, 1fr);
-    gap: 8px;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 10px;
 }
 
-@media (max-width: 768px) {
+@media (max-width: 1200px) {
+    .replica-ai-ideas-grid {
+        grid-template-columns: repeat(2, 1fr);
+    }
+}
+
+@media (max-width: 640px) {
     .replica-ai-ideas-grid {
         grid-template-columns: 1fr;
     }
@@ -2803,6 +2835,243 @@ details[open] > .replica-jobs-summary {
     flex: 1 1 auto;
 }
 
+/* ── AI 发散创意进度卡片与骨架屏 ───────────────────────────── */
+
+.replica-diverge-progress-card {
+    padding: 12px 14px;
+    border-radius: 10px;
+    background: linear-gradient(135deg, rgba(110, 231, 255, 0.08) 0%, rgba(56, 189, 248, 0.03) 100%);
+    border: 1px solid rgba(110, 231, 255, 0.25);
+    box-shadow: 0 4px 18px rgba(0, 0, 0, 0.18), 0 0 16px rgba(110, 231, 255, 0.08);
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    animation: replicaDivergeCardPulse 2.4s ease-in-out infinite alternate;
+}
+
+@keyframes replicaDivergeCardPulse {
+    0% { border-color: rgba(110, 231, 255, 0.22); box-shadow: 0 0 12px rgba(110, 231, 255, 0.06); }
+    100% { border-color: rgba(110, 231, 255, 0.45); box-shadow: 0 0 20px rgba(110, 231, 255, 0.16); }
+}
+
+.replica-diverge-progress-head {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+.replica-diverge-pulse-icon {
+    font-size: 20px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 32px;
+    height: 32px;
+    border-radius: 8px;
+    background: rgba(110, 231, 255, 0.14);
+    border: 1px solid rgba(110, 231, 255, 0.35);
+    animation: replicaIconSpinPulse 2s infinite ease-in-out;
+}
+
+@keyframes replicaIconSpinPulse {
+    0% { transform: scale(0.95); opacity: 0.85; }
+    50% { transform: scale(1.08); opacity: 1; filter: drop-shadow(0 0 6px rgba(110, 231, 255, 0.6)); }
+    100% { transform: scale(0.95); opacity: 0.85; }
+}
+
+.replica-diverge-progress-info {
+    flex: 1 1 auto;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.replica-diverge-progress-title {
+    font-size: 12.5px;
+    font-weight: 700;
+    color: rgba(255, 255, 255, 0.95);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+}
+
+.replica-chip-diverging {
+    background: rgba(110, 231, 255, 0.18);
+    color: #6ee7ff;
+    border: 1px solid rgba(110, 231, 255, 0.4);
+    font-size: 10px;
+    padding: 2px 7px;
+    border-radius: 4px;
+}
+
+.replica-diverge-progress-status {
+    font-size: 11px;
+    color: rgba(110, 231, 255, 0.92);
+    font-weight: 500;
+    line-height: 1.4;
+    transition: all 0.25s ease;
+}
+
+.replica-diverge-steps-row {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 6px;
+    margin: 4px 0 2px;
+}
+
+@media (max-width: 768px) {
+    .replica-diverge-steps-row {
+        grid-template-columns: repeat(2, 1fr);
+    }
+}
+
+.replica-diverge-step-item {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 5px 7px;
+    border-radius: 6px;
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid rgba(255, 255, 255, 0.07);
+    transition: all 0.22s ease;
+}
+
+.replica-diverge-step-item.step-done {
+    background: rgba(16, 185, 129, 0.12);
+    border-color: rgba(16, 185, 129, 0.35);
+}
+
+.replica-diverge-step-item.step-done .replica-diverge-step-bubble {
+    background: #10b981;
+    color: #064e3b;
+}
+
+.replica-diverge-step-item.step-current {
+    background: rgba(110, 231, 255, 0.15);
+    border-color: rgba(110, 231, 255, 0.55);
+    box-shadow: 0 0 10px rgba(110, 231, 255, 0.2);
+}
+
+.replica-diverge-step-item.step-current .replica-diverge-step-bubble {
+    background: #38bdf8;
+    color: #0c4a6e;
+    box-shadow: 0 0 6px #38bdf8;
+}
+
+.replica-diverge-step-item.step-pending {
+    opacity: 0.45;
+}
+
+.replica-diverge-step-item.step-pending .replica-diverge-step-bubble {
+    background: rgba(255, 255, 255, 0.15);
+    color: rgba(255, 255, 255, 0.6);
+}
+
+.replica-diverge-step-bubble {
+    width: 16px;
+    height: 16px;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 9.5px;
+    font-weight: 800;
+    flex-shrink: 0;
+}
+
+.replica-diverge-step-texts {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    line-height: 1.25;
+}
+
+.replica-diverge-step-title {
+    font-size: 10px;
+    font-weight: 700;
+    color: rgba(255, 255, 255, 0.9);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.replica-diverge-step-desc {
+    font-size: 8.5px;
+    color: rgba(255, 255, 255, 0.5);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.replica-diverge-progress-bar-wrap {
+    height: 4px;
+    border-radius: 2px;
+    background: rgba(255, 255, 255, 0.1);
+    overflow: hidden;
+}
+
+.replica-diverge-progress-bar-fill {
+    height: 100%;
+    border-radius: 2px;
+    background: linear-gradient(90deg, #38bdf8, #6ee7ff, #34d399);
+    transition: width 0.35s ease;
+}
+
+.replica-ai-ideas-skeleton-grid {
+    opacity: 0.85;
+}
+
+.replica-ai-idea-skeleton {
+    height: 64px;
+    border-radius: 9px;
+    background: rgba(255, 255, 255, 0.035);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    position: relative;
+    overflow: hidden;
+}
+
+.replica-ai-idea-skeleton .skeleton-shimmer {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background: linear-gradient(90deg, transparent 0%, rgba(110, 231, 255, 0.09) 50%, transparent 100%);
+    animation: replicaShimmerScan 1.6s infinite;
+}
+
+@keyframes replicaShimmerScan {
+    0% { transform: translateX(-100%); }
+    100% { transform: translateX(100%); }
+}
+
+/* ── AI 正交发散刺激器内联实时进度看板 ───────────────────────── */
+
+.replica-mutator-live-progress {
+    padding: 9px 12px;
+    border-radius: 8px;
+    background: rgba(110, 231, 255, 0.09);
+    border: 1px solid rgba(110, 231, 255, 0.3);
+    margin-bottom: 8px;
+    box-shadow: 0 2px 10px rgba(0, 0, 0, 0.15);
+}
+
+.replica-mutator-progress-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 11.5px;
+    line-height: 1.5;
+}
+
+.replica-mutator-progress-label {
+    flex: 1 1 auto;
+    color: rgba(255, 255, 255, 0.9);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
 
 .replica-preset-label {
     font-size: 11.5px;
@@ -2811,9 +3080,15 @@ details[open] > .replica-jobs-summary {
 }
 
 .replica-axis-inputs {
-    display: flex;
-    flex-direction: column;
-    gap: 10px;
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 12px;
+}
+
+@media (max-width: 768px) {
+    .replica-axis-inputs {
+        grid-template-columns: 1fr;
+    }
 }
 
 .replica-axis-field {

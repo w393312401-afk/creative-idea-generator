@@ -30,6 +30,13 @@ FX_CONFIG_SPEC = {
         'type': 'bool', 'default': True, 'hot': True, 'env': 'ADSPOWER_SILENT_MODE',
         'group': '连接', 'label': '后台静默运行（屏幕外运行，不弹窗抢焦点）',
     },
+    # macOS 上"屏幕外坐标"会被系统 clamp 回可见区域，静默模式挡不住抢焦点，得改用
+    # app 级隐藏。hide 需要「辅助功能」权限，没授权会自动降级成 focus。
+    'adsPowerMacWindowMode': {
+        'type': 'enum', 'options': ['hide', 'focus', 'off'],
+        'default': 'hide', 'hot': True, 'env': 'ADSPOWER_MACOS_WINDOW_MODE',
+        'group': '连接', 'label': 'macOS 窗口处理（hide=隐藏窗口／focus=仅归还焦点／off=不干预）',
+    },
     'googleFxImageModel': {
         'type': 'enum', 'options': list(GOOGLE_FX_IMAGE_MODELS),
         'default': 'Nano Banana 2', 'hot': True, 'group': '模型', 'label': '图片模型',

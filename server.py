@@ -1804,12 +1804,13 @@ def _replica_worker(task_id, config, job_id, label, run, task_type='replica'):
         set_project_key_context(None)
 
 
-def replica_extract_worker(task_id, config, job_id, base_fps=None):
+def replica_extract_worker(task_id, config, job_id, base_fps=None, state_diff_threshold=None):
     """只抽帧，停在 confirm_cost 成本确认卡点。不花模型钱，所以不必先问用户。"""
     from replica_pipeline import extract_replica_job
     _replica_worker(task_id, config, job_id, '抽帧',
                     lambda cb: extract_replica_job(config, job_id, on_progress=cb,
-                                                   base_fps=base_fps),
+                                                   base_fps=base_fps,
+                                                   state_diff_threshold=state_diff_threshold),
                     task_type='replica_extract')
 
 
@@ -2990,6 +2991,34 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                     self._send_json({'error': str(e)}, status=500)
             else:
                 self._send_json({'error': 'Not found'}, status=404)
+        elif path == '/api/get_frame_candidates':
+            if not self._gate():
+                return
+            title = query.get('title', [''])[0]
+            seq_str = query.get('sequence', [''])[0]
+            if not title or not seq_str:
+                self._send_json({'error': 'Missing title or sequence parameter'}, status=400)
+                return
+            try:
+                seq = int(seq_str)
+            except ValueError:
+                self._send_json({'error': 'sequence must be an integer'}, status=400)
+                return
+            project_dir = _get_project_dir(title)
+            frames_dir = os.path.join(project_dir, 'frames')
+            manifest = read_manifest(project_dir) or {}
+            target_frame = next((f for f in (manifest.get('frames') or []) if f.get('sequence') == seq or f.get('slot') == seq), None)
+            from candidate_selection_pipeline import sync_frame_candidates_pool
+            cands, chosen_idx, meta_payload = sync_frame_candidates_pool(frames_dir, seq, current_frame=target_frame, auto_archive_current=True)
+            self._send_json({
+                'status': 'ok',
+                'sequence': seq,
+                'candidates': cands,
+                'chosen_candidate_index': chosen_idx,
+                'ai_evaluation': target_frame.get('ai_evaluation') if target_frame else None,
+                'candidate_selection_reason': ((target_frame.get('candidate_selection_reason')
+                                                or target_frame.get('vlm_qa_reason')) if target_frame else None),
+            })
         elif path == '/api/deleted_slots':
             # 这单删过哪些拍、哪些还能撤销。数据源是 /api/delete_slot 写下的
             # .deleted_slots/<id>/ 快照目录，见 /api/restore_slot。
@@ -3463,6 +3492,100 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 self._send_json({'error': '联网参考归档文件读取失败'}, status=500)
                 return
             self._send_json({'status': 'ok', 'refs': list(reversed(archive))})
+        elif path == '/api/project/references':
+            # 检索项目或复刻任务绑定的爆款原片抽帧与 5 列拼图
+            if not self._gate():
+                return
+            try:
+                from prompt_pipeline import find_reference_frames_for_project
+                
+                title = query.get('title', [''])[0].strip()
+                job_id = query.get('job_id', [''])[0].strip()
+                total_beats = None
+                try:
+                    total_beats = int(query.get('total_beats', [''])[0])
+                except Exception:
+                    pass
+
+                pdir = None
+                # 1. 优先按 job_id 查找 (replica_jobs/replica_<job_id>)
+                if job_id:
+                    try:
+                        from replica_pipeline import job_dir as get_rjob_dir, validate_job_id as val_rjob
+                        clean_job = job_id if job_id.startswith('replica_') else f'replica_{job_id}'
+                        if val_rjob(clean_job):
+                            jdir = get_rjob_dir(clean_job)
+                            if os.path.isdir(jdir):
+                                pdir = jdir
+                    except Exception:
+                        pass
+
+                # 2. 按 title / project_key 查找
+                if not pdir and title:
+                    candidate = _get_project_dir(title)
+                    if candidate and os.path.exists(candidate):
+                        pdir = candidate
+                    else:
+                        safe = _safe_project_name(title)
+                        out_dir = os.path.join(OUTPUT_ROOT, safe)
+                        if os.path.exists(out_dir):
+                            pdir = out_dir
+                        else:
+                            for d in sorted(os.listdir(OUTPUT_ROOT)):
+                                if safe and safe in d:
+                                    pdir = os.path.join(OUTPUT_ROOT, d)
+                                    break
+                                elif title and title in d:
+                                    pdir = os.path.join(OUTPUT_ROOT, d)
+                                    break
+
+                # 3. 兜底：从 title 或 job_id 提取 replica_([a-f0-9]{12}) 匹配目录
+                if not pdir:
+                    for text in (job_id, title):
+                        if text:
+                            m = re.search(r'replica_([a-f0-9]{12})', text)
+                            if m:
+                                r_job = f'replica_{m.group(1)}'
+                                try:
+                                    from replica_pipeline import job_dir as r_job_dir, validate_job_id as r_val
+                                    if r_val(r_job):
+                                        rj_dir = r_job_dir(r_job)
+                                        if os.path.isdir(rj_dir):
+                                            pdir = rj_dir
+                                            break
+                                except Exception:
+                                    pass
+                                for d in os.listdir(OUTPUT_ROOT):
+                                    if m.group(1) in d:
+                                        pdir = os.path.join(OUTPUT_ROOT, d)
+                                        break
+                                if pdir:
+                                    break
+
+                ref_dict = {}
+                src_collage = None
+                if pdir and os.path.exists(pdir):
+                    refs, collage = find_reference_frames_for_project(pdir, total_beats)
+                    if refs:
+                        for k, v in refs.items():
+                            if v:
+                                u = str(v).replace('\\', '/')
+                                if '/outputs/' in u:
+                                    u = u[u.index('/outputs/'):]
+                                ref_dict[int(k)] = u
+                    if collage:
+                        cu = str(collage).replace('\\', '/')
+                        if '/outputs/' in cu:
+                            cu = cu[cu.index('/outputs/'):]
+                        src_collage = cu
+
+                self._send_json({
+                    'status': 'ok',
+                    'ref_frames': ref_dict,
+                    'source_collage_url': src_collage,
+                })
+            except Exception as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
         elif path == '/api/account-pool':
             # 视频生成号池:列出已添加的 Flow 账号(命名/备注/已知积分/上次检查时间/
             # 是否禁用)。池子为空时前端应显示"未启用号池"，行为回退到手动单选。
@@ -5042,6 +5165,98 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
             except Exception as e:
                 self._send_json({'status': 'error', 'message': str(e)}, status=500)
 
+        elif path == '/api/projects/delete':
+            # 项目工作台批量/单项彻底删除：一次性清理关联的点子库记录、生成任务记录、子作业及本地 outputs 媒体文件
+            if not self._gate():
+                return
+            try:
+                body = self._read_json_body()
+                projects = body.get('projects')
+                if not isinstance(projects, list):
+                    p_single = body.get('project')
+                    projects = [p_single] if isinstance(p_single, dict) else []
+                keys = body.get('keys') or body.get('project_keys')
+                if not projects and isinstance(keys, list):
+                    current_rows = build_projects_index(with_assets=False)
+                    key_set = set(keys)
+                    projects = [r for r in current_rows if r.get('project_key') in key_set]
+
+                if not projects:
+                    self._send_json({'status': 'error', 'message': '缺少待删除项目'}, status=400)
+                    return
+
+                deleted_tasks = []
+                deleted_library_ids = []
+                deleted_output_dirs = []
+
+                task_ids_to_delete = []
+                library_ids_to_delete = []
+                cleanup_targets = []
+
+                for p in projects:
+                    if not isinstance(p, dict):
+                        continue
+
+                    task_info = p.get('task') or {}
+                    if task_info.get('id'):
+                        task_ids_to_delete.append(task_info['id'])
+                    for sub in (p.get('sub_jobs') or []):
+                        if isinstance(sub, dict) and sub.get('id'):
+                            task_ids_to_delete.append(sub['id'])
+
+                    lib_info = p.get('library') or {}
+                    if lib_info.get('id'):
+                        library_ids_to_delete.append(lib_info['id'])
+                    elif p.get('saved') and p.get('id'):
+                        library_ids_to_delete.append(p.get('id'))
+
+                    title = p.get('project_key') or p.get('title')
+                    covers = []
+                    if p.get('cover'):
+                        covers.append(p.get('cover'))
+                    if p.get('covers'):
+                        covers.extend(p.get('covers'))
+                    if title:
+                        cleanup_targets.append((title, covers))
+
+                for title, covers in cleanup_targets:
+                    try:
+                        res = delete_idea_output_files(title, covers)
+                        if res.get('project_dir'):
+                            deleted_output_dirs.append(res['project_dir'])
+                    except Exception as e:
+                        if sys.stdout:
+                            print(f"[PROJECTS] 清理产物目录失败 {title}: {e}")
+
+                if task_ids_to_delete:
+                    with ACTIVE_TASKS_LOCK:
+                        for tid in task_ids_to_delete:
+                            t = ACTIVE_TASKS.get(tid)
+                            if t:
+                                t.get("cancel_event", threading.Event()).set()
+                                del ACTIVE_TASKS[tid]
+                            deleted_tasks.append(tid)
+                    for tid in task_ids_to_delete:
+                        try:
+                            delete_task_files(tid)
+                        except Exception:
+                            pass
+
+                if library_ids_to_delete:
+                    deleted_library_ids = delete_library_items(library_ids_to_delete)
+
+                self._send_json({
+                    'status': 'ok',
+                    'count': len(projects),
+                    'deleted_tasks_count': len(set(deleted_tasks)),
+                    'deleted_library_count': len(deleted_library_ids),
+                    'deleted_library_ids': deleted_library_ids,
+                })
+            except Exception as e:
+                if sys.stdout:
+                    print(f"Error deleting project(s): {e}")
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
+
         elif path == '/api/tasks/clear':
             if not self._gate():
                 return
@@ -5076,10 +5291,7 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 # 清空全部：同步清空常规点子库条目并彻底删除 outputs/ 目录下的所有常规本地媒体文件（保留爆款复刻项目与资产）
                 if status_group == "all":
                     for item in library_items:
-                        if isinstance(item, dict):
-                            # 永久豁免所有爆款复刻创意条目
-                            if is_replica_library_item(item):
-                                continue
+                        if isinstance(item, dict) and not is_replica_library_item(item):
                             item_id = item.get('id')
                             if item_id not in (None, ''):
                                 title = item.get('project_key') or item.get('title')
@@ -5093,6 +5305,7 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                                 removed = delete_library_item(item_id)
                                 if removed:
                                     deleted_library_ids.append(item_id)
+
                     # 彻底清理 outputs/ 目录下的常规残留项目文件夹与媒体文件，严禁删除 replica_jobs 及复刻项目资产
                     try:
                         outputs_dir = os.path.abspath(server_common.OUTPUT_ROOT if os.path.isabs(server_common.OUTPUT_ROOT) else os.path.join(base_dir, server_common.OUTPUT_ROOT))
@@ -5169,18 +5382,6 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 prompt_block = body.get('prompt_block', '')
                 target_sequences = body.get('target_sequences')
 
-                skip_cover = bool(
-                    config.get('skipCoverReference')
-                    or config.get('allowTextOnlyAnchor')
-                    or config.get('coverReferencePath') == 'none'
-                )
-                if not skip_cover and not resolve_cover_reference(config, title, project_key):
-                    self._send_json({
-                        'status': 'error',
-                        'message': '请先生成或选择封面图；第一帧必须以封面图进行图生图。',
-                    }, status=400)
-                    return
-
                 import uuid
                 task_id = f"frames_{uuid.uuid4().hex}"
 
@@ -5245,18 +5446,6 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 prompt_block = body.get('prompt_block', '')
                 target_sequences = body.get('target_sequences')
                 candidate_count = int(body.get('candidate_count') or 4)
-
-                skip_cover = bool(
-                    config.get('skipCoverReference')
-                    or config.get('allowTextOnlyAnchor')
-                    or config.get('coverReferencePath') == 'none'
-                )
-                if not skip_cover and not resolve_cover_reference(config, title, project_key):
-                    self._send_json({
-                        'status': 'error',
-                        'message': '请先生成或选择封面图；第一帧必须以封面图进行图生图。',
-                    }, status=400)
-                    return
 
                 import uuid
                 task_id = f"frames_sel_{uuid.uuid4().hex}"
@@ -5726,7 +5915,7 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
 
                 threading.Thread(
                     target=replica_extract_worker,
-                    args=(task_id, config, job_id, body.get('base_fps')),
+                    args=(task_id, config, job_id, body.get('base_fps'), body.get('state_diff_threshold')),
                     daemon=True
                 ).start()
                 self._send_json({'status': 'ok', 'task_id': task_id})
@@ -6221,31 +6410,26 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 task_id = f"videos_{uuid.uuid4().hex}"
 
                 cleanup_old_tasks()
-                # 多镜头包（omni / miniature）走链式生成：它们的 VIDEO 只上首帧，
-                # 后续槽位靠上一段的尾帧接力。判定必须走 active_skill_profile —— 它是
-                # 「本次请求该用哪个 profile」的唯一权威（SKILL_PROFILE 环境变量 >
-                # config.skillProfile > 按 videoModel 推断）。照 videoModel 的字面
-                # 自己再判一次，会漏掉「显式选了 omni、视频模型还是 Veo」这一档，
-                # 也会把显式选回 base 的人反手顶成链式。
-                is_chain_model = active_skill_profile(config) in ('omni', 'miniature')
-                if not is_chain_model:
-                    if config.get('generation_channel') == 'video_chain':
-                        is_chain_model = True
-                    else:
-                        # 落盘目录由 project_key 决定（worker 里 set_project_key_context 用的
-                        # 就是它），display_title 只是给人看的标题。这里若传 title，
-                        # display_title 与 project_key 不同名时会算出一个不存在的目录，
-                        # manifest 永远读不到，链式判定静默失效。
-                        project_dir = _get_project_dir(project_key or title)
-                        manifest_path = os.path.join(project_dir, 'manifest.json') if project_dir else None
-                        if manifest_path and os.path.exists(manifest_path):
-                            try:
-                                with open(manifest_path, 'r', encoding='utf-8') as f:
-                                    mf = json.load(f)
-                                    if mf.get('generation_channel') == 'video_chain':
-                                        is_chain_model = True
-                            except Exception:
-                                pass
+                # 仅当显式指定 generation_channel 为 video_chain，或历史 manifest 标记为 video_chain 时走链式生成；
+                # 正常的「生成所有视频」统一执行标准关键帧视频生成（generate_videos_worker），完整上传首尾帧
+                is_chain_model = False
+                if config.get('generation_channel') == 'video_chain':
+                    is_chain_model = True
+                else:
+                    # 落盘目录由 project_key 决定（worker 里 set_project_key_context 用的
+                    # 就是它），display_title 只是给人看的标题。这里若传 title，
+                    # display_title 与 project_key 不同名时会算出一个不存在的目录，
+                    # manifest 永远读不到，链式判定静默失效。
+                    project_dir = _get_project_dir(project_key or title)
+                    manifest_path = os.path.join(project_dir, 'manifest.json') if project_dir else None
+                    if manifest_path and os.path.exists(manifest_path):
+                        try:
+                            with open(manifest_path, 'r', encoding='utf-8') as f:
+                                mf = json.load(f)
+                                if mf.get('generation_channel') == 'video_chain':
+                                    is_chain_model = True
+                        except Exception:
+                            pass
                 target_worker = generate_video_chain_worker if is_chain_model else generate_videos_worker
 
                 get_or_create_task(task_id, {"type": "video_chain" if is_chain_model else "videos",
@@ -7017,6 +7201,25 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                         for key in ('fx_uuid', 'fx_src', 'backend', 'transport', 'actual_pixels',
                                     'degraded_reason', 'anchor_reference'):
                             target.pop(key, None)
+
+                        # 将手动上传的图片安全归档进候选池并同步至 manifest
+                        try:
+                            from candidate_selection_pipeline import sync_frame_candidates_pool
+                            up_cands, up_chosen_idx, _ = sync_frame_candidates_pool(
+                                frames_dir, sequence,
+                                current_frame={
+                                    'chosen_candidate_index': None,
+                                    'candidates': target.get('candidates', []),
+                                    'model': 'manual_upload',
+                                    'model_display': '手动上传',
+                                },
+                                target_path=dest_path,
+                                auto_archive_current=True
+                            )
+                            target['candidates'] = up_cands
+                            target['chosen_candidate_index'] = up_chosen_idx
+                        except Exception as cand_sync_err:
+                            log('WARN', 'FRAMES', f"手动上传归档候选池异常: {cand_sync_err}", title=title)
 
                         frames_list.sort(key=lambda f: f.get('sequence', 0))
                         # 其后的帧仍派生自被换掉的那张旧图——标 stale_lineage，
@@ -8397,68 +8600,22 @@ def _sync_project_manifest_with_disk_locked(project_dir):
         frame.setdefault("retry_count", 0)
         frame.setdefault("quality_gate", "pending_manual_review")
 
-        # 候选池同步与补齐（含 gpt-image-2 及所有历史生成帧）
-        cand_dir = os.path.join(frames_dir, 'candidates', f'frame_{seq:03d}')
-        if not frame.get('candidates') or len(frame.get('candidates', [])) == 0:
-            loaded_cands = []
-            meta_file = os.path.join(cand_dir, 'candidates_meta.json')
-            if os.path.exists(meta_file):
-                try:
-                    with open(meta_file, 'r', encoding='utf-8') as f:
-                        m_payload = json.load(f)
-                        if isinstance(m_payload, dict) and isinstance(m_payload.get('candidates'), list):
-                            chosen_c_idx = frame.get('chosen_candidate_index') or 1
-                            for cm in m_payload['candidates']:
-                                c_idx = cm.get('index') or 1
-                                cand_f = cm.get('path') or os.path.join(cand_dir, f'candidate_{c_idx}.webp')
-                                rel_cand_path, rel_cand_url = _rel_url_for(cand_f)
-                                c_m = cm.get('model') or (frame.get('model') if frame else None) or 'gemini-3.1-flash-image'
-                                c_m_disp = cm.get('model_display') or ('GPT-2' if 'gpt' in str(c_m).lower() else ('Google FX' if ('google_fx' in str(c_m).lower() or cm.get('fx_uuid')) else 'Gemini'))
-                                loaded_cands.append({
-                                    'index': c_idx,
-                                    'file': rel_cand_path,
-                                    'url': rel_cand_url,
-                                    'fx_uuid': cm.get('fx_uuid'),
-                                    'model': c_m,
-                                    'model_display': c_m_disp,
-                                    'is_chosen': (c_idx == chosen_c_idx),
-                                    'score': 85,
-                                    'strengths': f'候选图 #{c_idx}',
-                                    'defects': '',
-                                })
-                except Exception:
-                    loaded_cands = []
-            elif os.path.exists(frame_path):
-                try:
-                    os.makedirs(cand_dir, exist_ok=True)
-                    cand_dest = os.path.join(cand_dir, 'candidate_1.webp')
-                    if not os.path.exists(cand_dest):
-                        shutil.copy2(frame_path, cand_dest)
-                    c_m = frame.get('model') or 'gemini-3.1-flash-image'
-                    c_m_disp = 'GPT-2' if 'gpt' in str(c_m).lower() else 'Gemini'
-                    cand_meta_dest = {'index': 1, 'path': cand_dest, 'raw_src': cand_dest, 'fx_uuid': None, 'model': c_m, 'model_display': c_m_disp}
-                    with open(meta_file, 'w', encoding='utf-8') as f:
-                        json.dump({'sequence': seq, 'candidates': [cand_meta_dest]}, f, ensure_ascii=False, indent=2)
-                    rel_cand_path, rel_cand_url = _rel_url_for(cand_dest)
-                    loaded_cands.append({
-                        'index': 1,
-                        'file': rel_cand_path,
-                        'url': rel_cand_url,
-                        'fx_uuid': None,
-                        'model': c_m,
-                        'model_display': c_m_disp,
-                        'is_chosen': True,
-                        'score': 85,
-                        'strengths': '基础主帧',
-                        'defects': '',
-                    })
-                except Exception:
-                    pass
+        # 候选池同步与补齐（含 gpt-image-2 及所有历史生成帧，全量扫描盘与元数据）
+        try:
+            from candidate_selection_pipeline import sync_frame_candidates_pool
+            loaded_cands, chosen_c_idx, _ = sync_frame_candidates_pool(
+                frames_dir, seq,
+                current_frame=frame,
+                target_path=frame_path,
+                auto_archive_current=False
+            )
             if loaded_cands:
-                frame['candidates'] = loaded_cands
-                if not frame.get('chosen_candidate_index'):
-                    frame['chosen_candidate_index'] = 1
-                modified = True
+                if frame.get('candidates') != loaded_cands or frame.get('chosen_candidate_index') != chosen_c_idx:
+                    frame['candidates'] = loaded_cands
+                    frame['chosen_candidate_index'] = chosen_c_idx
+                    modified = True
+        except Exception as cand_sync_e:
+            pass
 
         rebuilt_frames.append(frame)
     if rebuilt_frames:

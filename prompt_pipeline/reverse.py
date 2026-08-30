@@ -2401,6 +2401,78 @@ def analyze_scene_constants(facts, min_ratio=SCENE_CONSTANT_RATIO,
     return out
 
 
+# ── 微缩题材判定（这一单该不该走微缩沙盘那套系统提示词）────────────────────────
+# 2026-08-30 实测 replica_af8db0d7a95f：一单**真人实拍**的半挂车改造被判成微缩片，
+# 交付正文里 39 处 miniature、33 处 giant hands、8 处 diorama，施工者成了"拇指高的
+# miniature builder"，用户看到的还是一屋子假人。唯一的触发证据是识别项里的一个词：
+#   "Caucasian male builder/craftsman in his 30s…"
+# —— fast_composer 的旧判据把 'craftsman' 当成"巨手工匠"的证据。可 craftsman 就是
+# 「手艺人/工匠」，真人施工片里最常见的自称之一。一个中性职业词把整条通道拨到了另一
+# 个题材上，而且全程没有任何提示。
+#
+# 现在只认真正指向微缩题材的证据：显式档位、题材词、或识别项里的比例/人偶记号。
+# **绝不再拿职业词当证据。**
+_MINIATURE_TOPIC_HINTS = (
+    'miniature', 'diorama', 'tabletop', 'dollhouse', "doll's house", 'dolls house',
+    '微缩', '沙盘', '手作模型', '微缩模型',
+)
+# 识别项里的微缩记号：人偶、拇指高、1:24 这类比例、以及真人化改写留下的
+# "miniature-scale"（见 prompt_pipeline.human_cast——改写会把 figurine 换成真人措辞，
+# 判据不能只认 figurine，否则归一之后证据就没了）。
+_CAST_MINIATURE_RE = re.compile(
+    r'(?i)\b(?:miniature|dollhouse|figurines?|thumb[-\s]tall|god[-\s]?hand)\b'
+    r'|\b1\s*[:：]\s*\d{1,3}\b'
+)
+
+
+def detect_miniature_scale(beats_doc, title=None, config=None):
+    """这一单是不是微缩沙盘题材。返回 (is_miniature, 证据说明)。
+
+    判定顺序：doc 上已经定过的 render_scale > 显式 skillProfile > 题材词 > 识别项记号。
+    落在 doc 上的那份是权威——判定必须**只做一次**并跟着任务走：识别项的措辞会被后续
+    改写（真人化）、被人在卡点上编辑，每跑一趟重新从文本里猜一次，就会出现同一单前后
+    两趟走两条通道。
+    """
+    doc = beats_doc if isinstance(beats_doc, dict) else {}
+
+    # 显式设置排在已定档**之前**：定档是为了让自动判定稳定（识别项被改写、被人编辑
+    # 都不该让同一单换通道），但它不该反过来压住用户当次的明确指定——那就成了"设置
+    # 无效"，正是这一串问题的老毛病。
+    if str((config or {}).get('skillProfile') or '').strip().lower() == 'miniature':
+        return True, '配置显式指定 skillProfile=miniature'
+
+    recorded = str(doc.get('render_scale') or '').strip().lower()
+    if recorded in ('miniature', 'full'):
+        return recorded == 'miniature', f'任务已定档：{recorded}'
+
+    haystack = ' '.join(str(x or '') for x in (
+        title, doc.get('carrier'), doc.get('scene_signature'), doc.get('video_name'))).lower()
+    for hint in _MINIATURE_TOPIC_HINTS:
+        if hint in haystack:
+            return True, f'题材词命中「{hint}」'
+
+    for c in (doc.get('cast_identity') or []):
+        m = _CAST_MINIATURE_RE.search(str(c or ''))
+        if m:
+            return True, f'识别项里的微缩记号「{m.group(0)}」'
+
+    return False, '没有任何微缩证据（题材词与识别项记号都没命中）'
+
+
+def freeze_render_scale(beats_doc, title=None, config=None):
+    """把微缩判定钉在 doc 上（render_scale: 'miniature' | 'full'），返回是否微缩。
+
+    只在键不存在时定一次——与 attach_scene_constants 判「键在不在」同一条理由：
+    之后识别项被改写或被人编辑，都不该让同一单换通道。
+    """
+    if not isinstance(beats_doc, dict):
+        return False
+    is_mini, why = detect_miniature_scale(beats_doc, title=title, config=config)
+    if 'render_scale' not in beats_doc:
+        beats_doc['render_scale'] = 'miniature' if is_mini else 'full'
+        beats_doc['render_scale_reason'] = why
+    return str(beats_doc.get('render_scale')).lower() == 'miniature'
+
 def attach_scene_constants(beats_doc, facts):
     """算出场景恒常特征并挂到文档上。只在字段**不存在**时算一次。
 
@@ -2426,6 +2498,18 @@ def attach_scene_constants(beats_doc, facts):
     cast = [str(x).strip() for x in (beats_doc.get('cast_identity') or []) if str(x).strip()]
     if cast:
         constants['cast'] = cast
+    # 通道判定必须排在真人化**之前**：真人化会把 figurine 换成真人措辞，那正是
+    # detect_miniature_scale 认微缩用的证据之一，先归一再判就等于把证据擦掉再断案。
+    freeze_render_scale(beats_doc)
+    # 活物一律真人：读数照原片老实读（原片真是微缩沙盘就该读出人偶），但**恒常项一落地
+    # 就归一成真人**——这一栏是全链路复述外形的唯一权威，写着 figurine 的话每一帧
+    # IMAGE 都会跟着复述一遍，交付出来就是一屋子蜡像。尺寸不归这里管（比例锁另有其人）。
+    # cast_identity 同步改写：两处不同步的话，合成器拿到的还是人偶那份。
+    from .human_cast import humanize_cast_list
+    if constants.get('cast'):
+        constants['cast'] = humanize_cast_list(list(constants['cast']))
+    if beats_doc.get('cast_identity'):
+        beats_doc['cast_identity'] = humanize_cast_list(list(beats_doc['cast_identity']))
     # 环境底噪与 motion 严格对称：那一栏是「一直在动」，这一栏是「一直在响」。同样统计
     # 不出来（帧事实是一张张无声画面），只能由 Pass B 读，或人在卡点上补。不给它落脚点，
     # 每条 VIDEO 结尾那句 "Ambient noise:" 就是模型现编的，整片的声场一拍一个样。
@@ -2600,8 +2684,14 @@ def scene_constants_lines(constants, signature=None):
                   # 这一栏与上面四栏的动词不同：它们是「在」，这一栏是「在动」。合成侧据此
                   # 要求每一条 VIDEO 都让它继续动（见 BaseComposer.scene_constants_block）。
                   ('motion', 'never stops moving anywhere in the film'))
+        from .human_cast import humanize_cast_list
         for key, label in labels:
             items = [str(x).strip() for x in (constants.get(key) or []) if str(x).strip()]
+            # 活物一律真人。attach_scene_constants 落地时已经归一过一次，这里再来一道
+            # 是因为这一栏之后还会被人在卡点上手改、也可能来自本次改动之前存下的旧任务；
+            # 送进提示词的那一份必须是真人措辞，不能指望上游都过过手。幂等，重复调无害。
+            if key == 'cast':
+                items = humanize_cast_list(items)
             if items:
                 lines.append(f'{label}: ' + '; '.join(items))
     return lines

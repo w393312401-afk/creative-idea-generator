@@ -28,7 +28,7 @@ from server_common import (
     apply_google_fx_runtime_overrides, fx_cancel_context, fx_request_deadline,
     read_manifest, write_manifest, GenerationCancelled, log,
     gpt_image_pixel_size, drop_stale_review_verdicts, stamp_manifest_capabilities,
-    gate_setting,
+    gate_setting, chain_guard_mode,
     # 号池轮转口径（帧序列与视频序列共用，见 server_common 的「换 IP 已全局关停」注释）
     _get_account_pool_service, _select_pool_account,
     _account_switch_interval, _account_rotation_ring, revalidate_leg_account,
@@ -38,6 +38,8 @@ from frame_continuity import (
     family_map, family_master, is_transition_frame, register_family_master,
     transition_result,
 )
+
+_CHAIN_GUARD_AUTOFIX_ATTEMPTS = 2
 
 
 
@@ -1752,7 +1754,7 @@ def text_only_anchor_allowed(config):
     return bool(config.get('allowTextOnlyAnchor') or config.get('skipCoverReference') or config.get('coverReferencePath') == 'none')
 
 
-def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=None, target_sequences=None):
+def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=None, target_sequences=None, chain_guard_review=True):
     import builtins
     # 纯 SPARK 内部旗标：AdsPower 侧早已删掉这个进程级全局标志，外部脚本不再读它
     # （真正送进脚本的取消信号见 _fx_batch_cancel_fn / fx_cancel_context）。
@@ -1939,6 +1941,9 @@ def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=
         except Exception:
             pass
 
+    manifest.pop('halted_at_beat', None)
+    manifest.pop('halted_at_sequence', None)
+
     if isinstance(manifest.get('google_fx_projects'), dict):
         canvas_session['projects_by_account'] = dict(manifest['google_fx_projects'])
     if manifest.get('google_fx_project_url'):
@@ -2014,11 +2019,23 @@ def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=
 
     generated_count = 0
 
-    def _emit_frame(frame_info):
+    # 这个事件里的 quality_gate 是**守卫跑之前**的读数（4选1 优选 / 初始态），前端
+    # 却拿它打"完成（质检通过）"那一行。链上守卫在本帧落盘之后才审，于是用户先看到
+    # 一行绿的、过一会儿卡片又变红——"当时说通过、后来说有问题"就是这么来的。
+    # guard_pending 如实告诉前端"后面还有一道审查"，让它把结论那句话留给守卫自己说。
+    def _guard_will_run(seq):
+        if (chain_guard_mode(config) if chain_guard_review else 'off') == 'off':
+            return False
+        # 与下面的守卫分支同一判据：首帧走锚点审查，其余拍要有上一帧才审得了。
+        return seq == 1 or os.path.exists(_webp_path(seq - 1))
+
+    def _emit_frame(frame_info, guard_pending=False):
         nonlocal generated_count
         generated_count += 1
         if on_progress:
-            on_progress('frame', {'frame': frame_info, 'current': generated_count, 'total': total_to_generate})
+            on_progress('frame', {'frame': frame_info, 'current': generated_count,
+                                  'total': total_to_generate,
+                                  'guard_pending': bool(guard_pending)})
 
     def _record_frame(seq, item, fx_src_path, fx_uuid, quality_gate, vlm_reason,
                       cover_reference=None, fx_account_id=None, continuity_check=None,
@@ -2061,7 +2078,7 @@ def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=
             frame_info['anchor_reference'] = 'cover'
         manifest_frames_by_seq[seq] = frame_info
         _save_manifest()  # 浏览器批量任务动辄数分钟，逐帧落盘保证进度可恢复
-        _emit_frame(frame_info)
+        _emit_frame(frame_info, guard_pending=_guard_will_run(seq))
         return frame_info
 
     chunks = plan_fx_chunks(
@@ -2138,15 +2155,14 @@ def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=
         ref_path = _fx_find_ref_for(frames_dir, chunk[0])
 
         if chunk[0] == 1:
+            _fx_clear_frame_reference(frames_dir, 1)
             cover_src = resolve_cover_reference(config, title)
-            if not cover_src and not text_only_anchor_allowed(config):
-                raise RuntimeError('生成帧序列前必须先生成或选择封面图；第一帧只能以封面图进行图生图')
             if cover_src:
                 ref_path = _fx_cover_ref_jpg(cover_src, frames_dir)
                 cover_ref_src = cover_src
                 # The cover is the image reference only. Send the parsed IMAGE 1 prompt verbatim.
             else:
-                # 链头无封面（分步任务）：纯文生图，不带任何图参考。
+                # 链头无封面：纯文生图，不带任何图参考。
                 ref_path = None
                 if on_progress:
                     on_progress('cover_reference_skipped', {
@@ -2344,12 +2360,178 @@ def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=
                         })
                     raise FrameContinuityError(
                         f'IMG {s:03d} 场景连续性检查失败：{continuity_check.get("reason")}')
+
+                # 链上逐拍守卫审查（生成一张审一张）
+                guard_mode = chain_guard_mode(config) if chain_guard_review else 'off'
+                if guard_mode != 'off':
+                    if s == 1:
+                        try:
+                            from chain_guard import run_anchor_guard
+
+                            def _resync_fx_from_disk():
+                                updated_manifest = read_manifest(project_dir)
+                                if updated_manifest and 'frames' in updated_manifest:
+                                    manifest['frames'] = updated_manifest['frames']
+                                    for f_entry in manifest['frames']:
+                                        if f_entry.get('sequence') == s:
+                                            manifest_frames_by_seq[s] = f_entry
+                                            break
+
+                            forward_build = (target_sequences is None)
+                            anchor_res = run_anchor_guard(
+                                config, title, prompt_block, project_dir,
+                                guard_mode=guard_mode, forward_build=forward_build,
+                                on_progress=on_progress,
+                                on_manifest_dirty=_resync_fx_from_disk,
+                                autofix_attempts=_CHAIN_GUARD_AUTOFIX_ATTEMPTS,
+                            )
+                            new_block = anchor_res.get('prompt_block')
+                            if new_block:
+                                prompt_block = new_block
+                            # 首帧判废就停在这里：它是整条 i2i 链的地基，接着往下渲
+                            # 等于让一张已知歪掉的图当所有下游帧的底图。
+                            if anchor_res.get('halt'):
+                                manifest['halted_at_beat'] = 0
+                                manifest['halted_at_sequence'] = 1
+                                break
+                        except GenerationCancelled:
+                            # 自动修复途中用户点了取消：必须原样抛出去，被下面的
+                            # 兜底吞掉就成了"点了取消还在接着渲"。
+                            raise
+                        except Exception as e:
+                            log('WARN', 'CHAIN_GUARD', f"IMG 001 锚点审查异常: {e}")
+                    elif s >= 2:
+                        beat = s - 1
+                        prev_seq = s - 1
+                        prev_file = _webp_path(prev_seq)
+                        if os.path.exists(prev_file):
+                            def _resync_fx_from_disk():
+                                updated_manifest = read_manifest(project_dir)
+                                if updated_manifest and 'frames' in updated_manifest:
+                                    manifest['frames'] = updated_manifest['frames']
+                                    for f_entry in manifest['frames']:
+                                        if f_entry.get('sequence') == s:
+                                            manifest_frames_by_seq[s] = f_entry
+                                            break
+
+                            try:
+                                from chain_guard import (
+                                    guard_beat, guard_autofix_enabled, guard_halt_enabled)
+
+                                forward_build = (target_sequences is None)
+                                guard_res = guard_beat(
+                                    config, title, prompt_block, beat, project_dir,
+                                    on_progress=on_progress,
+                                    allow_halt=forward_build,
+                                )
+                                _resync_fx_from_disk()
+
+                                if guard_res.get('halt') and guard_autofix_enabled(guard_mode) and forward_build:
+                                    from pipeline_orchestrator import fix_frame_issue
+                                    for attempt in range(1, _CHAIN_GUARD_AUTOFIX_ATTEMPTS + 1):
+                                        texts = '；'.join(
+                                            i.get('text') or '' for i in (guard_res.get('issues') or [])
+                                            if i.get('severity') == 'chain') or '结构级链式问题'
+                                        if on_progress:
+                                            on_progress('chain_guard_autofix', {
+                                                'beat': beat, 'sequence': s,
+                                                'attempt': attempt, 'max_attempts': _CHAIN_GUARD_AUTOFIX_ATTEMPTS,
+                                                'issues': guard_res.get('issues', []),
+                                                'message': f"🔧 第 {beat} 拍检出结构级问题，正在就地自动修复 "
+                                                           f"IMG {s:03d}（第 {attempt}/{_CHAIN_GUARD_AUTOFIX_ATTEMPTS} 次）：{texts}",
+                                            })
+                                        try:
+                                            fix_res = fix_frame_issue(
+                                                config, title, prompt_block, s,
+                                                on_progress=on_progress, cascade_downstream=False,
+                                                suppress_chain_guard=True,
+                                            )
+                                        except GenerationCancelled:
+                                            raise
+                                        except Exception as fix_err:
+                                            log('WARN', 'CHAIN_GUARD',
+                                                f"IMG {s:03d} 自动修复第 {attempt} 次未跑成，转为停链: {fix_err}")
+                                            break
+
+                                        if (fix_res or {}).get('rolled_back'):
+                                            log('WARN', 'CHAIN_GUARD',
+                                                f"IMG {s:03d} 自动修复第 {attempt} 次被三联屏门禁退回"
+                                                f"（画面已还原），转为停链等人处理")
+                                            if on_progress:
+                                                on_progress('chain_guard_autofix_rolled_back', {
+                                                    'beat': beat, 'sequence': s, 'attempt': attempt,
+                                                    'triptych': (fix_res or {}).get('triptych'),
+                                                    'rejected_fix': (fix_res or {}).get('rejected_fix'),
+                                                    'message': f"↩️ IMG {s:03d} 第 {attempt} 次自动修复被三联屏门禁退回，"
+                                                               f"画面已还原为修复前，转为停链等人处理",
+                                                })
+                                            _resync_fx_from_disk()
+                                            break
+
+                                        new_block = (fix_res or {}).get('prompt_block')
+                                        if new_block:
+                                            prompt_block = new_block
+                                        _resync_fx_from_disk()
+
+                                        guard_res = guard_beat(
+                                            config, title, prompt_block, beat, project_dir,
+                                            on_progress=on_progress, allow_halt=True,
+                                        )
+                                        _resync_fx_from_disk()
+                                        if not guard_res.get('halt'):
+                                            if on_progress:
+                                                on_progress('chain_guard_autofix_done', {
+                                                    'beat': beat, 'sequence': s, 'attempt': attempt,
+                                                    'message': f"✅ IMG {s:03d} 自动修复后复审通过（第 {attempt} 次），继续往下生成",
+                                                })
+                                            break
+
+                                still_flagged = bool(guard_res.get('halt'))
+                                if still_flagged and guard_halt_enabled(guard_mode):
+                                    manifest['halted_at_beat'] = beat
+                                    manifest['halted_at_sequence'] = s
+                                    if on_progress:
+                                        tail = ('' if guard_mode == 'halt'
+                                                else f"（已自动修复 {_CHAIN_GUARD_AUTOFIX_ATTEMPTS} 次仍未通过）")
+                                        on_progress('chain_guard_halt', {
+                                            'beat': beat,
+                                            'sequence': s,
+                                            'issues': guard_res.get('issues', []),
+                                            'autofix_exhausted': guard_autofix_enabled(guard_mode),
+                                            'message': f"第 {beat} 拍（IMG {prev_seq:03d}→{s:03d}）检出结构级链式问题{tail}，生成已自动暂停，请检查并修复此帧问题。",
+                                        })
+                                    break
+                                if still_flagged and guard_mode == 'autofix_soft' and on_progress:
+                                    # 软档：flag 已写进 manifest，链继续往下走。不发这条事件的话
+                                    # 结构级问题在屏幕上完全无声，只剩收尾汇总里一句没头没尾的
+                                    # 「N 帧一致性审查未过」。
+                                    on_progress('chain_guard_soft_continue', {
+                                        'beat': beat,
+                                        'sequence': s,
+                                        'issues': guard_res.get('issues', []),
+                                        'autofix_exhausted': True,
+                                        'message': f"⚠️ 第 {beat} 拍（IMG {prev_seq:03d}→{s:03d}）仍有结构级问题"
+                                                   f"（已自动修复 {_CHAIN_GUARD_AUTOFIX_ATTEMPTS} 次），软档不停链——"
+                                                   f"已记入待复核清单，继续往下渲。",
+                                    })
+                            except Exception as guard_err:
+                                log('WARN', 'CHAIN_GUARD', f"拍 {beat} 链上守卫执行异常: {guard_err}")
+
+                if manifest.get('halted_at_sequence'):
+                    break
         finally:
             shutil.rmtree(temp_out, ignore_errors=True)
+
+        if manifest.get('halted_at_sequence'):
+            break
 
     update_manifest_stale_status(manifest, project_dir,
                                  regenerated_sequences=target_sequences, finalize=True)
     _save_manifest()
+    if manifest.get('halted_at_sequence'):
+        manifest['manifest'] = '/' + os.path.relpath(manifest_path, os.path.dirname(os.path.abspath(__file__))).replace('\\', '/')
+        manifest['project_dir'] = os.path.abspath(project_dir)
+        return manifest
     manifest['manifest'] = '/' + os.path.relpath(manifest_path, os.path.dirname(os.path.abspath(__file__))).replace('\\', '/')
     manifest['project_dir'] = os.path.abspath(project_dir)
     return manifest
@@ -2480,11 +2662,12 @@ def detect_anchor_inertia(rendered_path, reference_path):
         return False, None
 
 
-def generate_frame_sequence(config, title, prompt_block, on_progress=None, target_sequences=None):
+def generate_frame_sequence(config, title, prompt_block, on_progress=None, target_sequences=None, chain_guard_review=True):
     if (config.get('imageBackend') or 'api').strip().lower() == 'google_fx':
         return _generate_frame_sequence_google_fx(
             config, title, prompt_block,
             on_progress=on_progress, target_sequences=target_sequences,
+            chain_guard_review=chain_guard_review,
         )
     from prompt_pipeline import (
         _parse_prompt_slots, image_space_family, cover_reference_is_same_layer,
@@ -2552,6 +2735,9 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
         except Exception:
             pass
 
+    manifest.pop('halted_at_beat', None)
+    manifest.pop('halted_at_sequence', None)
+
     if on_progress:
         total_to_generate = len(target_sequences) if target_sequences is not None else len(prompts)
         on_progress('start', {'total': total_to_generate})
@@ -2587,6 +2773,14 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
         # we can skip the external API call and use the existing file immediately.
         already_exists = os.path.exists(target_path) and os.path.getsize(target_path) > 0
         skip_api_call = already_exists and (target_sequences is None)
+
+        # 确保重渲前已有历史帧安全归档入候选池，不被新生成覆盖
+        if not skip_api_call and already_exists:
+            try:
+                from candidate_selection_pipeline import sync_frame_candidates_pool
+                sync_frame_candidates_pool(frames_dir, seq, current_frame=manifest_frames_by_seq.get(seq), auto_archive_current=True)
+            except Exception:
+                pass
 
         existing_frame = manifest_frames_by_seq.get(seq)
         model = ""
@@ -2634,14 +2828,12 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
         if not skip_api_call:
             cover_anchor = bool(cover_ref)
             coverless_head = seq == 1 and not cover_ref and not cover_layer_block
-            if coverless_head and not text_only_anchor_allowed(config):
-                raise RuntimeError('生成帧序列前必须先生成或选择封面图；第一帧只能以封面图进行图生图')
             if coverless_head and on_progress:
                 on_progress('cover_reference_skipped', {
                     'sequence': seq,
                     'message': 'IMG 001 无封面可用，链头改为纯文本生成',
                 })
-            reference = cover_ref if cover_anchor else previous_path
+            reference = cover_ref if cover_anchor else (previous_path if seq > 1 else None)
             # A targeted/subset prompt block may contain only ``IMAGE N``.  In
             # that case the loop never visits IMAGE N-1, but the durable chain
             # parent is still available on disk.  Resolve it by the real slot
@@ -2940,11 +3132,11 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
                 if existing_frame.get(key) is not None:
                     frame_info[key] = existing_frame[key]
 
-        # 保留全量帧序列产物到候选池（不删除、不覆盖）
-        cand_dir = os.path.join(frames_dir, 'candidates', f'frame_{seq:03d}')
-        meta_file = os.path.join(cand_dir, 'candidates_meta.json')
+        # 保留全量帧序列产物到候选池（不删除、不覆盖，全量累积）
         if not skip_api_call and os.path.exists(target_path):
+            cand_dir = os.path.join(frames_dir, 'candidates', f'frame_{seq:03d}')
             os.makedirs(cand_dir, exist_ok=True)
+            meta_file = os.path.join(cand_dir, 'candidates_meta.json')
             existing_cands_meta = []
             if os.path.exists(meta_file):
                 try:
@@ -2979,11 +3171,18 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
             except Exception:
                 pass
 
+            c_model = model or config.get('imageModel') or 'gemini-3.1-flash-image'
+            c_model_display = 'GPT-2' if 'gpt' in str(c_model).lower() else ('Google FX' if ('google_fx' in str(c_model).lower() or (existing_frame and existing_frame.get('fx_uuid'))) else 'Gemini')
             new_cand_meta = {
                 'index': new_c_idx,
                 'path': cand_file_dest,
                 'raw_src': cand_file_dest,
-                'fx_uuid': None,
+                'fx_uuid': existing_frame.get('fx_uuid') if existing_frame else None,
+                'model': c_model,
+                'model_display': c_model_display,
+                'score': 85,
+                'strengths': '标准生成帧',
+                'defects': '',
             }
             existing_cands_meta.append(new_cand_meta)
             try:
@@ -2992,99 +3191,38 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
             except Exception:
                 pass
 
-            existing_cands_manifest = (existing_frame.get('candidates', []) if existing_frame and isinstance(existing_frame.get('candidates'), list) else [])
-            updated_manifest_cands = []
-            for ec in existing_cands_manifest:
-                if isinstance(ec, dict):
-                    ec_copy = dict(ec)
-                    ec_copy['is_chosen'] = False
-                    updated_manifest_cands.append(ec_copy)
-
-            rel_cand_path = os.path.relpath(cand_file_dest, os.path.dirname(os.path.abspath(__file__))).replace('\\', '/')
-            c_model = model or config.get('imageModel') or 'gemini-3.1-flash-image'
-            c_model_display = 'GPT-2' if 'gpt' in str(c_model).lower() else ('Google FX' if 'google_fx' in str(c_model).lower() else 'Gemini')
-            updated_manifest_cands.append({
-                'index': new_c_idx,
-                'file': rel_cand_path,
-                'url': '/' + rel_cand_path if not rel_cand_path.startswith('/') else rel_cand_path,
-                'fx_uuid': None,
-                'model': c_model,
-                'model_display': c_model_display,
-                'is_chosen': True,
-                'score': 85,
-                'strengths': '标准生成帧',
-                'defects': '',
-            })
-            frame_info['candidates'] = updated_manifest_cands
-            frame_info['chosen_candidate_index'] = new_c_idx
+            try:
+                from candidate_selection_pipeline import sync_frame_candidates_pool
+                synced_cands, chosen_idx, _ = sync_frame_candidates_pool(
+                    frames_dir, seq,
+                    current_frame={'chosen_candidate_index': new_c_idx, 'candidates': existing_cands_meta, 'model': c_model},
+                    target_path=target_path,
+                    auto_archive_current=False
+                )
+                frame_info['candidates'] = synced_cands
+                frame_info['chosen_candidate_index'] = chosen_idx or new_c_idx
+            except Exception:
+                pass
         elif skip_api_call and existing_frame and existing_frame.get('candidates'):
             frame_info['candidates'] = existing_frame['candidates']
             if existing_frame.get('chosen_candidate_index'):
                 frame_info['chosen_candidate_index'] = existing_frame['chosen_candidate_index']
 
-        # 候选池兜底补齐：无论何种模型（含 gpt-image-2）与复用路径，确保候选池与 manifest 同步
-        if not frame_info.get('candidates'):
-            cand_dir = os.path.join(frames_dir, 'candidates', f'frame_{seq:03d}')
-            meta_file = os.path.join(cand_dir, 'candidates_meta.json')
-            loaded_cands = []
-            if os.path.exists(meta_file):
-                try:
-                    with open(meta_file, 'r', encoding='utf-8') as f:
-                        m_payload = json.load(f)
-                        if isinstance(m_payload, dict) and isinstance(m_payload.get('candidates'), list):
-                            for cm in m_payload['candidates']:
-                                c_idx = cm.get('index') or 1
-                                cand_f = cm.get('path') or os.path.join(cand_dir, f'candidate_{c_idx}.webp')
-                                rel_cand_path = os.path.relpath(cand_f, os.path.dirname(os.path.abspath(__file__))).replace('\\', '/')
-                                c_m = cm.get('model') or (existing_frame.get('model') if existing_frame else None) or model or config.get('imageModel') or 'gemini-3.1-flash-image'
-                                c_m_disp = cm.get('model_display') or ('GPT-2' if 'gpt' in str(c_m).lower() else ('Google FX' if ('google_fx' in str(c_m).lower() or cm.get('fx_uuid')) else 'Gemini'))
-                                loaded_cands.append({
-                                    'index': c_idx,
-                                    'file': rel_cand_path,
-                                    'url': '/' + rel_cand_path if not rel_cand_path.startswith('/') else rel_cand_path,
-                                    'fx_uuid': cm.get('fx_uuid'),
-                                    'model': c_m,
-                                    'model_display': c_m_disp,
-                                    'is_chosen': (c_idx == (existing_frame.get('chosen_candidate_index') if existing_frame else 1)),
-                                    'score': 85,
-                                    'strengths': f'候选图 #{c_idx}',
-                                    'defects': '',
-                                })
-                except Exception:
-                    loaded_cands = []
-            elif os.path.exists(target_path):
-                os.makedirs(cand_dir, exist_ok=True)
-                cand_dest = os.path.join(cand_dir, 'candidate_1.webp')
-                if not os.path.exists(cand_dest):
-                    try:
-                        shutil.copy2(target_path, cand_dest)
-                    except Exception:
-                        pass
-                c_m = model or config.get('imageModel') or 'gemini-3.1-flash-image'
-                c_m_disp = 'GPT-2' if 'gpt' in str(c_m).lower() else 'Gemini'
-                cand_meta_dest = {'index': 1, 'path': cand_dest, 'raw_src': cand_dest, 'fx_uuid': None, 'model': c_m, 'model_display': c_m_disp}
-                try:
-                    with open(meta_file, 'w', encoding='utf-8') as f:
-                        json.dump({'sequence': seq, 'candidates': [cand_meta_dest]}, f, ensure_ascii=False, indent=2)
-                except Exception:
-                    pass
-                rel_cand_path = os.path.relpath(cand_dest, os.path.dirname(os.path.abspath(__file__))).replace('\\', '/')
-                loaded_cands.append({
-                    'index': 1,
-                    'file': rel_cand_path,
-                    'url': '/' + rel_cand_path if not rel_cand_path.startswith('/') else rel_cand_path,
-                    'fx_uuid': None,
-                    'model': c_m,
-                    'model_display': c_m_disp,
-                    'is_chosen': True,
-                    'score': 85,
-                    'strengths': '基础主帧',
-                    'defects': '',
-                })
-            if loaded_cands:
-                frame_info['candidates'] = loaded_cands
-                if not frame_info.get('chosen_candidate_index'):
-                    frame_info['chosen_candidate_index'] = (existing_frame.get('chosen_candidate_index') if existing_frame else 1) or 1
+        # 候选池兜底补齐：无论何种模型（含 gpt-image-2）与复用路径，确保候选池与 manifest 全量同步
+        if not frame_info.get('candidates') or len(frame_info.get('candidates', [])) == 0:
+            try:
+                from candidate_selection_pipeline import sync_frame_candidates_pool
+                synced_cands, chosen_idx, _ = sync_frame_candidates_pool(
+                    frames_dir, seq,
+                    current_frame=existing_frame,
+                    target_path=target_path,
+                    auto_archive_current=True
+                )
+                if synced_cands:
+                    frame_info['candidates'] = synced_cands
+                    frame_info['chosen_candidate_index'] = chosen_idx or (existing_frame.get('chosen_candidate_index') if existing_frame else 1) or 1
+            except Exception:
+                pass
 
         manifest_frames_by_seq[seq] = frame_info
         previous_path = target_path
@@ -3097,7 +3235,16 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
         write_manifest(project_dir, manifest)
 
         if on_progress:
-            on_progress('frame', {'frame': frame_info, 'current': generated_count, 'total': total_to_generate})
+            # guard_pending：这一帧落盘后还有一道链上守卫要审（见下面的守卫分支）。
+            # 事件里的 quality_gate 是守卫**跑之前**的读数，前端拿它打的"质检通过"
+            # 并不是审查结论——不声明这一点，用户就会先看到绿的、过一会儿卡片变红。
+            _guard_pending = (
+                (chain_guard_mode(config) if chain_guard_review else 'off') != 'off'
+                and (seq == 1 or os.path.exists(os.path.join(frames_dir, f'img_{seq - 1:03d}.webp')))
+            )
+            on_progress('frame', {'frame': frame_info, 'current': generated_count,
+                                  'total': total_to_generate,
+                                  'guard_pending': bool(_guard_pending)})
 
         if not skip_api_call and current_quality_gate == 'frame_continuity_failed':
             if on_progress:
@@ -3110,9 +3257,180 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
             raise FrameContinuityError(
                 f'IMG {seq:03d} 场景连续性检查失败：{continuity_check.get("reason")}')
 
+        # 链上逐拍守卫审查（生成一张审一张）
+        guard_mode = chain_guard_mode(config) if chain_guard_review else 'off'
+        if seq == 1 and guard_mode != 'off':
+            # 首帧没有"上一拍"可比，走锚点审查：拿它跟爆款原片首帧/封面对标机位、
+            # 空间尺度与初始毛坯状态。FX 分支与 4选1 分支都有这一段，API 分支漏了——
+            # 而首帧是整条 i2i 链的地基，它歪了后面每一帧都跟着歪。
+            try:
+                from chain_guard import run_anchor_guard
+
+                def _resync_anchor_from_disk():
+                    updated_manifest = read_manifest(project_dir)
+                    if not (updated_manifest and 'frames' in updated_manifest):
+                        return
+                    for f_entry in updated_manifest['frames']:
+                        if f_entry.get('sequence') == 1:
+                            # 守卫是隔着磁盘改 manifest 的；本函数收尾会整份写盘，
+                            # 不把结论搬回内存副本就会被盖掉。
+                            frame_info.update({
+                                k: v for k, v in f_entry.items()
+                                if k in ('inline_anchor_review', 'quality_gate',
+                                         'vlm_qa_reason', 'flag_origin', 'review_issues')
+                            })
+                            manifest_frames_by_seq[1] = frame_info
+                            break
+
+                anchor_res = run_anchor_guard(
+                    config, title, prompt_block, project_dir,
+                    guard_mode=guard_mode,
+                    forward_build=(target_sequences is None),
+                    on_progress=on_progress,
+                    on_manifest_dirty=_resync_anchor_from_disk,
+                    autofix_attempts=_CHAIN_GUARD_AUTOFIX_ATTEMPTS,
+                )
+                new_block = anchor_res.get('prompt_block')
+                if new_block:
+                    prompt_block = new_block
+                # 首帧判废就停在这里：它是整条 i2i 链的地基，接着往下渲等于让一张
+                # 已知歪掉的图当所有下游帧的底图。
+                if anchor_res.get('halt'):
+                    manifest['halted_at_beat'] = 0
+                    manifest['halted_at_sequence'] = 1
+                    break
+            except GenerationCancelled:
+                # 自动修复途中用户点了取消：必须原样抛出去，被下面的兜底吞掉
+                # 就成了"点了取消还在接着渲"。
+                raise
+            except Exception as anchor_err:
+                log('WARN', 'CHAIN_GUARD', f"IMG 001 锚点审查异常: {anchor_err}")
+        elif seq >= 2 and guard_mode != 'off':
+            beat = seq - 1
+            prev_seq = seq - 1
+            prev_file = os.path.join(frames_dir, f'img_{prev_seq:03d}.webp')
+            if os.path.exists(prev_file):
+                try:
+                    from chain_guard import (
+                        guard_beat, guard_autofix_enabled, guard_halt_enabled)
+
+                    def _resync_from_disk():
+                        """守卫与自动修复都是隔着磁盘改 manifest 的，改完必须把这一份
+                        内存副本追上去——否则本函数收尾那次整份写盘会把它们全盖掉。"""
+                        updated_manifest = read_manifest(project_dir)
+                        if updated_manifest and 'frames' in updated_manifest:
+                            manifest['frames'] = updated_manifest['frames']
+                            for f_entry in manifest['frames']:
+                                if f_entry.get('sequence') == seq:
+                                    manifest_frames_by_seq[seq] = f_entry
+                                    break
+
+                    forward_build = (target_sequences is None)
+                    guard_res = guard_beat(
+                        config, title, prompt_block, beat, project_dir,
+                        on_progress=on_progress,
+                        allow_halt=forward_build,
+                    )
+                    _resync_from_disk()
+
+                    # autofix：就地走一遍「修复此帧问题」，复审过了就接着往下渲。
+                    if guard_res.get('halt') and guard_autofix_enabled(guard_mode) and forward_build:
+                        from pipeline_orchestrator import fix_frame_issue
+                        for attempt in range(1, _CHAIN_GUARD_AUTOFIX_ATTEMPTS + 1):
+                            texts = '；'.join(
+                                i.get('text') or '' for i in (guard_res.get('issues') or [])
+                                if i.get('severity') == 'chain') or '结构级链式问题'
+                            if on_progress:
+                                on_progress('chain_guard_autofix', {
+                                    'beat': beat, 'sequence': seq,
+                                    'attempt': attempt, 'max_attempts': _CHAIN_GUARD_AUTOFIX_ATTEMPTS,
+                                    'issues': guard_res.get('issues', []),
+                                    'message': f"🔧 第 {beat} 拍检出结构级问题，正在就地自动修复 "
+                                               f"IMG {seq:03d}（第 {attempt}/{_CHAIN_GUARD_AUTOFIX_ATTEMPTS} 次）：{texts}",
+                                })
+                            try:
+                                fix_res = fix_frame_issue(
+                                    config, title, prompt_block, seq,
+                                    on_progress=on_progress, cascade_downstream=False,
+                                    suppress_chain_guard=True,
+                                )
+                            except GenerationCancelled:
+                                raise
+                            except Exception as fix_err:
+                                log('WARN', 'CHAIN_GUARD',
+                                    f"IMG {seq:03d} 自动修复第 {attempt} 次未跑成，转为停链: {fix_err}")
+                                break
+
+                            if (fix_res or {}).get('rolled_back'):
+                                log('WARN', 'CHAIN_GUARD',
+                                    f"IMG {seq:03d} 自动修复第 {attempt} 次被三联屏门禁退回"
+                                    f"（画面已还原），转为停链等人处理")
+                                if on_progress:
+                                    on_progress('chain_guard_autofix_rolled_back', {
+                                        'beat': beat, 'sequence': seq, 'attempt': attempt,
+                                        'triptych': (fix_res or {}).get('triptych'),
+                                        'rejected_fix': (fix_res or {}).get('rejected_fix'),
+                                        'message': f"↩️ IMG {seq:03d} 第 {attempt} 次自动修复被三联屏门禁退回，"
+                                                   f"画面已还原为修复前，转为停链等人处理",
+                                    })
+                                _resync_from_disk()
+                                break
+
+                            new_block = (fix_res or {}).get('prompt_block')
+                            if new_block:
+                                prompt_block = new_block
+                            _resync_from_disk()
+
+                            guard_res = guard_beat(
+                                config, title, prompt_block, beat, project_dir,
+                                on_progress=on_progress, allow_halt=True,
+                            )
+                            _resync_from_disk()
+                            if not guard_res.get('halt'):
+                                if on_progress:
+                                    on_progress('chain_guard_autofix_done', {
+                                        'beat': beat, 'sequence': seq, 'attempt': attempt,
+                                        'message': f"✅ IMG {seq:03d} 自动修复后复审通过（第 {attempt} 次），继续往下生成",
+                                    })
+                                break
+
+                    still_flagged = bool(guard_res.get('halt'))
+                    if still_flagged and guard_halt_enabled(guard_mode):
+                        manifest['halted_at_beat'] = beat
+                        manifest['halted_at_sequence'] = seq
+                        if on_progress:
+                            tail = ('' if guard_mode == 'halt'
+                                    else f"（已自动修复 {_CHAIN_GUARD_AUTOFIX_ATTEMPTS} 次仍未通过）")
+                            on_progress('chain_guard_halt', {
+                                'beat': beat,
+                                'sequence': seq,
+                                'issues': guard_res.get('issues', []),
+                                'autofix_exhausted': guard_autofix_enabled(guard_mode),
+                                'message': f"第 {beat} 拍（IMG {prev_seq:03d}→{seq:03d}）检出结构级链式问题{tail}，生成已自动暂停，请检查并修复此帧问题。",
+                            })
+                        break
+                    if still_flagged and guard_mode == 'autofix_soft' and on_progress:
+                        # 软档：flag 已写进 manifest，链继续往下走（见入口一同款说明）。
+                        on_progress('chain_guard_soft_continue', {
+                            'beat': beat,
+                            'sequence': seq,
+                            'issues': guard_res.get('issues', []),
+                            'autofix_exhausted': True,
+                            'message': f"⚠️ 第 {beat} 拍（IMG {prev_seq:03d}→{seq:03d}）仍有结构级问题"
+                                       f"（已自动修复 {_CHAIN_GUARD_AUTOFIX_ATTEMPTS} 次），软档不停链——"
+                                       f"已记入待复核清单，继续往下渲。",
+                        })
+                except Exception as guard_err:
+                    log('WARN', 'CHAIN_GUARD', f"拍 {beat} 链上守卫执行异常: {guard_err}")
+
     manifest['frames'] = [manifest_frames_by_seq[s] for s in sorted(manifest_frames_by_seq.keys())]
     update_manifest_stale_status(manifest, project_dir,
                                  regenerated_sequences=target_sequences, finalize=True)
+    if manifest.get('halted_at_sequence'):
+        write_manifest(project_dir, manifest)
+        manifest['manifest'] = '/' + os.path.relpath(manifest_path, os.path.dirname(os.path.abspath(__file__))).replace('\\', '/')
+        manifest['project_dir'] = os.path.abspath(project_dir)
+        return manifest
 
     # Beat↔图像 1:1 硬闸（仅在全量渲染时检查——子集/单帧重试天然不会覆盖全集，
     # 用这条闸会误杀合法的定向重渲）。规划阶段的 outline_one_to_one_violations

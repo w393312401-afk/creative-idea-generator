@@ -88,14 +88,13 @@ class TestHeroSlotPlanning(unittest.TestCase):
             self.assertEqual(set(re.findall(r'IMAGE\s*(\d+)', plan['prompt'], re.IGNORECASE)), {'1'})
             self.assertIn('no last-frame reference image', plan['prompt'].lower())
 
-    def test_hero_slot_records_the_declaration_mismatch(self):
+    def test_hero_slot_does_not_block_and_generates(self):
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
             plan = self._plan(tmp, 'HERO')
-            # 正文声明了尾帧、契约说没有——这条不该被吞掉，它正是"组稿编号得回上游修"的信号。
-            self.assertIsNotNone(plan['anchor_declaration_mismatch'])
-            self.assertEqual(plan['anchor_declaration_mismatch']['declared_end'], 13)
-            self.assertIsNone(plan['anchor_declaration_mismatch']['contract_end'])
+            self.assertEqual(plan['action'], 'generate')
+            self.assertIsNone(plan['end_frame'])
+            self.assertIsNone(plan['end_anchor_slot'])
 
     def test_ordinary_slot_keeps_both_anchors(self):
         import tempfile

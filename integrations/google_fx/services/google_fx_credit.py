@@ -191,6 +191,20 @@ CREDIT_EXHAUSTED_KEYWORDS = [
     "没有点数",
     "缺少积分",
     "缺少点数",
+    # 单日上限 / 配额耗尽相关短语
+    "daily limit",
+    "reached the daily limit",
+    "reached daily limit",
+    "daily generation limit",
+    "daily_limit_reached",
+    "已达单日上限",
+    "已达到单日限制",
+    "单日上限",
+    "单日生成次数已达上限",
+    "今日生成次数已达上限",
+    "单日配额已用完",
+    "今日额度已耗尽",
+    "今日额度已用完",
     # 机器可读的错误码/标记形态（下划线连写，不会被上面的空格短语命中）。
     # video_generator 用本函数认「这次失败要不要 mark_exhausted」，而链路里
     # 传的常常是 "INSUFFICIENT_CREDITS: ..." 这种前缀形态。
@@ -200,6 +214,7 @@ CREDIT_EXHAUSTED_KEYWORDS = [
     "credits_exhausted",
     "credit_exhausted",
     "quota_exceeded",
+    "daily_limit",
 ]
 
 # ⚠️ 弱信号，**不能**单独当"积分耗尽"的判据。
@@ -243,7 +258,62 @@ _ZERO_CREDIT_REGEXES = [
     re.compile(r"\b(?:insufficient|out\s+of|not\s+enough|run\s+out\s+of)\s+(?:\w+\s+){0,3}credits?\b", re.IGNORECASE),
     re.compile(r"\bget\s+(?:more\s+)?(?:ai|flow|google\s+flow)\s+credits?\b", re.IGNORECASE),
     re.compile(r"\b(?:used\s+when\s+you'?re\s+out\s+of\s+(?:google\s+)?flow\s+credits?)\b", re.IGNORECASE),
+    re.compile(r"\b(?:reached\s+(?:the\s+)?daily\s+limit|daily\s+limit\s+for|daily\s+generation\s+limit)\b", re.IGNORECASE),
+    re.compile(r"(?:单日|今日|每天)(?:生成|使用|请求)?(?:次数|配额|额度|限制)?(?:已达上限|已用完|耗尽|不足)", re.IGNORECASE),
 ]
+
+# ⚠️ 只在**上下文里另有配额字样**时才算数的模糊短语。
+#
+# 这两句确实出现在真实的图片单日上限吐司里（"You've reached the daily limit for
+# Nano Banana 2 generations. Try using a different model."），但它们本身跟额度无关：
+# "try using a different model" 也是模型不可用/该模型暂不支持这类参数时的通用建议，
+# "you have not been charged" 更是任何一次失败退费都会说的话。把它们当独立判据，
+# 一条无关的模型报错就能把账号打进 24 小时冷却。
+#
+# 单独拿掉它们不会漏判真吐司——那句话里的 "daily limit" 已经被上面的强关键词命中。
+# 保留它们只为兜住被截断/改版后只剩后半句的变体，代价是必须与配额锚点同现。
+_AMBIGUOUS_QUOTA_PHRASES = (
+    "try using a different model",
+    "you have not been charged for this generation",
+)
+
+# 配额锚点：出现其一，才认为上面那两句说的是额度而不是别的毛病。
+_QUOTA_CONTEXT_ANCHORS = (
+    "limit", "quota", "credit", "generations",
+    "积分", "点数", "额度", "配额", "上限", "余额",
+)
+
+
+def _ambiguous_quota_hit(text: str) -> bool:
+    """模糊短语命中，且同一段文案里另有配额锚点。"""
+    if not any(phrase in text for phrase in _AMBIGUOUS_QUOTA_PHRASES):
+        return False
+    return any(anchor in text for anchor in _QUOTA_CONTEXT_ANCHORS)
+
+
+# 图片**单日**配额专用特征：跟"积分耗尽"分开记，因为处置不同——单日上限不该清零余额
+# （见 account_pool.mark_exhausted 里 image_quota_exceeded 的说明）。
+IMAGE_QUOTA_KEYWORDS = (
+    "daily limit", "daily_limit", "daily_limit_reached", "reached the daily limit",
+    "reached daily limit", "daily generation limit",
+    "单日上限", "单日配额", "今日额度", "今日生成次数已达上限", "已达单日上限",
+    "图片余额超限", "image_quota_exceeded", "image_limit_exceeded",
+)
+
+
+def is_image_quota_message(message: str) -> bool:
+    """这条报错是不是"图片单日配额用完了"（而不是账号积分耗尽）。
+
+    三处调用方（google_fx_image._is_image_quota_failure、server_common
+    .failover_and_select_next_account、helpers._classify_failure_for_switch）此前各自
+    抄了一份 token 清单，改一处漏两处。统一收在这里。
+    """
+    text = (message or "").lower()
+    if not text:
+        return False
+    if any(k in text for k in IMAGE_QUOTA_KEYWORDS):
+        return True
+    return _ambiguous_quota_hit(text)
 
 
 def _extract_credit_number(text: str) -> Optional[int]:
@@ -353,7 +423,9 @@ def is_credit_exhausted_message(message: str) -> bool:
         return False
     if any(keyword.lower() in text for keyword in CREDIT_EXHAUSTED_KEYWORDS):
         return True
-    return any(pattern.search(text) is not None for pattern in _ZERO_CREDIT_REGEXES)
+    if any(pattern.search(text) is not None for pattern in _ZERO_CREDIT_REGEXES):
+        return True
+    return _ambiguous_quota_hit(text)
 
 
 def is_credit_hint_message(message: str) -> bool:

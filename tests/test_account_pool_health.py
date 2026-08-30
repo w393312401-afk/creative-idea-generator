@@ -134,10 +134,22 @@ class TestAccountPoolHealthAndAutoPilot(unittest.TestCase):
         self.assertEqual(next_id, "acc_standby")
         self.assertEqual(config["googleFxUserId"], "acc_standby")
 
-        # 检查 acc_primary 已被冷却
+        # 检查 acc_primary 已被冷却且 reason 为 quota_exhausted
         accounts = self.pool.list_accounts(heal=False)
         primary = next(a for a in accounts if a["user_id"] == "acc_primary")
         self.assertIsNotNone(primary.get("cooldown_until"))
+        self.assertEqual(primary.get("cooldown_reason"), "quota_exhausted")
+
+        # 模拟 acc_standby 发生单日生成上限 (图片余额超限)
+        self.pool.add_account("acc_third", name="Third")
+        self.pool.record_measured_credit("acc_third", 50)
+        next_id2 = server_common.failover_and_select_next_account(
+            config, self.pool, failed_user_id="acc_standby", reason="You've reached the daily limit for Nano Banana 2 generations"
+        )
+        self.assertEqual(next_id2, "acc_third")
+        standby = next(a for a in self.pool.list_accounts(heal=False) if a["user_id"] == "acc_standby")
+        self.assertEqual(standby.get("cooldown_reason"), "image_quota_exceeded")
+        self.assertEqual(standby.get("last_generation_error"), "图片余额超限")
 
     def test_silent_inspector_lifecycle(self):
         # 测试巡检线程启动与关闭不会抛异常

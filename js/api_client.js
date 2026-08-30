@@ -224,6 +224,36 @@ function applyFrameEventToIdea(f, ownerIdea) {
 }
 
 /**
+ * 把链上守卫的停链结论就地贴到这一帧上（gate/原因/结构化问题清单），返回被改过的
+ * 那条帧记录供调用方重画卡片；没找到这一帧就返回 null。
+ *
+ * 为什么要在前端补这一手：守卫是隔着磁盘改 manifest 的，'frame' 事件早在守卫开审
+ * 之前就发完了。不贴的话，判废结论要等下一次整份重画（任务收尾 syncFrameRunToLibrary
+ * 或重新进项目）才显形——用户体感就是"生成当时说没问题、过一会儿突然说有问题"。
+ *
+ * 只在 halt（后端确实把 gate 写成 sequence_review_flagged）时调用，字段与
+ * chain_guard.guard_beat / guard_anchor 落盘的那几个保持一致，避免本地状态跟
+ * manifest 说两套话。
+ */
+function applyChainGuardVerdictToIdea(ownerIdea, sequence, issues) {
+    ownerIdea = ownerIdea || currentIdea;
+    if (!ownerIdea || !ownerIdea.frameRun || !Array.isArray(ownerIdea.frameRun.frames)) return null;
+    const f = ownerIdea.frameRun.frames.find(item => item && item.sequence === sequence);
+    if (!f) return null;
+    const list = Array.isArray(issues) ? issues : [];
+    const chainTexts = list.filter(i => i && i.severity === 'chain').map(i => i.text).filter(Boolean);
+    const allTexts = list.map(i => i && i.text).filter(Boolean);
+    f.quality_gate = 'sequence_review_flagged';
+    f.vlm_qa_reason = (chainTexts.length ? chainTexts : allTexts).join('；') || '（未记录原因）';
+    f.flag_origin = 'chain_guard';
+    f.review_issues = list;
+    if (currentIdea && currentIdea.id === ownerIdea.id) saveCurrentIdeaState();
+    const existingIdx = savedIdeas.findIndex(item => item.id === ownerIdea.id);
+    if (existingIdx !== -1) savedIdeas[existingIdx].frameRun = ownerIdea.frameRun;
+    return f;
+}
+
+/**
  * 确保帧任务有可增量合并的本地清单，但绝不清空已有帧。
  *
  * 一个整单任务可能有多个内部阶段，每个阶段都会广播 `start`：例如先单独生成并
@@ -350,7 +380,9 @@ function saveActiveBackgroundTasksToLocalStorage() {
             if (slot[type]) tasks.push({ ideaId, type, taskId: slot[type].taskId });
         });
     });
-    localStorage.setItem('spark_active_background_tasks', JSON.stringify({ tasks }));
+    try {
+        localStorage.setItem('spark_active_background_tasks', JSON.stringify({ tasks }));
+    } catch (_) {}
 }
 
 function resumeActiveBackgroundTasksIfExists() {
@@ -1305,9 +1337,19 @@ async function retrySingleFrame(seq) {
             signal: controller.signal,
             onEvent: (type, evData) => {
                 if (type === 'frame') {
-                    if (typeof framesFeedQualityLine === 'function') framesFeedQualityLine(ownerIdea.id, evData && evData.frame, true);
+                    if (typeof framesFeedQualityLine === 'function') framesFeedQualityLine(ownerIdea.id, evData && evData.frame, true, evData && evData.guard_pending);
                     applyFrameEventToIdea(evData && evData.frame, ownerIdea);
                     if (isViewingIdea(ownerIdea.id)) renderFramesForIdea(ownerIdea);
+                } else if (type === 'chain_guard_beat' || type === 'chain_guard_anchor') {
+                    // 单帧重试是定向重渲：守卫照审但恒不停链（allow_halt=False，见
+                    // chain_guard.guard_beat 的说明），所以这里只留痕、不动徽标。
+                    const gIssues = (evData && evData.issues) || [];
+                    const gTag = `IMG ${String((evData && evData.sequence) || seq).padStart(3, '0')}`;
+                    if (evData && evData.verdict === 'flagged') {
+                        feedLine(`⚠️ ${gTag} 链上守卫仍检出 ${gIssues.length} 处问题：${gIssues.map(i => i && i.text).filter(Boolean).join('；')}`, 'warn');
+                    } else if (evData && evData.verdict === 'pass') {
+                        feedLine(`🛡️ ${gTag} 链上守卫审查合格`, 'ok');
+                    }
                 } else if (type === 'frame_start') {
                     feedLine(`🎨 IMG ${String(seq).padStart(3, '0')} 渲染中…`);
                 } else if (type === 'candidate_generating') {
@@ -2830,6 +2872,56 @@ async function applyPromptBlockToIdea(ownerIdea, promptBlock, promptSlots, defer
             if (blockEl) blockEl.textContent = promptBlock;
         }
     }
+}
+
+// 下单渲染前的「提示词是不是最新那份」体检。
+//
+// 2026-08-30 实测（replica_cf9a445bc52b）：11:27 起的帧任务，用的是 09:35 那次合成的
+// 提示词——中间 10:17 / 11:19 / 11:21 三次重新合成都已经写进创意库，浏览器里这个 idea
+// 对象却还停在 09:35 的快照上。渲染下单送的是 `ownerIdea.prompt_block`（内存副本），
+// 于是重新合成出来的稿子一次都没被送出去过。
+//
+// 不能无脑用服务端那份覆盖：提示词编辑器允许手改，覆盖会把手改稿冲掉。用 updated_at
+// 区分这两种情形——
+//   · 两份一样            → 没事，直接放行
+//   · 不一样且服务端更新   → 本地是过期快照（正是上面那个坑），问用户
+//   · 不一样但服务端不更新 → 本地是手改稿（编辑器会回写，正常情况下两份会相等；
+//                            走到这里说明本地领先），一声不吭地放行
+//
+// 任何一步取数失败都放行：这是一道体检，不是门禁，不该让一次网络抖动挡住渲染。
+async function ensureFreshPromptBlock(ownerIdea, actionLabel) {
+    if (!ownerIdea || !ownerIdea.id) return true;
+    const local = String(ownerIdea.prompt_block || '');
+    if (!local) return true;
+
+    let remote = null;
+    try {
+        const resp = await fetch(`/api/library/item?id=${encodeURIComponent(ownerIdea.id)}`);
+        if (!resp.ok) return true;
+        remote = await resp.json();
+    } catch (e) {
+        return true;
+    }
+    if (!remote || !remote.prompt_block) return true;
+    if (String(remote.prompt_block) === local) return true;
+
+    const remoteAt = Number(remote.updated_at || 0);
+    const localAt = Number(ownerIdea.updated_at || 0);
+    if (!(remoteAt > localAt)) return true;   // 本地领先 = 手改稿，别动它
+
+    const when = remoteAt ? new Date(remoteAt * 1000).toLocaleString('zh-CN') : '较新时间';
+    const useRemote = await customConfirm(
+        `<b>这一单的提示词在服务端有更新的版本。</b><br><br>` +
+        `你正要${actionLabel || '渲染'}，但页面上这份提示词是更早的快照——` +
+        `之后（${when}）又重新合成过一次，新的那份已经写进创意库。<br><br>` +
+        `继续用页面上这份，就等于把重新合成的结果丢掉。`,
+        '用服务端最新的那份', '仍用页面上这份');
+    if (!useRemote) return true;
+
+    await applyPromptBlockToIdea(ownerIdea, remote.prompt_block, remote.prompt_slots, false);
+    ownerIdea.updated_at = remoteAt;
+    if (typeof showToast === 'function') showToast('已换用服务端最新的提示词', 'success');
+    return true;
 }
 
 // 提示词里「图片 N:」的条数＝帧槽位总数（与 renderFramesForIdea 用的是同一套契约）。

@@ -771,8 +771,10 @@ class OmniComposer(BaseComposer):
 
     def clip_duration(self):
         """本单单段视频的时长（秒）。时间线把切点钉在秒上，所以这个数必须与生成端
-        送给 Flow 面板的那个一致——两边都走 server_common.resolve_video_duration。"""
-        return server_common.resolve_video_duration(self.config)
+        送给 Flow 面板的那个一致——两边都走 server_common.resolve_video_duration，
+        并且带上同一个 self._duration_hint（begin_run 里按 beat_ladder 拍重算好的），
+        保证合成阶段的切点表和生成阶段实际请求的时长不会走成两个数。"""
+        return server_common.resolve_video_duration(self.config, fallback_hint=self._duration_hint)
 
     def ladder_for_kind(self, duration, kind='construction', observed_shots=None,
                         observed_scale=None, observed_scales=None):
@@ -1140,6 +1142,7 @@ single continuous take、one continuous take、single take、unbroken take 或�
                                             is_video=True)
         text = pp.fix_video_opening(i, text, profile='omni')
         text = pp.fix_sound_design(text, family=family or 'exterior')
+        text = pp.fix_natural_body_mechanics(text)
         text = self.ensure_actor_engagement(text, ladder, packet=packet, beat=beat,
                                             is_threshold_or_reveal=is_threshold_or_reveal)
         text = self.normalize_omni_video(
@@ -1223,6 +1226,7 @@ Rewrite rules (additive — do not lose content):
         if not candidate:
             return video_prompt, False
         candidate = pp.fix_video_opening(i, candidate, profile='omni')
+        candidate = pp.fix_natural_body_mechanics(candidate)
         candidate = self.normalize_omni_video(candidate, beat=beat)
         residual = omni_video_violations(
             candidate, ladder=ladder, duration=duration if beat else None,

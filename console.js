@@ -489,7 +489,9 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // Bind token input changes
     localTokenInput.addEventListener('input', (e) => {
-      localStorage.setItem('spark_dev_token', e.target.value.trim());
+      try {
+        localStorage.setItem('spark_dev_token', e.target.value.trim());
+      } catch (_) {}
     });
 
     // Toggle token visibility
@@ -679,6 +681,33 @@ document.addEventListener('DOMContentLoaded', () => {
       
       serverManaged = modeData.server_managed;
       needsAccessCode = modeData.needs_access_code;
+
+      if (modeData && modeData.runtime_version) {
+        const rv = modeData.runtime_version;
+        const policy = rv.policy_version || '';
+        const match = policy.match(/(v\d+)/);
+        const shortPolicy = match ? match[1] : (policy ? policy.slice(0, 10) : '');
+        const commit = rv.git_commit_short || (rv.git_commit ? rv.git_commit.slice(0, 7) : '');
+        const dirty = rv.git_dirty ? '*' : '';
+        const label = shortPolicy && commit ? `${shortPolicy} · ${commit}${dirty}` : (shortPolicy || commit || 'v1.0');
+        const tooltip = `SPARK 运行时版本信息:\n• 策略版本: ${policy || '默认'}\n• Git 提交: ${commit ? commit + (rv.git_dirty ? ' (有修改)' : ' (干净)') : '未知'}\n• 服务启动时间: ${rv.service_start_time ? new Date(rv.service_start_time * 1000).toLocaleString('zh-CN', { hour12: false }) : '未知'}\n• 代码状态: ${rv.stale ? '⚠️ 已过期 (需重启)' : '✓ 最新'}`;
+
+        const badge = document.getElementById('spark-version-badge');
+        if (badge) {
+          badge.textContent = label;
+          badge.style.display = 'inline-flex';
+          badge.classList.toggle('stale', Boolean(rv.stale));
+          badge.title = tooltip;
+        }
+
+        const badgeConsole = document.getElementById('spark-version-text-console');
+        const statusConsole = document.getElementById('spark-version-status-console');
+        if (badgeConsole && statusConsole) {
+          badgeConsole.textContent = label;
+          statusConsole.style.display = 'inline-flex';
+          statusConsole.title = tooltip;
+        }
+      }
 
       if (serverManaged) {
         if (statServerMode) statServerMode.textContent = '托管模式 (Managed)';

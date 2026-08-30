@@ -181,6 +181,23 @@ def get_runtime_adspower_headless() -> bool:
     return val in ("1", "true", "yes", "on")
 
 
+# macOS 上 --window-position 的屏幕外坐标会被窗口服务器 clamp 回可见区域，静默模式
+# 形同虚设（详见 utils/macos_window 模块头）。这里的模式决定改用哪种 macOS 原生手段：
+#   hide  : 隐藏浏览器 app + 归还焦点（默认；需要「辅助功能」权限，缺权限自动降级）
+#   focus : 只归还焦点，窗口留在屏幕上（零权限保底）
+#   off   : 不干预，沿用旧行为
+_ADSPOWER_MACOS_WINDOW_MODES = ("hide", "focus", "off")
+
+
+def get_runtime_adspower_macos_window_mode() -> str:
+    """返回 macOS 窗口抑制模式，默认 'hide'。非法值一律退回 'hide'。
+
+    只在 macOS 上有意义；Windows/Linux 侧调用点会先判平台再决定要不要问这个值。
+    """
+    val = runtime_env_or_default("ADSPOWER_MACOS_WINDOW_MODE", "hide").strip().lower()
+    return val if val in _ADSPOWER_MACOS_WINDOW_MODES else "hide"
+
+
 def get_runtime_google_fx_video_model() -> str:
     return runtime_env_or_default("GOOGLE_FX_VIDEO_MODEL", DEFAULT_GOOGLE_FX_VIDEO_MODEL)
 

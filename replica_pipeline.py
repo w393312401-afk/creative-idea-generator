@@ -168,6 +168,26 @@ def _dense_fps_for(base_fps):
     return min(12.0, round(base_fps * 3, 3))
 
 
+# 状态跳变检测灵敏度档位：analyze_timelapse_video.py 的 --state-diff-threshold 此前
+# 硬编码在脚本默认值（0.08），app 这一层完全摸不到。这道阈值直接决定「这一刻算不算
+# 发生了一次工序状态变化」——漏检就少一次 change_event，密采窗和峰值复核都不会去
+# 照顾那一刻，读出来的画面自然就糙。数值越低越敏感（抓住更细微的变化，噪声也更多），
+# 越高越保守（只认明显的跳变，容易把渐变工序整段吃掉）。
+STATE_DIFF_THRESHOLD_CHOICES = (0.04, 0.06, 0.08, 0.12, 0.16)
+DEFAULT_STATE_DIFF_THRESHOLD = 0.08
+
+
+def normalize_state_diff_threshold(value=None):
+    """请求里的敏感度阈值 → 档位表里的合法值。认不出来的一律回默认档（脚本原来的硬编码值）。"""
+    try:
+        threshold = float(value)
+    except (TypeError, ValueError):
+        return DEFAULT_STATE_DIFF_THRESHOLD
+    if threshold not in STATE_DIFF_THRESHOLD_CHOICES:
+        return DEFAULT_STATE_DIFF_THRESHOLD
+    return threshold
+
+
 # ── job 目录与状态 ───────────────────────────────────────────────────────────
 
 REPLICA_JOB_ID_RE = re.compile(r'^[a-zA-Z0-9_-]{3,64}$')
@@ -802,7 +822,7 @@ def _generate_collage_thumb(collage_path):
         return None
 
 
-def _run_analyzer(state, directory, base, dense, on_progress=None):
+def _run_analyzer(state, directory, base, dense, on_progress=None, state_diff_threshold=None):
     """跑抽帧脚本，并在跑的过程中按已落盘的帧数报进度。
 
     脚本本身只在**结束时**才 print（见 analyze_timelapse_video.py 的收尾段），所以
@@ -816,7 +836,8 @@ def _run_analyzer(state, directory, base, dense, on_progress=None):
     """
     args = [sys.executable, _analyzer_script(),
             '--video', state['video_path'], '--output-dir', directory,
-            '--base-fps', str(base), '--dense-fps', str(dense)]
+            '--base-fps', str(base), '--dense-fps', str(dense),
+            '--state-diff-threshold', str(state_diff_threshold or DEFAULT_STATE_DIFF_THRESHOLD)]
     if not on_progress:
         return subprocess.run(args, capture_output=True, text=True,
                               timeout=_ANALYZER_TIMEOUT_SEC, **_win_subprocess_flags())
@@ -864,28 +885,33 @@ def _run_analyzer(state, directory, base, dense, on_progress=None):
     return subprocess.CompletedProcess(args, proc.returncode, out, err)
 
 
-def run_extract(state, on_progress=None, base_fps=None):
+def run_extract(state, on_progress=None, base_fps=None, state_diff_threshold=None):
     """调 skill 自带的抽帧脚本。不重写它——它已经把延时特有的采样纪律做完了。
 
-    `base_fps` 是基线抽帧密度（见 EXTRACT_FPS_CHOICES）。不传就沿用这条 job 上
-    次用过的档位，没跑过就用默认档。
+    `base_fps` 是基线抽帧密度（见 EXTRACT_FPS_CHOICES）。`state_diff_threshold` 是
+    状态跳变检测灵敏度（见 STATE_DIFF_THRESHOLD_CHOICES）。两个都不传就沿用这条 job
+    上次用过的档位，没跑过就用默认档。
     """
     base = normalize_extract_fps(
         base_fps if base_fps is not None else (state.get('sampling') or {}).get('base_fps'))
     dense = _dense_fps_for(base)
+    threshold = normalize_state_diff_threshold(
+        state_diff_threshold if state_diff_threshold is not None
+        else (state.get('sampling') or {}).get('state_diff_threshold'))
     state['stage'] = 'extract'
-    state['sampling'] = {'base_fps': base, 'dense_fps': dense}
+    state['sampling'] = {'base_fps': base, 'dense_fps': dense, 'state_diff_threshold': threshold}
     _save_state(state)
     if on_progress:
         on_progress('replica_stage', {
             'stage': 'extract',
-            'message': f'正在抽帧：基线 {base:g}fps + 状态跳变密采 {dense:g}fps + '
-                       f'首尾密采（视频越长越久）…',
+            'message': f'正在抽帧：基线 {base:g}fps + 状态跳变密采 {dense:g}fps '
+                       f'（灵敏度阈值 {threshold:g}）+ 首尾密采（视频越长越久）…',
         })
 
     directory = job_dir(state['job_id'])
     _purge_extract_products(directory, state)
-    proc = _run_analyzer(state, directory, base, dense, on_progress=on_progress)
+    proc = _run_analyzer(state, directory, base, dense, on_progress=on_progress,
+                         state_diff_threshold=threshold)
     if proc.returncode != 0:
         raise RuntimeError(f'抽帧脚本失败（exit {proc.returncode}）:\n{(proc.stderr or "")[-2000:]}')
 
@@ -1421,6 +1447,7 @@ def run_mutate(state, config, axis_spec, on_progress=None):
     """从已确认的 beats 派生一个变体 job。原 job 保持不动，可以反复派生。"""
     from prompt_pipeline import reverse
 
+    on_progress = _tag_progress_with_action(on_progress, 'variant')
     source_beats = state.get('beats')
     if not source_beats:
         raise ValueError('还没有节拍阶梯，无法二创')
@@ -1481,9 +1508,26 @@ def run_mutate(state, config, axis_spec, on_progress=None):
         state['lineage_variants'] = parent_lineage + [variant_id]
         _save_state(state)
 
+    if on_progress:
+        on_progress('replica_stage', {
+            'stage': 'mutate_beats',
+            'action': 'variant',
+            'message': '正在沿变异轴派生二创变体阶梯...',
+            'done': 1,
+            'total': 4,
+        })
+
     try:
         variant_beats = reverse.mutate_beats(config, source_beats, axis_spec, on_progress=on_progress)
         variant_beats['pipeline_id'] = variant_id
+        if on_progress:
+            on_progress('replica_stage', {
+                'stage': 'mutate_beats',
+                'action': 'variant',
+                'message': f'正在生成变体双语对照（共 {len(variant_beats.get("beats") or [])} 拍）...',
+                'done': 3,
+                'total': 4,
+            })
         # 二创改写过的英文字段，其中文对照刚被 _merge_variant 作废（见那里的注释）；补回来，
         # 否则变体的卡点又退回一屏英文。与 run_reverse 同一个理由、同一个位置。
         reverse.translate_beats(config, variant_beats, on_progress=on_progress)
@@ -1500,9 +1544,12 @@ def run_mutate(state, config, axis_spec, on_progress=None):
     if on_progress:
         on_progress('replica_stage', {
             'stage': 'review_beats',
+            'action': 'variant',
             'message': (f'二创节拍已生成（{len(variant_beats.get("beats") or [])} 拍，'
                         f'变异轴：{"、".join(reverse.MUTATION_AXES[a] for a in variant_state["mutation_axes"] if a in reverse.MUTATION_AXES)}）。'
                         f'请核对后再合成提示词。'),
+            'done': 4,
+            'total': 4,
             'job_id': variant_id,
             'beats': variant_beats,
             'validation': variant_state['validation'],
@@ -1572,11 +1619,11 @@ def evaluate_variant_compatibility(config, baseline_job_id, mutation_axes=None, 
 
 
 def mutate_orthogonal(config, baseline_job_id, mutation_axes=None, preset=None, brief=None, on_progress=None):
-
     """基于已有的 1:1 母本执行四轴正交替换，瞬间派生二创 Job。"""
     from prompt_pipeline import reverse
     from prompt_pipeline import mutate
 
+    on_progress = _tag_progress_with_action(on_progress, 'mutate_orthogonal')
     baseline_job_id = validate_job_id(baseline_job_id)
     state = _load_state(baseline_job_id)
     if not state:
@@ -1661,8 +1708,17 @@ def mutate_orthogonal(config, baseline_job_id, mutation_axes=None, preset=None, 
             preset=preset,
             brief=brief,
             config=config,
+            on_progress=on_progress,
         )
         variant_beats['pipeline_id'] = variant_id
+        if on_progress:
+            on_progress('replica_stage', {
+                'stage': 'mutate_beats',
+                'action': 'mutate_orthogonal',
+                'message': f'正在生成变体双语对照与物理音效（共 {len(variant_beats.get("beats") or [])} 拍）...',
+                'done': 4,
+                'total': 5,
+            })
         # 翻译成中文对照
         reverse.translate_beats(config, variant_beats, on_progress=on_progress)
         _write_beats(variant_state, variant_beats)
@@ -1677,8 +1733,11 @@ def mutate_orthogonal(config, baseline_job_id, mutation_axes=None, preset=None, 
     if on_progress:
         on_progress('replica_stage', {
             'stage': 'review_beats',
+            'action': 'mutate_orthogonal',
             'message': (f'四轴正交变体已生成（{len(variant_beats.get("beats") or [])} 拍，'
                         f'预置：{preset or "自定义"}）。骨架拓扑 100% 锁死。'),
+            'done': 5,
+            'total': 5,
             'job_id': variant_id,
             'beats': variant_beats,
             'validation': variant_state.get('validation') or [],
@@ -1749,6 +1808,164 @@ def _load_overview(state):
     except (OSError, ValueError):
         return {}
 
+
+def _ground_prompt_block_on_footage(config, state, beats, observed_digests, on_progress=None):
+    """后置那道：合成收尾后，逐拍拿原片实拍画面把整份 prompt_block 校对一遍。
+
+    两条链路（极速 / 深度）共用这一个调用点——这正是 2026-08-30 那次「首帧对齐只在深线
+    生效」的解药：口径只有一份，就不会再出现一条线校过、另一条没校而 prompt_block 上看
+    不出区别的情况。
+
+    只订正画面（机位/景别/构图/材质/植被/人物外观与站位），不动施工进度——拍表是用户逐拍
+    核对过的，视觉模型只看得见三张图，没有资格改因果顺序。约束写在
+    observed_grounding._VERIFY_SYSTEM 的 SCOPE 段里。
+
+    整段失败一律软退：校对是增量收益，不该把已经合成好的一单拖死。
+    """
+    block = state.get('prompt_block')
+    if not block or not observed_digests:
+        return
+    try:
+        from prompt_pipeline.observed_grounding import ground_prompt_block_on_observed
+        grounded, report = ground_prompt_block_on_observed(
+            config, block, beats, job_dir(state['job_id']),
+            on_progress=on_progress, digests=observed_digests)
+    except Exception as exc:
+        state['observed_grounding'] = {'error': str(exc)[:200]}
+        if sys.stdout:
+            print(f'[REPLICA] 原片实拍校对整段软退（保留未校对的提示词）: {exc}')
+        return
+    if grounded and grounded != block:
+        state['prompt_block'] = _ensure_prompt_block_summaries(grounded, beats)
+    state['observed_grounding'] = report
+
+
+def _enforce_cast_scale(state, compose_state, beats, on_progress=None):
+    """把人偶物理比例锁钉进每一条提到活物的 IMAGE 提示词。
+
+    必须排在 `_ground_prompt_block_on_footage` **之后**：那一道会整段重写正文，先锁后校
+    等于锁句被重写掉；而且视觉订正的 SCOPE 明说不准动施工进度，比例锁是确定性注入，
+    放在最后一步最安全。
+
+    2026-08-30 实测（replica_cf9a445bc52b）：九帧 IMAGE 里跟人偶比例有关的句子一句都没有，
+    packet 里连 `cast_scale` 这个键都不存在，而整套比例机制（worker_scale_percent）又是
+    VIDEO 单边的——用户看到的 IMG 006 人偶压过整个地基，就是这么来的。
+    """
+    block = state.get('prompt_block')
+    packet = (compose_state or {}).get('packet') or {}
+    if not block:
+        return
+    try:
+        from prompt_pipeline.observed_grounding import (
+            enforce_cast_scale_lock, measure_cast_scale)
+        # 极速线的 packet 由 synthesize_drift_lock_packet 就地量好；深度线的 packet 是
+        # 模型产的，schema 里没有这个键。在这里统一补齐——不补的话又是「一条线有锁、
+        # 另一条没有」，也就是 2026-08-30 连查两个坑的同一个病根。
+        if not packet.get('cast_scale') and not reverse.is_variant_doc(beats):
+            measured = measure_cast_scale(
+                beats, job_dir(state['job_id']),
+                cast_identity=(beats or {}).get('cast_identity'))
+            if measured:
+                packet = dict(packet)
+                packet['cast_scale'] = measured
+                if isinstance(compose_state, dict):
+                    compose_state['packet'] = packet
+        locked, report = enforce_cast_scale_lock(block, packet, beats)
+    except Exception as exc:
+        state['cast_scale_lock'] = {'error': str(exc)[:200]}
+        if sys.stdout:
+            print(f'[REPLICA] 人偶比例锁软退（保留未加锁的提示词）: {exc}')
+        return
+    if locked and locked != block:
+        state['prompt_block'] = _ensure_prompt_block_summaries(locked, beats)
+    state['cast_scale_lock'] = report
+    if report.get('locked'):
+        if on_progress:
+            on_progress('replica_stage', {
+                'stage': 'compose',
+                'message': (f'已按原片量出的人偶比例（{report.get("scale") or ""}）'
+                            f'锁定 {len(report["locked"])} 条图片提示词'),
+            })
+    elif sys.stdout:
+        print(f'[REPLICA] ⚠️ 未下人偶比例锁：{report.get("skipped")}')
+
+
+def _enforce_human_cast(state, beats=None, config=None, on_progress=None):
+    """活物一律真人：把整份 prompt_block 里的「假人」措辞就地掰回真人措辞。
+
+    必须排在 `_ground_prompt_block_on_footage` 与 `_enforce_cast_scale` **之后**：
+    前者会整段重写正文（它的 SCOPE 明写着可以改「活物的外形与衣着」，2026-08-30 实测
+    正是它把原片里活生生的施工者写成了 "the lone equipment figurine"），后者注入的锁句
+    自带一整套人偶措辞。两道都跑完再收口，才轮得到"最后一版正文"。
+
+    尺寸不归这里管——比例锁写的 1:24 / 7cm 原样保留（见 prompt_pipeline.human_cast）。
+    """
+    block = state.get('prompt_block')
+    if not block:
+        return
+    try:
+        from prompt_pipeline.human_cast import humanize_prompt_block
+        fixed = humanize_prompt_block(block)
+    except Exception as exc:
+        if sys.stdout:
+            print(f'[REPLICA] 真人化收口软退（保留原稿）: {exc}')
+        return
+    if fixed and fixed != block:
+        state['prompt_block'] = fixed
+        state['human_cast_rewrite'] = True
+        if on_progress:
+            on_progress('replica_stage', {
+                'stage': 'compose',
+                'message': '已把提示词里的人偶/蜡像措辞统一改写为真人（活物一律真人）',
+            })
+    _warn_if_miniature_wording_leaked(state, beats, config=config, on_progress=on_progress)
+
+
+# 微缩题材的招牌措辞。真实尺度的单子里出现它们，说明这一趟走错了通道——不是某个词
+# 写歪了，是整份系统提示词发错了那一份。
+_MINIATURE_LEAK_MARKERS = ('miniature', 'diorama', 'giant hand', 'giant human hand',
+                           'micro-tool', 'thumb tall', 'thumb-tall', 'tabletop set')
+
+
+def _warn_if_miniature_wording_leaked(state, beats, config=None, on_progress=None):
+    """真实尺度的单子里混进微缩措辞就大声说出来。
+
+    2026-08-30 的教训：一单真人实拍的半挂车改造被 `'craftsman' in cast_identity`
+    这条判据拨进了微缩通道，交付正文里 39 处 miniature、33 处 giant hands、8 处
+    diorama，人全成了拇指高的模型——而整个过程一行提示都没有，直到图渲出来、用户
+    自己看出来为止。路由那一头已经修好（reverse.detect_miniature_scale），这里是
+    兜底的哨兵：判据万一又漏，至少不再是静默的。
+
+    只报不改：把 "macro diorama photograph" 这类整句机位描述自动改写，风险远大于
+    收益——它牵着景别、焦段与整段构图。这里给出数字和位置，人一眼就知道该重合成。
+    """
+    block = state.get('prompt_block') or ''
+    if not isinstance(block, str) or not block:
+        return
+    if str((beats or {}).get('render_scale') or '').strip().lower() == 'miniature':
+        return   # 微缩单里这些词本来就该有
+    try:
+        from prompt_pipeline import active_skill_profile
+        if active_skill_profile(config) == 'miniature':
+            return   # 用户把链路钉死成微缩，这些词是他自己要的，不是走错了道
+    except Exception:
+        pass
+    low = block.lower()
+    hits = {m: low.count(m) for m in _MINIATURE_LEAK_MARKERS if m in low}
+    if not hits:
+        return
+    total = sum(hits.values())
+    detail = '、'.join(f'{k}×{v}' for k, v in sorted(hits.items(), key=lambda kv: -kv[1]))
+    state['miniature_wording_leak'] = {'total': total, 'hits': hits}
+    if sys.stdout:
+        print(f'[REPLICA] ⚠️ 真实尺度的单子里出现 {total} 处微缩措辞（{detail}）——'
+              f'多半是合成通道走错了，建议重新合成')
+    if on_progress:
+        on_progress('replica_stage', {
+            'stage': 'compose',
+            'message': (f'⚠️ 这是真实尺度的单子，但提示词里有 {total} 处微缩题材措辞（{detail}）；'
+                        f'人会被渲成模型/蜡像，建议重新合成一次'),
+        })
 
 def _backfill_time_windows(state, beats):
     """存量任务补算定长窗。只在缺的时候算一次，并落盘。
@@ -1925,6 +2142,42 @@ def run_compose(state, config, dimensions=None, on_progress=None, reset_cache=Fa
     state['compose_mode'] = 'deep' if use_deep else 'fast'
     state['compose_fallback'] = None
 
+    # 前置那道（见 prompt_pipeline.observed_grounding）：把反推阶段逐帧读到的画面记录压成
+    # 逐槽位的「原片实拍事实卡」。算一次，两条链路共用——快线通过 state 拿整份、深线通过
+    # config 拿逐拍那份。这一步零模型调用，纯读盘。
+    #
+    # 二创不做：拿原片画面去校一份「换成废弃巴士」的提示词，等于把新载体又拧回旧载体，
+    # 和 scene_constants / banned_elements 不继承是同一条理由。
+    observed_digests = {}
+    if not reverse.is_variant_doc(beats):
+        try:
+            from prompt_pipeline import micro_traces_channel_enabled
+            from prompt_pipeline.observed_grounding import build_observed_digests
+            # 微观痕迹只发给微缩通道（见 pp.micro_traces_channel_enabled）：base / omni
+            # 是全尺寸实景，微距级痕迹在它们的景别下渲染不出来，只会挤掉真看得见的依据。
+            observed_digests = build_observed_digests(
+                beats, job_dir(state['job_id']),
+                include_micro_traces=micro_traces_channel_enabled(config)) or {}
+        except Exception as exc:
+            if sys.stdout:
+                print(f'[REPLICA] 原片实拍事实卡构建软退（本单合成不带画面依据）: {exc}')
+            observed_digests = {}
+    if observed_digests and (observed_digests.get('images') or observed_digests.get('videos')):
+        # 只挂在 config 上，不写进 state：state 要落盘且被前端每两秒轮询一次，
+        # 十几拍的事实卡是几十 KB 的纯派生数据，进去只会让每一次轮询都背着它。
+        if isinstance(config, dict):
+            config['_observed_digests'] = observed_digests
+        if on_progress:
+            on_progress('replica_stage', {
+                'stage': 'compose',
+                'message': (f'已备好原片实拍事实卡：{len(observed_digests.get("images") or {})} 张静帧、'
+                            f'{len(observed_digests.get("videos") or {})} 段运动，将随合成输入一起发给写手'),
+            })
+    else:
+        observed_digests = {}
+        if sys.stdout:
+            print('[REPLICA] ⚠️ 没有可用的逐帧读数，本单合成不带原片画面依据（提示词仅凭拍表文字）')
+
     if not use_deep:
         try:
             from prompt_pipeline.fast_composer import compose_replica_one_pass
@@ -1932,6 +2185,10 @@ def run_compose(state, config, dimensions=None, on_progress=None, reset_cache=Fa
             if not state.get('title_locked') or not state.get('title'):
                 state['title'] = compose_state.get('title')
             state['prompt_block'] = prompt_block
+            _ground_prompt_block_on_footage(
+                config, state, beats, observed_digests, on_progress=on_progress)
+            _enforce_cast_scale(state, compose_state, beats, on_progress=on_progress)
+            _enforce_human_cast(state, beats, config=config, on_progress=on_progress)
             _write_compose_state(state, compose_state)
             _save_state(state)
             return run_audit(state, on_progress=on_progress)
@@ -1975,6 +2232,10 @@ def run_compose(state, config, dimensions=None, on_progress=None, reset_cache=Fa
         # 必须在落进 state 之前剥掉（见 _prompt_block_only）。激发那条线在
         # server.py 里过的是同一道 parse_sections。
         state['prompt_block'] = _ensure_prompt_block_summaries(_prompt_block_only(composed), beats)
+        _ground_prompt_block_on_footage(
+            config, state, beats, observed_digests, on_progress=on_progress)
+        _enforce_cast_scale(state, compose_state, beats, on_progress=on_progress)
+        _enforce_human_cast(state, beats, config=config, on_progress=on_progress)
         _write_compose_state(state, compose_state)
         _save_state(state)
 
@@ -2417,26 +2678,33 @@ def _overview_ready(job_id):
     return os.path.exists(os.path.join(job_dir(job_id), 'video_overview.json'))
 
 
-def extract_replica_job(config, job_id, on_progress=None, base_fps=None):
+def extract_replica_job(config, job_id, on_progress=None, base_fps=None, state_diff_threshold=None):
     """只抽帧，停在 confirm_cost。
 
     与 Pass A 分成两个任务，是为了让「先看预估再决定烧不烧钱」这句话在代码里成立。
     抽帧是本地 ffmpeg，不花模型钱，所以它可以在用户没确认任何东西的情况下自己跑完。
 
-    `base_fps` 与这条 job 上次用的密度不同时**必须**重抽：那正是用户点「按新密度
-    重抽帧」的全部意思，沿用旧帧等于这个按钮什么也没做。
+    `base_fps` 或 `state_diff_threshold` 与这条 job 上次用的档位不同时**必须**重抽：
+    那正是用户点「按新档位重抽帧」的全部意思，沿用旧帧等于这个按钮什么也没做。
     """
     state = _begin(job_id)
     try:
-        current = (state.get('sampling') or {}).get('base_fps')
-        wants = normalize_extract_fps(base_fps) if base_fps is not None else None
-        density_changed = wants is not None and normalize_extract_fps(current) != wants
-        if (_overview_ready(job_id) and not density_changed
+        sampling = state.get('sampling') or {}
+        wants_fps = normalize_extract_fps(base_fps) if base_fps is not None else None
+        fps_changed = wants_fps is not None and normalize_extract_fps(sampling.get('base_fps')) != wants_fps
+        wants_threshold = (normalize_state_diff_threshold(state_diff_threshold)
+                            if state_diff_threshold is not None else None)
+        threshold_changed = (wants_threshold is not None
+                              and normalize_state_diff_threshold(sampling.get('state_diff_threshold'))
+                              != wants_threshold)
+        resample_needed = fps_changed or threshold_changed
+        if (_overview_ready(job_id) and not resample_needed
                 and state.get('stage') not in ('ingest', 'extract')):
             # 已经抽过帧（例如换个送审档位回来重跑）：不重抽，直接回到确认卡点。
             state['stage'] = 'confirm_cost'
             return _save_state(state)
-        return run_extract(state, on_progress=on_progress, base_fps=base_fps)
+        return run_extract(state, on_progress=on_progress, base_fps=base_fps,
+                           state_diff_threshold=state_diff_threshold)
     except Exception as e:
         state['error'] = str(e)
         _save_state(state)
@@ -2469,7 +2737,7 @@ def start_replica_job(config, job_id, on_progress=None, degraded=False, scope=No
 # 那十来处 on_progress 调用点，是因为前端的判据是「动作期间的每一条事件都带 action」：
 # 逐个 emission 手加字段，漏一条就会在那一瞬间闪回「待人工核对」，而且下次谁再加一条
 # 事件又会漏。包一层之后这条保证是结构性的。
-_ACTION_TAGGED = frozenset({'autofix', 'fix_beats', 'autobalance', 'refine_craft', 'translate'})
+_ACTION_TAGGED = frozenset({'autofix', 'fix_beats', 'autobalance', 'refine_craft', 'translate', 'variant', 'mutate_orthogonal'})
 
 
 def _tag_progress_with_action(on_progress, action):

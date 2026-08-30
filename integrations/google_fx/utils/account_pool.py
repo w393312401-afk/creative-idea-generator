@@ -985,31 +985,55 @@ class AccountPool:
             _write_state(state)
 
     def mark_exhausted(self, user_id: str, cooldown_hours: float = 24.0,
-                       credit: Optional[int] = None):
+                       credit: Optional[int] = None,
+                       reason: str = "quota_exhausted",
+                       error_detail: Optional[str] = None):
         """账号额度不够用了：写回余额、进冷却。
 
         credit：页面实测到的余额。传了就按实测值写回——"积分不足"跟"余额为 0"
         是两回事，一律写 0 会在控制台显示一个页面上根本不存在的余额，跟本模块
         "积分数字只信真实探测"的规矩直接冲突。没实测到（只命中了耗尽关键词）
         才退回写 0。
+
+        reason="image_quota_exceeded"（图片单日配额）是个例外：那是"今天的图片份额
+        用完了"，跟积分余额无关，没实测到余额时**一个字都不改**——照旧写 0 会伪造
+        一个不存在的余额，还会连带把账号按 zero_credit 自动禁用。
         """
         with _LOCK:
             state = _read_state()
             if user_id not in state:
                 return
             cooldown_until = (_now() + timedelta(hours=cooldown_hours)).isoformat()
-            measured = 0 if credit is None else max(0, int(credit))
-            state[user_id]["credit"] = measured
-            _sync_zero_credit_disabled(state[user_id], measured)
+            # 图片单日上限跟"积分为 0"是两回事：账号余额可能还剩几百分，只是今天的
+            # 图片配额用完了。没实测到余额就写 0，会在控制台显示一个页面上根本不存在
+            # 的余额（本模块"积分数字只信真实探测"的规矩），还会顺手把账号按
+            # zero_credit 自动禁用——那是另一种故障的标记，人看了会误判。
+            image_capped = (reason == "image_quota_exceeded")
+            if credit is None and image_capped:
+                measured = state[user_id].get("credit")
+            else:
+                measured = 0 if credit is None else max(0, int(credit))
+                state[user_id]["credit"] = measured
+                _sync_zero_credit_disabled(state[user_id], measured)
             state[user_id]["cooldown_until"] = cooldown_until
-            state[user_id]["cooldown_reason"] = "quota_exhausted"
-            state[user_id]["last_generation_error"] = "quota_exhausted"
+            state[user_id]["cooldown_reason"] = reason
+            err_label = error_detail or ("图片余额超限" if (reason == "image_quota_exceeded" or "image" in str(reason) or "daily" in str(reason)) else "quota_exhausted")
+            state[user_id]["last_generation_error"] = err_label
             state[user_id]["last_generation_error_at"] = _now_iso()
             state[user_id]["consecutive_failures"] = int(
                 state[user_id].get("consecutive_failures", 0)
             ) + 1
             _write_state(state)
-        log(f"🧊 账号 {user_id} 标记为额度不足（实测余额 {measured}），冷却至 {cooldown_until}", "账号池")
+        log_reason = ("图片单日配额超限（不动积分余额）"
+                      if (reason == "image_quota_exceeded" or "image" in str(reason) or "daily" in str(reason))
+                      else f"额度不足（实测余额 {measured}）")
+        log(f"🧊 账号 {user_id} 标记为{log_reason}，冷却至 {cooldown_until}", "账号池")
+
+    def mark_image_quota_exceeded(self, user_id: str, cooldown_hours: float = 24.0,
+                                  credit: Optional[int] = None, error_detail: str = "图片余额超限"):
+        """专门标记图片余额超限/单日限额。"""
+        self.mark_exhausted(user_id, cooldown_hours=cooldown_hours, credit=credit,
+                            reason="image_quota_exceeded", error_detail=error_detail)
 
     def mark_login_required(self, user_id: str, cooldown_hours: float = 2.0):
         """账号登录失效/验证码/安全拦截等待人工处理超时：跟 mark_exhausted 一样

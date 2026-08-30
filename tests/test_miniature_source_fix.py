@@ -72,7 +72,9 @@ def test_ensure_pacing_and_deduplicate_boilerplate():
 
 
 def test_ensure_living_cast_reaction_fallback():
-    """When a miniature video prompt has zero mention of figurines, dynamic action-reaction fallback must be injected."""
+    """When a miniature video prompt has zero mention of the living cast, the dynamic
+    action-reaction fallback must be injected - in REAL-HUMAN wording (2026-08-30
+    活物一律真人): the residents of a miniature set are small people, never resin figurines."""
     composer = MiniatureComposer()
     prompt_without_cast = (
         "Use the provided image as the exact starting composition. "
@@ -82,7 +84,8 @@ def test_ensure_living_cast_reaction_fallback():
         "where the giant hand completes the work and withdraws."
     )
     fixed = composer.ensure_living_cast_reaction(prompt_without_cast)
-    assert 'miniature couple figurines' in fixed
+    assert 'miniature-scale resident couple' in fixed
+    assert 'figurine' not in fixed.lower()
     assert 'tilt their heads' in fixed or 'curiosity' in fixed or 'tracking' in fixed
 
 

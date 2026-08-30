@@ -582,13 +582,13 @@ function renderProjectsBulkBar() {
     document.getElementById('projects-list')?.classList.add('has-selection');
 
     const running = rows.filter(p => (p.task || {}).status === 'running').length;
-    const withTask = rows.filter(p => (p.task || {}).id).length;
-    const saved = rows.filter(p => p.saved && (p.library || {}).id).length;
+    const withTask = rows.filter(p => (p.task || {}).id || (p.sub_jobs || []).length > 0).length;
     const btns = [];
     if (running) btns.push(`<button type="button" class="projects-btn danger" data-bulk="cancel">✕ 取消运行中（${running}）</button>`);
     btns.push('<button type="button" class="projects-btn" data-bulk="copy-titles">📋 复制标题</button>');
+    // 核心主操作：彻底删除所选项目（包含任务记录、点子库收藏及本地磁盘媒体）
+    btns.push(`<button type="button" class="projects-btn danger" data-bulk="delete-projects" title="彻底删除所选项目：同步清除生成任务记录、点子库收藏及本地磁盘生成的图片/视频文件">🗑️ 彻底删除（${rows.length}）</button>`);
     if (withTask) btns.push(`<button type="button" class="projects-btn" data-bulk="delete-task" title="只删除生成任务记录与日志，已收藏的创意与磁盘素材不受影响">🧹 仅清除任务记录（${withTask}）</button>`);
-    if (saved) btns.push(`<button type="button" class="projects-btn danger" data-bulk="unsave" title="从点子库删除并彻底清理本地磁盘生成的图片/视频文件">🗑️ 从点子库彻底删除（${saved}）</button>`);
 
     bar.innerHTML = `
         <span class="projects-bulk-count">已选 ${rows.length} 个项目</span>
@@ -604,6 +604,47 @@ function projectsSyncSelectAllBtn() {
     const allOn = keys.length > 0 && keys.every(k => projectsSelected.has(k));
     btn.textContent = allOn ? '⬜ 取消全选' : '☑️ 全选';
     btn.disabled = keys.length === 0;
+}
+
+// 批量项目彻底删除：调用 /api/projects/delete 一次性清理任务记录、点子库收藏及 outputs 媒体
+async function projectsBulkDeleteProjects(rows) {
+    if (!rows || !rows.length) return 0;
+    try {
+        const res = await fetch('/api/projects/delete', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ projects: rows }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (res.ok && data.status === 'ok') {
+            const deletedLibIds = new Set(data.deleted_library_ids || []);
+            rows.forEach(p => {
+                if (p.library && p.library.id) deletedLibIds.add(p.library.id);
+                if (p.saved && p.id) deletedLibIds.add(p.id);
+            });
+            if (deletedLibIds.size && typeof savedIdeas !== 'undefined' && Array.isArray(savedIdeas)) {
+                savedIdeas = savedIdeas.filter(i => !deletedLibIds.has(i.id));
+                try { localStorage.setItem('spark_library', JSON.stringify(savedIdeas)); }
+                catch (e) { console.warn('[library] localStorage 镜像写入失败', e); }
+                if (typeof updateFavoriteButtonState === 'function') updateFavoriteButtonState();
+            }
+            return data.count || rows.length;
+        }
+    } catch (e) {
+        console.warn('Bulk projects delete API failed, falling back to sequential', e);
+    }
+
+    // 失败回退：同时执行 unsave 和 delete-task
+    const unsaved = await projectsBulkUnsave(rows);
+    const taskIds = [];
+    rows.forEach(p => {
+        if ((p.task || {}).id) taskIds.push(p.task.id);
+        (p.sub_jobs || []).forEach(j => { if (j && j.id) taskIds.push(j.id); });
+    });
+    if (taskIds.length) {
+        await projectsBulkJobRequest('/api/tasks/delete', taskIds);
+    }
+    return rows.length;
 }
 
 // 批量收藏删除：优先单次批量端点（/api/library/items/bulk_delete），大幅降低网络耗时与避免部分删除。
@@ -703,6 +744,16 @@ async function projectsRunBulkAction(act) {
                 : `${ids.length} 个项目中 ${ok} 个已请求取消，其余失败`,
                 ok === ids.length ? 'info' : 'error');
             refreshProjects({ assets: false });
+            break;
+        }
+
+        case 'delete-projects': {
+            if (!await projectsConfirm(
+                `确定彻底删除这 ${rows.length} 个项目吗？\n⚠ 将同步清除任务记录、点子库收藏以及本地磁盘生成的图片/视频文件，不可恢复。`)) return;
+            const ok = await projectsBulkDeleteProjects(rows);
+            showToast(ok ? `已彻底删除 ${ok} 个项目及对应磁盘素材` : '删除失败，请稍后重试', ok ? 'success' : 'error');
+            projectsSelected.clear();
+            refreshProjects();
             break;
         }
 
@@ -820,11 +871,10 @@ function projectsDetailActionsHtml(p) {
     if (p.assets && p.assets.file_count) {
         btns.push('<button type="button" class="projects-btn" data-act="gallery">🖼️ 去画廊看资产</button>');
     }
-    if (p.saved) {
-        btns.push('<button type="button" class="projects-btn danger" data-act="unsave">🗑️ 从点子库删除</button>');
-    }
-    if (task.id) {
-        btns.push('<button type="button" class="projects-btn danger" data-act="delete-task">🗑️ 删除任务记录</button>');
+    // 核心主删除操作：彻底删除该项目（同时清理任务记录、点子库收藏及本地媒体文件）
+    btns.push('<button type="button" class="projects-btn danger" data-act="delete-project" title="彻底删除该项目：同步清除生成任务记录、点子库收藏及本地磁盘生成的图片/视频文件">🗑️ 彻底删除项目</button>');
+    if (task.id && p.saved) {
+        btns.push('<button type="button" class="projects-btn danger" data-act="delete-task" title="只删除生成任务记录与日志，已收藏的创意与本地磁盘素材文件不受影响">🧹 仅清除任务记录</button>');
     }
     return btns.join('');
 }
@@ -1058,6 +1108,18 @@ async function projectsRunAction(act, p, event, jobId) {
         case 'remix':
             await startProjectRemix(p);
             break;
+        case 'delete-project': {
+            const title = p.title || p.project_key || '未命名项目';
+            if (!await projectsConfirm(
+                `确定彻底删除项目「${title}」吗？\n⚠ 将同步清除任务记录、点子库收藏以及本地磁盘已生成的图片/视频文件，不可恢复。`)) return;
+            const ok = await projectsBulkDeleteProjects([p]);
+            showToast(ok ? `项目「${title}」及关联资产已彻底删除` : '删除失败，请稍后重试', ok ? 'success' : 'error');
+            if (projectsSelectedKey === p.project_key) {
+                projectsSelectedKey = null;
+            }
+            refreshProjects();
+            break;
+        }
         case 'unsave':
             await deleteFromLibrary((p.library || {}).id);
             refreshProjects();
@@ -1137,12 +1199,12 @@ async function startProjectRemix(p) {
     // 立刻定位会被那次重渲把滚动位置顶回顶部。
     setTimeout(() => {
         if (typeof replicaFocusSection !== 'function') return;
-        // 逐个回落：每一栏都有自己的渲染条件（二创变体要 beats 非空、母本视窗要过了
-        // 抽帧），条件不满足时那个锚点根本不存在，而 replicaFocusSection 找不到锚点是
+        // 逐个回落：每一栏都有自己的渲染条件（二创发散要 beats 非空），
+        // 条件不满足时那个锚点根本不存在，而 replicaFocusSection 找不到锚点是
         // 彻底静默的——不滚动、不报错。所以按可能性从窄到宽试，别只赌一个。
         const targets = beats.length
-            ? ['replica-sec-variant', 'replica-sec-workbench', 'replica-sec-current-job']
-            : ['replica-sec-current-job', 'replica-sec-workbench', 'replica-sec-jobs'];
+            ? ['replica-sec-variant', 'replica-sec-current-job']
+            : ['replica-sec-current-job', 'replica-sec-jobs'];
         targets.some(id => replicaFocusSection(id));
     }, 600);
 }

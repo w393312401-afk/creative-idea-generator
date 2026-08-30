@@ -250,7 +250,8 @@ class TestSamplingDensity(ExtractedJobCase):
         self.assertEqual(argv[argv.index('--base-fps') + 1], '4.0')
         # 密采窗跟着基线走：基线抬上去还留着默认 6fps，等于密采不再密。
         self.assertEqual(argv[argv.index('--dense-fps') + 1], '12.0')
-        self.assertEqual(out['sampling'], {'base_fps': 4.0, 'dense_fps': 12.0})
+        self.assertEqual(out['sampling'],
+                         {'base_fps': 4.0, 'dense_fps': 12.0, 'state_diff_threshold': 0.08})
 
     def test_an_unknown_density_falls_back_to_the_default_tier(self):
         """不做四舍五入到最近档：静默改档位比明确回落到默认档更难查。"""

@@ -326,7 +326,8 @@ class TestRunIdeateReturnShape(unittest.TestCase):
                 "beat_outline": ["1", "2", "3", "4", "5", "6"]
             }])
 
-        with patch.object(pp, 'fetch_trend_snippet', return_value=''), \
+        with patch.object(pp, 'read_ledger', return_value=[]), \
+             patch.object(pp, 'fetch_trend_snippet', return_value=''), \
              patch.object(pp, 'fetch_custom_url_snippet', return_value=''), \
              patch.object(pp, 'load_reference_file', return_value=''), \
              patch.object(pp, '_chat', side_effect=fake_chat):

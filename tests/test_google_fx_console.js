@@ -30,6 +30,13 @@ test('login-required cooldown is distinguished from a plain cooldown', () => {
 
   const exhausted = fx.accountState({ cooldown_until: '2099-01-01T00:00:00Z', credit: 0 }, 0);
   assert.equal(exhausted.key, 'cooling');
+
+  const imageExceeded = fx.accountState({
+    cooldown_until: '2099-01-01T00:00:00Z', cooldown_reason: 'image_quota_exceeded', credit: 500
+  }, 0);
+  assert.equal(imageExceeded.key, 'image_limit');
+  assert.equal(imageExceeded.label, '图片余额超限');
+  assert.equal(imageExceeded.tone, 'bad');
 });
 
 test('never-probed credit is its own state, not "ready" and not "empty"', () => {

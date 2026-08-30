@@ -184,11 +184,30 @@ function syncSlotToolbar(type) {
         retryDirtyBtn.textContent = `⚡ 重渲已改动帧 (${dirty})`;
     }
 
-    // 「🖼️ 多宫格检查器」快捷入口按钮
-    const cvBtn = bar.querySelector('.slot-collage-btn');
-    if (cvBtn) {
-        const hasCollage = typeof currentIdea !== 'undefined' && currentIdea && (currentIdea.collage_url || (currentIdea.frameRun && (currentIdea.frameRun.collage_url || (currentIdea.frameRun.frames && currentIdea.frameRun.frames.length))));
-        cvBtn.hidden = !hasCollage;
+    // 「🎯 原片对标滑块」快捷入口按钮
+    const bmBtn = bar.querySelector('.slot-benchmark-btn');
+    if (bmBtn) {
+        const curIdea = typeof currentIdea !== 'undefined' ? currentIdea : null;
+        // 判据只认"确有可对标的原片素材"。放宽到 title / collage_url 的话，
+        // 任何项目都会亮出这枚按钮，点进去是一片空——这正是它要避免的事。
+        const refMapProbe = (curIdea && (curIdea.ref_frames || curIdea.reference_frames
+            || (curIdea.frameRun && curIdea.frameRun.ref_frames))) || null;
+        const hasIdea = !!(curIdea && (
+            (refMapProbe && typeof refMapProbe === 'object' && Object.keys(refMapProbe).length) ||
+            curIdea.source_collage ||
+            curIdea.source_collage_url
+        ));
+        bmBtn.hidden = !hasIdea;
+        if (hasIdea) {
+            const refMap = (curIdea && (curIdea.ref_frames || curIdea.reference_frames || (curIdea.frameRun && curIdea.frameRun.ref_frames))) || {};
+            const refCount = refMap && typeof refMap === 'object' ? Object.keys(refMap).length : 0;
+            const totalCount = (curIdea && (curIdea.image_count || (curIdea.frameRun && curIdea.frameRun.image_count) || (curIdea.frameRun && curIdea.frameRun.frames && curIdea.frameRun.frames.length))) || refCount || 0;
+            if (refCount > 0) {
+                bmBtn.title = `打开爆款原片对标滑块 (${totalCount > 0 ? `${totalCount} 拍中 ` : ''}${refCount} 拍已绑定原片抽帧)`;
+            } else {
+                bmBtn.title = '打开交互式多宫格检查器与对标滑块（逐拍对标、地平透视线、5列拼图总览）';
+            }
+        }
     }
 
     // 「全部修复」只在真有待修帧时露面，并把条数写在按钮上——⚠ 计数里还混着
@@ -208,6 +227,27 @@ function setSlotFilter(type, filter) {
 function clearSlotSelection(type) {
     slotToolbarState[type].selected.clear();
     syncSlotToolbar(type);
+}
+
+/**
+ * 当前视口里最靠上的那一枚图片槽位的拍号。对标滑块从这一拍打开，
+ * 而不是永远回到第 1 拍。判据用的是垂直方向——结果网格是换行铺开、
+ * 随页面纵向滚动的，横向可见性说明不了任何事。
+ */
+function firstVisibleSlotSeq(type = 'image') {
+    const grid = slotRenderTarget(type);
+    if (!grid) return 1;
+    const cards = Array.from(grid.querySelectorAll(`.slot-card[data-seq]`))
+        .filter(c => !c.classList.contains('slot-filtered-out')
+            && (!c.dataset.type || c.dataset.type === type));
+    if (!cards.length) return 1;
+    const vh = window.innerHeight || document.documentElement.clientHeight;
+    const visible = cards.find(c => {
+        const r = c.getBoundingClientRect();
+        return r.bottom > 0 && r.top < vh;
+    });
+    const pick = visible || cards[0];
+    return parseInt(pick.dataset.seq, 10) || 1;
 }
 
 /** 滚到第一枚带徽标的卡片，并短暂高亮——20 拍以上的单子靠肉眼扫太慢。 */
@@ -469,8 +509,25 @@ function bindSlotToolbar(type) {
         if (sizeBtn) { applySlotSize(sizeBtn.dataset.size); return; }
         if (e.target.closest('.slot-jump-btn')) { jumpToFirstFlagged(type); return; }
         if (e.target.closest('.slot-retry-dirty-btn')) { bulkRetryDirtySlots(type); return; }
-        if (e.target.closest('.slot-collage-btn')) {
-            if (typeof openCollageViewer === 'function') openCollageViewer();
+        if (e.target.closest('.slot-benchmark-btn')) {
+            // 网格 id 只有 #frames-grid / #beats-grid（合并视图）两种，
+            // 走 slotRenderTarget 拿，别硬写。写错 id 的话 targetSeq 恒为 1，
+            // "从当前视口那一拍打开"这件事就等于没做。
+            const targetSeq = firstVisibleSlotSeq('image');
+
+            if (typeof openBenchmarkCompare === 'function') {
+                openBenchmarkCompare({
+                    idea: typeof currentIdea !== 'undefined' ? currentIdea : null,
+                    seq: targetSeq,
+                });
+            } else if (typeof openCollageViewer === 'function') {
+                openCollageViewer({
+                    idea: typeof currentIdea !== 'undefined' ? currentIdea : null,
+                    initialMode: 'compare',
+                    compareType: 'benchmark',
+                    initialFrameSeq: targetSeq,
+                });
+            }
             return;
         }
         // 「全部修复」只有图片工具条有这枚按钮（视频槽位没有"待修问题"这一说）
@@ -583,8 +640,8 @@ function initGlobalSlotMarqueeSelection() {
         const resultsArea = e.target.closest('#results-view, #frames-section, #videos-section, .frames-wrapper, .frames-grid, #beats-grid, .idea-section');
         if (!resultsArea) return;
 
-        // 点击在按钮、输入框、勾选框、操作栏等交互元素上时不触发框选
-        if (e.target.closest('button, input, textarea, a, select, label, .slot-actions, .slot-badge, .slot-label, .slot-select, .slot-bulk, .slot-toolbar, .review-panel, .section-tools')) {
+        // 点击在按钮、文本输入框、操作栏按钮等交互控件上时不触发框选
+        if (e.target.closest('button, input:not(.slot-select-box), textarea, a, select, .slot-actions, .section-tools')) {
             return;
         }
 
@@ -592,7 +649,7 @@ function initGlobalSlotMarqueeSelection() {
         const hasModifier = !!(e.shiftKey || e.ctrlKey || e.metaKey);
 
         // 若直接点在卡片主体上且未按 Shift/Ctrl/Cmd，则保留卡片的单击（灯箱）与原生直接拖拽（换位/搬运）行为
-        if (card && !hasModifier) {
+        if (card && !hasModifier && !e.target.closest('.slot-select')) {
             return;
         }
 

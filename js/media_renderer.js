@@ -661,6 +661,73 @@ function renderFramesForIdea(idea) {
     // 审查结论面板与卡片同源、同一次重渲刷新：审查跑完/修完一帧后各处都会
     // reloadManifestIntoIdea + renderFramesForIdea，面板因此不需要自己的刷新时机
     if (typeof renderReviewPanel === 'function') renderReviewPanel(idea);
+
+    // 异步补充原片基准抽帧与 5 列拼图（如尚未挂载）
+    if (idea && (!idea.ref_frames || !Object.keys(idea.ref_frames).length) && !idea._fetchingRefs) {
+        idea._fetchingRefs = true;
+        let projectTitle = idea.title || (typeof getIdeaSaveTitle === 'function' ? getIdeaSaveTitle(idea) : '') || idea.project_key || '';
+        let jobId = idea.replica_job_id || (idea.frameRun && idea.frameRun.replica_job_id) || (typeof idea.id === 'string' && idea.id.startsWith('replica_') ? idea.id : '');
+        if (!jobId) {
+            const rawFrames = (idea.frameRun && idea.frameRun.frames) || idea.frames || [];
+            const candidateStrings = [
+                projectTitle,
+                idea.collage_url,
+                idea.source_collage,
+                ...(Array.isArray(rawFrames) ? rawFrames.map(f => f.url || f.file || '') : [])
+            ].filter(Boolean);
+            for (const str of candidateStrings) {
+                const m = str.match(/(?:replica_|run_replica_)([a-f0-9]{12})/i);
+                if (m) {
+                    jobId = `replica_${m[1]}`;
+                    break;
+                }
+            }
+        }
+        if (!projectTitle && Array.isArray(itemsToRender) && itemsToRender.length) {
+            const firstU = itemsToRender[0].frame ? (itemsToRender[0].frame.url || itemsToRender[0].frame.file || '') : '';
+            const mDir = firstU.match(/\/outputs\/([^/]+)\//);
+            if (mDir) projectTitle = mDir[1];
+        }
+        if (projectTitle || jobId) {
+            fetch(`/api/project/references?title=${encodeURIComponent(projectTitle)}&job_id=${encodeURIComponent(jobId)}`)
+                .then(r => r.ok ? r.json() : null)
+                .then(data => {
+                    idea._fetchingRefs = false;
+                    if (data && data.status === 'ok') {
+                        let updated = false;
+                        if (data.ref_frames && Object.keys(data.ref_frames).length > 0) {
+                            idea.ref_frames = data.ref_frames;
+                            if (idea.frameRun) idea.frameRun.ref_frames = data.ref_frames;
+                            updated = true;
+                        }
+                        if (data.source_collage_url) {
+                            idea.source_collage = data.source_collage_url;
+                            if (idea.frameRun) idea.frameRun.source_collage = data.source_collage_url;
+                            updated = true;
+                        }
+                        if (updated) {
+                            // 重新刷新卡片动作与工具条
+                            if (typeof syncSlotToolbar === 'function') syncSlotToolbar('image');
+                            // 逐卡片更新状态（赋予「🎯 对标原片」操作能力）
+                            itemsToRender.forEach(item => {
+                                const seq = item.sequence;
+                                const card = document.getElementById(`frame-slot-${seq}`);
+                                if (card && typeof renderSlotCard === 'function' && typeof frameSlotState === 'function') {
+                                    renderSlotCard(card, frameSlotState(item.frame, {
+                                        seq,
+                                        busy: framesBusy,
+                                        pending: isFramePending(seq),
+                                    }));
+                                }
+                            });
+                        }
+                    }
+                })
+                .catch(() => {
+                    idea._fetchingRefs = false;
+                });
+        }
+    }
 }
 
 function renderVideosForIdea(idea) {
@@ -808,12 +875,12 @@ const COVER_ROLE_HINTS = {
     frame1: '第一帧图生图的参考图；选带文案的封面会把文字带进生成画面',
 };
 
-// 某个用途实际用的那张封面（显式指定 none 禁用 → 显式指定某张 → 主封面 → 最后一张）
+// 某个用途实际用的那张封面（显式指定 none 禁用 → 显式指定某张 → 主封面 → 最后一张 → cover/cover_image 兜底）
 function coverRoleUrl(idea, role) {
     const covers = (idea && idea.covers) || [];
     const roles = (idea && idea.coverRoles) || {};
     if (roles[role] === 'none') return null;
-    return roles[role] || (idea && idea.activeCoverUrl) || covers[covers.length - 1] || null;
+    return roles[role] || (idea && idea.activeCoverUrl) || covers[covers.length - 1] || (idea && (idea.cover || idea.cover_image || idea.coverUrl || idea.cover_url)) || null;
 }
 
 // 用途分配落盘：点子库条目（前端副本）+ 项目 manifest（服务端唯一真相）。

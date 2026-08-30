@@ -342,7 +342,11 @@ class TestCameraAngle(unittest.TestCase):
         self.assertIn('wooded slope outside', rule)
         self.assertIn('below the subject looking up', rule)
         self.assertIn('main room', rule)
-        self.assertIn('directly overhead', rule)
+        # 观测到 bird_eye 就得写出"陡俯"，不能被稀释成 high_angle（reverse.py 把
+        # top_down/overhead/aerial 全归一到 bird_eye，它是"原片确实是俯拍"的唯一出口）
+        self.assertIn('steeply overhead looking down at the ground plane', rule)
+        # 但同时要否掉正交地图化——这才是 45° 菱形/顶视平面图的病根
+        self.assertIn('rather than a flat orthographic plan view', rule)
         # 「绝不用航拍/高角度」那条默认规则不能压过实际观测
         self.assertIn('OVERRIDES', rule)
 
@@ -983,3 +987,94 @@ class SubjectPlacementBindsTheImageTest(unittest.TestCase):
         self.assertEqual(pp.fix_subject_placement(self.IMG, ''), self.IMG)
         self.assertEqual(pp.fix_subject_placement('', self.READING), '')
 
+
+
+class MicroTracesOnlyReachTheMiniatureChannelTest(unittest.TestCase):
+    """微观痕迹只喂 mini 通道（2026-08-30，用户反馈）。
+
+    micro_traces 是 Pass A 逐帧量的微距级痕迹（锯末、粉笔弹线、飞溅）。miniature 通道
+    整条片子就是微距镜头贴着模型拍的，这一栏是它的主要画面内容；base / omni 交付全尺寸
+    实景，同样的痕迹在它们的景别下一个像素都渲染不出来，进提示词只会挤掉真看得见的
+    画面依据。
+
+    盯的是三个注入点必须**同时**关：少关一处，那一处就静默恢复投喂，而这种恢复不会
+    报任何错——和这一族字段此前每个洞的形状一模一样。同族的 MAT SPECS / FASTENING
+    是工程规格，不受门控影响，非 mini 通道照样要。
+    """
+
+    ENTRY = {
+        'text': '铺屋面瓦',
+        'mat_specs': ['9mm OSB sheathing, raw matte face'],
+        'fasteners': ['countersunk black drywall screws'],
+        'micro': ['fine sawdust along the pencil cut-line'],
+        'tool': 'impact driver',
+    }
+    FACT = {'subject': 'roof deck', 'materials': ['cedar shingle'],
+            'micro_traces': ['chalk snap line on the subfloor']}
+
+    def _plan_block(self, micro_traces):
+        _plan, block = pp.build_outline_plan_block(
+            [dict(self.ENTRY)], 1, multishot=True, micro_traces=micro_traces)
+        return block
+
+    def test_the_planning_prompt_drops_the_line_and_the_rule_together(self):
+        """清单行与 FORENSIC DETAIL 里说 micro 的那半句是一对。只关行不关规则，
+        规划器会照着一条「抄清单里的 MICRO TRACES」自己编几条填进去。"""
+        mini = self._plan_block(True)
+        self.assertIn('MICRO TRACES:', mini)
+        self.assertIn('"MICRO TRACES"', mini)
+
+        base = self._plan_block(False)
+        self.assertNotIn('MICRO TRACES', base)
+        self.assertIn('FORENSIC DETAIL', base)
+        self.assertIn('MAT SPECS:', base)
+        self.assertIn('FASTENING:', base)
+
+    def test_the_craft_dict_never_carries_micro_off_channel(self):
+        """在数据层丢而不是在渲染层跳过：observed_craft 一旦挂上就会随断点落盘，
+        任何一个新读取点都会重新拿到它。"""
+        mini = pp._craft_from_outline_entry(self.ENTRY, include_micro=True)
+        self.assertIn('micro', mini)
+
+        base = pp._craft_from_outline_entry(self.ENTRY, include_micro=False)
+        self.assertNotIn('micro', base)
+        self.assertIn('mat_specs', base)
+        self.assertIn('fasteners', base)
+
+    def test_the_compose_prompt_bullet_follows_the_data(self):
+        base = pp._craft_from_outline_entry(self.ENTRY, include_micro=False)
+        directive = pp.observed_craft_directive({'observed_craft': base})
+        self.assertNotIn('MICRO TRACES', directive)
+        self.assertIn('MATERIAL SPECS', directive)
+
+    def test_apply_observed_craft_fields_honours_the_gate(self):
+        ladder = [{'operation': 'board'}]
+        pp.apply_observed_craft_fields(
+            ladder, {'beat_outline': [dict(self.ENTRY)]}, include_micro=False)
+        self.assertNotIn('micro', pp.observed_craft_of(ladder[0]))
+
+        ladder = [{'operation': 'board'}]
+        pp.apply_observed_craft_fields(
+            ladder, {'beat_outline': [dict(self.ENTRY)]}, include_micro=True)
+        self.assertIn('micro', pp.observed_craft_of(ladder[0]))
+
+    def test_the_observed_fact_cards_drop_the_micro_row(self):
+        from prompt_pipeline.observed_grounding import _image_digest, _video_digest
+        beat = {'camera_move': 'static'}
+        self.assertIn('Observed micro traces',
+                      _image_digest(self.FACT, include_micro=True))
+        self.assertNotIn('Observed micro traces',
+                         _image_digest(self.FACT, include_micro=False))
+        self.assertIn('Observed micro traces',
+                      _video_digest(beat, [self.FACT], include_micro=True))
+        self.assertNotIn('Observed micro traces',
+                         _video_digest(beat, [self.FACT], include_micro=False))
+
+    def test_the_gate_reads_the_profile_and_nothing_else(self):
+        """通道就是 profile。按题材关键词再猜一遍就是第二个真相源。"""
+        self.assertTrue(pp.micro_traces_channel_enabled({'skillProfile': 'miniature'}))
+        for profile in ('base', 'omni'):
+            self.assertFalse(pp.micro_traces_channel_enabled({'skillProfile': profile}))
+        # 题材写着 miniature 但通道是 base：仍然不发。
+        self.assertFalse(pp.micro_traces_channel_enabled(
+            {'skillProfile': 'base', 'videoModel': 'Veo 3.1', 'title': 'miniature shack'}))

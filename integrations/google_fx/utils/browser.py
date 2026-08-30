@@ -15,6 +15,7 @@ from urllib.parse import urlparse
 from pathlib import Path
 
 from ..config import (
+    IS_MAC,
     PAGE_LOAD_TIMEOUT,
     DEFAULT_USER_ID,
     DEFAULT_PORT,
@@ -25,6 +26,7 @@ from ..config import (
     get_runtime_adspower_window_position,
     get_runtime_adspower_window_size,
     get_runtime_adspower_headless,
+    get_runtime_adspower_macos_window_mode,
 )
 from . import account_binding
 from .logger import log
@@ -173,11 +175,88 @@ def _is_ws_port_open(ws_url: str) -> bool:
         return False
 
 
+def _macos_frontmost_app() -> str:
+    """当前前台应用名；非 macOS 或取不到时返回空串。"""
+    if not IS_MAC:
+        return ""
+    try:
+        from .macos_window import frontmost_app
+        return frontmost_app()
+    except Exception:
+        return ""
+
+
+def suppress_browser_window(ws_url: str, previous_app: str = "", hide: bool = True) -> bool:
+    """让刚启动的 AdsPower 浏览器别占着最前端（macOS 专用，其它平台 no-op）。
+
+    hide=True 时隐藏浏览器 app 再归还焦点；hide=False 只归还焦点。返回是否真的
+    隐藏成功。任何异常都吞掉——窗口没藏住只是碍眼，不该让生成任务挂掉。
+    """
+    if not IS_MAC:
+        return False
+    try:
+        from .macos_window import hide_browser, restore_focus
+        if hide:
+            return hide_browser(ws_url, previous_app)
+        restore_focus(previous_app)
+        return False
+    except Exception as e:
+        log(f"⚠️ 抑制浏览器窗口时异常（不影响任务）: {type(e).__name__}: {e}", "浏览器启动")
+        return False
+
+
+def reveal_browser_window(ws_url: str) -> bool:
+    """把隐藏起来的浏览器窗口显示并切到最前（macOS 专用，其它平台 no-op）。
+
+    给"等待人工处理登录/验证码"用：那种时候抢焦点正是我们想要的，人得看见窗口。
+    """
+    if not IS_MAC:
+        return False
+    try:
+        from .macos_window import show_browser
+        return show_browser(ws_url)
+    except Exception as e:
+        log(f"⚠️ 恢复浏览器窗口时异常: {type(e).__name__}: {e}", "浏览器启动")
+        return False
+
+
+def reveal_hidden_browser_windows() -> int:
+    """把所有被静默隐藏的浏览器窗口翻到最前（macOS 专用，其它平台返回 0）。
+
+    人工接管链路只拿得到 Playwright 的 page，取不到 CDP 端口，所以按"本进程隐藏过
+    谁"来恢复，而不是按某个具体 ws_url。
+    """
+    if not IS_MAC:
+        return 0
+    try:
+        from .macos_window import reveal_hidden
+        return reveal_hidden()
+    except Exception as e:
+        log(f"⚠️ 恢复浏览器窗口时异常: {type(e).__name__}: {e}", "浏览器启动")
+        return 0
+
+
+def rehide_browser_windows(previous_app: str = "") -> int:
+    """人工处理结束后把翻出来的窗口重新藏回去（macOS 专用，其它平台返回 0）。"""
+    if not IS_MAC:
+        return 0
+    try:
+        from .macos_window import rehide_revealed
+        return rehide_revealed(previous_app)
+    except Exception as e:
+        log(f"⚠️ 重新隐藏浏览器窗口时异常: {type(e).__name__}: {e}", "浏览器启动")
+        return 0
+
+
 def build_adspower_launch_args(silent: bool = True) -> tuple[str, list[str]]:
     """🛠️ 构造 AdsPower 启动所需的 Chromium 参数列表与 URL 编码串。
 
     静默后台模式（silent=True）：
-    - --window-position=-10000,-10000：将窗口生成在屏幕可见范围之外，完全不抢占用户焦点与打字输入
+    - --window-position=-10000,-10000：把窗口生成在屏幕可见范围之外。
+      ⚠️ 仅 Windows 有效。macOS 的窗口服务器会把屏幕外坐标 clamp 回可见区域，而且
+      Chromium 启动时会 activate 自己，所以光靠这个参数在 Mac 上根本挡不住抢焦点。
+      参数保留是为了跨平台一致（在 Mac 上无害），Mac 侧真正干活的是
+      utils/macos_window 的 app 级隐藏，由 get_ads_ws_url 在启动成功后调用。
     - --window-size=1280,800：确保标准化渲染视口，不影响 DOM / WebGL / Canvas
     - --disable-features=CalculateNativeWinOcclusion,HardwareMediaKeyHandling：
       禁用 Windows 窗口遮挡检测，防止窗口移出屏幕后 Chrome 自动挂起或降低帧率
@@ -246,8 +325,21 @@ def get_ads_ws_url(user_id=None, port=None, auto_rotate_proxy=True,
         api_start_url += "&headless=1"
     api_stop_url = f"http://127.0.0.1:{port}/api/v1/browser/stop?user_id={user_id}"
 
+    # macOS 上屏幕外坐标无效，得在启动后用 app 级隐藏收拾窗口；先记下当前前台应用，
+    # 隐藏完把焦点还回去，用户正在打的字才不会被打断。
+    mac_window_mode = get_runtime_adspower_macos_window_mode() if IS_MAC else "off"
+    mac_suppress = (
+        silent_mode
+        and mac_window_mode != "off"
+        and not get_runtime_adspower_headless()  # headless 压根没有窗口，不用管
+    )
+    previous_app = _macos_frontmost_app() if mac_suppress else ""
+
     if silent_mode:
-        log(f"🤫 AdsPower 静默后台启动中 (屏幕外坐标: {get_runtime_adspower_window_position()})", "浏览器启动")
+        if IS_MAC:
+            log(f"🤫 AdsPower 静默后台启动中 (macOS 窗口模式: {mac_window_mode})", "浏览器启动")
+        else:
+            log(f"🤫 AdsPower 静默后台启动中 (屏幕外坐标: {get_runtime_adspower_window_position()})", "浏览器启动")
 
     max_start_attempts = max(1, int(max_start_attempts))
     for attempt in range(1, max_start_attempts + 1):
@@ -272,6 +364,9 @@ def get_ads_ws_url(user_id=None, port=None, auto_rotate_proxy=True,
             if _is_ws_port_open(ws_url):
                 if attempt > 1:
                     log(f"✅ 第 {attempt} 次尝试成功启动浏览器，端口已启用: {ws_url}", "浏览器启动")
+                if mac_suppress:
+                    suppress_browser_window(ws_url, previous_app,
+                                            hide=(mac_window_mode == "hide"))
                 return ws_url
 
             log(f"⚠️ AdsPower 返回的 WebSocket 端口未启用 (尝试 {attempt}/{max_start_attempts}): {ws_url}，尝试强制关闭并重启...", "浏览器启动")

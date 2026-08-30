@@ -125,7 +125,11 @@ function syncFramesImageModelPicker() {
                 const apiSel = document.getElementById('settings-api-image-model');
                 if (apiSel) apiSel.value = config.imageModel;
             }
-            localStorage.setItem('spark_config', JSON.stringify(config));
+            try {
+                localStorage.setItem('spark_config', JSON.stringify(config));
+            } catch (e) {
+                console.warn('Failed to save config to localStorage:', e);
+            }
             updateCoverModelDisplay();
             showToast(`帧序列生图模型已切换：${sel.value}（下次生成/单帧重试生效）`, 'success');
         });
@@ -424,7 +428,11 @@ function applySettingsFormToConfig() {
 
 function saveConfig() {
     applySettingsFormToConfig();
-    localStorage.setItem('spark_config', JSON.stringify(config));
+    try {
+        localStorage.setItem('spark_config', JSON.stringify(config));
+    } catch (e) {
+        console.warn('Failed to save spark_config:', e);
+    }
     updateCoverModelDisplay();
     syncFramesImageModelPicker();
     syncSettingsApiImageModelPicker();
@@ -475,7 +483,11 @@ function syncFxModelToServer() {
 
 function autoSaveConfig() {
     applySettingsFormToConfig();
-    localStorage.setItem('spark_config', JSON.stringify(config));
+    try {
+        localStorage.setItem('spark_config', JSON.stringify(config));
+    } catch (e) {
+        console.warn('Failed to save spark_config:', e);
+    }
     updateCoverModelDisplay();
     syncFramesImageModelPicker();
     syncSettingsApiImageModelPicker();
@@ -550,7 +562,11 @@ function resetConfig() {
     // applySettingsFormToConfig 之后——那一步不碰门禁项，但顺序颠倒会让人误以为
     // 它会把删掉的键再写回来。
     if (typeof resetGateSettings === 'function') resetGateSettings();
-    localStorage.setItem('spark_config', JSON.stringify(config));
+    try {
+        localStorage.setItem('spark_config', JSON.stringify(config));
+    } catch (e) {
+        console.warn('Failed to save spark_config on reset:', e);
+    }
     updateCoverModelDisplay();
     syncFramesImageModelPicker();
     syncSettingsLlmModelPicker();
@@ -828,38 +844,241 @@ function updateCoverModelDisplay() {
     }
 }
 
-function saveCurrentIdeaState() {
-    if (currentIdea) {
-        localStorage.setItem('spark_current_idea', JSON.stringify(currentIdea));
-    } else {
-        localStorage.removeItem('spark_current_idea');
+function sanitizeIdeaForStorage(idea, level = 0) {
+    if (!idea || typeof idea !== 'object') return null;
+
+    if (level >= 3) {
+        return {
+            id: idea.id,
+            title: idea.title || '',
+            theme: idea.theme || '',
+            creativity: idea.creativity || '',
+            timestamp: idea.timestamp || '',
+            _is_stub: true
+        };
     }
+
+    const cleanUrl = (url, maxLen = 4096) => {
+        if (!url || typeof url !== 'string') return url;
+        if (url.startsWith('data:')) {
+            if (level >= 1 || url.length > maxLen) {
+                return null;
+            }
+        }
+        return url;
+    };
+
+    const clone = { ...idea };
+
+    // 1. candidateImages: 候选图片通常包含海量 base64，不宜写入 localStorage
+    if (clone.candidateImages) {
+        if (level >= 1) {
+            delete clone.candidateImages;
+        } else {
+            const safeCandidates = {};
+            let hasAny = false;
+            Object.keys(clone.candidateImages).forEach(k => {
+                const list = clone.candidateImages[k];
+                if (Array.isArray(list)) {
+                    const filtered = list.map(item => {
+                        if (typeof item === 'string') {
+                            return cleanUrl(item, 2048);
+                        } else if (item && typeof item === 'object' && item.url) {
+                            return { ...item, url: cleanUrl(item.url, 2048) };
+                        }
+                        return null;
+                    }).filter(Boolean);
+                    if (filtered.length > 0) {
+                        safeCandidates[k] = filtered;
+                        hasAny = true;
+                    }
+                }
+            });
+            if (hasAny) {
+                clone.candidateImages = safeCandidates;
+            } else {
+                delete clone.candidateImages;
+            }
+        }
+    }
+
+    // 2. covers
+    if (Array.isArray(clone.covers)) {
+        clone.covers = clone.covers.map(c => cleanUrl(c, 2048)).filter(Boolean);
+    }
+
+    // 3. frameRun
+    if (clone.frameRun && typeof clone.frameRun === 'object') {
+        const fr = { ...clone.frameRun };
+        if (fr.collage && typeof fr.collage === 'string' && fr.collage.startsWith('data:')) {
+            fr.collage = null; // 拼图为大图 base64 时剔除，避免挤爆 quota
+        }
+        if (Array.isArray(fr.frames)) {
+            fr.frames = fr.frames.map(f => {
+                if (!f || typeof f !== 'object') return f;
+                const safeF = { ...f };
+                if (safeF.url && typeof safeF.url === 'string' && safeF.url.startsWith('data:') && safeF.url.length > 2048) {
+                    safeF.url = null;
+                }
+                if (safeF.candidates || safeF.candidateImages) {
+                    delete safeF.candidates;
+                    delete safeF.candidateImages;
+                }
+                return safeF;
+            });
+        }
+        clone.frameRun = fr;
+    }
+
+    // 4. Level 2 剪枝调试大字段
+    if (level >= 2) {
+        delete clone.audit_md;
+        delete clone.raw_response;
+        delete clone.debug_logs;
+    }
+
+    return clone;
 }
 
-function loadCurrentIdeaState() {
+/**
+ * 尝试清理 localStorage 中的次要缓存项以释放空间
+ */
+function pruneStaleLocalStorage() {
+    try {
+        // 1. 清理过期的 prompt history
+        const phKeys = [];
+        for (let i = 0; i < localStorage.length; i++) {
+            const key = localStorage.key(i);
+            if (key && key.startsWith('spark_prompt_history_')) {
+                phKeys.push(key);
+            }
+        }
+        if (phKeys.length > 20) {
+            phKeys.slice(20).forEach(k => {
+                try { localStorage.removeItem(k); } catch (_) {}
+            });
+        }
+
+        // 2. 压缩 spark_image_history
+        const imgHistStr = localStorage.getItem('spark_image_history');
+        if (imgHistStr && imgHistStr.length > 200000) {
+            try {
+                const hist = JSON.parse(imgHistStr);
+                if (Array.isArray(hist) && hist.length > 3) {
+                    localStorage.setItem('spark_image_history', JSON.stringify(hist.slice(0, 3)));
+                }
+            } catch (_) {}
+        }
+    } catch (_) {}
+}
+
+function saveCurrentIdeaState() {
+    if (!currentIdea) {
+        try {
+            localStorage.removeItem('spark_current_idea');
+            localStorage.removeItem('spark_current_idea_id');
+        } catch (_) {}
+        return;
+    }
+
+    // 记录 ID 存根供恢复
+    try {
+        if (currentIdea.id) {
+            localStorage.setItem('spark_current_idea_id', String(currentIdea.id));
+        }
+    } catch (_) {}
+
+    // 分级尝试序列化与写入，绝不向外抛出 QuotaExceededError 异常
+    for (let level = 0; level <= 3; level++) {
+        try {
+            const payload = sanitizeIdeaForStorage(currentIdea, level);
+            if (!payload) break;
+            const str = JSON.stringify(payload);
+            localStorage.setItem('spark_current_idea', str);
+            return; // 成功保存
+        } catch (e) {
+            const isQuota = e.name === 'QuotaExceededError' || e.code === 22 || e.number === 0x8007000E || (e.message && e.message.includes('quota'));
+            if (isQuota) {
+                console.warn(`[saveCurrentIdeaState] localStorage 配额超限 (level ${level})，尝试降级压缩...`, e);
+                if (level === 0) {
+                    pruneStaleLocalStorage();
+                }
+            } else {
+                console.warn('[saveCurrentIdeaState] 保存当前创意状态失败:', e);
+                break;
+            }
+        }
+    }
+
+    // 若极度紧张连 Level 3 都失败，至少记录 ID 并静默兜底，不中断前端操作流程
+    try {
+        if (currentIdea && currentIdea.id) {
+            localStorage.setItem('spark_current_idea_id', String(currentIdea.id));
+        }
+    } catch (_) {}
+}
+
+async function loadCurrentIdeaState() {
     const stored = localStorage.getItem('spark_current_idea');
+    const storedId = localStorage.getItem('spark_current_idea_id');
+    let loadedIdea = null;
+
     if (stored) {
         try {
-            const idea = JSON.parse(stored);
-            if (idea) {
-                currentIdea = idea;
-                renderIdea(idea);
-                
-                const placeholderView = document.getElementById('output-placeholder-view');
-                const contentView = document.getElementById('output-content-view');
-                const loadingView = document.getElementById('output-loading-view');
-                
-                if (placeholderView) placeholderView.classList.remove('active');
-                if (loadingView) loadingView.classList.remove('active');
-                if (contentView) contentView.classList.add('active');
-                
-                const lastTab = localStorage.getItem('spark_active_tab') || 'overview';
-                switchTab(lastTab);
-                
-                updateActiveGenerationBanner();
-            }
+            loadedIdea = JSON.parse(stored);
         } catch (e) {
-            console.error("Failed to load current idea state", e);
+            console.error("Failed to parse stored current idea state", e);
         }
+    }
+
+    if (loadedIdea) {
+        currentIdea = loadedIdea;
+        renderIdea(loadedIdea);
+        
+        const placeholderView = document.getElementById('output-placeholder-view');
+        const contentView = document.getElementById('output-content-view');
+        const loadingView = document.getElementById('output-loading-view');
+        
+        if (placeholderView) placeholderView.classList.remove('active');
+        if (loadingView) loadingView.classList.remove('active');
+        if (contentView) contentView.classList.add('active');
+        
+        const lastTab = localStorage.getItem('spark_active_tab') || 'overview';
+        switchTab(lastTab);
+        
+        updateActiveGenerationBanner();
+
+        // 若当前渲染的是精简存根或存在服务端 ID，尝试在后台增量补全最新完整数据
+        if (loadedIdea.id) {
+            fetch(`/api/library/item?id=${encodeURIComponent(loadedIdea.id)}`)
+                .then(r => r.ok ? r.json() : null)
+                .then(fullItem => {
+                    if (fullItem && fullItem.id === loadedIdea.id && currentIdea && currentIdea.id === loadedIdea.id) {
+                        currentIdea = { ...loadedIdea, ...fullItem };
+                        renderIdea(currentIdea);
+                    }
+                })
+                .catch(() => {});
+        }
+    } else if (storedId) {
+        // 如果 localStorage 中 idea 被清理但存有 ID，尝试从服务端拉取恢复
+        fetch(`/api/library/item?id=${encodeURIComponent(storedId)}`)
+            .then(r => r.ok ? r.json() : null)
+            .then(fullItem => {
+                if (fullItem && fullItem.id) {
+                    currentIdea = fullItem;
+                    renderIdea(fullItem);
+                    const placeholderView = document.getElementById('output-placeholder-view');
+                    const contentView = document.getElementById('output-content-view');
+                    const loadingView = document.getElementById('output-loading-view');
+                    if (placeholderView) placeholderView.classList.remove('active');
+                    if (loadingView) loadingView.classList.remove('active');
+                    if (contentView) contentView.classList.add('active');
+                    const lastTab = localStorage.getItem('spark_active_tab') || 'overview';
+                    switchTab(lastTab);
+                    updateActiveGenerationBanner();
+                }
+            })
+            .catch(() => {});
     }
 }

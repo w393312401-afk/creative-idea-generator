@@ -90,6 +90,40 @@ def _persist_optimization_results(project_dir, title, prompt_block, optimization
             print(f"[VIDEO OPTIMIZER] Warning: failed to sync stepped state: {e}")
 
 
+def resolve_optimizer_profile(config, manifest_data=None):
+    """这一趟视频提示词优化该按哪个题材 profile 跑。
+
+    2026-08-30 修：此前这里读的是 `manifest['profile'] or config['profile']`——**两个键
+    全仓库没有任何写入方**（前端与 server_config.json 用的都是 `skillProfile`，解析口径
+    唯一长在 server_common.active_skill_profile）。于是它恒为 'base'：用户在配置中心
+    「提示词链路」里选 Omni / Miniature，这道门一次都没读到过。典型的「配了但从未生效」，
+    与 qaGateLevel / imageEditTransport / skillProfile 栽过的是同一个坑。
+
+    manifest 上那份仍然优先：它是"这一单已经钉死用哪条链路"的位置。现在没有写入方，
+    读到就当显式指定。
+    """
+    recorded = str(((manifest_data or {}).get('profile') or '')).strip().lower()
+    if recorded:
+        return recorded
+    return server_common.active_skill_profile(config)
+
+
+def _is_miniature_job(profile, video_prompt):
+    """这一段该不该按微缩沙盘（巨手 + 微距）的规则优化。
+
+    两个来源都保留，是有意的，不是"兜底"：
+      · profile == 'miniature' —— 用户显式钉死链路，不需要正文佐证；
+      · 正文自己就是微缩片 —— 合成侧判微缩走的是**题材证据**
+        （reverse.detect_miniature_scale），不是 profile：一单微缩片配着 Omni Flash
+        完全合法，此时 profile 会解析成 'omni'。这时若只认 profile，就会拿真实尺度的
+        规则去优化一段巨手微距片，往里塞一个「1.78m 高的工人」。
+    profile 显式说了不是微缩，也不能一票否决正文——两者只是同一件事的两个观测口。
+    """
+    if str(profile or '').strip().lower() == 'miniature':
+        return True
+    low = str(video_prompt or '').lower()
+    return 'miniature' in low or 'macro diorama' in low
+
 def optimize_single_video_prompt(config, start_frame_path, end_frame_path, original_video_prompt,
                                  slot_index=None, start_seq=None, end_seq=None,
                                  video_meta='', spatial_contract=None, profile=None):
@@ -121,11 +155,7 @@ def optimize_single_video_prompt(config, start_frame_path, end_frame_path, origi
     meta_str = str(video_meta or '').upper()
     is_crossing = 'BRIDGE' in meta_str or 'CUT' in meta_str
     
-    is_miniature = (
-        str(profile or '').lower() == 'miniature'
-        or 'miniature' in original_video_prompt.lower()
-        or 'macro diorama' in original_video_prompt.lower()
-    )
+    is_miniature = _is_miniature_job(profile, original_video_prompt)
 
     contract_info = ""
     if isinstance(spatial_contract, dict) and spatial_contract:
@@ -176,13 +206,16 @@ def optimize_single_video_prompt(config, start_frame_path, end_frame_path, origi
             "   - If a worker or character is visible in Image 1 and/or Image 2, the video prompt MUST explicitly describe their continuous "
             "kinetic labor and posture progression from Image 1's starting pose to Image 2's landing pose across the entire clip. "
             "Strictly FORBID static poses or leaving the character unmoving (e.g. 'remain standing', 'stay put', 'static in place', 'standing still', 'holding position', 'where they were').\n"
+            "   - NATURAL BODY MECHANICS (mandatory): that progression must read as real human mechanics, never a smooth constant-speed glide between the two poses — weight shifts onto the working leg or arm before each effort, the torso leans and counter-rotates with the load, and there is a brief natural settle between reaching for a tool and gripping it. A worker whose only description is the start pose and the end pose renders as a robotic linear blend; describe the weight and timing of the motion connecting them, not just the two poses.\n"
             "   - Camera perspective: Faithful to the camera angle, lens feel, and framing established in Image 1 and Image 2 (locked to the active camera setup without inventing new camera moves or altering the viewpoint angle).\n"
         )
         syntax_rule = (
             "6. MANDATORY SYNTAX & CLAUSES:\n"
             f"   - Opening sentence MUST be: \"Use the provided first frame and last frame as exact composition anchors. "
             f"Use IMAGE {s_idx} as the actual first-frame image and IMAGE {e_idx} as the actual last-frame image; every "
-            "visible action must interpolate between those two frame images without inventing a third layout.\"\n"
+            "visible action must move naturally from the first frame's pose to the last frame's exact pose and layout — "
+            "with real human weight, momentum, and non-uniform timing, never a smooth constant-speed blend between two "
+            "fixed poses — without inventing a third layout.\"\n"
             "   - Pacing clause MUST be: \"Continuous construction time-lapse, not real-time footage.\"\n"
         )
         living_cast_rule = (
@@ -194,15 +227,17 @@ def optimize_single_video_prompt(config, start_frame_path, end_frame_path, origi
 
     system_prompt = (
         "You are an expert visual supervisor and video prompt optimization engine for continuous "
-        "time-lapse construction and renovation videos (interpolating between two keyframes for "
+        "time-lapse construction and renovation videos (bridging two keyframes for "
         "Google Veo / Omni video generation).\n\n"
         "You are provided with two ACTUAL rendered images in chronological order:\n"
         f"1. Image 1: The START anchor frame (IMAGE {s_idx})\n"
         f"2. Image 2: The END anchor frame (IMAGE {e_idx})\n\n"
         "Your task is to visually compare Image 1 and Image 2, identify all physical deltas between them, "
-        "and REWRITE / OPTIMIZE the provided VIDEO prompt so that it 100% accurately, smoothly, and "
-        "physically interpolates between these two exact images, completely preventing visual jumps, "
-        "pops, teleportation, or ungrounded discrepancies.\n\n"
+        "and REWRITE / OPTIMIZE the provided VIDEO prompt so that it 100% accurately and physically "
+        "connects these two exact images through real human weight, momentum, and non-uniform motion — "
+        "never a smooth constant-speed blend between two fixed poses, which reads as a robotic glide, not "
+        "a moving body — while completely preventing visual jumps, pops, teleportation, or ungrounded "
+        "discrepancies.\n\n"
         "RULES & PROTOCOLS (MUST COMPLY STRICTLY):\n"
         "1. FULL-FIELD 4-ZONE DELTA SCANNING:\n"
         "   - Top / Overhead: Roof, rafters, skylights, ceiling panels, light fixtures, insulation.\n"
@@ -235,7 +270,8 @@ def optimize_single_video_prompt(config, start_frame_path, end_frame_path, origi
         "Visually inspect both images and rewrite the VIDEO prompt to match their exact real physical delta."
     )
 
-    from prompt_pipeline import _multimodal_chat, clean_prompt_text, fix_camera_contradictions, _strip_code_fences, _reraise_if_cancelled
+    from prompt_pipeline import (_multimodal_chat, clean_prompt_text, fix_camera_contradictions,
+                                 _strip_code_fences, _reraise_if_cancelled, fix_natural_body_mechanics)
 
     try:
         response = _multimodal_chat(
@@ -269,11 +305,14 @@ def optimize_single_video_prompt(config, start_frame_path, end_frame_path, origi
             expected_anchor = (
                 f"Use the provided first frame and last frame as exact composition anchors. "
                 f"Use IMAGE {s_idx} as the actual first-frame image and IMAGE {e_idx} as the actual last-frame image; "
-                f"every visible action must interpolate between those two frame images without inventing a third layout."
+                f"every visible action must move naturally from the first frame's pose to the last frame's exact pose "
+                f"and layout — with real human weight, momentum, and non-uniform timing, never a smooth "
+                f"constant-speed blend between two fixed poses — without inventing a third layout."
             )
             if not optimized.lower().startswith("use the provided first frame and last frame as exact composition anchors"):
                 optimized = f"{expected_anchor} {optimized}"
 
+        optimized = fix_natural_body_mechanics(optimized)
         return optimized
     except Exception as e:
         _reraise_if_cancelled(e)
@@ -321,7 +360,7 @@ def optimize_video_prompts_for_sequence(config, title, prompt_block, on_progress
     # 读取空间契约与 manifest 中已持久化的差量优化记录
     manifest_data = server_common.read_manifest(project_dir) or {}
     spatial_contract = manifest_data.get('spatial_contract')
-    profile = manifest_data.get('profile') or config.get('profile') or 'base'
+    profile = resolve_optimizer_profile(config, manifest_data)
     existing_optimizations = manifest_data.get('video_prompt_optimizations') or {}
     if not isinstance(existing_optimizations, dict):
         existing_optimizations = {}
