@@ -48,7 +48,7 @@ from prompt_pipeline import (
     frame_review_status, merge_review_results,
     outline_items_by_beat, outline_delivery_log_line,
     _merge_outline_frame_verdicts,
-    find_reference_frames_for_project,
+    find_reference_frames_with_roles,
     compose_anchor_and_packet,
     compose_remaining_beats,
     refine_packet_from_accepted_anchor,
@@ -690,7 +690,8 @@ def _sequence_consistency_review(config, title, prompt_block, project_dir, on_pr
         outline_kw['outline_items'] = outline_items
 
     # 爆款对标基准：关键帧与 5 列拼图
-    ref_frame_paths, source_collage_path = find_reference_frames_for_project(project_dir, total_beats)
+    ref_frame_paths, ref_frame_roles, source_collage_path = find_reference_frames_with_roles(
+        project_dir, total_beats)
     rendered_collage_path = os.path.join(project_dir, 'frames', 'full_collage.jpg')
     if not os.path.exists(rendered_collage_path):
         c_name = f"{os.path.basename(os.path.normpath(project_dir))}_collage.jpg"
@@ -701,6 +702,8 @@ def _sequence_consistency_review(config, title, prompt_block, project_dir, on_pr
     benchmark_kw = {}
     if ref_frame_paths:
         benchmark_kw['ref_frame_paths'] = ref_frame_paths
+        # 过门梯那几格挂的是包络端点而非基准帧，角色必须一起传下去。
+        benchmark_kw['ref_frame_roles'] = ref_frame_roles
     if source_collage_path and rendered_collage_path and os.path.exists(rendered_collage_path):
         benchmark_kw['source_collage_path'] = source_collage_path
         benchmark_kw['rendered_collage_path'] = rendered_collage_path

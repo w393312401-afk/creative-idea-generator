@@ -296,6 +296,7 @@ function openCollageViewer(opts = {}) {
     let collageUrl = opts.collageUrl || (idea && idea.collage_url) || (idea && idea.frameRun && idea.frameRun.collage_url) || '';
     let sourceCollageUrl = opts.sourceCollageUrl || (idea && idea.source_collage) || (idea && idea.source_collage_url) || '';
     let rawRefFrames = opts.refFrames || (idea && idea.ref_frames) || (idea && idea.reference_frames) || (idea && idea.frameRun && idea.frameRun.ref_frames) || {};
+    const refRoles = opts.refFrameRoles || (idea && idea.ref_frame_roles) || (idea && idea.frameRun && idea.frameRun.ref_frame_roles) || {};
 
     // 归一化 refFrames
     const refFrames = {};
@@ -1607,7 +1608,7 @@ function bindCompareSliderEvents(modal) {
                 openLightbox([{
                     type: 'image',
                     url: curBeat.refUrl,
-                    caption: `<strong>第 ${curBeat.seq} 拍原片基准抽帧 (REF ${String(curBeat.seq).padStart(3, '0')})</strong> [爆款对标基准]`
+                    caption: `<strong>第 ${curBeat.seq} 拍原片基准抽帧 (REF ${String(curBeat.seq).padStart(3, '0')})</strong> ${refFrameRoleLabel(refRoles, curBeat.seq)}`
                 }], 0);
             }
         }, { signal });

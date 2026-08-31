@@ -502,6 +502,7 @@ function renderSteppedFinalAllFramesThumbsHtml(state) {
 function openSteppedSequencesLightbox(title, sequences, activeIdx = 0) {
     if (!sequences || !sequences.length) return;
     const refFrames = (steppedState && steppedState.ref_frames) || {};
+    const refRoles = (steppedState && steppedState.ref_frame_roles) || {};
     const items = [];
     let initialItemIdx = 0;
     
@@ -524,7 +525,7 @@ function openSteppedSequencesLightbox(title, sequences, activeIdx = 0) {
             items.push({
                 type: 'image',
                 url: steppedImageUrl(refPath),
-                caption: `<strong>第 ${seq} 拍原片基准抽帧 (REF ${String(seq).padStart(3, '0')})</strong> [爆款对标基准] · ${title}`
+                caption: `<strong>第 ${seq} 拍原片基准抽帧 (REF ${String(seq).padStart(3, '0')})</strong> ${refFrameRoleLabel(refRoles, seq)} · ${title}`
             });
         }
     });

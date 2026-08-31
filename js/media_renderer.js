@@ -698,6 +698,9 @@ function renderFramesForIdea(idea) {
                         if (data.ref_frames && Object.keys(data.ref_frames).length > 0) {
                             idea.ref_frames = data.ref_frames;
                             if (idea.frameRun) idea.frameRun.ref_frames = data.ref_frames;
+                            // 过门梯那几格是包络端点而非对标基准（原片硬切过门，没拍过门槛帧）。
+                            idea.ref_frame_roles = data.ref_frame_roles || {};
+                            if (idea.frameRun) idea.frameRun.ref_frame_roles = idea.ref_frame_roles;
                             updated = true;
                         }
                         if (data.source_collage_url) {

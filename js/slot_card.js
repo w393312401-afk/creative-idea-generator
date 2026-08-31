@@ -280,6 +280,7 @@ function openSlotLightbox(type, seq) {
     if (!valid.length) return;
 
     const refFrames = (idea && (idea.ref_frames || (idea.frameRun && idea.frameRun.ref_frames))) || {};
+    const refRoles = (idea && (idea.ref_frame_roles || (idea.frameRun && idea.frameRun.ref_frame_roles))) || {};
     const mediaList = [];
     let targetIdx = 0;
 
@@ -299,7 +300,7 @@ function openSlotLightbox(type, seq) {
             mediaList.push({
                 type: 'image',
                 url: refUrl,
-                caption: `<strong>🎯 第 ${seqNum} 拍爆款原片基准抽帧 (REF ${String(seqNum).padStart(3, '0')})</strong> [爆款对标基准]`,
+                caption: `<strong>🎯 第 ${seqNum} 拍爆款原片基准抽帧 (REF ${String(seqNum).padStart(3, '0')})</strong> ${refFrameRoleLabel(refRoles, seqNum)}`,
             });
         }
     });

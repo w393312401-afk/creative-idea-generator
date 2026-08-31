@@ -485,3 +485,9 @@ function getIdeaSaveTitle(idea) {
     return idea.project_key || idea.title || '';
 }
 
+// 过门梯那几格挂的是硬切两侧的**包络端点**，不是对标基准：原片是硬切过门，根本没拍过
+// 门槛帧（2026-08-31 复盘）。标成「对标基准」会让人照着一张跨空间层的图挑毛病。
+function refFrameRoleLabel(roles, seq) {
+    const role = roles && (roles[seq] || roles[String(seq)]);
+    return role === 'envelope' ? '[包络端点 · 原片未拍摄此镜]' : '[爆款对标基准]';
+}

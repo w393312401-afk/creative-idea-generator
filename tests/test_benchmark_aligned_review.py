@@ -133,6 +133,8 @@ class TestBenchmarkAlignedReview(unittest.TestCase):
         with open(c_gen, 'wb') as f: f.write(b'c_gen')
 
         frame_paths = {1: f1, 2: f2, 3: f3}
+        # 第 1 拍审查的是 IMAGE 1 -> IMAGE 2，只认 2 号槽；3 号槽故意空着，
+        # 用来锁住「空槽不许向前借上一拍的帧」这条新纪律。
         ref_paths = {1: self.ref_img, 2: self.ref_img}
 
         with patch.object(pp, 'check_beat_consistency', return_value=[]) as mock_beat, \
@@ -147,8 +149,13 @@ class TestBenchmarkAlignedReview(unittest.TestCase):
             self.assertEqual(res['failures'], {})
             self.assertEqual(res['collage_macro_issues'], ['拼图整体节奏偏快'])
             self.assertTrue(any(i['layer'] == 'collage_macro' for i in res['issues']))
-            # Ensure ref_frame_path was passed to beat check
-            self.assertEqual(mock_beat.call_args[1].get('ref_frame_path'), self.ref_img)
+            # 逐拍层按 beat+1 挂帧：第 1 拍拿到 2 号槽的帧，第 2 拍（3 号槽空）不挂。
+            by_beat = {call[0][2]: call[1] for call in mock_beat.call_args_list}
+            self.assertEqual(by_beat[1].get('ref_frame_path'), self.ref_img)
+            self.assertEqual(by_beat[1].get('ref_frame_role'), 'benchmark')
+            # 空槽 = 挂帧那边判定「这一格没有可用基准」。借上一拍的帧会借到跨空间层
+            # 的图，正是过门帧假违规的来源（2026-08-31）。
+            self.assertIsNone(by_beat[2].get('ref_frame_path'))
 
     def test_check_anchor_consistency(self):
         mock_resp = '["首帧机位与爆款原片不符：原片为低角度仰拍，生成图为平视"]'

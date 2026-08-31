@@ -3497,7 +3497,7 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
             if not self._gate():
                 return
             try:
-                from prompt_pipeline import find_reference_frames_for_project
+                from prompt_pipeline import find_reference_frames_with_roles
                 
                 title = query.get('title', [''])[0].strip()
                 job_id = query.get('job_id', [''])[0].strip()
@@ -3563,9 +3563,10 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                                     break
 
                 ref_dict = {}
+                role_dict = {}
                 src_collage = None
                 if pdir and os.path.exists(pdir):
-                    refs, collage = find_reference_frames_for_project(pdir, total_beats)
+                    refs, roles, collage = find_reference_frames_with_roles(pdir, total_beats)
                     if refs:
                         for k, v in refs.items():
                             if v:
@@ -3573,6 +3574,10 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                                 if '/outputs/' in u:
                                     u = u[u.index('/outputs/'):]
                                 ref_dict[int(k)] = u
+                        # 过门梯那几格是包络端点而非对标基准，前端据此换措辞。
+                        for k, v in (roles or {}).items():
+                            if v and int(k) in ref_dict:
+                                role_dict[int(k)] = str(v)
                     if collage:
                         cu = str(collage).replace('\\', '/')
                         if '/outputs/' in cu:
@@ -3582,6 +3587,7 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 self._send_json({
                     'status': 'ok',
                     'ref_frames': ref_dict,
+                    'ref_frame_roles': role_dict,
                     'source_collage_url': src_collage,
                 })
             except Exception as e:

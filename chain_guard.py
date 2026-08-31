@@ -27,6 +27,7 @@ from prompt_pipeline import (
     _multimodal_chat,
     _strip_code_fences,
     find_reference_frames_for_project,
+    find_reference_frames_with_roles,
 )
 from pipeline_orchestrator import _outline_items_for_review
 
@@ -188,16 +189,24 @@ def guard_beat(config, title, prompt_block, beat, project_dir, on_progress=None,
     outline_out = {} if outline_items else None
 
     # 爆款原片对标关键帧（Beat b 审查的是从 Frame b -> Frame b+1 的交付，对标 Frame b+1 终点）
+    # 只认 beat+1 这一格。挂帧那边「挂不出合规帧就不挂」是**声明**，不是缺失：
+    # 原来的 `or ref_dict.get(beat)` 会在这一格空着时向前借上一拍的帧，正好在过门
+    # 前后借到跨空间层的图，把假违规又请回来（2026-08-31）。
     if ref_path is None:
         try:
-            ref_dict, _ = find_reference_frames_for_project(project_dir, total_beats)
-            ref_path = ref_dict.get(beat + 1) or ref_dict.get(beat)
+            ref_dict, role_dict, _ = find_reference_frames_with_roles(project_dir, total_beats)
+            ref_path = ref_dict.get(beat + 1) or ref_dict.get(str(beat + 1))
+            ref_role = role_dict.get(beat + 1) or role_dict.get(str(beat + 1)) or 'benchmark'
         except Exception:
             ref_path = None
+            ref_role = 'benchmark'
+    else:
+        ref_role = 'benchmark'
 
     extra_kw = {}
     if ref_path:
         extra_kw['ref_frame_path'] = ref_path
+        extra_kw['ref_frame_role'] = ref_role
 
     # 1. 判：逐拍一致性审查
     raw_issues = check_beat_consistency(

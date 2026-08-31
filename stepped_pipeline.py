@@ -16,7 +16,7 @@ from prompt_pipeline import (
     prompt_block_from_output,
     prompt_slots_list,
     optimize_video_prompts_for_sequence,
-    find_reference_frames_for_project,
+    find_reference_frames_with_roles,
 )
 from pipeline_orchestrator import render_single_frame, _render_videos_with_recovery, persist_outline_delivery_ledger
 from frame_generator import generate_frame_sequence
@@ -58,14 +58,20 @@ def _save_state(title, state):
 
 
 def _enrich_state_with_refs(state, project_dir=None):
-    """自动检索项目关联的爆款原片/节拍阶梯抽帧（{seq: path}）及原片5列拼图，注入 state 供前端对标。"""
+    """自动检索项目关联的爆款原片/节拍阶梯抽帧（{seq: path}）及原片5列拼图，注入 state 供前端对标。
+
+    ref_frame_roles 同时注入：过门梯那几格挂的是硬切两侧的**包络端点**，不是对标基准
+    （原片根本没拍过门槛帧）。前端不区分就会把端点当基准展示，用户照着它挑毛病，
+    正是这条链路一直被误读的地方。"""
     if not state or not isinstance(state, dict) or not state.get('title'):
         return state
     pdir = project_dir or _get_project_dir(state['title'])
     try:
-        ref_frames, src_collage = find_reference_frames_for_project(pdir, state.get('total_beats'))
+        ref_frames, ref_roles, src_collage = find_reference_frames_with_roles(
+            pdir, state.get('total_beats'))
         if ref_frames:
             state['ref_frames'] = {int(k): v for k, v in ref_frames.items()}
+            state['ref_frame_roles'] = {int(k): v for k, v in (ref_roles or {}).items()}
         if src_collage:
             state['source_collage'] = src_collage
     except Exception as e:

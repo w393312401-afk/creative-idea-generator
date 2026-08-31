@@ -4336,6 +4336,24 @@ def _transition_stage_description(stage, hardware_installed):
     }[stage]
 
 
+def _source_beat_index_of(beat, ordinal):
+    """这一拍在**原片拍序**里的位置（1-based）。认不出来就用位置兜底。
+
+    爆款对标基准帧是按原片拍序挂的。展开过门梯 / 插入重构图拍之后，交付梯的 index 被
+    重排，「交付第 k 拍」与「原片第 k 拍」从此不是同一个数——不留这个锚点，
+    find_reference_frames_with_roles 只能按序号硬映射，过门之后的每一拍都会整体偏移，
+    偏移量正好等于插入的子拍数（2026-08-31 复盘：海蚀洞单 IMG 007 门槛帧挂到了原片
+    第 7 拍的室内蒙皮帧上）。"""
+    if isinstance(beat, dict):
+        existing = beat.get('source_beat_index')
+        if isinstance(existing, int) and existing > 0:
+            return existing
+        declared = beat.get('index')
+        if isinstance(declared, int) and declared > 0:
+            return declared
+    return ordinal
+
+
 def expand_spatial_transition_beats(beat_ladder, parsed_brief):
     """Expand conceptual crossing/reset markers without consuming construction milestones.
 
@@ -4351,11 +4369,15 @@ def expand_spatial_transition_beats(beat_ladder, parsed_brief):
     ensure_spatial_contract(parsed_brief)
     expanded = []
     bridge_serial = 0
-    for source in beat_ladder:
+    for source_ordinal, source in enumerate(beat_ladder, 1):
         beat = dict(source) if isinstance(source, dict) else source
         if not isinstance(beat, dict):
             expanded.append(beat)
             continue
+        # 原片拍序锚点。展开前打，展开后 finalize_beat_ladder_fields 只重排 index，
+        # 不动这个字段——对标基准帧的挂帧从此有据，不再靠序号。
+        this_source_index = _source_beat_index_of(source, source_ordinal)
+        beat['source_beat_index'] = this_source_index
         is_primary_marker = beat.get('bridge_stage') == 1 and not beat.get('hard_cut')
         is_secondary_marker = bool(beat.get('hard_cut')) and parsed_brief.get('pacing_skeleton') == 'nested_space_payoff'
         if is_primary_marker:
@@ -4368,6 +4390,12 @@ def expand_spatial_transition_beats(beat_ladder, parsed_brief):
                     'operation': 'threshold', 'bridge_stage': bridge_serial, 'hard_cut': False,
                     'space_id': space_id, 'transition_stage': stage, 'camera_family': camera,
                     'reveal_scope': reveal, 'light_source_state': light,
+                    # 过门梯的子拍是运行期凭空插出来的镜头编排，原片里没有对应帧：
+                    # source_beat_index 置空 = 声明「无原片对标」，挂帧那边据此
+                    # 走包络参考而不是逐像素基准（见 find_reference_frames_with_roles）。
+                    'source_beat_index': None,
+                    'synthetic_beat': 'threshold_ladder',
+                    'crossing_source_beat_index': this_source_index,
                     'result_space_family': 'exterior' if space_id == 'site' else 'interior',
                     'turn_direction': (threshold_topology(parsed_brief)['turn_direction']
                                        if stage in ('landing_turn', 'orientation_turn') else None),
@@ -4415,6 +4443,12 @@ def expand_spatial_transition_beats(beat_ladder, parsed_brief):
                     'space_id': space_id, 'transition_stage': stage, 'camera_family': camera,
                     'reveal_scope': reveal,
                     'light_source_state': 'primary-space return light and carried portable lamp only',
+                    # 过门梯的子拍是运行期凭空插出来的镜头编排，原片里没有对应帧：
+                    # source_beat_index 置空 = 声明「无原片对标」，挂帧那边据此
+                    # 走包络参考而不是逐像素基准（见 find_reference_frames_with_roles）。
+                    'source_beat_index': None,
+                    'synthetic_beat': 'threshold_ladder_secondary',
+                    'crossing_source_beat_index': this_source_index,
                     'result_space_family': 'interior', 'description': description,
                     'turn_direction': None,
                     'before_state': before_state,
@@ -4461,6 +4495,9 @@ def expand_spatial_transition_beats(beat_ladder, parsed_brief):
                         'light_source_state': beat.get('light_source_state') or 'unchanged motivated light',
                         'result_space_family': 'interior', 'bridge_stage': None, 'hard_cut': False,
                         'stage_scope': 'default',
+                        # 重构图拍同样是插出来的，原片没有它。不置空就会顶掉真实拍的挂帧位。
+                        'source_beat_index': None,
+                        'synthetic_beat': 'camera_reframe',
                     })
                     run = 0
                 beat['camera_family'] = palette[pidx]
@@ -14259,7 +14296,7 @@ def check_anchor_consistency(config, prompt_block, anchor_image_path, ref_frame_
 
 def check_beat_consistency(config, prompt_block, beat_index, total_beats, image_before_path,
                             image_after_path, timeout=60, outline_items=None, outline_out=None,
-                            ref_frame_path=None):
+                            ref_frame_path=None, ref_frame_role='benchmark'):
     """局部逐拍一致性审查：只看该拍自己的两张锚点帧（若提供爆款原片对应参考关键帧，则同时做
     对标保真度与机位/量级审查），规则见 _local_beat_review_system_prompt 顶部注释。
     返回该拍的中文违规描述 list（可能为空 list = 判定为干净）；**None = 本拍审查没跑成**
@@ -14272,7 +14309,11 @@ def check_beat_consistency(config, prompt_block, beat_index, total_beats, image_
     返回的违规列表，因此不会流向 failures / quality_gate。
 
     ref_frame_path: 爆款原片中对应本拍完成时刻抽出来的客观关键帧。传入且存在时，作为
-    第三张附件（IMAGE REF）送入 VLM，用于硬性比对机位俯仰角/焦段、工程工序量级与空间骨架。"""
+    第三张附件（IMAGE REF）送入 VLM，用于硬性比对机位俯仰角/焦段、工程工序量级与空间骨架。
+    ref_frame_role: 'benchmark'（默认，逐像素对标）或 'envelope'。过门梯的子拍是运行期
+    插出来的镜头编排，原片是硬切过门、根本没拍过门槛本身——能给它挂的只有翻面前后那两个
+    端点。端点当基准用会每轮稳定报一条假的「机位偏离爆款原片」，过门帧因此永远过不了；
+    role='envelope' 时明确告诉审查这是端点参照，只判场景/空间层连续性，不判机位与构图。"""
     system_prompt = _local_beat_review_system_prompt()
     # 拍号只出现在 user turn：system prompt 因此在所有拍之间完全一致、可被 prompt
     # 缓存复用（见 _local_beat_review_system_prompt 的 2026-07-25 说明）。
@@ -14292,8 +14333,21 @@ def check_beat_consistency(config, prompt_block, beat_index, total_beats, image_
         f"Treat any permanent visible result outside this record as a candidate phase overshoot."
     )
     has_ref = bool(ref_frame_path and os.path.exists(ref_frame_path))
+    is_envelope_ref = has_ref and str(ref_frame_role or '').strip().lower() == 'envelope'
     ref_desc = ""
-    if has_ref:
+    if is_envelope_ref:
+        # 过门梯这一拍在原片里不存在，附件只是硬切另一侧最近的一张幸存帧。
+        ref_desc = (
+            f"\n\nIMAGE REF (the third attached image) is an ENVELOPE ENDPOINT, NOT a benchmark. "
+            f"This beat is a threshold-crossing shot that the viral source video never filmed - it "
+            f"cut straight across the doorway, so no ground-truth frame exists for it. IMAGE REF is "
+            f"merely the nearest surviving frame on one side of that cut. Use it ONLY to confirm that "
+            f"IMAGE B stays in the same physical scene, space layer and material world. DO NOT compare "
+            f"camera angle, framing, focal length, shot scale or composition against it, and DO NOT "
+            f"report a camera-setup or benchmark-fidelity mismatch for this beat - a deliberate "
+            f"difference in camera setup is expected here.\n"
+        )
+    elif has_ref:
         ref_desc = (
             f"\n\nIMAGE REF (the third attached image) is the ACTUAL benchmark keyframe "
             f"extracted from the viral source video for beat {beat_index}. "
@@ -14304,7 +14358,10 @@ def check_beat_consistency(config, prompt_block, beat_index, total_beats, image_
         f"You are judging beat {beat_index} of {total_beats} (VIDEO {beat_index}). "
         f"IMAGE A (the first attached image) is the ACTUAL rendered IMAGE {beat_index}; "
         f"IMAGE B (the second attached image) is the ACTUAL rendered IMAGE {beat_index + 1}. "
-        + (f"IMAGE REF (the third attached image) is the viral benchmark keyframe for beat {beat_index}. " if has_ref else "")
+        + (f"IMAGE REF (the third attached image) is an envelope endpoint near beat {beat_index}, not a benchmark. "
+           if is_envelope_ref else
+           (f"IMAGE REF (the third attached image) is the viral benchmark keyframe for beat {beat_index}. "
+            if has_ref else ""))
         + f"This {'IS' if is_final else 'is NOT'} the final beat of the sequence. "
         f"Name the frames as IMAGE {beat_index} / IMAGE {beat_index + 1} in your descriptions. "
         f"Judge only this beat and report violations as a JSON list."
@@ -14589,13 +14646,244 @@ def check_collage_macro_alignment(config, source_collage_path, rendered_collage_
         return None
 
 
-def find_reference_frames_for_project(project_dir, total_beats=None):
-    """根据 project_dir（或其绑定的 replica_job_id）自动检索爆款原片抽出来的关键帧
-    映射表 {beat: ref_frame_path} 以及 5 列多宫格拼图路径 (source_collage_path)。
+# ── 爆款对标基准帧的挂帧 ─────────────────────────────────────────────────────
+#
+# 2026-08-31 复盘（海蚀洞穴微缩木屋单）：过门帧的对标基准长期挂错，表现为「ref 不是
+# 已经在室内，就是一张特写」。三个叠加的成因，这一节的函数各治一条：
+#
+#   1. 取拍尾。原规则是 `ref[k+1] = 第 k 拍的 coverage_frames[-1]`。原片在空间边界上
+#      是硬切的，第 6 拍（exterior）的拍尾帧 review_199.png @29.0s 与第 7 拍
+#      （main_interior）的拍首帧是**同一张**——"第 6 拍的交付态"物理上就是第一张室内
+#      帧。跨越空间边界时取拍尾必然拿到室内图，这不是偶发。→ _beat_window_frames
+#      按拍窗切断重叠，_select_beat_ref_frame 再按空间层/景别/切点筛。
+#   2. 序号偏移。expand_spatial_transition_beats 会插拍并重排编号。→ 改按
+#      source_beat_index 挂帧（见 _source_beat_index_of）。
+#   3. 结构性缺口。过门梯那几帧原片根本没拍过（原片是硬切过门）。→ 这些槽位不挂基准
+#      帧，只挂包络端点（role='envelope'），审查那边据此不做逐像素对标。
+
+# 原片剪辑切点前后这个半径内的帧一律不选：切点附近的帧空间语义会跳变，用户遇到的
+# "ref 是个特写"基本都落在这个窗口里。与 reverse.py 里对切点边缘的取值保持一致。
+_REF_CUT_EDGE_SECONDS = 0.15
+
+# 目标帧没有声明自己是特写时，这两档景别不作为对标基准。
+_REF_TIGHT_SHOT_SCALES = ('close', 'extreme_close')
+
+
+def _source_space_family(beat):
+    """原片拍的空间层：'exterior' / 'interior'。
+
+    timelapse_beats 的 `space` 是自由词表（'exterior' / 'main_interior' / 'cabin' …），
+    只能问「是不是外景」——与 is_interior_space 同一条判据。"""
+    space = str((beat or {}).get('space') or '').strip().lower()
+    if not space:
+        return ''
+    if space in ('exterior', 'site', 'outdoor', 'outdoors', 'outside'):
+        return 'exterior'
+    return 'interior'
+
+
+def _beat_window_frames(beat, next_beat=None):
+    """这一拍**自己**窗内的候选帧 [(timestamp, frame_name), …]，按时间升序。
+
+    coverage_frames 在拍边界上是重叠的（前一拍的最后一张 == 后一拍的第一张）。挂帧要的
+    是"这一拍的交付态"，重叠那张属于下一拍，必须切掉——尤其当下一拍换了空间层时，那张
+    就是第一张室内帧。"""
+    frames = []
+    for item in (beat or {}).get('coverage_frames') or []:
+        if isinstance(item, dict) and item.get('frame'):
+            try:
+                ts = float(item.get('timestamp'))
+            except (TypeError, ValueError):
+                ts = None
+            frames.append((ts, str(item['frame'])))
+    if not frames:
+        # 老 job 只有 evidence_frames（纯文件名，没有时间戳）。按原顺序给出去，
+        # 时间相关的筛选（切点/拍窗）自动失效，景别筛选仍然生效。
+        return [(None, str(f)) for f in ((beat or {}).get('evidence_frames') or []) if f]
+
+    def _bound(value):
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    start = _bound((beat or {}).get('start'))
+    end = _bound((beat or {}).get('end'))
+    next_start = _bound((next_beat or {}).get('start'))
+    # 有下一拍时以它的起点为界，严格开区间——落在界上的那张帧属于下一拍（跨空间层时
+    # 它就是第一张室内帧）。没有下一拍（全片最后一拍）时以自己的 end 为界且**含**端点，
+    # 否则最后那张交付帧会被自己的拍尾挡掉。
+    cutoff = next_start if next_start is not None else end
+    inclusive = next_start is None
+
+    kept = []
+    for ts, name in frames:
+        if ts is None:
+            kept.append((ts, name))
+            continue
+        if start is not None and ts < start:
+            continue
+        if cutoff is not None and (ts > cutoff if inclusive else ts >= cutoff):
+            continue
+        kept.append((ts, name))
+    kept.sort(key=lambda x: (x[0] is None, x[0]))
+    # 切完一张不剩（拍窗比抽帧步长还短）：退回原始候选，宁可挂一张边界帧，
+    # 也别让这一拍凭空丢掉基准。
+    return kept or sorted(frames, key=lambda x: (x[0] is None, x[0]))
+
+
+def _frame_shot_scale(facts_by_name, frame_name):
+    fact = (facts_by_name or {}).get(frame_name) or {}
+    return str(fact.get('shot_scale') or '').strip().lower()
+
+
+def _select_beat_ref_frame(beat, next_beat, rf_dir, facts_by_name,
+                           want_family='', want_tight=False):
+    """在这一拍的窗内挑一张能当对标基准的帧，挑不出来返回 None。
+
+    **挑不出来就返回 None，不许硬塞。** 挂一张空间层或景别对不上的帧，比不挂更糟：
+    审查会拿它去判机位与空间骨架，每一轮都稳定报一条假违规，过门帧因此永远过不了。
+
+    筛选顺序（全部依据已落盘的读数，零额外模型开销）：
+      · 空间层：拍级 `space` 与目标帧声明的 family 不一致 → 整拍弃用（跨层挂帧是错的，
+        不是"挑哪张"的问题）；
+      · 拍窗：切掉与下一拍重叠的边界帧（见 _beat_window_frames）；
+      · 切点：避开 observed_cuts ±0.15s；
+      · 景别：目标不是特写时排除 close / extreme_close；
+      · 取剩下的**最后一张**——保留原规则"拍尾即交付态"的本意。
+    """
+    if not beat or not rf_dir:
+        return None
+    if want_family:
+        source_family = _source_space_family(beat)
+        if source_family and source_family != want_family:
+            return None
+
+    candidates = _beat_window_frames(beat, next_beat)
+    if not candidates:
+        return None
+
+    cuts = []
+    for c in (beat.get('observed_cuts') or []):
+        try:
+            cuts.append(float(c))
+        except (TypeError, ValueError):
+            pass
+
+    def _near_cut(ts):
+        return ts is not None and any(abs(ts - c) <= _REF_CUT_EDGE_SECONDS for c in cuts)
+
+    def _exists(name):
+        path = os.path.join(rf_dir, name)
+        return path if os.path.exists(path) else None
+
+    # 三档逐级放宽：全部约束 → 允许贴近切点 → 只要求文件存在。每一档内都取最后一张。
+    tiers = [
+        lambda ts, name: (not _near_cut(ts)) and (want_tight or _frame_shot_scale(facts_by_name, name) not in _REF_TIGHT_SHOT_SCALES),
+        lambda ts, name: want_tight or _frame_shot_scale(facts_by_name, name) not in _REF_TIGHT_SHOT_SCALES,
+        lambda ts, name: True,
+    ]
+    for keep in tiers:
+        for ts, name in reversed(candidates):
+            if not keep(ts, name):
+                continue
+            path = _exists(name)
+            if path:
+                return path
+    return None
+
+
+def _storyboard_scene_fallback(rf_dir, source_ordinal):
+    """storyboard 布局的文件名兜底：scene_NNN_end.png / scene_NNN.png。
+
+    这类目录里根本没有 coverage_frames 记的那些 review_NNN.png，按帧名一张都找不到。
+    改造前这条兜底就在（按原片拍序编号），去掉它会让 storyboard 单的挂帧整个塌成空。
+    它绕过空间层/景别筛选是没办法的事：这里只有一个拍序号，没有可判的逐帧读数。"""
+    if not (rf_dir and isinstance(source_ordinal, int) and source_ordinal > 0):
+        return None
+    for name in (f'scene_{source_ordinal:03d}_end.png', f'scene_{source_ordinal:03d}.png'):
+        path = os.path.join(rf_dir, name)
+        if os.path.exists(path):
+            return path
+    return None
+
+
+def _load_frame_facts_for_refs(cand_dirs):
+    """{帧文件名: 逐帧读数}。读 reverse.py Pass A 落盘的 frame_facts.json。
+
+    与 observed_grounding.load_frame_facts 同一份形状，这里内联是为了避开
+    prompt_pipeline ← observed_grounding 的循环导入。读不到返回 {}：景别筛选随即失效，
+    其余筛选照常——事实卡是增量信息，缺了不该把挂帧整个卡死。"""
+    for cdir in cand_dirs or []:
+        path = os.path.join(cdir, 'frame_facts.json')
+        if not os.path.exists(path):
+            continue
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                raw = json.load(f)
+        except (OSError, ValueError):
+            continue
+        facts = raw.get('facts') if isinstance(raw, dict) else raw
+        if not isinstance(facts, list):
+            continue
+        out = {}
+        for item in facts:
+            if isinstance(item, dict) and item.get('frame'):
+                out[str(item['frame'])] = item
+        if out:
+            return out
+    return {}
+
+
+def _source_crossing_boundary(beats):
+    """原片里外景→室内翻面的位置，返回 (最后一个外景拍序, 第一个室内拍序)，1-based。
+
+    原片通常是**硬切**过门的：它从来没拍过"站在门槛外、门还关着"这个画面（海蚀洞单是
+    第 6 拍外墙抹灰直接切到第 7 拍室内蒙皮）。过门梯那几帧因此没有对标基准可挂，只能
+    挂这两端作为包络。找不到翻面返回 (None, None)。"""
+    last_exterior = None
+    for ordinal, beat in enumerate(beats or [], 1):
+        family = _source_space_family(beat)
+        if family == 'exterior':
+            last_exterior = ordinal
+        elif family == 'interior' and last_exterior is not None:
+            return last_exterior, ordinal
+    return None, None
+
+
+def _load_delivered_beat_ladder(cand_dirs):
+    """交付梯（compose_state.json 的 beat_ladder）。找不到返回 []。
+
+    挂帧必须看交付梯而不是原片拍表：偏移就发生在两者之间。"""
+    for cdir in cand_dirs or []:
+        path = os.path.join(cdir, 'compose_state.json')
+        if not os.path.exists(path):
+            continue
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            ladder = data.get('beat_ladder')
+            if isinstance(ladder, list) and ladder:
+                return ladder
+        except Exception:
+            pass
+    return []
+
+
+def find_reference_frames_with_roles(project_dir, total_beats=None):
+    """根据 project_dir（或其绑定的 replica_job_id）自动检索爆款原片抽出来的关键帧。
+
+    返回 (ref_frames_by_beat, ref_frame_roles, source_collage_path)：
+      · ref_frames_by_beat: {帧号: 关键帧路径}。**缺号是声明，不是缺失**——挂不出空间层
+        与景别都对得上的帧时这一格就空着，调用方不许向前后借帧（见上面那节说明）。
+      · ref_frame_roles:    {帧号: 'benchmark' | 'envelope'}。过门梯那几格是硬切两侧的
+        包络端点，不能拿来对机位（见 check_beat_consistency 的 ref_frame_role）。
+      · source_collage_path: 爆款原片 5 列多宫格拼图。
+
     支持自动从目录名提取 job_id 并递归解析 video_overview.json 溯源上游抽帧目录。
-    纯只读探测，找不到返回 ({}, None)。"""
+    纯只读探测，找不到返回 ({}, {}, None)。"""
     if not project_dir or not os.path.exists(project_dir):
-        return {}, None
+        return {}, {}, None
     manifest = {}
     manifest_path = os.path.join(project_dir, 'manifest.json')
     if os.path.exists(manifest_path):
@@ -14671,6 +14959,8 @@ def find_reference_frames_for_project(project_dir, total_beats=None):
 
     source_collage_path = None
     ref_frames_by_beat = {}
+    # {帧号: 'benchmark' | 'envelope'}，见 check_beat_consistency 的 ref_frame_role。
+    ref_frame_roles = {}
 
     # 1. 寻找爆款原片 5 列拼图（排查 *_collage.jpg，排除自身渲染生成的 full_collage.jpg 与缩略图）
     for cdir in cand_dirs:
@@ -14706,8 +14996,15 @@ def find_reference_frames_for_project(project_dir, total_beats=None):
         if rf_dir:
             break
 
+    ladder = _load_delivered_beat_ladder(cand_dirs)
+
     if tb_data and tb_data.get('beats') and rf_dir:
         beats = tb_data.get('beats', [])
+        facts_by_name = _load_frame_facts_for_refs(cand_dirs)
+
+        def _source_beat(ordinal):
+            return beats[ordinal - 1] if isinstance(ordinal, int) and 1 <= ordinal <= len(beats) else None
+
         # IMG 1: Beat 1 起始锚点 (初始毛坯状态)
         b1 = beats[0]
         cov1 = b1.get('coverage_frames') or []
@@ -14720,25 +15017,72 @@ def find_reference_frames_for_project(project_dir, total_beats=None):
             if os.path.exists(alt_p1):
                 p1 = alt_p1
         ref_frames_by_beat[1] = p1
+        ref_frame_roles[1] = 'benchmark'
 
-        # IMG k+1: Beat k 的终点交付状态 (k from 1 to len(beats))
-        for idx, b in enumerate(beats, start=1):
-            cov = b.get('coverage_frames') or []
-            evi = b.get('evidence_frames') or []
-            end_f = cov[-1]['frame'] if cov else (evi[-1] if evi else None)
-            if end_f:
-                p_end = os.path.join(rf_dir, end_f)
-                if not os.path.exists(p_end):
-                    alt_end = os.path.join(rf_dir, f'scene_{idx:03d}_end.png')
-                    if os.path.exists(alt_end):
-                        p_end = alt_end
-                    else:
-                        alt_end2 = os.path.join(rf_dir, f'scene_{idx:03d}.png')
-                        if os.path.exists(alt_end2):
-                            p_end = alt_end2
-                ref_frames_by_beat[idx + 1] = p_end
-    else:
-        # Fallback: 扫描目录文件进行比例映射
+        last_exterior, first_interior = _source_crossing_boundary(beats)
+
+        def _envelope_ref(family):
+            """过门梯子拍的包络端点：外景侧取翻面前最后一张仍在室外的帧，室内侧取翻面后
+            第一张室内帧。原片没拍过门槛本身，这两端是唯一诚实的参照。"""
+            if family == 'exterior' and last_exterior:
+                return _select_beat_ref_frame(_source_beat(last_exterior),
+                                              _source_beat(last_exterior + 1),
+                                              rf_dir, facts_by_name, want_family='exterior')
+            if family == 'interior' and first_interior:
+                target = _source_beat(first_interior)
+                window = _beat_window_frames(target, _source_beat(first_interior + 1))
+                for _ts, name in window:
+                    path = os.path.join(rf_dir, name)
+                    if os.path.exists(path):
+                        return path
+            return None
+
+        # 交付梯逐拍挂帧。IMAGE k+1 = 交付第 k 拍的到达帧；它对应原片的哪一拍，只认
+        # source_beat_index，不认位置——展开过门梯会插拍，位置从那里开始就错了。
+        # 拿不到交付梯（老单/未落盘）时退回位置映射，行为与改造前逐字相同。
+        delivered = ladder if ladder else [{'source_beat_index': n} for n in range(1, len(beats) + 1)]
+        for position, item in enumerate(delivered, 1):
+            item = item if isinstance(item, dict) else {}
+            image_seq = position + 1
+            want_family = str(item.get('result_space_family') or '').strip().lower()
+            if want_family not in ('exterior', 'interior'):
+                want_family = ''
+
+            synthetic = str(item.get('synthetic_beat') or '')
+            if synthetic:
+                # 运行期插出来的拍，原片没有对应帧。
+                if synthetic == 'camera_reframe':
+                    continue  # 纯机位重构，无可对标，整格不挂
+                envelope = _envelope_ref(want_family)
+                if envelope:
+                    ref_frames_by_beat[image_seq] = envelope
+                    ref_frame_roles[image_seq] = 'envelope'
+                continue
+
+            # source_beat_index 缺席 = 这条梯子是本次改动之前落盘的（老单），它没被
+            # 打过锚点。退回位置映射，行为与改造前逐字相同——缺席不等于「无原片对标」，
+            # 那是 synthetic_beat 才有的声明。
+            src_index = item.get('source_beat_index')
+            if not (isinstance(src_index, int) and src_index > 0):
+                src_index = position
+
+            source = _source_beat(src_index)
+            if source is None:
+                continue
+            picked = _select_beat_ref_frame(source, _source_beat(src_index + 1),
+                                            rf_dir, facts_by_name, want_family=want_family)
+            if not picked:
+                # storyboard 布局：coverage 记的帧名在这个目录里一张都不存在。
+                picked = _storyboard_scene_fallback(rf_dir, src_index)
+            if not picked:
+                # 挑不出合规帧就不挂。挂一张空间层/景别对不上的帧比不挂更糟：审查会拿它
+                # 判机位与空间骨架，每轮稳定报一条假违规。
+                continue
+            ref_frames_by_beat[image_seq] = picked
+            ref_frame_roles[image_seq] = 'benchmark'
+    elif not (tb_data and tb_data.get('beats')):
+        # Fallback: 只在**完全没有**原片拍表时才按比例映射目录文件。有拍表却走这条，
+        # 等于把上面刚对齐的挂帧重新打乱（2026-08-31：这是过门帧错位最坏的一档）。
         keyframe_paths = []
         for cdir in cand_dirs:
             if not os.path.isdir(cdir):
@@ -14761,14 +15105,26 @@ def find_reference_frames_for_project(project_dir, total_beats=None):
             for b in range(1, n_targets + 1):
                 idx = min(n_keyframes - 1, max(0, int(round(((b - 1) / max(1, n_targets - 1)) * (n_keyframes - 1)))))
                 ref_frames_by_beat[b] = keyframe_paths[idx]
+                ref_frame_roles[b] = 'benchmark'
 
-    return ref_frames_by_beat, source_collage_path
+    return ref_frames_by_beat, ref_frame_roles, source_collage_path
+
+
+def find_reference_frames_for_project(project_dir, total_beats=None):
+    """{帧号: 对标基准帧路径} 与 5 列拼图路径。
+
+    挂帧本体见 find_reference_frames_with_roles——这里丢掉 role 只是为了保持既有调用点
+    （chain_guard / stepped_pipeline / server / candidate_selection）的二元解包形状。
+    需要区分「基准」与「包络」的调用点（一致性审查）请直接用带 role 的那个。"""
+    refs, _roles, collage = find_reference_frames_with_roles(project_dir, total_beats)
+    return refs, collage
 
 
 def check_full_sequence_consistency(config, prompt_block, frame_image_paths, degraded=False,
                                     only_beats=None, skip_global=False, on_progress=None,
                                     global_only_beats=None, outline_items=None,
-                                    ref_frame_paths=None, source_collage_path=None,
+                                    ref_frame_paths=None, ref_frame_roles=None,
+                                    source_collage_path=None,
                                     rendered_collage_path=None):
     """整套序列渲染完成后的一致性审查，取代原来盲文本的逐轮全量审核（见
     prompt_pipeline_refactor 里去掉的 validate_and_repair / 审核表)。
@@ -14824,6 +15180,8 @@ def check_full_sequence_consistency(config, prompt_block, frame_image_paths, deg
     outline_frame_verdicts——灰度期它是这一层判定的**唯一**去处。
     ref_frame_paths: {帧号: 爆款原片同阶段关键帧路径}。给出时逐拍层同时做对标保真度
     与机位审查（见 check_beat_consistency 的 ref_frame_path）。
+    ref_frame_roles: {帧号: 'benchmark' | 'envelope'}。过门梯的子拍原片没拍过，只能挂
+    翻面前后的端点，标 'envelope' 让那一拍不做机位/构图对标（见 ref_frame_role）。
     source_collage_path / rendered_collage_path: 爆款原片与本单各自的 5 列拼图。两张
     都在时追加第 4 层 check_collage_macro_alignment（宏观节奏/光影演变对齐）。"""
     if not prompt_block or not frame_image_paths:
@@ -14856,8 +15214,16 @@ def check_full_sequence_consistency(config, prompt_block, frame_image_paths, deg
         def _run(beat, pair):
             before, after = pair
             items = outline_by_beat.get(beat)
-            ref_path = (ref_frame_paths or {}).get(beat + 1) or (ref_frame_paths or {}).get(str(beat + 1)) or (ref_frame_paths or {}).get(beat) or (ref_frame_paths or {}).get(str(beat))
-            extra = {'ref_frame_path': ref_path} if ref_path else {}
+            # 只认 beat+1。空着 = 挂帧那边判定「这一格没有可用基准」，向前借上一拍
+            # 的帧只会借到跨空间层的图（见 find_reference_frames_with_roles 的兜底纪律）。
+            ref_key = next((k for k in (beat + 1, str(beat + 1))
+                            if (ref_frame_paths or {}).get(k)), None)
+            ref_path = (ref_frame_paths or {}).get(ref_key) if ref_key is not None else None
+            # role 必须跟着**同一个键**取：挂帧回退到 beat 键时，角色也得跟着回退，
+            # 否则包络参考会被当成基准，过门那一拍照样每轮报假的机位偏离。
+            ref_role = (ref_frame_roles or {}).get(ref_key) if ref_key is not None else None
+            extra = ({'ref_frame_path': ref_path,
+                      'ref_frame_role': ref_role or 'benchmark'} if ref_path else {})
             if not items:
                 # 没有卡片工序（老单/未绑定的梯子）：调用形状与改造前逐字相同
                 return check_beat_consistency(config, prompt_block, beat, total_beats,

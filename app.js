@@ -4232,7 +4232,11 @@ async function openCandidateSelectionModal(seq, frameData) {
     if (bmBoxEl) {
         const curIdea = typeof currentIdea !== 'undefined' ? currentIdea : null;
         const refFrames = (curIdea && (curIdea.ref_frames || (curIdea.frameRun && curIdea.frameRun.ref_frames))) || {};
+        const refRoles = (curIdea && (curIdea.ref_frame_roles || (curIdea.frameRun && curIdea.frameRun.ref_frame_roles))) || {};
         const refUrl = refFrames[seqNum] || refFrames[String(seqNum)] || '';
+        // 过门梯这一格原片没拍过，附件只是硬切另一侧最近的一张幸存帧：
+        // 标成「黄金对标基准」会让人照着一张跨空间层的图对机位。
+        const refIsEnvelope = (refRoles[seqNum] || refRoles[String(seqNum)]) === 'envelope';
         if (refUrl) {
             bmBoxEl.style.display = 'block';
             bmBoxEl.innerHTML = `
@@ -4242,10 +4246,12 @@ async function openCandidateSelectionModal(seq, frameData) {
                         <div>
                             <div style="font-weight:700; font-size:13px; color:#f59e0b; display:flex; align-items:center; gap:6px;">
                                 <span>🎯 爆款原片节拍抽帧 (REF ${padSeq})</span>
-                                <span style="font-size:11px; background:rgba(245,158,11,0.2); padding:1px 6px; border-radius:4px; font-weight:600;">黄金对标基准</span>
+                                <span style="font-size:11px; background:rgba(245,158,11,0.2); padding:1px 6px; border-radius:4px; font-weight:600;">${refIsEnvelope ? '包络端点' : '黄金对标基准'}</span>
                             </div>
                             <div style="font-size:11.5px; color:#94a3b8; margin-top:3px; line-height:1.4;">
-                                作为第 ${seqNum} 拍（${escapeHtml(beatTag)}）机位透视、光照色调与施工差量的标准对标参考
+                                ${refIsEnvelope
+                                    ? `原片硬切过门，没有拍过第 ${seqNum} 拍（${escapeHtml(beatTag)}）这个镜头；这只是切点一侧最近的一张帧，只用于核对场景与材质连续，不用来对机位与构图`
+                                    : `作为第 ${seqNum} 拍（${escapeHtml(beatTag)}）机位透视、光照色调与施工差量的标准对标参考`}
                             </div>
                         </div>
                     </div>

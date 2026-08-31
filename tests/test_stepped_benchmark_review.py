@@ -29,12 +29,15 @@ class TestSteppedBenchmarkReview(unittest.TestCase):
         with open(os.path.join(self.project_dir, 'manifest.json'), 'w', encoding='utf-8') as f:
             json.dump(manifest, f)
 
-        # Mock find_reference_frames_for_project
+        # Mock find_reference_frames_with_roles
         fake_refs = {1: '/outputs/ref_001.png', 2: '/outputs/ref_002.png'}
+        # 第 2 格是过门梯的包络端点，不是对标基准——前端要能区分。
+        fake_roles = {1: 'benchmark', 2: 'envelope'}
         fake_collage = '/outputs/source_collage.jpg'
 
         with patch('stepped_pipeline._get_project_dir', return_value=self.project_dir), \
-             patch('stepped_pipeline.find_reference_frames_for_project', return_value=(fake_refs, fake_collage)):
+             patch('stepped_pipeline.find_reference_frames_with_roles',
+                   return_value=(fake_refs, fake_roles, fake_collage)):
             
             raw_state = {
                 'title': self.project_title,
@@ -45,6 +48,8 @@ class TestSteppedBenchmarkReview(unittest.TestCase):
             self.assertIn('ref_frames', enriched)
             self.assertEqual(enriched['ref_frames'][1], '/outputs/ref_001.png')
             self.assertEqual(enriched['ref_frames'][2], '/outputs/ref_002.png')
+            self.assertEqual(enriched['ref_frame_roles'][1], 'benchmark')
+            self.assertEqual(enriched['ref_frame_roles'][2], 'envelope')
             self.assertEqual(enriched['source_collage'], fake_collage)
 
     def test_get_stepped_status_includes_refs(self):
@@ -55,10 +60,12 @@ class TestSteppedBenchmarkReview(unittest.TestCase):
         }
 
         fake_refs = {1: '/outputs/ref_001.png', 2: '/outputs/ref_002.png', 3: '/outputs/ref_003.png'}
+        fake_roles = {1: 'benchmark', 2: 'benchmark', 3: 'benchmark'}
         fake_collage = '/outputs/benchmark_collage.jpg'
 
         with patch('stepped_pipeline._get_project_dir', return_value=self.project_dir), \
-             patch('stepped_pipeline.find_reference_frames_for_project', return_value=(fake_refs, fake_collage)):
+             patch('stepped_pipeline.find_reference_frames_with_roles',
+                   return_value=(fake_refs, fake_roles, fake_collage)):
             
             sp._save_state(self.project_title, state)
             loaded = sp.get_stepped_status(self.project_title)
