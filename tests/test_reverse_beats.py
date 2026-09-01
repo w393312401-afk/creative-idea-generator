@@ -1961,6 +1961,49 @@ class TestAnchorGrounding(unittest.TestCase):
         with patch.object(pp, '_multimodal_chat', side_effect=AssertionError('不该被调用')):
             self.assertEqual(reverse.ground_anchor_on_reference({}, 'p', None), 'p')
 
+    def test_the_system_prompt_never_asks_for_negative_syntax(self):
+        """出图端没有负向通道：任何 SD 风格的禁忌词都会被照着画出来。
+
+        2026-09-01 首帧渲出暗角/望远镜镜头/中心圆孔，就是这条指令的直接产物。
+        """
+        captured = {}
+
+        def _capture(config, system, user, images, **kw):
+            captured['system'] = system
+            return 'ok'
+
+        with patch.object(pp, '_multimodal_chat', side_effect=_capture):
+            reverse.ground_anchor_on_reference({}, 'original prompt', __file__)
+        system = captured['system']
+        # 旧指令要求把这串权重括号原样拼在正向提示词末尾——出图端会照着画
+        self.assertNotIn('append strong anti-symmetry negative prompts', system)
+        self.assertNotIn('centered composition, symmetrical framing, central hole', system)
+        self.assertNotIn('telescope vignette, tunnel vision, one-point perspective', system)
+        self.assertIn('no negative-prompt channel', system)
+        self.assertIn('NEVER append a negative prompt', system)
+        # 分区必须写成散文，不能再是 Grid 标签——那是首帧格式与其余拍不一致的来源
+        self.assertNotIn('Grid A1', system)
+        self.assertIn('NOT as a labelled list', system)
+
+    def test_a_weighted_negative_tail_is_stripped_from_the_reply(self):
+        reply = ('High-angle wide shot inside a wet basalt sea cave. '
+                 '(centered composition, symmetrical framing, central hole, circular portal, '
+                 'telescope vignette, tunnel vision, one-point perspective:1.6)')
+        with patch.object(pp, '_multimodal_chat', return_value=reply):
+            out = reverse.ground_anchor_on_reference({}, 'original prompt', __file__)
+        self.assertEqual(out, 'High-angle wide shot inside a wet basalt sea cave.')
+
+    def test_stripping_leaves_ordinary_parentheses_and_never_empties(self):
+        self.assertEqual(
+            reverse.strip_weighted_negatives('A ledge (on the right) under daylight.'),
+            'A ledge (on the right) under daylight.')
+        self.assertEqual(
+            reverse.strip_weighted_negatives('Negative prompt: blurry, lowres\nA wet stone shelf.'),
+            'A wet stone shelf.')
+        # 全是负向时不能返回空串，宁可原样保留
+        self.assertEqual(reverse.strip_weighted_negatives('(blurry:1.2)'), '(blurry:1.2)')
+        self.assertEqual(reverse.strip_weighted_negatives(''), '')
+
 
 class TestPassAOptimizationTests(unittest.TestCase):
     """测试 Pass A 增量缓存、二分重试与峰值帧并发。"""

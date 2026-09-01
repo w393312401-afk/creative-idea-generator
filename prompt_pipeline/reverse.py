@@ -2588,6 +2588,33 @@ def anchor_reference_frame(beats_doc, overview, facts=None):
     return entries[0]['frame_path']
 
 
+_WEIGHTED_NEGATIVE_RE = re.compile(r'\(\s*[^()]*?:\s*\d+(?:\.\d+)?\s*\)')
+_NEGATIVE_LINE_RE = re.compile(r'(?im)^[ \t]*(?:negative(?:\s+prompt)?|anti-symmetry\s+negatives?)[ \t]*[:：].*$')
+
+
+def strip_weighted_negatives(text):
+    """剥掉 SD 风格的负向提示词与权重括号。
+
+    出图端是 Gemini image（Nano Banana 2），整条链路没有负向通道，也不解析 `(...:1.6)`
+    权重语法——这类括号会被当成画面描述照着画。2026-09-01 那次「首帧渲出暗角、望远镜
+    镜头、对标帧根本没有的中心圆孔」就是这么来的：一句本意是禁止的
+    `(centered composition, ..., telescope vignette, tunnel vision:1.6)` 被原样拼在正向
+    提示词末尾，语义整个翻转。
+
+    上游的 system prompt 已经明说不要写，但那是软约束；这里做硬兜底，顺带清掉历史缓存
+    里可能已经带上的尾巴。
+    """
+    if not text:
+        return text
+    cleaned = _NEGATIVE_LINE_RE.sub('', text)
+    cleaned = _WEIGHTED_NEGATIVE_RE.sub('', cleaned)
+    # 剥掉留下的孤立标点与空行，别让提示词以 " ." 或连续空行收尾
+    cleaned = re.sub(r'[ \t]+([.,;])', r'\1', cleaned)
+    cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
+    cleaned = re.sub(r'[ \t]{2,}', ' ', cleaned)
+    return cleaned.strip() or text
+
+
 def ground_anchor_on_reference(config, anchor_prompt, frame_path, on_progress=None):
     """拿原片真实首帧重写锚点图提示词的画面描述。失败原样返回，绝不阻塞合成。
 
@@ -2605,29 +2632,34 @@ def ground_anchor_on_reference(config, anchor_prompt, frame_path, on_progress=No
         "You are rewriting ONE photoreal image prompt: the opening anchor frame (IMAGE 1) of a "
         "reconstruction sequence. You are shown the ACTUAL first frame of the reference film "
         "this sequence reproduces.\n\n"
-        "Rewrite the prompt so that its camera perspective, viewpoint angle, 3-zone spatial layout "
+        "Rewrite the prompt so that its camera perspective, viewpoint angle, spatial layout "
         "(left third vs center third vs right third), portal/opening placement, structure, materials, "
         "weathering, vegetation, clutter and light 100% faithfully match what you observe in the reference frame.\n\n"
         "Rules:\n"
         "1. [Strict Spatial Topology & Asymmetry Lock]:\n"
         "   - Read the exact camera angle, pitch, bearing, and framing from the reference frame.\n"
-        "   - Explicitly declare the 3-zone spatial layout:\n"
-        "     * Left zone (Grid A1, B1, C1): solid boundary/rock/wall or opening.\n"
-        "     * Center zone (Grid A2, B2, C2): floor substrate, pools/depressions, vanishing depth.\n"
-        "     * Right zone (Grid A3, B3, C3): portal opening, wall, or exterior view.\n"
-        "   - If the opening/portal is off-center (e.g. on the right side) and the viewpoint is 3/4 oblique, "
-        "you MUST explicitly write this 3/4 oblique off-center framing. NEVER collapse an off-center opening into a centered circular vignette or symmetrical tunnel.\n"
+        "   - Describe what occupies the left third, the center third and the right third of the frame — "
+        "solid boundary, rock or wall; floor substrate, pools, depressions, vanishing depth; portal opening or "
+        "exterior view — written as flowing visual prose, NOT as a labelled list and NOT as grid coordinates.\n"
+        "   - State the framing positively, exactly as the reference frame shows it. If the opening/portal is "
+        "off-center (e.g. on the right side) and the viewpoint is 3/4 oblique, you MUST write that 3/4 oblique "
+        "off-center framing explicitly, with the field of view reaching corner to corner and the scene filling the "
+        "frame edge to edge. NEVER collapse an off-center opening into a centered circular vignette or symmetrical tunnel.\n"
         "2. [Clean Frame Anchor & Structural Balance]:\n"
         "   - Do NOT describe transient moving workers or floating tools.\n"
         "   - If the reference frame shows a person standing on one side of the frame (e.g. on a rock ledge or floor on the left), "
         "you MUST describe the permanent physical structure, rock shelf, or raised platform they occupy to preserve the authentic visual weight on that side, "
         "preventing the image generator from shifting openings to the center.\n"
-        "3. [Negative Restraints Against Centered Symmetries]:\n"
-        "   - For cave, tunnel, portal, or interior frames, append strong anti-symmetry negative prompts at the end: "
-        "`(centered composition, symmetrical framing, central hole, circular portal, telescope vignette, tunnel vision, one-point perspective:1.6)`.\n"
-        "4. [Material & Texture Fidelity]:\n"
+        "3. [Material & Texture Fidelity]:\n"
         "   - Keep every decay, stain, water puddle, moss, debris and texture the reference frame actually shows.\n"
-        "5. Plain visual prose only — no commentary or code fences.\n"
+        "4. [Positive Description Only]:\n"
+        "   - The renderer has no negative-prompt channel and no weight syntax. Every word you write gets drawn.\n"
+        "   - NEVER append a negative prompt, a banned-element list, or weighted tokens such as `(...:1.6)`. "
+        "Naming an unwanted effect (vignette, tunnel vision, circular portal, centered composition) makes the "
+        "renderer draw that effect. Say what the frame DOES look like instead.\n"
+        "5. Plain visual prose only — no commentary, no headings, no zone labels, no code fences. "
+        "Match the wording and shape of an ordinary photoreal shot description, so this prompt reads like every "
+        "other beat in the sequence.\n"
         "Respond with ONLY the rewritten prompt, nothing else."
     )
     try:
@@ -2638,7 +2670,7 @@ def ground_anchor_on_reference(config, anchor_prompt, frame_path, on_progress=No
         if sys.stdout:
             print(f'[REVERSE] 锚点图对齐真实首帧失败，沿用组稿阶段的提示词: {exc}')
         return anchor_prompt
-    text = (text or '').strip()
+    text = strip_weighted_negatives((text or '').strip())
     if not text:
         return anchor_prompt
     if on_progress:

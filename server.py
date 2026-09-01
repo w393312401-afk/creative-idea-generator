@@ -5273,31 +5273,40 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 library_items = read_library() or []
                 to_delete = []
                 with ACTIVE_TASKS_LOCK:
-                    for tid, t in ACTIVE_TASKS.items():
-                        # 永久豁免所有爆款复刻任务
-                        if is_replica_task(t):
-                            continue
+                    for tid, t in list(ACTIVE_TASKS.items()):
                         if status_group == "all":
+                            # 彻底清空时，运行中的复刻任务仍受保护，其余任务均清空
+                            if is_replica_task(t) and t.get("status") == "running":
+                                continue
                             to_delete.append(tid)
-                        elif status_group == "completed" and t.get("status") == "completed":
-                            to_delete.append(tid)
-                        elif status_group == "failed_cancelled" and t.get("status") in ("failed", "cancelled"):
-                            to_delete.append(tid)
+                        elif status_group == "completed":
+                            if is_replica_task(t):
+                                continue
+                            if t.get("status") == "completed":
+                                to_delete.append(tid)
+                        elif status_group == "failed_cancelled":
+                            if is_replica_task(t):
+                                continue
+                            if t.get("status") in ("failed", "cancelled"):
+                                to_delete.append(tid)
                         elif status_group == "no_cover":
+                            if is_replica_task(t):
+                                continue
                             if t.get("status") != "running" and not task_has_cover(t, base_dir=base_dir, library_items=library_items):
                                 to_delete.append(tid)
                     for tid in to_delete:
-                        ACTIVE_TASKS[tid]["cancel_event"].set()
-                        del ACTIVE_TASKS[tid]
-                # 逐条显式删除，而不是靠一次全目录扫描"谁不在内存里就删谁"
+                        if tid in ACTIVE_TASKS:
+                            ACTIVE_TASKS[tid]["cancel_event"].set()
+                            del ACTIVE_TASKS[tid]
+                # 逐条显式删除任务文件
                 for tid in to_delete:
                     delete_task_files(tid)
 
                 deleted_library_ids = []
-                # 清空全部：同步清空常规点子库条目并彻底删除 outputs/ 目录下的所有常规本地媒体文件（保留爆款复刻项目与资产）
+                # 清空全部：彻底清空项目工作台上的所有点子库项目，并彻底清理 outputs/ 下生成的图片与视频（严格保留 outputs/replica_jobs/）
                 if status_group == "all":
                     for item in library_items:
-                        if isinstance(item, dict) and not is_replica_library_item(item):
+                        if isinstance(item, dict):
                             item_id = item.get('id')
                             if item_id not in (None, ''):
                                 title = item.get('project_key') or item.get('title')
@@ -5311,13 +5320,20 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                                 removed = delete_library_item(item_id)
                                 if removed:
                                     deleted_library_ids.append(item_id)
+                    # 确保 library 索引完全清空
+                    try:
+                        with LIBRARY_LOCK:
+                            _write_library_index([], None)
+                    except Exception as e:
+                        if sys.stdout:
+                            print(f"[CLEAR] 重置 library 索引异常: {e}")
 
-                    # 彻底清理 outputs/ 目录下的常规残留项目文件夹与媒体文件，严禁删除 replica_jobs 及复刻项目资产
+                    # 彻底清理 outputs/ 目录下的所有生成项目文件夹与媒体文件，严禁删除 outputs/replica_jobs/ 目录
                     try:
                         outputs_dir = os.path.abspath(server_common.OUTPUT_ROOT if os.path.isabs(server_common.OUTPUT_ROOT) else os.path.join(base_dir, server_common.OUTPUT_ROOT))
                         if os.path.isdir(outputs_dir):
                             for entry in os.listdir(outputs_dir):
-                                if entry == '.gitkeep':
+                                if entry == '.gitkeep' or entry == 'replica_jobs':
                                     continue
                                 ep = os.path.join(outputs_dir, entry)
                                 ep_abs = os.path.abspath(ep)
@@ -5337,7 +5353,6 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 elif status_group == "no_cover":
                     for item in library_items:
                         if isinstance(item, dict) and not library_item_has_cover(item, base_dir=base_dir):
-                            # 永久豁免所有爆款复刻创意条目
                             if is_replica_library_item(item):
                                 continue
                             item_id = item.get('id')

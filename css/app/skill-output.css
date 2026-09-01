@@ -2155,9 +2155,16 @@ body.slot-merged-view .slot-toolbar[data-slot-type="video"] .slot-merge-btn {
     font-size: 0.72rem;
     line-height: 1.7;
     color: var(--text-secondary);
+    user-select: text;
+    -webkit-user-select: text;
+    cursor: text;
 }
 
-.gen-feed-line { word-break: break-all; }
+.gen-feed-line {
+    word-break: break-all;
+    user-select: text;
+    -webkit-user-select: text;
+}
 .gen-feed-line.ok { color: #10b981; }
 .gen-feed-line.warn { color: #d97706; }
 .gen-feed-line.err { color: #ef4444; }
@@ -2420,6 +2427,9 @@ body.slot-merged-view .slot-toolbar[data-slot-type="video"] .slot-merge-btn {
     line-height: 1.5;
     /* 违规原文常常是一整句话：允许换行，但不许把面板撑成一堵墙 */
     overflow-wrap: anywhere;
+    user-select: text;
+    -webkit-user-select: text;
+    cursor: text;
 }
 
 .review-issue-meta {

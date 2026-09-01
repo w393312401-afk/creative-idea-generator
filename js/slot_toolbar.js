@@ -619,6 +619,41 @@ if (typeof document !== 'undefined') {
  * 无论从网格空白处、边距、外围区域还是直接从卡片上方拖起，均能流畅拉出半透明青色框选框，
  * 实时计算视口 2D AABB 矩形碰撞，高亮并多选触碰到的所有卡片。
  */
+/**
+ * 判断目标元素是否属于明确的非框选区域（文本展示、交互控件、日志输出、审查面板等）。
+ * 保证这些区域内的文本选择、点击与交互 100% 遵循原生浏览器行为，绝不触发槽位框选。
+ */
+function isExcludedFromMarquee(target) {
+    if (!target || !(target instanceof Element)) return true;
+
+    // 1. 任何原生或自定义交互控件：按钮、输入框、链接、下拉框、标签等
+    if (target.closest('button, input:not(.slot-select-box), textarea, a, select, label, [contenteditable="true"]')) {
+        return true;
+    }
+
+    // 2. 槽位工具栏、批量操作栏、卡片操作按钮区、小工具图标等
+    if (target.closest('.slot-toolbar, .slot-actions, .section-tools, .slot-bulk, .slot-badges, .slot-badge')) {
+        return true;
+    }
+
+    // 3. 实时生成动态（日志区）、审查结论面板、单帧违规详情弹层、审计报告、成片播放器等（高频复制文本区域）
+    if (target.closest('.gen-live-feed, .review-panel, .review-issue-pop, .audit-panel, #merged-video-container, .cover-wrapper, #cover-section')) {
+        return true;
+    }
+
+    // 4. 次级设置弹层、说明文字、元数据信息、进度条、提示词展示区等
+    if (target.closest('.section-pop, .section-title, .frames-controls, .frames-meta, .frames-progress, .frames-desc, .frames-dnd-hint, .cover-desc-text, .prompt-block, .prompt-display, .prompt-text, .hook-box, .hook-value')) {
+        return true;
+    }
+
+    // 5. 抽屉、灯箱、模态弹窗、Toast 等浮层组件
+    if (target.closest('.history-drawer, .tasks-drawer, .drawer, .lightbox, .modal, .dialog, .toast, .projects-overlay')) {
+        return true;
+    }
+
+    return false;
+}
+
 let marqueeSelectionBound = false;
 
 function initGlobalSlotMarqueeSelection() {
@@ -636,14 +671,12 @@ function initGlobalSlotMarqueeSelection() {
         // 仅响应鼠标主键（左键）
         if (e.button !== 0) return;
 
-        // 检查是否在结果槽位区域内
-        const resultsArea = e.target.closest('#results-view, #frames-section, #videos-section, .frames-wrapper, .frames-grid, #beats-grid, .idea-section');
-        if (!resultsArea) return;
+        // 严禁在日志区、审查面板、文本展示区及各类交互控件上触发框选，确保文字能正常划选复制
+        if (isExcludedFromMarquee(e.target)) return;
 
-        // 点击在按钮、文本输入框、操作栏按钮等交互控件上时不触发框选
-        if (e.target.closest('button, input:not(.slot-select-box), textarea, a, select, .slot-actions, .section-tools')) {
-            return;
-        }
+        // 仅在卡片网格本身或紧邻网格的容器内触发
+        const resultsArea = e.target.closest('.frames-grid, #beats-grid, .frames-wrapper');
+        if (!resultsArea) return;
 
         const card = e.target.closest('.slot-card');
         const hasModifier = !!(e.shiftKey || e.ctrlKey || e.metaKey);
@@ -817,12 +850,14 @@ function initGlobalSlotMarqueeSelection() {
         window.addEventListener('mouseup', onMouseUp, true);
     });
 
-    // 空白区域单击直接清空选中集
+    // 空白区域单击直接清空选中集（排除文本展示与交互区域）
     document.addEventListener('click', (e) => {
         if (e.shiftKey || e.ctrlKey || e.metaKey) return;
-        const resultsArea = e.target.closest('#results-view, #frames-section, #videos-section, .frames-wrapper, .frames-grid, #beats-grid');
+        if (isExcludedFromMarquee(e.target)) return;
+
+        const resultsArea = e.target.closest('.frames-grid, #beats-grid, .frames-wrapper');
         if (!resultsArea) return;
-        if (e.target.closest('.slot-card, button, input, textarea, a, select, label, .slot-actions, .slot-badge, .slot-label, .slot-select, .slot-bulk, .slot-toolbar, .review-panel, .section-tools')) {
+        if (e.target.closest('.slot-card')) {
             return;
         }
         if (slotMergedView || e.target.closest('#beats-grid')) {

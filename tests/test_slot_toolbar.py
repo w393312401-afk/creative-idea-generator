@@ -559,4 +559,45 @@ class TestMarqueeSelection:
         selected = page.evaluate("() => Array.from(slotToolbarState.image.selected).sort((a, b) => a - b)")
         assert selected == [2, 3, 4, 5]
 
+    def test_drag_in_live_feed_does_not_trigger_marquee(self, page):
+        """在实时生成动态（日志区域）内划选文本，绝不触发槽位框选，也不抹掉文字选区。"""
+        # 显示实时生成动态并注入一条测试日志
+        page.evaluate("""() => {
+            const feed = document.getElementById('frames-live-feed');
+            feed.style.display = 'block';
+            const lines = document.getElementById('frames-live-feed-lines');
+            lines.innerHTML = '<div class="gen-feed-line err" id="test-log-line">[11:23:06] ⚠️ 测试守卫检出 1 处问题：碎石找平未交付</div>';
+        }""")
+
+        box = page.eval_on_selector("#test-log-line", "el => { const r = el.getBoundingClientRect(); return { x: r.left, y: r.top, w: r.width, h: r.height }; }")
+
+        # 在日志文本上方拖拽
+        page.mouse.move(box["x"] + 10, box["y"] + box["h"] / 2)
+        page.mouse.down()
+        page.mouse.move(box["x"] + box["w"] - 10, box["y"] + box["h"] / 2, steps=5)
+
+        # 拖拽中途与结束，均不应出现 marquee 元素，body 也不应打上 is-slot-marquee-selecting 标记
+        hasMarquee = page.evaluate("() => !!document.querySelector('.slot-marquee-box')")
+        isSelecting = page.evaluate("() => document.body.classList.contains('is-slot-marquee-selecting')")
+        page.mouse.up()
+
+        assert not hasMarquee, "日志区域拖拽不应生成框选矩形 (.slot-marquee-box)"
+        assert not isSelecting, "日志区域拖拽不应为 body 添加 is-slot-marquee-selecting"
+
+    def test_click_in_live_feed_does_not_clear_selection(self, page):
+        """在实时生成动态日志内单击或复制，不应清空已选中的卡片槽位。"""
+        page.eval_on_selector("#frame-slot-1 .slot-select-box", "el => el.click()")
+        assert page.evaluate("() => Array.from(slotToolbarState.image.selected)") == [1]
+
+        page.evaluate("""() => {
+            const feed = document.getElementById('frames-live-feed');
+            feed.style.display = 'block';
+            const lines = document.getElementById('frames-live-feed-lines');
+            lines.innerHTML = '<div class="gen-feed-line ok" id="test-click-line">IMG 001 审查合格</div>';
+        }""")
+
+        page.eval_on_selector("#test-click-line", "el => el.dispatchEvent(new MouseEvent('click', { bubbles: true }))")
+        assert page.evaluate("() => Array.from(slotToolbarState.image.selected)") == [1], "点击日志文本不应清空已选卡片"
+
+
 

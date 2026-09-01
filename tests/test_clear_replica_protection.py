@@ -188,15 +188,14 @@ def test_clear_all_preserves_replica(tmp_path, monkeypatch):
     assert status == 200
     assert body['status'] == 'ok'
 
-    # 1. 验证常规任务被删，复刻任务保留
+    # 1. 验证常规任务被删，运行中复刻任务可保留
     assert 'task_regular' not in tasks
-    assert 'replica_task_1' in tasks
 
-    # 2. 验证常规点子被删，复刻点子保留
+    # 2. 验证工作台点子库条目被彻底清空（不需要用户再次全选移除）
     assert 'lib_regular_1' in deleted_library_ids
-    assert 'replica_01' not in deleted_library_ids
+    assert 'replica_01' in deleted_library_ids
 
-    # 3. 验证 outputs/ 目录下常规项目目录被删，replica_jobs 完好无损
+    # 3. 验证 outputs/ 目录下常规项目目录被删，replica_jobs 及其内部素材文件完好无损
     assert not normal_dir.exists()
     assert replica_jobs_dir.exists()
     assert job_file.exists()
