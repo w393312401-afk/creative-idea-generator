@@ -16,20 +16,30 @@ from .scene_state import PERSISTENT_STRUCTURAL_CUES, scrub_planning_annotations
 
 TRANSITION_OPERATIONS = {"threshold", "reward", "reframe", "reveal"}
 
-# cast_action 是**一拍**的身体动线，写的是「先 A、然后 B」（'stands atop ladder grinding
-# overhead beams, then crouches grinding floor grid welds'）。VIDEO 要的就是这条动线，
-# 但 IMAGE 是一张静帧，渲不出「先 A 然后 B」——模型必须二选一，而上一帧正作为锚点参考图
-# 摆在它面前，最省力的一选就是「照抄上一帧那个人」。2026-08-25 实测（run_replica_06edb…
-# 河畔观景室）交付出来的正是这个：IMG 011-015 背景从毛石换到成品木地板，人物贴图五帧
-# 像素级重合。所以 IMAGE 侧只取动线**落点**那一段——与 _beat_block_text 的
-# "this beat's IMAGE shows them settled in that pose" 是同一个口径。
-_CAST_SEQUENCE_RE = re.compile(r',?\s+(?:and\s+)?then\s+', re.IGNORECASE)
-
-
-def _settled_cast_pose(cast: str) -> str:
-    """The pose a beat's cast LANDS in — the last leg of its 'A, then B' motion line."""
-    legs = [leg.strip(" ,;") for leg in _CAST_SEQUENCE_RE.split(_text(cast)) if leg.strip(" ,;")]
-    return legs[-1] if legs else _text(cast)
+# ── 帧序列净帧策略（用户 2026-08-31 定）────────────────────────────────────
+# **活物一个都不进 IMAGE，人只活在 VIDEO 里。**
+#
+# 病根不是「锁得不够」，是锁不过参考图：帧序列走链式图生图（第 N 帧拿第 N-1 帧当参考），
+# 上一帧里那个人是**像素**，提示词里「换个姿势」是**文字**，两者打架文字必输。此前为此
+# 叠过四层文字修复（本模块的人物姿态句、_beat_block_text 的 CAST IN FRAME、
+# check_cast_in_frame、check_repetitive_cast_positioning），每一层都堵住了上一层的漏，
+# 但没一层动到这个前提，于是交付物长期是「背景一帧帧在变、人物贴图像素级重合」
+# （2026-08-25 run_replica_06edb 河畔观景室 IMG 011-015；2026-08-31 拖车小屋 IMG 004-016）。
+#
+# 静帧里根本没有人，就没有可抄的姿态。人改由 VIDEO 承担：每段视频里人从画外入画、干完
+# 活在最后一刻退出画外，所以每段的首尾锚点帧本来就该是空的——这跟净帧策略是同一件事的
+# 两半，别只关一半（只关 IMAGE 不改 VIDEO 的话，人会在视频里凭空出现）。
+#
+# 例外只有一个：requires_occupant 那一拍（「点亮全景、人物入住」），交付物就是那个人。
+# 它由 TRANSITION_OPERATIONS 从这条压缩里整个放行，不必在这里另开分支。
+#
+# 实现方式是**不写**，不是写「画面里没有人」：否定式人物句会触发扩散模型的粉色大象效应，
+# fix_image_clean_frame_proactive 专门在删这类句子。净帧靠字段缺席，不靠否定句。
+#
+# 下面这个名字是**声明，不是开关**：改成 False 不会恢复旧行为。它存在是为了让散落在
+# __init__ / observed_grounding / cast_lock / composers 里的相关注释有一个可 grep 的
+# 落点——这条策略横跨五个文件，谁改其中一处都得先看见其余四处。
+PERSON_FREE_IMAGE_FRAMES = True
 
 
 # 「他们不碰活儿」是**微缩线专有**的规则（composers/miniature.py 第 2 节："They watch;
@@ -420,51 +430,41 @@ def compile_delta_image_prompt(
     milestone = _text(beat.get("milestone_name"))
     after = _text(beat.get("after_state"))
     extent = _text(beat.get("completion_extent"))
-    cast = _settled_cast_pose(beat.get("cast_action"))
     traces = [_text(x) for x in (beat.get("persistent_traces") or []) if _text(x)][:3]
 
-    # 白名单里必须有 cast_action。2026-08-23 实测：这一步把 composer 写的正文整段丢掉、
-    # 只按下面这几个字段重拼，人偶的姿态句就是在这里消失的——21 张图里只有第 1 帧
-    # （不走这条压缩）写了人偶，其余每一帧只剩锚点句里那个钉死的坐姿。
+    # 白名单里**没有** cast_action，这是 2026-08-31 的策略（PERSON_FREE_IMAGE_FRAMES）。
+    # 这一步把 composer 写的正文整段丢掉、只按下面这几个字段重拼，所以「不进白名单」
+    # 就等于「这张静帧里不会有人」——净帧是靠字段缺席实现的，不靠否定句。
     #
     # 显示顺序固定；超长时按 drop_order 从后往前整句让位。让位次序是「谁重复得最多谁先走」：
     # completion_extent 与 after_state 讲的基本是同一件事，persistent_traces 是锦上添花，
-    # 继承句在锚点句之外再兜一层。机位/锚点/本拍增量/人偶姿态/收尾那句净帧声明永不退——
-    # 人偶姿态句正是 2026-08-23 那条「交付出来一动不动」的修复本体，退了等于没改；
+    # 继承句在锚点句之外再兜一层。机位/锚点/本拍增量/收尾那句净帧声明永不退——
     # 净帧那句带着防倒退约束，是 reward 帧倒退老账的兜底。
     blocks = {
         'preserve': f"Inherited state remains unchanged: {preserve}." if preserve else '',
         'delta': f"Only visible construction delta in this frame: {milestone}.",
-        # 「同一个人」与「同一个姿势」是两件事，这一句必须两边都写。只写前半句的后果
-        # 是确定的：2026-08-25 实测那条河畔片里，工人不是 primary_landmark，于是
-        # _canonical_anchor_clause 那句 "free to take a new pose and a new spot this frame"
-        # （活物锚点专有）根本没机会出现，整张提示词里关于人的指令只剩「同一身份、同样
-        # 穿着、同样大小」——纯粹的保持一致，配上上一帧当参考图，交付出来就是五帧同一张
-        # 人物贴图。放开姿态的配重不能只挂在锚点那条路上：画面里有活物就得给。
-        'cast': (f"Cast in frame: {cast} — same identity, costume and scale as before, but a "
-                 f"visibly different pose and position from the previous frame, never that "
-                 f"posture copied over"
-                 f"{', and never touching the work' if _cast_is_bystander(cast) else ''}."
-                 ) if cast else '',
+        # 2026-08-31 起这里不再拼人物句：帧序列一律净帧（PERSON_FREE_IMAGE_FRAMES）。
+        # 此前这一格写的是「同一身份、同样穿着，但换个姿势换个站位」——那是在跟参考图
+        # 掰手腕：链式图生图里上一帧的人是像素、"换个姿势"是文字，文字赢不了，交付出来
+        # 就是五帧同一张人物贴图。人现在只活在 VIDEO 里，从画外入画、干完出画（见
+        # __init__._beat_block_text 的 CAST IN FRAME 段），所以每段视频的首尾帧都无人可抄。
+        #
+        # 注意这里是**不写**，不是写「画面里没有人」：否定式的人物句会触发扩散模型的
+        # 粉色大象效应，fix_image_clean_frame_proactive 专门在删这种句子。
         'after': f"Completed terminal state: {after}." if after else '',
         'extent': f"Completion extent: {extent}." if extent else '',
         'traces': (f"Visible physical evidence remains: {', '.join(traces)}."
                    if traces else ''),
-        # 防倒退与净帧原本是分开的两句（共三十词）。人偶姿态句进白名单后 180 词的硬顶
-        # 塞不下，合并成一句省下七个词——两条约束一条不少，只是不再各占一句。
+        # 防倒退与净帧合成一句（省七个词）——两条约束一条不少，只是不再各占一句。
         # 「no active construction」这一条的本意是「别把下一阶段的施工画进来、别让在建
-        # 状态糊掉本帧要读的那个完成度」。但 cast 本身就在施工时（复刻线），它跟上面那句
-        # Cast in frame 是字面冲突的：一句要求画出这个人在磨焊缝，一句要求画面里没有施工。
-        # 模型只能二选一，而参考图就在手边——于是两句都不执行，人照抄上一帧。所以 cast
-        # 动手时把这一条收窄到「除上面那一个姿态之外」，本意一字不少，冲突消掉。
+        # 状态糊掉本帧要读的那个完成度」。2026-08-31 之前它还要跟同一段里的人物姿态句
+        # 打架（一句要求画这个人在磨焊缝、一句要求画面里没有施工），人物句撤掉之后
+        # 这条恢复成无条件的那一版。
         'guard': ("One clean documentary photograph: no unrelated work, no later-stage result, "
-                  "no regression of any previously completed feature, "
-                  + ("no active construction"
-                     if (not cast or _cast_is_bystander(cast))
-                     else "no construction activity beyond the single cast pose stated above")
-                  + ", no text artifacts."),
+                  "no regression of any previously completed feature, no active construction, "
+                  "no text artifacts."),
     }
-    order = ['preserve', 'delta', 'cast', 'after', 'extent', 'traces', 'guard']
+    order = ['preserve', 'delta', 'after', 'extent', 'traces', 'guard']
     drop_order = ['traces', 'extent', 'after', 'preserve']
 
     def _assemble():

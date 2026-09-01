@@ -333,7 +333,7 @@ Every object is `inherited in place`, `human-moved` (state the movement and dest
 
 ### Clean Frame Boundary
 
-IMAGE prompts must contain zero active workers and zero active machines. Workers, tools, vehicles, and temporary machines appear only inside VIDEO prompts. In construction VIDEO prompts the worker is already at the work face at zero seconds, acts immediately, and continues through the final shot; no entry or exit shot is used. Parked plant is not an active machine and may remain.
+IMAGE prompts are person-free stills: zero workers, zero residents, zero bystanders, zero hands, zero active machines — and no sentence saying nobody is present either, since a negative makes image models render people. Workers, tools, vehicles, and temporary machines appear only inside VIDEO prompts. Because both anchors are empty, each construction VIDEO opens on an empty frame, brings the worker in from off-frame immediately after the opening instant for the first effective tool contact without pausing, and takes the worker fully out of frame before the closing moment. The entry and the exit are each one quick move, never a stroll onto the set and never an idle tail. Parked plant is not an active machine and may remain.
 
 ### Worker Identity Lock
 

@@ -6,8 +6,6 @@ and that spatial migration is enforced from reverse to compose and linter/fixer.
 
 import unittest
 import prompt_pipeline as pp
-from prompt_pipeline.fast_reverse import _default_cast_action_for_stage
-from prompt_pipeline.fast_composer import build_fast_composer_system_prompt
 from prompt_pipeline.composers.miniature import MiniatureComposer
 
 
@@ -55,27 +53,6 @@ class DynamicSpatialMigrationTests(unittest.TestCase):
         # 修复后的提示词不能触发重复报警
         errors = pp.check_repetitive_cast_positioning(fixed)
         self.assertEqual(errors, [])
-
-    def test_fast_reverse_stage_based_cast_defaults(self):
-        """反推 fallback 必须按工序阶段提供具象化位置与动作。"""
-        demo = _default_cast_action_for_stage('demolition', 1, 17)
-        self.assertIn("blueprint", demo.lower())
-
-        struct = _default_cast_action_for_stage('structural', 5, 17)
-        self.assertIn("structural framework", struct.lower())
-
-        trans = _default_cast_action_for_stage('transition', 11, 17)
-        self.assertIn("threshold", trans.lower())
-
-        reveal = _default_cast_action_for_stage('reveal', 17, 17)
-        self.assertIn("celebrating", reveal.lower())
-
-    def test_fast_composer_system_prompt_mandates_spatial_migration(self):
-        """直通合成系统提示词必须显式包含全序列空间迁移律。"""
-        sys_prompt = build_fast_composer_system_prompt(is_miniature=True)
-        self.assertIn("DYNAMIC SPATIAL MIGRATION & ANTI-POSITION-LOCK PROTOCOL", sys_prompt)
-        self.assertIn("STRICTLY BAN REPETITIVE LOWER-LEFT STANDING", sys_prompt)
-        self.assertNotIn("Describe their precise physical location", sys_prompt)
 
     def test_ensure_living_cast_reaction_dynamic(self):
         """MiniatureComposer 注入动作必须根据当前 beat 动态变化。"""

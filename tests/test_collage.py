@@ -69,6 +69,35 @@ class TestBuildKeyframeCollage(unittest.TestCase):
         # 6 行 vs 5 行：不降采样的那张必须更高
         self.assertGreater(kept_h, sampled_h)
 
+    def test_incomplete_last_row_is_black_not_a_repeated_frame(self):
+        """排不满的最后一行必须是黑格，不能是复制的末帧。
+
+        这张拼图会当作「整条序列一览」喂给模型，
+        补出来的复制格会被读成「结尾停留了很久」，节拍梯上给结尾多分时长。21 张 5 列
+        正是线上撞到的那一档：真帧 21 张，第 22–25 格必须是黑的。
+        """
+        from PIL import Image
+        frames = [self._make_frame(f'p_{i:03d}.png', (200, 0, 0)) for i in range(21)]
+        output = Path(self.tmp) / 'padded_collage.jpg'
+        self.assertEqual(
+            build_keyframe_collage(frames, output, columns=5, max_frames=0, tile_width=120),
+            output)
+
+        margin, padding, cols, rows = 4, 4, 5, 5
+        with Image.open(output) as im:
+            im = im.convert('RGB')
+            tile_w = (im.width - 2 * margin - (cols - 1) * padding) / cols
+            tile_h = (im.height - 2 * margin - (rows - 1) * padding) / rows
+
+            def centre(index):
+                row, col = divmod(index, cols)
+                return (int(margin + col * (tile_w + padding) + tile_w / 2),
+                        int(margin + row * (tile_h + padding) + tile_h / 2))
+
+            self.assertGreater(im.getpixel(centre(20))[0], 150)   # 第 21 格是真的末帧
+            for k in range(21, 25):
+                self.assertLess(max(im.getpixel(centre(k))), 40, f'第 {k + 1} 格不是黑格')
+
     def test_max_frames_one_does_not_blow_up(self):
         """max_frames=1 曾经直接 ZeroDivisionError（step 要除以 max_frames-1）。"""
         frames = [self._make_frame(f'o_{i:03d}.png', (i % 255, 30, 40)) for i in range(10)]

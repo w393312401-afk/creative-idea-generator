@@ -802,8 +802,8 @@ Every VIDEO must follow this exact structure:
 **SCUP P0 Kill Gates** — targeted rewrite (see loop above) if any fires:
 - Structure errors (count, slot type, mixed protocol, shot family)
 - Camera DNA Block not copied literally across same-family IMAGEs
-- Any `IMAGE` contains active workers or machines (violates Clean Frame Boundary).
-- Any construction video featuring workers does not begin at t=0s with the worker already at the work face making effective tool contact, or contains worker entrance/exit choreography.
+- Any `IMAGE` contains a person (worker, resident, bystander, hand) or an active machine, or states that nobody is present (violates the person-free Clean Frame Boundary).
+- Any construction video featuring workers does not bring them in from off-frame after the opening instant for immediate effective tool contact, or does not take them fully out of frame before the final moment (violates Person-Free Anchors & Worker Entry/Exit).
 - Any video featuring loose/fluid materials fails to encapsulate them in rigid containers (violates Rigid Container Encapsulation RCE).
 - **Volume Conservation Gate (P0)**: container capacity, trip count, or spoil-pile growth must plausibly account for the volume removed or delivered in the beat. Clearing a room-scale debris field or cutting a passable opening into two hand crates fails; any cut-out solid piece that never receives an on-camera carry-out fails. A correctly scaled, visibly growing spoil pile satisfies encapsulation for material that is not transported out of frame.
 - Vague landmark or boundary locations that skip natural-language position + depth layer + Z-depth scale (internally tracked via `Grid A1-C3`, but the delivered prompt must state position/depth/scale in natural language — literal `Grid` tokens in the delivered text instead fail the No Banned Notations Gate below), or that fail to lock secondary drift-prone objects relatively using RPL.

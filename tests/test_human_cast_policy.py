@@ -272,49 +272,5 @@ class TestExplicitProfileBeatsTheFrozenVerdict(unittest.TestCase):
         self.assertEqual(msgs, [])
 
 
-class TestFastLaneAnnouncesWhatItCannotDo(unittest.TestCase):
-    """极速直通通道做不到的设置，必须当场说出口。
-
-    「提示词链路」选 Omni 多镜头组接，而极速通道只有两份系统提示词（微缩 / 真实尺度），
-    两份写的都是单镜头正文——多镜头切点语法只有深度通道按 active_skill_profile 分派
-    OmniComposer 才有。不说的话，用户看到的是"我明明选了多镜头"，而交付的每一条 VIDEO
-    都是一镜到底，且没有任何地方能看出为什么。
-    """
-
-    def _notes(self, config, is_miniature=False):
-        from prompt_pipeline.fast_composer import announce_fast_lane_limits
-        msgs = []
-        announce_fast_lane_limits(
-            config, is_miniature,
-            on_progress=lambda evt, data: msgs.append(data.get('message') or ''))
-        return msgs
-
-    def test_choosing_omni_on_the_fast_lane_is_announced(self):
-        for cfg in ({'skillProfile': 'omni'},
-                    {'skillProfile': 'auto', 'videoModel': 'Omni Flash'}):
-            with self.subTest(str(cfg)):
-                notes = self._notes(cfg)
-                self.assertTrue(notes, '选了 omni 却走极速通道必须出声')
-                joined = ' '.join(notes)
-                self.assertIn('单镜头', joined)
-                self.assertIn('深度合成', joined, '必须说清楚怎么才能拿到多镜头')
-
-    def test_a_veo_job_on_the_fast_lane_needs_no_warning(self):
-        """base 档要的就是单镜延时，极速通道产的正是它——没有落差就别制造噪音。"""
-        self.assertEqual(self._notes({'skillProfile': 'auto', 'videoModel': 'Veo 3.1'}), [])
-
-    def test_an_explicit_choice_gets_told_how_topic_and_grammar_differ(self):
-        """题材由原片证据定，链路只管视频语法。显式钉了链路却拿到微缩口径时，
-        要说清这两件事不是一回事，而不是让人以为设置被无视了。"""
-        notes = self._notes({'skillProfile': 'base', 'videoModel': 'Veo 3.1'}, is_miniature=True)
-        self.assertTrue(notes)
-        self.assertIn('微缩', ' '.join(notes))
-
-    def test_auto_never_produces_the_topic_note(self):
-        """没显式表过态就不该收到"你选的和实际不同"这类话——他没选过。"""
-        notes = self._notes({'skillProfile': 'auto', 'videoModel': 'Veo 3.1'}, is_miniature=True)
-        self.assertEqual(notes, [])
-
-
 if __name__ == '__main__':
     unittest.main()

@@ -682,10 +682,6 @@ def ingest_video(file_bytes, filename, config=None):
         'cost_estimate': None,
         'sampling': None,        # 抽帧密度，run_extract 定下来（EXTRACT_FPS_CHOICES）
         'review_scope': None,    # 送审档位，run_reverse 定下来（reverse.REVIEW_SCOPES）
-        'reverse_mode': None,    # 'fast' 极速直读 / 'deep' 标准 Pass A+B，run_reverse 定下来
-        'reverse_fallback': None,  # 极速通道失败自动降级时的原因，正常为 None
-        'compose_mode': None,    # 'fast' 极速直通 / 'deep' 标准 Phase 1+2，run_compose 定下来
-        'compose_fallback': None,  # 同上，合成侧的降级原因
         'degraded': False,
         'facts': None,
         'beats': None,
@@ -1021,50 +1017,6 @@ def run_reverse(state, config, on_progress=None, degraded=False, scope=None):
     state['review_scope'] = scope
     state['degraded'] = scope == 'degraded'
     _save_state(state)
-
-    # 走极速原生反推还是标准 Pass A+B，只由配置决定（reverseMode='deep' / deepReverse）。
-    # 这里曾经还夹了一条 isinstance(..., MagicMock) 的"测试替身探测"来强制走标准链路——
-    # 生产代码按"我是不是正在被 mock"改行为，等于两条链路各自的真实覆盖都说不清；
-    # 要测哪条就在配置里明说哪条。
-    use_deep = bool((config or {}).get('reverseMode') == 'deep' or (config or {}).get('deepReverse'))
-
-    # 走了哪条通道要留在状态里：两条链路的节拍精度差着一档，回到卡点上（或者过几天再打开
-    # 这条任务）得能看出手里这份阶梯是直读出来的还是逐帧读出来的，否则「细节不对」根本
-    # 无从判断该重跑还是该手改。降级也记一笔，理由同上——静默降级最难查。
-    state['reverse_mode'] = 'deep' if use_deep else 'fast'
-    state['reverse_fallback'] = None
-    _save_state(state)
-
-    if not use_deep:
-        try:
-            from prompt_pipeline.fast_reverse import fast_video_native_reverse
-            state['stage'] = 'review_frames'
-            _save_state(state)
-            beats = fast_video_native_reverse(config, directory, on_progress=on_progress)
-            beats['pipeline_id'] = state['job_id']
-            _write_beats(state, beats)
-            # 极速链路的 beats 是模型直出的，自带不了 Pass B 的 validation 字段。不当场
-            # 重跑一遍确定性校验，人工卡点上永远显示"0 项硬伤"，run_compose 的
-            # validation error 闸也就空转——这条线唯一拦得住幻觉的两道闸会一起失灵。
-            _revalidate(state, persist=False)
-            state['stage'] = 'review_beats'
-            _save_state(state)
-            if on_progress:
-                errors = [v for v in (state.get('validation') or []) if v.get('level') == 'error']
-                on_progress('replica_stage', {
-                    'stage': 'review_beats',
-                    'message': (f'节拍阶梯已生成：{len(beats.get("beats") or [])} 拍，'
-                                f'{len(errors)} 项硬伤待处理。请对着证据帧核对后再合成提示词。'),
-                    'beats': beats,
-                    'validation': state.get('validation') or [],
-                })
-            return state
-        except Exception as e:
-            if sys.stdout:
-                print(f"[REPLICA] 极速原生反推异常，平滑降级至标准 Pass A+B 链路: {e}")
-            state['reverse_mode'] = 'deep'
-            state['reverse_fallback'] = str(e)[:200]
-            _save_state(state)
 
     facts = reverse.extract_frame_facts(config, directory, on_progress=on_progress,
                                         scope=scope)
@@ -1479,9 +1431,6 @@ def run_mutate(state, config, axis_spec, on_progress=None):
         'sampling': state.get('sampling'),
         'review_scope': state.get('review_scope'),
         'degraded': state.get('degraded'),
-        # 变体的节拍是从这份阶梯派生的，通道出身跟着一起带走：不带的话变体页上
-        # 「这份阶梯多准」就查不到出处了。
-        'reverse_mode': state.get('reverse_mode'),
         'facts': state.get('facts'),
         'beats': None,
         'validation': [],
@@ -1666,9 +1615,6 @@ def mutate_orthogonal(config, baseline_job_id, mutation_axes=None, preset=None, 
         'sampling': state.get('sampling'),
         'review_scope': state.get('review_scope'),
         'degraded': state.get('degraded'),
-        # 变体的节拍是从这份阶梯派生的，通道出身跟着一起带走：不带的话变体页上
-        # 「这份阶梯多准」就查不到出处了。
-        'reverse_mode': state.get('reverse_mode'),
         'facts': state.get('facts'),
         'beats': None,
         'validation': [],
@@ -1850,7 +1796,14 @@ def _enforce_cast_scale(state, compose_state, beats, on_progress=None):
     2026-08-30 实测（replica_cf9a445bc52b）：九帧 IMAGE 里跟人偶比例有关的句子一句都没有，
     packet 里连 `cast_scale` 这个键都不存在，而整套比例机制（worker_scale_percent）又是
     VIDEO 单边的——用户看到的 IMG 006 人偶压过整个地基，就是这么来的。
+
+    `reverse` 必须在这里显式导入：本文件是逐函数局部 import 它的，而这个函数曾是全仓
+    唯一漏掉那一行的——`name 'reverse' is not defined` 被下面自己的 except 吞成一句软退，
+    比例锁于是一次都没真正执行过（2026-08-31 日志实证）。软退分支存在的意义是「量不出
+    比例就别硬锁」，不是替代导入错误的兜底。
     """
+    from prompt_pipeline import reverse
+
     block = state.get('prompt_block')
     packet = (compose_state or {}).get('packet') or {}
     if not block:
@@ -1858,9 +1811,8 @@ def _enforce_cast_scale(state, compose_state, beats, on_progress=None):
     try:
         from prompt_pipeline.observed_grounding import (
             enforce_cast_scale_lock, measure_cast_scale)
-        # 极速线的 packet 由 synthesize_drift_lock_packet 就地量好；深度线的 packet 是
-        # 模型产的，schema 里没有这个键。在这里统一补齐——不补的话又是「一条线有锁、
-        # 另一条没有」，也就是 2026-08-30 连查两个坑的同一个病根。
+        # packet 是模型产的，schema 里没有 cast_scale 这个键。在这里按原片量出来补齐——
+        # 不补的话比例锁没有权威数可用，`enforce_cast_scale_lock` 只能空转。
         if not packet.get('cast_scale') and not reverse.is_variant_doc(beats):
             measured = measure_cast_scale(
                 beats, job_dir(state['job_id']),
@@ -2133,18 +2085,9 @@ def run_compose(state, config, dimensions=None, on_progress=None, reset_cache=Fa
         except Exception:
             pass
 
-    # 与 run_reverse 同一口径：极速直通 / 标准合成只由配置决定，不探测测试替身。
-    use_deep = bool((config or {}).get('composeMode') == 'deep' or (config or {}).get('deepCompose'))
-
-    # 与反推通道同一条纪律：走了哪条要留痕。这两条通道产出的 packet 完全不是一回事
-    # （极速那条是写死的常量），而 prompt_block 上看不出区别——渲染出来空间漂移时，
-    # 没有这一笔就查不到是通道的问题。
-    state['compose_mode'] = 'deep' if use_deep else 'fast'
-    state['compose_fallback'] = None
-
     # 前置那道（见 prompt_pipeline.observed_grounding）：把反推阶段逐帧读到的画面记录压成
-    # 逐槽位的「原片实拍事实卡」。算一次，两条链路共用——快线通过 state 拿整份、深线通过
-    # config 拿逐拍那份。这一步零模型调用，纯读盘。
+    # 逐槽位的「原片实拍事实卡」。挂在 config 上，合成器按拍取用。
+    # 这一步零模型调用，纯读盘。
     #
     # 二创不做：拿原片画面去校一份「换成废弃巴士」的提示词，等于把新载体又拧回旧载体，
     # 和 scene_constants / banned_elements 不继承是同一条理由。
@@ -2177,26 +2120,6 @@ def run_compose(state, config, dimensions=None, on_progress=None, reset_cache=Fa
         observed_digests = {}
         if sys.stdout:
             print('[REPLICA] ⚠️ 没有可用的逐帧读数，本单合成不带原片画面依据（提示词仅凭拍表文字）')
-
-    if not use_deep:
-        try:
-            from prompt_pipeline.fast_composer import compose_replica_one_pass
-            prompt_block, compose_state = compose_replica_one_pass(config, state, on_progress=on_progress)
-            if not state.get('title_locked') or not state.get('title'):
-                state['title'] = compose_state.get('title')
-            state['prompt_block'] = prompt_block
-            _ground_prompt_block_on_footage(
-                config, state, beats, observed_digests, on_progress=on_progress)
-            _enforce_cast_scale(state, compose_state, beats, on_progress=on_progress)
-            _enforce_human_cast(state, beats, config=config, on_progress=on_progress)
-            _write_compose_state(state, compose_state)
-            _save_state(state)
-            return run_audit(state, on_progress=on_progress)
-        except Exception as e:
-            if sys.stdout:
-                print(f"[REPLICA] 极速合成通道异常，平滑降级至标准合成链路: {e}")
-            state['compose_mode'] = 'deep'
-            state['compose_fallback'] = str(e)[:200]
 
     try:
         try:

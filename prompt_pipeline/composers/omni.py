@@ -931,11 +931,11 @@ class OmniComposer(BaseComposer):
 
     def ensure_actor_engagement(self, video_prompt, ladder, packet=None, beat=None,
                                 is_threshold_or_reveal=False):
-        """确保正文里的施工主体从零秒起就在作业面上（并清掉进出场措辞）。
+        """确保正文里的施工主体从画外入画、干完出画（首尾锚点帧一律无人）。
 
         默认是 omni 的实景工人口径。世界观不同的子 profile（微缩线的施工主体是从画幅
-        边缘伸入的巨人手，进出画本身就是契约要求）必须覆写这一处，否则会被塞进一句
-        "the same lone worker is already positioned at the active work face"。"""
+        边缘伸入的巨人手，本来就自带进出画）必须覆写这一处，否则会被塞进一句写实工人的
+        入画/出画措辞。"""
         return ensure_ladder_out_and_in(
             video_prompt, ladder, packet=packet, beat=beat,
             is_threshold_or_reveal=is_threshold_or_reveal)
@@ -1196,7 +1196,7 @@ Rewrite rules (additive — do not lose content):
 - Restructure the body into exactly {len(ladder)} shots IN THIS ORDER, naming each one in prose exactly as written here: {scales}. Join them with clean cuts or match cuts.
 - This is NOT a shot-scale rotation. Do not write "establishing long shot", "full shot", "medium shot", or "wide outro shot" anywhere — those names belong to the retired grammar and count as a contract violation.
 - The first and the last shot are the SAME camera setup, framing, and focal length, differing only in how far the work has progressed; say so explicitly in the last shot ("the same camera setup as the opening wide working shot"). The insert(s) cut into that setup and cut back at the same completion level.
-- The worker is already at the active work face in the opening wide working shot and makes the first effective tool contact from the opening instant; that shot carries this beat's whole visible advance up to roughly three quarters; the insert(s) carry tool contact, material physics, and the persistent traces without advancing the state; the returning wide shot compresses the remaining repetitions the same way and reaches the beat's resulting state while visible work continues. Never show or describe a worker entrance or exit.
+- Both anchor frames are person-free stills, so the opening wide working shot starts empty and the worker ENTERS FROM OFF-FRAME immediately after the opening instant, straight to the active work face, making the first effective tool contact without pausing; that shot carries this beat's whole visible advance up to roughly three quarters; the insert(s) carry tool contact, material physics, and the persistent traces without advancing the state; the returning wide shot compresses the remaining repetitions the same way and reaches the beat's resulting state, and the worker STEPS FULLY OUT OF FRAME before its last moment so the closing frame is empty of people again. The entry and the exit are each one quick move — never a stroll onto the set and never a lingering tail.
 - Preserve the visible stage-milestone skeleton VERBATIM in meaning: the declared visible start state, the declared resulting state, both declared progress lines (primary and secondary material/stock), the first effective tool contact at the opening moment, the material source/container and the movement path, and repeated work cycles. Use the words "repeated"/"repeatedly"/"cycle by cycle"/"course by course" literally — "repetitions" alone does not read as repeated cycles.
 - All numbers and counts must be written in English words. Never include arabic digits.
 - NEVER write oner, one-shot, one-take, single continuous take, one continuous take, single take, or unbroken take — there is no exemption.
@@ -1263,25 +1263,28 @@ def ensure_ladder_out_and_in(video_prompt, ladder, packet=None, beat=None,
         return text
     if not any(re.search(rf'\b{w}s?\b', low) for w in ('worker', 'crew', 'person', 'builder', 'laborer')):
         return text
-    agent = r'(?:the\s+)?(?:same\s+)?(?:one\s+lone\s+)?(?:workers?|crew|persons?|builders?|laborers?)'
+    # 净帧策略（frame_state.PERSON_FREE_IMAGE_FRAMES）之后这里整个翻了向：首尾锚点帧
+    # 都是空的，所以要洗掉的是「开场就已经在作业面上」这类**旧策略**句子，进出画的句子
+    # 一律留着。理由见 pp.fix_out_and_in 的策略注释。
+    agent = pp._WORKER_AGENT_RE_SRC
     text = re.sub(
-        rf'(?i)\b(?:in\s+the\s+(?:opening|wide\s+working|returning\s+wide)\s+shot|at\s+(?:zero\s+seconds?|the\s+(?:start|beginning)))[,;:]?\s*'
-        rf'{agent}[^.;]*?\b(?:enters?|walks?\s+in|steps?\s+in)(?:[^.;]*[.;])?', '', text)
-    text = re.sub(
-        rf'(?i)(?:,?\s*(?:and|then)?\s*)?{agent}[^.;]*?\b(?:exits?|walks?\s+out|steps?\s+out|leaves?\s+the\s+(?:frame|scene))(?:[^.;]*[.;])?',
-        '', text)
+        rf'(?i)(?:^|(?<=[.;]))\s*(?:in\s+the\s+(?:opening|wide\s+working|returning\s+wide)\s+shot|'
+        rf'at\s+(?:zero\s+seconds?|t\s*=\s*0s?|the\s+(?:start|beginning)))[,;:]?\s*'
+        rf'{agent}[^.;]*?\b(?:already\s+(?:at|positioned|in\s+place))\b[^.;]*[.;]', ' ', text)
     text = re.sub(r'\s{2,}', ' ', text).strip()
-    low = text.lower()
-    if ('zero seconds' in low or 't=0' in low or 'opening frame' in low or 'opening instant' in low) and any(
-            p in low for p in ('already at', 'already positioned', 'first effective tool contact')):
+    has_entry = bool(re.search(rf'(?i){agent}[^.;]*?{pp._WORKER_ENTRY_RE_SRC}', text))
+    has_exit = bool(re.search(rf'(?i)(?:{agent}|they|he|she)[^.;]*?{pp._WORKER_EXIT_RE_SRC}', text))
+    if has_entry and has_exit:
         return text
     costume = pp._worker_costume_from_packet(packet)
     if text and not text.rstrip().endswith(('.', '!', '?')):
         text = text.rstrip() + '.'
     clause = (
-        f" In the opening frame the same lone worker{costume} is already positioned at the active "
-        "work face and makes the first effective tool contact immediately; every following shot "
-        "continues that visible operation through the last shot of the clip."
+        f" The opening frame is empty of people; immediately after that opening instant the same "
+        f"lone worker{costume} enters from off-frame straight to the active work face and makes the "
+        "first effective tool contact without pausing; every following shot continues that visible "
+        "operation, and the worker steps fully out of frame in the last shot so the closing frame "
+        "is empty of people again."
     )
     return (text.rstrip() + clause).strip()
 

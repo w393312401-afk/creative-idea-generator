@@ -50,8 +50,14 @@ def test_beat_block_text_distinguishes_working_vs_bystander_cast():
         'anchor_rule': 'static',
     }
     block_working = pp._beat_block_text(1, working_contract)
-    assert 'They actively execute the physical work cycle without freezing' in block_working
-    assert 'They watch, never touch the work' not in block_working
+    assert 'They actively execute the physical work cycle without ever freezing' in block_working
+    assert 'They watch the work without ever touching it' not in block_working
+    # 净帧策略（2026-08-31）：IMAGE 不写人，VIDEO 里人从画外入画、干完出画。
+    # 「never leave the frame」是旧策略的措辞，现在正好相反——它必须消失。
+    assert 'never leave the frame' not in block_working
+    assert 'PERSON-FREE still' in block_working
+    assert 'ENTER FROM OFF-FRAME' in block_working
+    assert 'STEP FULLY OUT OF FRAME' in block_working
 
     bystander_contract = {
         'beat': {
@@ -67,8 +73,9 @@ def test_beat_block_text_distinguishes_working_vs_bystander_cast():
         'anchor_rule': 'static',
     }
     block_bystander = pp._beat_block_text(2, bystander_contract)
-    assert 'They watch, never touch the work' in block_bystander
+    assert 'They watch the work without ever touching it' in block_bystander
     assert 'They actively execute the physical work cycle' not in block_bystander
+    assert 'never leave the frame' not in block_bystander
 
 def test_video_optimizer_system_prompt_includes_worker_continuous_pose_transition():
     from unittest.mock import patch

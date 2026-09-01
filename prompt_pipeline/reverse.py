@@ -2406,7 +2406,7 @@ def analyze_scene_constants(facts, min_ratio=SCENE_CONSTANT_RATIO,
 # 交付正文里 39 处 miniature、33 处 giant hands、8 处 diorama，施工者成了"拇指高的
 # miniature builder"，用户看到的还是一屋子假人。唯一的触发证据是识别项里的一个词：
 #   "Caucasian male builder/craftsman in his 30s…"
-# —— fast_composer 的旧判据把 'craftsman' 当成"巨手工匠"的证据。可 craftsman 就是
+# —— 当年的旧判据把 'craftsman' 当成"巨手工匠"的证据。可 craftsman 就是
 # 「手艺人/工匠」，真人施工片里最常见的自称之一。一个中性职业词把整条通道拨到了另一
 # 个题材上，而且全程没有任何提示。
 #

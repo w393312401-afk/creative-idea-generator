@@ -295,15 +295,20 @@ class TestNegativeExampleIsCaught(unittest.TestCase):
 
     def test_out_and_in_no_double_entry_and_clean_grammar(self):
         from prompt_pipeline import fix_out_and_in, check_out_and_in
-        # 旧断点里的进出场措辞会被清掉，并改成 0 秒已经在工位直接开工。
+        # 净帧策略：写手自己写的进出画一律留着，不再补第二句（幂等）。
         body = ("A worker in a yellow vest enters, builds a timber frame, and exits. "
                 "Nails and conduits remain.")
         migrated = fix_out_and_in(body, False, beat=None, packet=None)
-        self.assertNotRegex(migrated.lower(), r'\b(?:enters?|exits?|walks out|leaves the frame)\b')
-        self.assertIn('At t=0s', migrated)
-        self.assertIn('already positioned at the active work face', migrated)
-        self.assertIn('first effective tool contact immediately', migrated)
-        self.assertEqual(check_out_and_in(migrated), [])
+        self.assertEqual(migrated, body, '已经写全进出画的正文不该被再追加一句')
+        # 旧策略那句「0 秒已在工位」跟空的首帧锚点冲突，要被洗掉并换成入画/出画。
+        legacy = ("At t=0s, one lone worker is already positioned at the active work face. "
+                  "The worker hammers beams into place.")
+        rewritten = fix_out_and_in(legacy, False, beat=None, packet=None)
+        self.assertNotIn('already positioned at the active work face', rewritten)
+        self.assertIn('enters from off-frame', rewritten)
+        self.assertIn('steps fully out of frame', rewritten)
+        self.assertEqual(check_out_and_in(rewritten), [])
+        self.assertEqual(fix_out_and_in(rewritten, False, beat=None, packet=None), rewritten)
         # 被动语态的拍描述不能拼进 'cycles of'（实测单曾产出破碎语法+双逗号）
         beat = {'operation': 'framing', 'description':
                 'An independent internal timber framing structure and floor platform are erected inside the cavity.'}
@@ -317,16 +322,23 @@ class TestNegativeExampleIsCaught(unittest.TestCase):
         # 服装截断落在词边界，不再出现 "solid dark enters"
         self.assertNotIn('solid dark enters', out)
 
-    def test_worker_boundary_choreography_is_rejected(self):
+    def test_worker_boundary_choreography_is_required(self):
+        """这条判据 2026-08-31 整个翻了向：首尾锚点帧都是空的，进出画是唯一正确的写法。"""
         from prompt_pipeline import check_out_and_in
-        old = ('At t=0s, one lone worker enters the frame, hammers the wall, and exits '
-               'before the final frame.')
-        self.assertTrue(any('entrance or exit' in e for e in check_out_and_in(old)))
-        direct = ('At t=0s, one lone worker is already positioned at the active work face and '
+        boundary = ('The opening frame is empty of people; one lone worker enters the frame, '
+                    'makes the first effective tool contact immediately, hammers the wall, and '
+                    'exits before the final frame.')
+        self.assertEqual(check_out_and_in(boundary), [])
+        # 旧策略那句现在要被判：它跟空的首帧锚点冲突。
+        legacy = ('At t=0s, one lone worker is already positioned at the active work face and '
                   'makes the first effective tool contact immediately, continuing through the final frame.')
-        self.assertEqual(check_out_and_in(direct), [])
-        material_flow = direct + ' Rubble exits through a rigid chute into a skip outside.'
-        self.assertEqual(check_out_and_in(material_flow), [])
+        errs = check_out_and_in(legacy)
+        self.assertTrue(any('enter from off-frame' in e for e in errs), errs)
+        self.assertTrue(any('step fully out of frame' in e for e in errs), errs)
+        # 材料进出画从来不是人物进出画，不能拿它顶替。
+        material_only = ('At t=0s, one lone worker is already positioned at the active work face. '
+                         'Rubble exits through a rigid chute into a skip outside.')
+        self.assertTrue(check_out_and_in(material_only))
 
     def test_out_and_in_injects_locked_worker_scale(self):
         from prompt_pipeline import fix_out_and_in

@@ -99,14 +99,17 @@ def build_keyframe_collage(
             indices = sorted(list(dict.fromkeys(indices)))
             paths = [paths[i] for i in indices]
 
+    # 最后一行排不满不补帧：ffmpeg 的 tile 滤镜在输入结束时会自己把剩下的格子填成
+    # `color=` 指定的黑色。这里曾经 `padded.append(padded[-1])` 补末帧——21 张 5 列
+    # 就会渲染出 4 格一模一样的成品图，而这张拼图是要喂给模型当「整条序列一览」的
+    # 复制格会被读成「结尾停留了很久」，
+    # 节拍梯上给结尾多分时长。Pass B 的分页拼图同理：多出来的重复格与
+    # `_sheet_layout_block` 声明的条数对不上。
     rows = math.ceil(len(paths) / columns)
-    padded = list(paths)
-    while len(padded) < rows * columns:
-        padded.append(padded[-1])
 
     concat_list_path = out.parent / f".tmp_concat_{out.stem}.txt"
     try:
-        lines = [f"file '{str(p.resolve()).replace('\'', '\'\\\'\'')}'\n" for p in padded]
+        lines = [f"file '{str(p.resolve()).replace('\'', '\'\\\'\'')}'\n" for p in paths]
         concat_list_path.write_text("".join(lines), encoding="utf-8")
 
         scale_w = max(120, tile_width)

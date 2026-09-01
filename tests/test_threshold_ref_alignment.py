@@ -12,6 +12,7 @@
   3. 结构性缺口 —— 过门梯那几帧原片根本没拍过（test_threshold_slots_get_envelope_role）。
 """
 
+import inspect
 import json
 import os
 import shutil
@@ -270,6 +271,228 @@ class TestRefMappingEndToEnd(unittest.TestCase):
         self._write_ladder([{'source_beat_index': n} for n in range(1, 9)])
         refs, _roles, _ = pp.find_reference_frames_with_roles(self.tmp, total_beats=8)
         self.assertEqual(sorted(refs), [1, 2, 3, 4, 5])
+
+
+class TestFreeVocabularySpaceFamily(unittest.TestCase):
+    """E：`space` 是自由词表，不是 'exterior' 这种枚举值。
+
+    2026-08-31 复盘（Tiny House 拖车单）：真实单的 space 写的是 'outdoor trailer yard'
+    / 'woodland clearing'，旧判据只做全等匹配，于是每一条外景拍都被判成 interior，
+    外景那半条序列一格基准帧都挂不上。本类的 fixture 一律用自由词表原文——用
+    'exterior' 当 fixture 正是当初漏掉这个洞的原因。"""
+
+    def test_free_text_exterior_is_not_misread_as_interior(self):
+        for space in ('outdoor trailer yard', 'woodland clearing', 'front yard'):
+            self.assertEqual(pp._source_space_family({'space': space}), 'exterior', space)
+
+    def test_free_text_interior_stays_interior(self):
+        for space in ('main living studio', 'ensuite bathroom', 'cottage interior'):
+            self.assertEqual(pp._source_space_family({'space': space}), 'interior', space)
+
+    def test_ladder_map_outranks_the_word_fallback(self):
+        # 交付梯自己说了算：词根兜底认不出的空间层，映射表也能判对。
+        ladder = [{'observed_space': 'the flats behind the barn',
+                   'result_space_family': 'exterior'}]
+        fmap = pp._space_family_map_from_ladder(ladder)
+        self.assertEqual(pp._source_space_family({'space': 'the flats behind the barn'}, fmap),
+                         'exterior')
+        # 没有映射表时它落到兜底，判成室内——正是要靠梯子救回来的那一档。
+        self.assertEqual(pp._source_space_family({'space': 'the flats behind the barn'}),
+                         'interior')
+
+    def test_synthetic_beats_never_enter_the_map(self):
+        # 插出来的拍没有原片对应 space，混进映射表会把真实拍的空间层带偏。
+        ladder = [{'observed_space': 'main living studio', 'result_space_family': 'exterior',
+                   'synthetic_beat': 'camera_reframe'}]
+        self.assertEqual(pp._space_family_map_from_ladder(ladder), {})
+
+    def test_crossing_boundary_found_on_free_text_beats(self):
+        beats = [{'space': 'outdoor trailer yard'}, {'space': 'outdoor trailer yard'},
+                 {'space': 'main living studio'}]
+        self.assertEqual(pp._source_crossing_boundary(beats), (2, 3))
+
+
+class TestSourceBeatAnchorStamping(unittest.TestCase):
+    """F：一比一梯子的原片拍序锚点。
+
+    2026-08-31 复盘：锚点原先只在 expand_spatial_transition_beats 里打，而一比一分支
+    根本不走那个函数——复刻线交付的每一条梯子 source_beat_index 全是缺席，挂帧一路退到
+    位置映射，「交付第 k 拍 == 原片第 k 拍」从此没有任何东西守着。"""
+
+    def test_stamps_from_outline_refs_first(self):
+        ladder = [{'outline_refs': [3]}, {'outline_refs': [4]}]
+        self.assertEqual(pp.stamp_source_beat_anchors(ladder), 2)
+        self.assertEqual([b['source_beat_index'] for b in ladder], [3, 4])
+
+    def test_falls_back_to_position_without_outline_refs(self):
+        ladder = [{}, {}, {}]
+        pp.stamp_source_beat_anchors(ladder)
+        self.assertEqual([b['source_beat_index'] for b in ladder], [1, 2, 3])
+
+    def test_never_overwrites_an_existing_anchor(self):
+        ladder = [{'source_beat_index': 9, 'outline_refs': [1]}]
+        pp.stamp_source_beat_anchors(ladder)
+        self.assertEqual(ladder[0]['source_beat_index'], 9)
+
+    def test_synthetic_beats_keep_their_empty_anchor(self):
+        # 空着是一句声明（「原片没拍过这一格」），补上位置号等于把声明改成谎话。
+        ladder = [{'synthetic_beat': 'threshold_ladder', 'source_beat_index': None}]
+        pp.stamp_source_beat_anchors(ladder)
+        self.assertIsNone(ladder[0]['source_beat_index'])
+
+
+class TestEstablishingWideRef(unittest.TestCase):
+    """G：自动找全景帧。
+
+    对标帧要核对的是机位、构图留白、空间骨架与道具尺度——这四件事只有全景说得清。
+    窗内有全景就选窗内最靠后的那张（状态仍是本拍的交付态）；整拍都是特写时退到同空间
+    最近的一张全景，角色降级成 establishing（它不是本拍的时刻）。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.rf = os.path.join(self.tmp, 'review_frames')
+        os.makedirs(self.rf)
+        for n in range(1, 60):
+            with open(os.path.join(self.rf, 'review_%03d.png' % n), 'wb') as f:
+                f.write(b'x')
+        # 第 1 拍有全景，第 2 拍全程特写，第 3 拍在另一个空间且有全景。
+        self.beats = [
+            {'index': 1, 'space': 'outdoor trailer yard', 'start': 0.0, 'end': 5.0,
+             'coverage_frames': [{'frame': 'review_001.png', 'timestamp': 1.0},
+                                 {'frame': 'review_002.png', 'timestamp': 3.0},
+                                 {'frame': 'review_003.png', 'timestamp': 4.5}]},
+            {'index': 2, 'space': 'outdoor trailer yard', 'start': 5.0, 'end': 10.0,
+             'coverage_frames': [{'frame': 'review_010.png', 'timestamp': 6.0},
+                                 {'frame': 'review_011.png', 'timestamp': 9.0}]},
+            {'index': 3, 'space': 'main living studio', 'start': 10.0, 'end': 15.0,
+             'coverage_frames': [{'frame': 'review_020.png', 'timestamp': 11.0},
+                                 {'frame': 'review_021.png', 'timestamp': 14.0}]},
+        ]
+        self.facts = {
+            'review_001.png': {'shot_scale': 'wide'},
+            'review_002.png': {'shot_scale': 'wide'},
+            'review_003.png': {'shot_scale': 'medium'},
+            'review_010.png': {'shot_scale': 'close'},
+            'review_011.png': {'shot_scale': 'close'},
+            'review_020.png': {'shot_scale': 'wide'},
+            'review_021.png': {'shot_scale': 'wide'},
+        }
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_window_pick_prefers_the_last_wide_frame(self):
+        # 窗尾那张是中景，但全景优先：取窗内最靠后的一张全景。
+        picked = pp._select_beat_ref_frame(self.beats[0], self.beats[1], self.rf, self.facts,
+                                           want_family='exterior')
+        self.assertEqual(os.path.basename(picked), 'review_002.png')
+
+    def test_cut_avoidance_still_outranks_the_wide_preference(self):
+        # 压在切点上的全景空间语义会跳变：宁可要一张不贴切点的中景。
+        beat = dict(self.beats[0], observed_cuts=[1.0, 3.0])
+        picked = pp._select_beat_ref_frame(beat, self.beats[1], self.rf, self.facts,
+                                           want_family='exterior')
+        self.assertEqual(os.path.basename(picked), 'review_003.png')
+
+    def test_tight_target_still_gets_a_tight_ref(self):
+        picked = pp._select_beat_ref_frame(self.beats[1], self.beats[2], self.rf, self.facts,
+                                           want_family='exterior', want_tight=True)
+        self.assertEqual(os.path.basename(picked), 'review_011.png')
+
+    def test_establishing_search_stays_inside_the_same_space(self):
+        # 第 2 拍全程特写，同空间最近的一张全景是第 1 拍的 review_002；
+        # 第 3 拍的全景在另一个空间，绝不许借。
+        picked = pp._nearest_establishing_frame(self.beats, 2, self.rf, self.facts)
+        self.assertEqual(os.path.basename(picked), 'review_002.png')
+
+    def test_establishing_prefers_looking_backwards(self):
+        # 往后找会拿到一张施工更完整的画面，写手照着它会把还没做的工序提前画出来。
+        beats = list(self.beats)
+        beats[2] = dict(beats[2], space='outdoor trailer yard')  # 同空间，但在本拍之后
+        picked = pp._nearest_establishing_frame(beats, 2, self.rf, self.facts)
+        self.assertEqual(os.path.basename(picked), 'review_002.png')
+
+    def test_no_wide_anywhere_in_the_space_returns_nothing(self):
+        facts = {k: {'shot_scale': 'close'} for k in self.facts}
+        self.assertIsNone(pp._nearest_establishing_frame(self.beats, 2, self.rf, facts))
+
+    def test_all_close_beat_gets_an_establishing_role_end_to_end(self):
+        with open(os.path.join(self.tmp, 'timelapse_beats.json'), 'w', encoding='utf-8') as f:
+            json.dump({'beats': self.beats}, f)
+        with open(os.path.join(self.tmp, 'frame_facts.json'), 'w', encoding='utf-8') as f:
+            json.dump({'facts': [dict(v, frame=k) for k, v in self.facts.items()]}, f)
+        with open(os.path.join(self.tmp, 'compose_state.json'), 'w', encoding='utf-8') as f:
+            json.dump({'beat_ladder': [
+                {'source_beat_index': 1, 'result_space_family': 'exterior',
+                 'observed_space': 'outdoor trailer yard'},
+                {'source_beat_index': 2, 'result_space_family': 'exterior',
+                 'observed_space': 'outdoor trailer yard'},
+                {'source_beat_index': 3, 'result_space_family': 'interior',
+                 'observed_space': 'main living studio'},
+            ]}, f)
+        refs, roles, _ = pp.find_reference_frames_with_roles(self.tmp, total_beats=3)
+        base = {k: os.path.basename(v) for k, v in refs.items()}
+        # IMG 2 = 交付第 1 拍：窗内有全景，照常 benchmark。
+        self.assertEqual(base[2], 'review_002.png')
+        self.assertEqual(roles[2], 'benchmark')
+        # IMG 3 = 交付第 2 拍：整拍特写、而原片这一拍没声明自己是特写 → 同空间全景退档。
+        self.assertEqual(base[3], 'review_002.png')
+        self.assertEqual(roles[3], 'establishing')
+
+    def test_source_beat_declared_tight_keeps_the_close_benchmark(self):
+        # 原片这一拍本身就是特写：它的交付态就是一只手的距离，不该被换成全景。
+        beats = [dict(b) for b in self.beats]
+        beats[1]['shot_scale'] = 'close'
+        with open(os.path.join(self.tmp, 'timelapse_beats.json'), 'w', encoding='utf-8') as f:
+            json.dump({'beats': beats}, f)
+        with open(os.path.join(self.tmp, 'frame_facts.json'), 'w', encoding='utf-8') as f:
+            json.dump({'facts': [dict(v, frame=k) for k, v in self.facts.items()]}, f)
+        with open(os.path.join(self.tmp, 'compose_state.json'), 'w', encoding='utf-8') as f:
+            json.dump({'beat_ladder': [
+                {'source_beat_index': 1, 'result_space_family': 'exterior'},
+                {'source_beat_index': 2, 'result_space_family': 'exterior'},
+                {'source_beat_index': 3, 'result_space_family': 'interior'},
+            ]}, f)
+        refs, roles, _ = pp.find_reference_frames_with_roles(self.tmp, total_beats=3)
+        self.assertEqual(os.path.basename(refs[3]), 'review_011.png')
+        self.assertEqual(roles[3], 'benchmark')
+
+
+class TestCandidateScorerRoleAwareness(unittest.TestCase):
+    """H：四选一打分必须分档读挂帧角色。
+
+    打分那段把 IMAGE REF 写成「绝对基准，违者大幅扣分」。benchmark 该这么写，另外两档
+    不行：envelope 的机位本来就该不一样，establishing 的施工进度本来就该不一样——不分档
+    的话那几拍稳定挑中「最像那张错图」的候选。"""
+
+    def _ref_block(self, role):
+        import candidate_selection_pipeline as csp
+        src = inspect.getsource(csp.evaluate_and_select_best_candidate)
+        self.assertIn('ref_frame_role', src)
+        return src
+
+    def test_scorer_accepts_the_role_argument(self):
+        import candidate_selection_pipeline as csp
+        sig = inspect.signature(csp.evaluate_and_select_best_candidate)
+        self.assertIn('ref_frame_role', sig.parameters)
+        self.assertEqual(sig.parameters['ref_frame_role'].default, 'benchmark')
+
+    def test_envelope_and_establishing_get_their_own_wording(self):
+        src = self._ref_block('any')
+        # 包络端点：不判机位。
+        self.assertIn('包络端点参考图', src)
+        self.assertIn('严禁据此比对机位视角', src)
+        # 同空间全景：不判进度。
+        self.assertIn('同空间全景参考图', src)
+        self.assertIn('严禁据此比对施工进度', src)
+        # 基准那一档的原措辞保留。
+        self.assertIn('【绝对基准注意】', src)
+
+    def test_pipeline_passes_the_role_through(self):
+        import candidate_selection_pipeline as csp
+        src = inspect.getsource(csp)
+        self.assertIn('find_reference_frames_with_roles', src)
+        self.assertIn("eval_kw['ref_frame_role']", src)
 
 
 if __name__ == '__main__':

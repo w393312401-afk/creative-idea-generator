@@ -485,9 +485,14 @@ function getIdeaSaveTitle(idea) {
     return idea.project_key || idea.title || '';
 }
 
-// 过门梯那几格挂的是硬切两侧的**包络端点**，不是对标基准：原片是硬切过门，根本没拍过
-// 门槛帧（2026-08-31 复盘）。标成「对标基准」会让人照着一张跨空间层的图挑毛病。
+// 挂帧的三种角色各有各的读法，标错一个用户就会照着一张不该照的图挑毛病（2026-08-31 复盘）：
+//   envelope    过门梯那几格挂的是硬切两侧的包络端点——原片硬切过门，根本没拍过门槛帧；
+//   establishing 同空间最近的一张全景——本拍原片全程特写时的退档，机位构图能对，
+//                但它不是本拍的时刻，施工进度对不得；
+//   benchmark   原片这一拍的真实交付帧，逐像素对标。
 function refFrameRoleLabel(roles, seq) {
     const role = roles && (roles[seq] || roles[String(seq)]);
-    return role === 'envelope' ? '[包络端点 · 原片未拍摄此镜]' : '[爆款对标基准]';
+    if (role === 'envelope') return '[包络端点 · 原片未拍摄此镜]';
+    if (role === 'establishing') return '[同空间全景参考 · 非本拍时刻]';
+    return '[爆款对标基准]';
 }

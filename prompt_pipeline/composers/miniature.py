@@ -555,6 +555,23 @@ Rewrite rules (additive — do not lose content):
 - NEVER write oner, one-shot, one-take, single continuous take, one continuous take, single take, or unbroken take — there is no exemption.
 - Output ONLY the rewritten video prompt body. No headings, no labels, no commentary."""
 
+    # 净帧策略（frame_state.PERSON_FREE_IMAGE_FRAMES）在微缩线上的另一半：静帧里没有住户，
+    # 所以住户必须在这段视频里进画、出画，首尾两帧才对得上空的锚点。写手写没写住户都要有
+    # 这一句——写了住户却不写边界，交付出来就是「锚点无人、片子里的人凭空出现」。
+    _CAST_FRAME_BOUNDARY = (
+        "The opening and closing frames are person-free: the miniature-scale residents walk in "
+        "from off-frame just after the clip begins and step fully back out of frame before the "
+        "final moment.")
+
+    def _ensure_cast_frame_boundary(self, text):
+        low = (text or '').lower()
+        if 'person-free' in low or ('walk in from off-frame' in low and 'out of frame' in low):
+            return text
+        text = (text or '').rstrip()
+        if text and not text.endswith(('.', '!', '?')):
+            text += '.'
+        return (text + ' ' + self._CAST_FRAME_BOUNDARY).strip()
+
     def ensure_living_cast_reaction(self, video_prompt, beat=None, packet=None, is_threshold_or_reveal=False):
         """确保微缩场景中常驻的人偶具备动态三段式因果时序咬合，杜绝死人/假人现象。"""
         text = video_prompt or ''
@@ -565,7 +582,7 @@ Rewrite rules (additive — do not lose content):
         # 检查是否已包含人偶/居民描述
         has_cast = any(k in low for k in ('figurin', 'couple', 'bystander', 'resident', 'cast in frame'))
         if has_cast:
-            return text
+            return self._ensure_cast_frame_boundary(text)
 
         # 若正文未提及人偶，根据工序阶段与空间动态派发与场景互动的动作与位置，严禁机械固定于 "Down by the diorama edge"
         stg = str((beat or {}).get('stage') or '').lower()
@@ -605,7 +622,7 @@ Rewrite rules (additive — do not lose content):
             text = text.rstrip() + f". {cast_phrase}"
         else:
             text = text.rstrip() + f" {cast_phrase}"
-        return text
+        return self._ensure_cast_frame_boundary(text)
 
     # ── 微缩专属的确定性清洗 ────────────────────────────────────────────────
 

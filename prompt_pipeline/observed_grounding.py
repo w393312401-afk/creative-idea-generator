@@ -187,9 +187,12 @@ def _image_digest(fact, include_micro=True):
         lines.append(f'Observed framing / subject placement: {placement}')
     for line in _zones_digest(fact):
         lines.append(f'Observed zone — {line}')
+    # cast_appearance 不进静帧事实卡：帧序列一律净帧（frame_state.PERSON_FREE_IMAGE_FRAMES），
+    # 这张 IMAGE 里根本不该有人，把「他长什么样」发给写手就是在请他写进去。人物外形仍然
+    # 完整送达 VIDEO 一侧——cast_identity 是单独一栏发的（见 reverse.attach_scene_constants），
+    # 那才是全片口径的人物识别项，逐帧读数这一份本来就是它的原料。
     for key, label in (('materials', 'Observed materials'),
                        ('material_specs', 'Observed material specs'),
-                       ('cast_appearance', 'Observed living cast'),
                        ('micro_traces', 'Observed micro traces')):
         if key == 'micro_traces' and not include_micro:
             continue
@@ -333,10 +336,12 @@ def _compact_slot_digests(slot_digests, threshold=0.6):
     # 按**栏目**提取，不按整行。逐帧读数是逐帧独立写出来的，同一件事每帧措辞都略有出入，
     # 整行比对几乎匹配不上任何一条（实测提取率 0，整块随即撞上限被截断）。
     #
-    # 只提这两栏：人偶外形和材质规格描述的是「这部片子由什么构成」，全片近乎不变，说一次
-    # 就够。机位/构图/景别/完成度/材质本身即便重复也必须逐拍留着——它们正是写手用来分辨
-    # 这一拍跟上一拍差在哪的依据，提走就等于把每一拍写成同一拍。
-    hoistable = ('Observed living cast:', 'Observed material specs:')
+    # 只提材质规格这一栏：它描述的是「这部片子由什么构成」，全片近乎不变，说一次就够。
+    # 机位/构图/景别/完成度/材质本身即便重复也必须逐拍留着——它们正是写手用来分辨这一拍
+    # 跟上一拍差在哪的依据，提走就等于把每一拍写成同一拍。
+    # 'Observed living cast:' 曾经也在这里。净帧策略之后静帧事实卡不再发这一栏（见
+    # _image_digest），提不到任何东西，留着只是空跑一遍——一并撤掉。
+    hoistable = ('Observed material specs:',)
     hits = {}
     for n in sorted(per_slot):
         for ln in per_slot[n]:
@@ -724,7 +729,7 @@ You may ONLY correct how the shot LOOKS and how the camera BEHAVES:
   - spatial layout: what is in the left / centre / right zone, foreground / midground / background
   - materials, surface finish, weathering, grime, cracking, debris
   - vegetation, ground cover, clutter, terrain and sky actually present in frame
-  - the living cast's appearance, clothing condition and where they physically stand
+  - the living cast's appearance, clothing condition and where they physically stand (VIDEO only)
   - camera movement, shot count and cut rhythm inside the clip (VIDEO only)
 
 You may NOT touch:
@@ -737,7 +742,7 @@ The beat ladder was verified by a human. You are correcting the photography, not
 [RULES]
 1. Keep the prompt in the same language it is written in (English descriptive prose). Keep roughly the same length and the same structure. Do not add commentary, headings, code fences, or bullet lists.
 2. Change only what is actually wrong. If a slot already matches the frames, return it unchanged.
-3. Never describe transient workers, floating tools, or human hands in an IMAGE slot — those are still anchors.
+3. An IMAGE slot is a PERSON-FREE still anchor: never describe the cast, transient workers, floating tools, or human hands in it, and never add a sentence saying nobody is there either. If an IMAGE slot already names a person, remove them and describe what the empty space looks like instead. The cast belongs to the VIDEO slot, where they enter from off-frame and leave before the final moment.
 4. Be concrete. "wider framing" is useless; "the hut occupies roughly one third of the frame height with open savannah margin on both sides" is a correction.
 5. If the reference frames are too dark, blurred, or ambiguous to judge, leave the slot unchanged rather than guessing.
 

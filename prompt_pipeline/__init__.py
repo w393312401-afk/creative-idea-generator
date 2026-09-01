@@ -3789,13 +3789,33 @@ def _beat_action_phrase(beat):
     return "repeats the beat's single manual task in continuous cycles"
 
 
-def fix_out_and_in(prompt, is_threshold_or_reveal=False, beat=None, packet=None):
-    """Compatibility-named fixer for the direct-action-from-zero worker policy.
+# 进出画契约（2026-08-31，帧序列净帧的另一半）。
+#
+# 这条策略此前是反过来的：「entrance/exit choreography is retired」——工人在 t=0 就已经
+# 站在工作面上，全程不许进出画。那一版是为了不把片长浪费在走路上，前提是首尾锚点帧里
+# 本来就有人。净帧策略（frame_state.PERSON_FREE_IMAGE_FRAMES）把那个前提拿掉了：现在
+# 首尾两张锚点帧都是空的，工人若在 t=0 就在画面里，就跟首帧锚点直接矛盾——视频模型
+# 只能二选一，通常的选法是让人凭空出现，比钉死更难看。
+#
+# 所以两半必须一起翻：静帧无人，视频里的人从画外入画、干完在最后一刻退回画外。这同时
+# 也是「人物钉死」的解药——每段视频的首尾帧都没有人，模型没有上一帧的姿态可抄。
+#
+# ⚠️ 别照着旧注释把「禁止进出画」改回来：那条规则的前提（锚点帧里有人）已经不存在了，
+# 改回来只会让 fix 与 check 又各说各话。
+_WORKER_AGENT_RE_SRC = (r'(?:the\s+)?(?:same\s+)?(?:one\s+)?(?:lone\s+)?'
+                        r'(?:workers?|crew|persons?|builders?|laborers?)')
+# 入画/出画的判据。副词插在动词和介词之间是这条链上最常见的写法（"steps fully out of
+# frame"、"walks straight in"），所以两条都留一个副词位——漏掉它的后果实测是 fix 认不出
+# 自己刚写进去的那句话，每跑一遍再追加一遍（test_it_is_idempotent 抓到的正是这个）。
+_WORKER_ENTRY_RE_SRC = (r'\b(?:enters?\b|'
+                        r'(?:walks?|steps?|comes?|moves?)\s+(?:\w+\s+){0,2}?(?:in|into|on)\b)')
+_WORKER_EXIT_RE_SRC = (r'\b(?:exits?|withdraws?|clears?\s+the\s+frame|'
+                       r'(?:walks?|steps?|moves?|backs?)\s+(?:\w+\s+){0,2}?out\b|'
+                       r'leaves?\s+(?:\w+\s+){0,2}?(?:frame|shot)\b)')
 
-    Entrance/exit choreography is retired. Construction clips start with the worker already
-    at the work face and the first effective tool contact at t=0, then keep working through
-    the final frame.
-    """
+
+def fix_out_and_in(prompt, is_threshold_or_reveal=False, beat=None, packet=None):
+    """Guarantee the worker's off-frame entry and exit so both anchor frames stay empty."""
     if is_threshold_or_reveal:
         return prompt
     low = prompt.lower()
@@ -3816,41 +3836,40 @@ def fix_out_and_in(prompt, is_threshold_or_reveal=False, beat=None, packet=None)
                             'the workers', 'both workers']
     is_multi = any(phrase in low for phrase in multi_worker_phrases)
 
-    # Scrub legacy worker-boundary sentences emitted by older checkpoints/upstream drafts.
-    # Material/debris entering or leaving the frame is intentionally unaffected.
-    agent = r'(?:the\s+)?(?:same\s+)?(?:one\s+lone\s+)?(?:workers?|crew|persons?|builders?|laborers?)'
+    # 反过来洗：删掉「t=0 就已经站在工作面上」这类**旧策略**的句子。它跟空的首帧锚点
+    # 字面冲突，留着就是给模型两条互斥指令。写手自己写的进出画句子一律留着。
+    agent = _WORKER_AGENT_RE_SRC
     prompt = re.sub(
-        rf'(?i)\b(?:at\s+t\s*=\s*0s?|at\s+zero\s+seconds?|at\s+the\s+(?:very\s+)?(?:start|beginning)|in\s+the\s+(?:opening|full|medium)\s+shot)[,;:]?\s*'
-        rf'{agent}[^.;]*?\b(?:enters?|walks?\s+in|steps?\s+in|comes?\s+in)(?:[^.;]*[.;])?',
-        '', prompt)
-    prompt = re.sub(
-        rf'(?i)(?:,?\s*(?:and|then)?\s*(?:by\s+[^,.;]+[,;]?\s*)?){agent}[^.;]*?\b(?:exits?|walks?\s+out|steps?\s+out|leaves?\s+the\s+(?:frame|scene))(?:[^.;]*[.;])?',
-        '.', prompt)
+        rf'(?i)(?:^|(?<=[.;]))\s*(?:at\s+t\s*=\s*0s?|at\s+zero\s+seconds?)[,;:]?\s*'
+        rf'{agent}[^.;]*?\b(?:already\s+(?:at|positioned|in\s+place))\b[^.;]*[.;]',
+        ' ', prompt)
     prompt = re.sub(r'\s{2,}', ' ', prompt).strip()
 
     low = prompt.lower()
-    direct_start = ('t=0' in low or 'zero seconds' in low) and any(
-        p in low for p in ('already at', 'already positioned', 'first tool contact',
-                           'begins the first', 'starts the first'))
-    if direct_start:
+    has_entry = bool(re.search(rf'(?i){agent}[^.;]*?{_WORKER_ENTRY_RE_SRC}', prompt))
+    has_exit = bool(re.search(rf'(?i)(?:{agent}|they|he|she)[^.;]*?{_WORKER_EXIT_RE_SRC}', prompt))
+    if has_entry and has_exit:
         return prompt
 
-    # Add direct action at zero. There is deliberately no empty handoff tail.
     if not prompt.endswith('.'):
         prompt += '.'
 
     if is_multi:
         scale_clause = _worker_scale_clause_from_packet(packet, plural=True)
-        clause = (f" At t=0s, the workers{scale_clause} are already positioned at the active work "
-                  "faces and make the first effective tool contact immediately; they continue the "
-                  "same visible operation through the final frame.")
+        clause = (f" The opening frame is empty of people; immediately after that opening instant "
+                  f"the workers{scale_clause} enter from off-frame straight to the active work "
+                  "faces and make the first effective tool contact without pausing, continue the "
+                  "same visible operation, then step fully out of frame in the closing moment so "
+                  "the final frame is empty of people again.")
     else:
         costume = _worker_costume_from_packet(packet)
         scale_clause = _worker_scale_clause_from_packet(packet)
         action = _beat_action_phrase(beat)
-        clause = (f" At t=0s, one lone worker{costume}{scale_clause} is already positioned at the "
-                  f"active work face and makes the first effective tool contact immediately; the worker {action} "
-                  "continuously through the final frame.")
+        clause = (f" The opening frame is empty of people; immediately after that opening instant "
+                  f"one lone worker{costume}{scale_clause} enters from off-frame straight to the "
+                  f"active work face and makes the first effective tool contact without pausing; the "
+                  f"worker {action}, then steps fully out of frame in the closing moment "
+                  "so the final frame is empty of people again.")
 
     prompt += clause
     return prompt
@@ -4352,6 +4371,42 @@ def _source_beat_index_of(beat, ordinal):
         if isinstance(declared, int) and declared > 0:
             return declared
     return ordinal
+
+
+def stamp_source_beat_anchors(beat_ladder):
+    """给一比一梯子逐拍打上原片拍序锚点 `source_beat_index`，返回打上的拍数。
+
+    2026-08-31 复盘：锚点原先只在 `expand_spatial_transition_beats` 里打，而**一比一
+    模式根本不走那个函数**（见 compose 主流程的 `_outline_strict` 分支）——复刻线交付的
+    每一条梯子，`source_beat_index` 全是缺席。挂帧那边于是一路退到位置映射，
+    「交付第 k 拍 == 原片第 k 拍」这个假设从此没有任何东西守着：它在没插拍时碰巧成立，
+    一旦有人给这条分支加回插拍（重构图拍 / 高风险拆拍），基准帧会整体偏移插入的拍数，
+    而且不报错——正是 2026-08-31 那次过门帧挂错的同一个形状。
+
+    锚点取值优先 `outline_refs`（compile_outline_fallback_ladder 落的「稳定 1-based 清单
+    引用」，是这一拍认领了清单第几条的权威说法），其次才是位置。一比一契约下两者恒等，
+    但清单引用能在契约破掉时把话说对。
+
+    已有锚点的拍不动；`synthetic_beat` 的拍更不动——它们的锚点空着**是一句声明**
+    （「原片没拍过这一格」），补上位置号等于把声明改成谎话。"""
+    stamped = 0
+    for position, beat in enumerate(beat_ladder or [], 1):
+        if not isinstance(beat, dict) or beat.get('synthetic_beat'):
+            continue
+        existing = beat.get('source_beat_index')
+        if isinstance(existing, int) and existing > 0:
+            stamped += 1
+            continue
+        source_index = 0
+        refs = beat.get('outline_refs')
+        if isinstance(refs, (list, tuple)) and refs:
+            try:
+                source_index = int(refs[0])
+            except (TypeError, ValueError):
+                source_index = 0
+        beat['source_beat_index'] = source_index if source_index > 0 else position
+        stamped += 1
+    return stamped
 
 
 def expand_spatial_transition_beats(beat_ladder, parsed_brief):
@@ -6760,14 +6815,10 @@ def _canonical_anchor_clause(landmarks):
             continue
         prose = scale_prose(lm.get('z_depth_scale'))
         if _is_living_landmark(name):
-            # 活物锚点：锁身份/服装/比例，明确让出姿态与站位。方位不写——会走动的
-            # 东西钉方位等于钉站位。分句里不许出现分号：check_anchor_scale_lock 的
-            # 比例窗口扫到分号就收口，比例声明会落在窗口外。
-            piece = f"{name}, the same figures in the same costume at the same size"
-            if prose:
-                piece += f", rising to {prose}"
-            piece += ", free to take a new pose and a new spot this frame"
-            parts.append(piece)
+            # 活物锚点整条不进 IMAGE 正文（frame_state.PERSON_FREE_IMAGE_FRAMES）。
+            # 帧序列一律净帧，静帧里没有这个人，把他写进逐帧复读的锚点句就是把他钉回去
+            # ——这正是「人偶被锚点锁死」那条老账的本体。他的身份/服装/比例由 VIDEO 侧的
+            # cast_identity 与比例锁（observed_grounding.cast_scale_clause）继续管。
             continue
         bearing = _grid_bearing(lm.get('grid'))
         piece = f"{name} {bearing}" if bearing else name
@@ -6853,6 +6904,13 @@ def fix_primary_landmarks(prompt, packet, family='exterior'):
 
     sentences = re.split(r'(?<=[.!?])\s+', prompt)
     landmarks = _family_landmarks(packet, family)
+
+    # 活物锚点在净帧策略下整条退场（见 _canonical_anchor_clause）。这里就把它们从判据里
+    # 摘掉，否则「正文没写这个人名」会被判成 missing、白拼一条锚点句出来。
+    if landmarks:
+        landmarks = [lm for lm in landmarks
+                     if not (isinstance(lm, dict)
+                             and _is_living_landmark(str(lm.get('name', '')).strip()))]
 
     if landmarks is None:
         # interior frames of a packet without a registered interior set: strip stanzas that
@@ -7164,6 +7222,13 @@ def apply_proactive_fixes(i, video_prompt, image_prompt, packet, mode, is_last, 
     # 160 -> 180（= IMAGE_WORD_LIMIT）：本拍人偶姿态句进白名单后要占掉约二十词，留在
     # 160 会把收尾的防倒退句挤下车。硬顶本身没动，超了照样由 validate_beat_prompts 报。
     image_prompt = compile_delta_image_prompt(image_prompt, beat, max_words=IMAGE_WORD_LIMIT)
+    # 净帧再收一次口。上面那次 fix_image_clean_frame_proactive 洗的是 composer 的正文，
+    # 而 compile_delta_image_prompt 把正文整段丢掉、改用 beat 的 preserve_state /
+    # after_state / milestone_name 重拼——那几栏是规划期写的，从没过过这道洗。
+    # 帧序列一律净帧（frame_state.PERSON_FREE_IMAGE_FRAMES）之后这条不能省：里程碑名
+    # 写成 "worker fastens the last cladding panel" 的话，人就是从这里漏进静帧的。
+    image_prompt = fix_image_clean_frame_proactive(
+        image_prompt, allow_occupant=beat_requires_occupant(beat))
     # reward 拍在上一行被原样放行（frame_state.TRANSITION_OPERATIONS），于是它是全序列
     # 唯一一张既没有继承句、也没有防倒退句的帧。这里把那两句补回去。
     if is_last:
@@ -7377,7 +7442,11 @@ def check_natural_body_mechanics(prompt):
 
 
 def check_out_and_in(prompt, is_threshold_or_reveal=False):
-    """Compatibility-named validator for direct action from t=0 with no ingress/egress."""
+    """Both anchor frames are empty of people, so a worker clip must enter and exit.
+
+    这条校验 2026-08-31 整个翻了向：旧版禁止进出画、并硬性要求「t=0 工人已在工作面上」。
+    净帧策略（frame_state.PERSON_FREE_IMAGE_FRAMES）之后首尾锚点帧里都没有人，旧判据会把
+    唯一正确的写法判成违规、回炉一轮把人塞回首帧。见 fix_out_and_in 的策略注释。"""
     if is_threshold_or_reveal:
         return []
     errors = []
@@ -7391,20 +7460,21 @@ def check_out_and_in(prompt, is_threshold_or_reveal=False):
         
     has_worker = any(re.search(rf'\b{w}s?\b', low) for w in ('worker', 'crew', 'person', 'builder', 'laborer'))
     if has_worker:
-        boundary_re = re.compile(
-            r'\b(?:workers?|crew|persons?|builders?|laborers?)\b[^.!?]{0,180}'
-            r'\b(?:enters?|walks? in|steps? in|exits?|walks? out|steps? out|leaves? the (?:frame|scene))\b')
-        for sentence in re.split(r'(?<=[.!?])\s+', low):
-            if boundary_re.search(sentence) and not re.search(
-                    r'\b(?:no|without|never|do not|does not|must not)\b[^.!?]*\b(?:entr|exit|walk|leav)',
-                    sentence):
-                errors.append("VIDEO must not spend time on worker entrance or exit choreography")
-                break
-        starts_at_zero = ('t=0' in low or 'zero seconds' in low or 'opening frame' in low or 'opening instant' in low) and any(
-            p in low for p in ('already at', 'already positioned', 'first effective tool contact',
-                               'first tool contact', 'begins the first', 'starts the first'))
-        if not starts_at_zero:
-            errors.append("VIDEO with a worker must start at t=0 with the worker already at the work face and the first effective action underway")
+        agent = _WORKER_AGENT_RE_SRC
+        has_entry = bool(re.search(rf'(?i){agent}[^.;]*?{_WORKER_ENTRY_RE_SRC}', prompt))
+        has_exit = bool(re.search(rf'(?i)(?:{agent}|they|he|she)[^.;]*?{_WORKER_EXIT_RE_SRC}', prompt))
+        if not has_entry:
+            errors.append("VIDEO with a worker must have them enter from off-frame after the "
+                          "opening instant — the first-frame anchor is a person-free still")
+        if not has_exit:
+            errors.append("VIDEO with a worker must have them step fully out of frame before the "
+                          "final moment — the last-frame anchor is a person-free still")
+        # 进出画是这一条的**边界**，不是内容：中间那段仍然必须是不停歇的有效施工。
+        if not any(p in low for p in ('first effective tool contact', 'first tool contact',
+                                      'without pausing', 'immediately', 'begins the first',
+                                      'starts the first')):
+            errors.append("VIDEO must make the first effective tool contact immediately on entry — "
+                          "the entry is one beat of movement, never a stroll onto the set")
     return errors
 
 
@@ -7776,15 +7846,16 @@ def check_primary_landmarks_exact_match(image_prompt, packet, family='exterior')
             continue
         name = str(lm.get('name', '')).strip()
 
+        # 活物锚点整条不判：帧序列一律净帧（frame_state.PERSON_FREE_IMAGE_FRAMES），
+        # IMAGE 正文里本来就不该有这个名字，_canonical_anchor_clause 也不再拼它。
+        # 判名字会把净帧判成违规、回炉一轮又把人写回去——这条硬校验曾是把人偶钉死的
+        # 第二道锁（先判名字必须逐字出现，再判方位），两半现在一起退。
+        if _is_living_landmark(name):
+            continue
+
         # Landmark name check (case-insensitive exact string match)
         if name.lower() not in low:
             errors.append(f"IMAGE prompt fails to restate primary landmark name exactly: '{name}'")
-
-        # 活物锚点不判方位：它们锁的是身份/服装/比例，站位每一拍都可以变（见
-        # _canonical_anchor_clause）。过去这条硬校验正是把人偶钉死的第二道锁——
-        # composer 让人偶换个站位，这里就报「没写方位」，回炉一轮换回原样。
-        if _is_living_landmark(name):
-            continue
 
         # 方位检查（2026-08-05 起取代旧的"grid 串必须出现"）。旧判据是文字水印的直接
         # 成因：它强制把 'Grid A2' 写进送给图像模型的正文。现在要求的是同一条空间约束
@@ -7818,12 +7889,15 @@ _SCALE_PROSE_ALTERNATION = re.compile(
 
 
 def check_cast_in_frame(video_prompt, image_prompt, beat):
-    """这一拍观测到活物，交付提示词却一个字没提它们。
+    """这一拍观测到活物，VIDEO 却一个字没提它们。
 
-    2026-08-23 实测（微缩树桩屋）：二十条 VIDEO 里十八条一个 figurine 字样都没有，
-    而每一张 IMAGE 又只剩锚点句里那个钉死的姿态——两头都不提，人偶当然不会动。
-    IMAGE 侧现在由 frame_state.compile_delta_image_prompt 确定性补一句；VIDEO 侧只能
-    靠这条校验把「漏听了 CAST IN FRAME」变成一次回炉。"""
+    2026-08-23 实测（微缩树桩屋）：二十条 VIDEO 里十八条一个 figurine 字样都没有，人偶
+    当然不会动。这条校验把「漏听了 CAST IN FRAME」变成一次回炉。
+
+    **只判 VIDEO。** 帧序列一律净帧（frame_state.PERSON_FREE_IMAGE_FRAMES），IMAGE 里
+    没有人是对的，2026-08-31 之前这里连 IMAGE 一起判，正是逼着每张静帧写人的那道锁。
+    image_prompt 形参保留：调用点都是位置传参，且反向校验（IMAGE 里混进了人）以后可能
+    落在这里。"""
     errors = []
     cast = str((beat or {}).get('cast_action') or '').strip()
     if not cast:
@@ -7833,14 +7907,13 @@ def check_cast_in_frame(video_prompt, image_prompt, beat):
     if not cues:
         # 观测句里没有可锚的名词（写成了 "they" 之类），无从判起——不报，交给措辞校验。
         return errors
-    for label, text in (('IMAGE', image_prompt), ('VIDEO', video_prompt)):
-        low = str(text or '').lower()
-        if not any(cue in low for cue in cues):
-            errors.append(
-                f"{label} prompt never mentions this beat's cast, but the reference film shows "
-                f"them in frame ({cast}). They are the only living thing in the shot: name them "
-                f"and write the one micro-motion they make this beat."
-            )
+    low = str(video_prompt or '').lower()
+    if not any(cue in low for cue in cues):
+        errors.append(
+            f"VIDEO prompt never mentions this beat's cast, but the reference film shows "
+            f"them in frame ({cast}). They are the only living thing in the shot: name them, "
+            f"walk them in from off-frame, and walk them back out before the final moment."
+        )
     return errors
 
 
@@ -8887,9 +8960,10 @@ def rework_structural_video_beat(config, i, video_prompt, structural_errs, packe
         action_rule = (
             "- The added sentences must describe the beat's single visible operation sweeping "
             "progressively across its full extent for the whole clip, performed by the same "
-            "single lone worker in progressive -ing verbs. The worker is already at the work "
-            "face at t=0 and makes the first effective tool contact immediately; do not show "
-            "or describe any entrance or exit."
+            "single lone worker in progressive -ing verbs. Both anchor frames are person-free, "
+            "so the worker enters from off-frame right after the opening instant, makes the "
+            "first effective tool contact without pausing, and steps fully out of frame before "
+            "the final moment."
             + (f" Reuse this worker choreography verbatim where relevant: {chore}\n" if chore else "\n")
         )
     system = (
@@ -11893,6 +11967,10 @@ Space Type: {space_type}
     # 开关影响。非一比一路径（老任务/老断点/手动主题）完全保留原行为。
     if _outline_strict:
         beat_ladder = finalize_beat_ladder_fields(beat_ladder)
+        # 原片拍序锚点。一比一分支不走 expand_spatial_transition_beats，锚点只能在这里
+        # 打；不打的话挂对标基准帧只能靠「交付第 k 拍 == 原片第 k 拍」这个无人看守的
+        # 假设（见 stamp_source_beat_anchors）。
+        stamp_source_beat_anchors(beat_ladder)
         # 观察到的空间序列收口（复刻线）：过门标记以原片为准，不以规划器的判断为准。
         # 放在 finalize 之后，因为它要覆盖 finalize 按 bridge/hard_cut 推出来的默认
         # space_id/camera_family；放在 total_beats 重算之前，因为它不增删任何一拍。
@@ -13477,10 +13555,12 @@ def _milestone_beat_directive(beat, img_before="this beat's starting IMAGE",
         'Name the material source as a stack / crate / bundle / bucket / rack / tray / barrow / bag / '
         'pile standing at a stated spot, and trace the movement path from it to the work face.',
         'Both progress markers above developing continuously and independently.',
-        'At t=0 the same lone worker is already at the work face and makes the first effective '
-        'tool contact immediately; no entrance or exit choreography.',
-        f'Continue visible work through the final frame while landing on the completed state matching {img_after}; '
-        'do not reserve a worker-free tail inside this construction clip.',
+        'Both anchor frames are person-free: the worker enters from off-frame right after the '
+        'opening instant, straight to the work face, and makes the first effective tool contact '
+        'without pausing.',
+        f'Continue visible work up to the closing moment while landing on the completed state matching {img_after}; '
+        'then the worker steps fully out of frame so the final frame is empty of people again. The entry and the '
+        'exit are each one quick move, never a stroll onto the set and never an idle tail.',
     ]
 
     image_block = '\n'.join(f'{n}. {rule}' for n, rule in enumerate(image_rules, 1))
@@ -13587,20 +13667,28 @@ def _beat_block_text(i, contract):
     from prompt_pipeline.frame_state import _cast_is_bystander
     is_bystander = _cast_is_bystander(cast_action) if cast_action else True
     cast_role_rule = (
-        "They watch, never touch the work, never leave the frame"
+        "They watch the work without ever touching it"
         if is_bystander
-        else "They actively execute the physical work cycle without freezing, never leave the frame"
+        else "They actively execute the physical work cycle without ever freezing into a held pose"
     )
+    # 帧序列净帧（frame_state.PERSON_FREE_IMAGE_FRAMES）：IMAGE 里一个活物都不写，人整个
+    # 交给 VIDEO——从画外入画、干完在最后一刻退回画外。两件事必须一起说：只把人从 IMAGE
+    # 拿掉而 VIDEO 照旧「他们全程在画面里」，人就会在片子里凭空出现又凭空消失，比钉死更难看。
+    # 入画/出画同时也是钉死的解药：每段视频的首尾锚点帧都没有人，模型没有上一帧的姿态可抄。
     cast_section = (
-        f"\nCAST IN FRAME (observed in the reference film): {cast_action}. This beat's IMAGE shows "
-        f"them settled in that pose; this beat's VIDEO must show them MOVING INTO it via an "
-        f"ACTION-REACTION CAUSAL CHAIN: tie their immediate reflex to the craftsman/worker entry (e.g. "
-        f"tilting heads back in awe as hands enter), their movement/gaze tracking to the active tool work, "
-        f"and their settled posture to the finished result. Never isolate character movement as a passive "
-        f"afterthought at clip end. NEVER write that they remain, stay put, hold their position or are "
-        f"unchanged: a cast that holds one pose for the whole sequence is delivered as dolls that never move, "
-        f"and they are the only living thing in the frame. {cast_role_rule}, "
-        f"and their identity, costume and scale never change.\n"
+        f"\nCAST IN FRAME (observed in the reference film): {cast_action}.\n"
+        f"- This beat's IMAGE is a PERSON-FREE still: the first-frame and last-frame anchors show "
+        f"the space with nobody in it. Do not write the cast, their body, their hands or their tools "
+        f"into the IMAGE prompt at all — not even as an absence.\n"
+        f"- This beat's VIDEO carries the whole cast performance, and it is bounded by those two empty "
+        f"anchors: they ENTER FROM OFF-FRAME after the opening instant, perform the observed action as an "
+        f"ACTION-REACTION CAUSAL CHAIN (immediate reflex to the trigger -> movement and gaze tracking the "
+        f"active work -> settled posture at the finished result), then STEP FULLY OUT OF FRAME before the "
+        f"final moment so the closing frame matches the empty last-frame anchor. State both the entry and "
+        f"the exit explicitly.\n"
+        f"- NEVER write that they remain, stay put, hold their position or are unchanged: a cast that holds "
+        f"one pose is delivered as dolls that never move. {cast_role_rule}, and their identity, costume and "
+        f"scale never change while they are in frame.\n"
         if cast_action else "")
     insert_subject = str(beat.get('insert_subject') or '').strip()
     insert_section = (
@@ -13868,10 +13956,10 @@ Hard vetoes to check against these two images:
 [Local Scene-Consistency Rules]
 - VMFP & RCE Volume: Loose materials must be encapsulated in rigid, countable containers (buckets/bags) and have volume percentage capacities, with the container scale matched to the load per the VOLUME CONSERVATION veto above (a correctly scaled, visibly growing spoil pile also satisfies encapsulation for material that stays in frame).
 - RHMA Reflection: Glossy/wet surfaces must use highly blurred, diffused reflections (RHMA-Blur) to prevent video flicker.
-- Clean Frame Boundary: Image anchors must have ZERO active workers or active machinery.
-- Direct-at-zero worker action: workers are already at the active work face at t=0s and make the first effective tool contact immediately.
+- Clean Frame Boundary: image anchors are PERSON-FREE stills — zero workers, zero residents, zero bystanders, zero hands, and no active machinery. A person visible in an image anchor is a violation, and so is the same person repeated in the same pose across consecutive anchors.
+- Person-free anchors + worker entry/exit: image anchors contain nobody, so each construction clip has the worker entering from off-frame right after the opening instant, making the first effective tool contact without pausing, and stepping fully out of frame before the final moment.
 - PERSPECTIVE ISOLATION: Do not flip camera facing directions (e.g. turning 180 degrees from looking out to looking in) in the same spatial axis without a clean separate phase or TBCP transition.
-- NO WORKER BOUNDARY CHOREOGRAPHY: Never show or describe workers entering, arriving, exiting, walking out, or leaving the frame. Use the whole construction clip for visible work from t=0s through the final frame; the separate reward beat may be worker-free.
+- WORKER BOUNDARY CHOREOGRAPHY IS REQUIRED, AND IS ONE BEAT LONG: the worker enters from off-frame and leaves before the final frame, but the entry and the exit must each be a single quick move straight to/from the work face — flag a clip that spends real time on walking, arriving, setting down bags, or lingering after the work is done. Everything between the two is uninterrupted visible work. Never flag the entry or the exit itself as a defect; the anchor frames are person-free by contract. The separate reward beat may be worker-free throughout.
 - RIGID CONTAINER ENCAPSULATION: All loose materials, debris, fasteners, and liquids must be stored and tracked inside rigid, quantifiable containers (e.g. buckets, parts trays, boxes), and their volumes must be described as continuously increasing or decreasing.
 - INTERIOR ANCHOR QUALIFICATION (only applies if this beat is the threshold crossing beat, tagged [BRIDGE ...] or [CUT]): the interior landmarks this crossing lands on must plausibly ALREADY EXIST at crossing time — original structure, natural rock/wood formations, pre-existing wreckage, or items installed in an earlier on-camera beat. NEVER future construction products (an uncarved staircase, unplaced furniture, uninstalled fixtures).
 - SEALED ENTRY BEFORE ANY CROSSING (applies to EVERY crossing beat — [BRIDGE], [BRIDGE TURN] and [CUT] alike): the premise of every crossing in this system is that NOTHING of the interior is visible before it. A shut door, closed hatch, sealed shell, or pitch-black opening in the exterior IMAGE is the REQUIRED state — never report it as a missing interior peek, an unopened/unfinished entry, a blocked crossing, or a reason the next frame cannot be interior. There is no peek and no anchor scale-up to look for between these two images: the entry is opened and passed through INSIDE this beat's own clip. Conversely, an exterior IMAGE that already shows the entry standing open with the interior visible through it IS a violation of this rule. Judge the slot as a crossing clip (a pure camera move, sterile of workers, with no construction happening during the move) and never against the construction-clip rules (single milestone package, dual progress, worker entry/exit and agent flow, kinetic climax motion). The interior IMAGE is deliberately re-established rather than matched frame-to-frame against the exterior one, so do not report its different composition, framing, or camera position as a defect. What still applies across this crossing: construction order, envelope-seal continuity, and state monotonicity — it resets the camera only, so anything an earlier exterior beat sealed or repaired must read as still sealed and repaired on its inner face in the interior first frame. Those three apply PER SPACE: the space a crossing lands in may be raw and untouched or may already carry work from an earlier visit — judge it only against what THIS beat declares and against work previously shown IN THIS SAME space. A space that is bare is never a regression of the space the camera just left, and equally, a space that already looks worked on is not a violation when this film has been in it before. Never demand that an interior read as a ruin because it is the first time you are seeing it.
@@ -14310,10 +14398,13 @@ def check_beat_consistency(config, prompt_block, beat_index, total_beats, image_
 
     ref_frame_path: 爆款原片中对应本拍完成时刻抽出来的客观关键帧。传入且存在时，作为
     第三张附件（IMAGE REF）送入 VLM，用于硬性比对机位俯仰角/焦段、工程工序量级与空间骨架。
-    ref_frame_role: 'benchmark'（默认，逐像素对标）或 'envelope'。过门梯的子拍是运行期
-    插出来的镜头编排，原片是硬切过门、根本没拍过门槛本身——能给它挂的只有翻面前后那两个
-    端点。端点当基准用会每轮稳定报一条假的「机位偏离爆款原片」，过门帧因此永远过不了；
-    role='envelope' 时明确告诉审查这是端点参照，只判场景/空间层连续性，不判机位与构图。"""
+    ref_frame_role: 'benchmark'（默认，逐像素对标）/ 'envelope' / 'establishing'。过门梯的
+    子拍是运行期插出来的镜头编排，原片是硬切过门、根本没拍过门槛本身——能给它挂的只有翻面
+    前后那两个端点。端点当基准用会每轮稳定报一条假的「机位偏离爆款原片」，过门帧因此永远
+    过不了；role='envelope' 时明确告诉审查这是端点参照，只判场景/空间层连续性，不判机位
+    与构图。role='establishing' 是反过来的一档：附件是同一个空间里最近的一张全景（本拍
+    原片全程特写、或一张合规帧都挑不出来时的退档），机位/构图/尺度照判，**施工进度不判**
+    ——那张帧不是本拍的时刻，照着它判进度会稳定报一条假的「工序超前/滞后」。"""
     system_prompt = _local_beat_review_system_prompt()
     # 拍号只出现在 user turn：system prompt 因此在所有拍之间完全一致、可被 prompt
     # 缓存复用（见 _local_beat_review_system_prompt 的 2026-07-25 说明）。
@@ -14333,7 +14424,9 @@ def check_beat_consistency(config, prompt_block, beat_index, total_beats, image_
         f"Treat any permanent visible result outside this record as a candidate phase overshoot."
     )
     has_ref = bool(ref_frame_path and os.path.exists(ref_frame_path))
-    is_envelope_ref = has_ref and str(ref_frame_role or '').strip().lower() == 'envelope'
+    _ref_role = str(ref_frame_role or '').strip().lower()
+    is_envelope_ref = has_ref and _ref_role == 'envelope'
+    is_establishing_ref = has_ref and _ref_role == 'establishing'
     ref_desc = ""
     if is_envelope_ref:
         # 过门梯这一拍在原片里不存在，附件只是硬切另一侧最近的一张幸存帧。
@@ -14346,6 +14439,18 @@ def check_beat_consistency(config, prompt_block, beat_index, total_beats, image_
             f"camera angle, framing, focal length, shot scale or composition against it, and DO NOT "
             f"report a camera-setup or benchmark-fidelity mismatch for this beat - a deliberate "
             f"difference in camera setup is expected here.\n"
+        )
+    elif is_establishing_ref:
+        # 同空间最近的一张全景。机位/构图/尺度照判，施工进度不判——它不是本拍的时刻。
+        ref_desc = (
+            f"\n\nIMAGE REF (the third attached image) is an ESTABLISHING WIDE SHOT of the SAME "
+            f"physical space from the viral source video, but it was NOT filmed at this beat's "
+            f"moment - the source only ever covered beat {beat_index} in tight shots, so no wide "
+            f"ground-truth frame exists for this exact moment. Use it to check camera setup, "
+            f"framing, spatial skeleton, scale of the space and prop/person proportions. "
+            f"DO NOT compare construction progress, completion extent, installed materials or "
+            f"stage scope against it, and DO NOT report a phase overshoot or shortfall based on "
+            f"differences in how finished the build looks in IMAGE REF.\n"
         )
     elif has_ref:
         ref_desc = (
@@ -14668,16 +14773,64 @@ _REF_CUT_EDGE_SECONDS = 0.15
 # 目标帧没有声明自己是特写时，这两档景别不作为对标基准。
 _REF_TIGHT_SHOT_SCALES = ('close', 'extreme_close')
 
+# 全景档。对标帧的用途是核对**机位、构图留白、空间骨架与道具尺度**，这四件事只有全景
+# 帧说得清：一张中景把空间切掉一半，一张特写只剩一只手，照着它对机位必然对不出东西来。
+# 原片逐帧读数（frame_facts.shot_scale）产出的词是 wide / medium / close 三档，另外几个
+# 词是别的分析器版本留下的同义写法，一并认。
+_REF_WIDE_SHOT_SCALES = ('wide', 'extreme_wide', 'very_wide', 'wide_shot', 'establishing')
 
-def _source_space_family(beat):
+
+# 自由词表里认得出外景的词根。**这是兜底，不是判据**——首选永远是交付梯自己声明的
+# observed_space → result_space_family 映射（见 _space_family_map_from_ladder）。
+# 逐词匹配（按空白/标点切词），不做子串匹配：子串会把 "outside corner"、"site-built
+# cabinet" 这类室内措辞误判成外景。
+_EXTERIOR_SPACE_WORDS = frozenset((
+    'exterior', 'outdoor', 'outdoors', 'outside', 'site', 'yard', 'driveway',
+    'clearing', 'field', 'meadow', 'garden', 'street', 'lot', 'shore', 'beach',
+    'hillside', 'woodland', 'forest', 'rooftop',
+))
+
+
+def _space_family_map_from_ladder(ladder):
+    """{原片拍的 space 原文（小写）: 'exterior' | 'interior'}。
+
+    交付梯每一格都同时带着 `observed_space`（原片拍的 space 原文）与
+    `result_space_family`（这一格要交付的空间层），这两个字段是同一条链路上游写的，
+    互为同一次判定的两面。拿它当映射表 = 用**这一单自己的**词表判空间层，不必去猜
+    自由词表里哪个词是外景。"""
+    mapping = {}
+    for item in ladder or []:
+        if not isinstance(item, dict) or item.get('synthetic_beat'):
+            continue  # 插出来的拍没有原片对应 space，不能进映射表
+        space = str(item.get('observed_space') or '').strip().lower()
+        family = str(item.get('result_space_family') or '').strip().lower()
+        if space and family in ('exterior', 'interior'):
+            mapping.setdefault(space, family)
+    return mapping
+
+
+def _source_space_family(beat, family_map=None):
     """原片拍的空间层：'exterior' / 'interior'。
 
-    timelapse_beats 的 `space` 是自由词表（'exterior' / 'main_interior' / 'cabin' …），
-    只能问「是不是外景」——与 is_interior_space 同一条判据。"""
+    timelapse_beats 的 `space` 是**自由词表**——真实单里写的是 'outdoor trailer yard'、
+    'woodland clearing'、'main living studio' 这类整句描述，不是 'exterior' 这种枚举值。
+    2026-08-31 复盘：这里原先只做全等匹配（space in ('exterior','site',…)），自由词表
+    一个都对不上，于是**每一条外景拍都被判成 interior**；交付梯声明 want_family=
+    'exterior' 的那几格因此整拍弃用，前端表现为「外景那半条序列全是无对标帧」。
+    _source_crossing_boundary 同时被打瞎（永远找不到外景→室内的翻面），过门梯那几格
+    的包络端点也跟着一格都挂不上。测试没接住是因为 fixture 写的是 space='exterior'，
+    正好落在旧白名单里——那份词表是原片分析器早就不再产出的方言。
+
+    判定顺序：交付梯自己的 observed_space → family 映射（权威，见
+    _space_family_map_from_ladder）→ 词根兜底 → 都不认时按室内（外景之外的一切都是
+    室内，与 is_interior_space 同一条判据）。"""
     space = str((beat or {}).get('space') or '').strip().lower()
     if not space:
         return ''
-    if space in ('exterior', 'site', 'outdoor', 'outdoors', 'outside'):
+    mapped = (family_map or {}).get(space)
+    if mapped in ('exterior', 'interior'):
+        return mapped
+    if _EXTERIOR_SPACE_WORDS & set(re.findall(r"[a-z]+", space)):
         return 'exterior'
     return 'interior'
 
@@ -14738,7 +14891,7 @@ def _frame_shot_scale(facts_by_name, frame_name):
 
 
 def _select_beat_ref_frame(beat, next_beat, rf_dir, facts_by_name,
-                           want_family='', want_tight=False):
+                           want_family='', want_tight=False, family_map=None):
     """在这一拍的窗内挑一张能当对标基准的帧，挑不出来返回 None。
 
     **挑不出来就返回 None，不许硬塞。** 挂一张空间层或景别对不上的帧，比不挂更糟：
@@ -14755,7 +14908,7 @@ def _select_beat_ref_frame(beat, next_beat, rf_dir, facts_by_name,
     if not beat or not rf_dir:
         return None
     if want_family:
-        source_family = _source_space_family(beat)
+        source_family = _source_space_family(beat, family_map)
         if source_family and source_family != want_family:
             return None
 
@@ -14777,20 +14930,83 @@ def _select_beat_ref_frame(beat, next_beat, rf_dir, facts_by_name,
         path = os.path.join(rf_dir, name)
         return path if os.path.exists(path) else None
 
-    # 三档逐级放宽：全部约束 → 允许贴近切点 → 只要求文件存在。每一档内都取最后一张。
-    tiers = [
-        lambda ts, name: (not _near_cut(ts)) and (want_tight or _frame_shot_scale(facts_by_name, name) not in _REF_TIGHT_SHOT_SCALES),
-        lambda ts, name: want_tight or _frame_shot_scale(facts_by_name, name) not in _REF_TIGHT_SHOT_SCALES,
-        lambda ts, name: True,
-    ]
-    for keep in tiers:
+    # 景别偏好：目标是特写就找特写，否则**先找全景**（见 _REF_WIDE_SHOT_SCALES：
+    # 对标帧要核对的机位/构图/尺度只有全景说得清），找不到全景再退中景/未知，
+    # 特写永远是最后一档。
+    if want_tight:
+        scale_groups = [_REF_TIGHT_SHOT_SCALES, None]
+    else:
+        scale_groups = [_REF_WIDE_SHOT_SCALES, None]
+
+    def _scale_ok(group, name):
+        scale = _frame_shot_scale(facts_by_name, name)
+        if group is not None:
+            return scale in group
+        # 未指定组 = 「除特写外的一切」这一档（含读数缺失的空字符串）。
+        return want_tight or scale not in _REF_TIGHT_SHOT_SCALES
+
+    # 逐级放宽，**切点约束排在景别偏好前面**：贴着切点的那一张空间语义会跳变，挂错空间
+    # 比挂错景别严重得多，所以宁可要一张不贴切点的中景，也不要一张压在切点上的全景。
+    # 最后一档只要求文件存在——挑不出合规帧时宁可给一张特写，也别让这一拍凭空丢基准。
+    tiers = [(True, g) for g in scale_groups] + [(False, g) for g in scale_groups]
+    tiers.append((False, 'any'))
+    for avoid_cut, group in tiers:
         for ts, name in reversed(candidates):
-            if not keep(ts, name):
+            if avoid_cut and _near_cut(ts):
+                continue
+            if group != 'any' and not _scale_ok(group, name):
                 continue
             path = _exists(name)
             if path:
                 return path
     return None
+
+
+def _nearest_establishing_frame(beats, source_ordinal, rf_dir, facts_by_name):
+    """同一空间里离这一拍最近的一张**全景**帧，找不到返回 None。
+
+    自动找全景帧（2026-08-31）。窗内挑出来的基准帧有两种情况对不了机位：这一拍原片
+    全程是特写/中景（挑得出帧，但那张帧看不见空间），或者整拍一张合规帧都挑不出来
+    （那一格今天是空的）。两种情况下，同一个空间里最近的一张全景帧都比「一张特写」和
+    「什么都没有」更有用——它说得清机位站位、构图留白与道具尺度。
+
+    纪律：
+      · **只在同一个 `space` 里找。** 跨空间的全景是另一个房间的构图，挂上去就是错的。
+      · **优先往回找**（时间上不晚于本拍结束）。往后找会拿到一张施工更完整的画面，
+        写手照着它画会把还没做的工序提前画出来；往回找只会少画，由本拍的工序描述补回。
+      · 挂的角色是 `establishing` 而不是 `benchmark`——它**不是本拍的状态**，审查那边
+        据此只判空间骨架与机位，不判施工进度（见 check_beat_consistency）。
+    """
+    if not (beats and rf_dir and isinstance(source_ordinal, int) and 1 <= source_ordinal <= len(beats)):
+        return None
+    target = beats[source_ordinal - 1] or {}
+    space = str(target.get('space') or '').strip().lower()
+    if not space:
+        return None
+    try:
+        anchor_ts = float(target.get('end'))
+    except (TypeError, ValueError):
+        anchor_ts = None
+
+    scored = []
+    for ordinal, beat in enumerate(beats, 1):
+        if str((beat or {}).get('space') or '').strip().lower() != space:
+            continue
+        next_beat = beats[ordinal] if ordinal < len(beats) else None
+        for ts, name in _beat_window_frames(beat, next_beat):
+            if _frame_shot_scale(facts_by_name, name) not in _REF_WIDE_SHOT_SCALES:
+                continue
+            if not os.path.exists(os.path.join(rf_dir, name)):
+                continue
+            if ts is None or anchor_ts is None:
+                # 没有时间戳（老 job 只有 evidence_frames）：按拍序远近排，同拍最近。
+                scored.append((1, abs(ordinal - source_ordinal), 0.0, name))
+            else:
+                scored.append((0 if ts <= anchor_ts else 1, abs(ts - anchor_ts), -ts, name))
+    if not scored:
+        return None
+    scored.sort()
+    return os.path.join(rf_dir, scored[0][3])
 
 
 def _storyboard_scene_fallback(rf_dir, source_ordinal):
@@ -14835,7 +15051,7 @@ def _load_frame_facts_for_refs(cand_dirs):
     return {}
 
 
-def _source_crossing_boundary(beats):
+def _source_crossing_boundary(beats, family_map=None):
     """原片里外景→室内翻面的位置，返回 (最后一个外景拍序, 第一个室内拍序)，1-based。
 
     原片通常是**硬切**过门的：它从来没拍过"站在门槛外、门还关着"这个画面（海蚀洞单是
@@ -14843,7 +15059,7 @@ def _source_crossing_boundary(beats):
     挂这两端作为包络。找不到翻面返回 (None, None)。"""
     last_exterior = None
     for ordinal, beat in enumerate(beats or [], 1):
-        family = _source_space_family(beat)
+        family = _source_space_family(beat, family_map)
         if family == 'exterior':
             last_exterior = ordinal
         elif family == 'interior' and last_exterior is not None:
@@ -14876,8 +15092,10 @@ def find_reference_frames_with_roles(project_dir, total_beats=None):
     返回 (ref_frames_by_beat, ref_frame_roles, source_collage_path)：
       · ref_frames_by_beat: {帧号: 关键帧路径}。**缺号是声明，不是缺失**——挂不出空间层
         与景别都对得上的帧时这一格就空着，调用方不许向前后借帧（见上面那节说明）。
-      · ref_frame_roles:    {帧号: 'benchmark' | 'envelope'}。过门梯那几格是硬切两侧的
-        包络端点，不能拿来对机位（见 check_beat_consistency 的 ref_frame_role）。
+      · ref_frame_roles:    {帧号: 'benchmark' | 'envelope' | 'establishing'}。过门梯那
+        几格是硬切两侧的包络端点，不能拿来对机位；'establishing' 是同空间最近的一张全景
+        （本拍原片全是特写、或一张合规帧都挑不出来时的退档），它不是本拍的状态，只能拿来
+        对空间骨架与机位（见 check_beat_consistency 的 ref_frame_role）。
       · source_collage_path: 爆款原片 5 列多宫格拼图。
 
     支持自动从目录名提取 job_id 并递归解析 video_overview.json 溯源上游抽帧目录。
@@ -14959,7 +15177,8 @@ def find_reference_frames_with_roles(project_dir, total_beats=None):
 
     source_collage_path = None
     ref_frames_by_beat = {}
-    # {帧号: 'benchmark' | 'envelope'}，见 check_beat_consistency 的 ref_frame_role。
+    # {帧号: 'benchmark' | 'envelope' | 'establishing'}，见 check_beat_consistency
+    # 的 ref_frame_role。
     ref_frame_roles = {}
 
     # 1. 寻找爆款原片 5 列拼图（排查 *_collage.jpg，排除自身渲染生成的 full_collage.jpg 与缩略图）
@@ -15001,6 +15220,9 @@ def find_reference_frames_with_roles(project_dir, total_beats=None):
     if tb_data and tb_data.get('beats') and rf_dir:
         beats = tb_data.get('beats', [])
         facts_by_name = _load_frame_facts_for_refs(cand_dirs)
+        # 空间层判据先从交付梯自己身上取（observed_space → result_space_family）。
+        # 拿不到梯子时它是空表，_source_space_family 自动退回词根兜底。
+        family_map = _space_family_map_from_ladder(ladder)
 
         def _source_beat(ordinal):
             return beats[ordinal - 1] if isinstance(ordinal, int) and 1 <= ordinal <= len(beats) else None
@@ -15019,7 +15241,7 @@ def find_reference_frames_with_roles(project_dir, total_beats=None):
         ref_frames_by_beat[1] = p1
         ref_frame_roles[1] = 'benchmark'
 
-        last_exterior, first_interior = _source_crossing_boundary(beats)
+        last_exterior, first_interior = _source_crossing_boundary(beats, family_map)
 
         def _envelope_ref(family):
             """过门梯子拍的包络端点：外景侧取翻面前最后一张仍在室外的帧，室内侧取翻面后
@@ -15027,7 +15249,8 @@ def find_reference_frames_with_roles(project_dir, total_beats=None):
             if family == 'exterior' and last_exterior:
                 return _select_beat_ref_frame(_source_beat(last_exterior),
                                               _source_beat(last_exterior + 1),
-                                              rf_dir, facts_by_name, want_family='exterior')
+                                              rf_dir, facts_by_name, want_family='exterior',
+                                              family_map=family_map)
             if family == 'interior' and first_interior:
                 target = _source_beat(first_interior)
                 window = _beat_window_frames(target, _source_beat(first_interior + 1))
@@ -15041,6 +15264,15 @@ def find_reference_frames_with_roles(project_dir, total_beats=None):
         # source_beat_index，不认位置——展开过门梯会插拍，位置从那里开始就错了。
         # 拿不到交付梯（老单/未落盘）时退回位置映射，行为与改造前逐字相同。
         delivered = ladder if ladder else [{'source_beat_index': n} for n in range(1, len(beats) + 1)]
+        # 位置映射是兜底，不是常态。整条梯子一个锚点都没有、而它的长度又与原片拍数对不上
+        # 时，「交付第 k 拍 == 原片第 k 拍」这个假设已经站不住了——照挂就是整体偏移。
+        # 说出来（挂帧本身照旧，老单不因此塌成空）。
+        if (ladder and len(ladder) != len(beats)
+                and not any(isinstance((it or {}).get('source_beat_index'), int)
+                            for it in ladder if isinstance(it, dict))):
+            if sys.stdout:
+                print(f'[REF] ⚠️ 交付梯 {len(ladder)} 拍 / 原片 {len(beats)} 拍，且梯子上没有'
+                      f' source_beat_index 锚点：对标基准帧只能按位置硬映射，可能整体偏移。')
         for position, item in enumerate(delivered, 1):
             item = item if isinstance(item, dict) else {}
             image_seq = position + 1
@@ -15069,11 +15301,26 @@ def find_reference_frames_with_roles(project_dir, total_beats=None):
             source = _source_beat(src_index)
             if source is None:
                 continue
+            # 原片这一拍本身就是特写时才找特写：那种拍的"交付态"就是一只手的距离，
+            # 硬塞一张全景反而对不上。判据用原片读数，不猜。
+            want_tight = str(source.get('shot_scale') or '').strip().lower() in _REF_TIGHT_SHOT_SCALES
             picked = _select_beat_ref_frame(source, _source_beat(src_index + 1),
-                                            rf_dir, facts_by_name, want_family=want_family)
+                                            rf_dir, facts_by_name, want_family=want_family,
+                                            want_tight=want_tight, family_map=family_map)
             if not picked:
                 # storyboard 布局：coverage 记的帧名在这个目录里一张都不存在。
                 picked = _storyboard_scene_fallback(rf_dir, src_index)
+            # 自动找全景帧：挑出来的是一张特写（整拍都是特写，走到了最后一档），或者
+            # 整拍一张都挑不出来时，退到同空间最近的一张全景。它不是本拍的状态，所以
+            # 角色是 establishing 而不是 benchmark（见 _nearest_establishing_frame）。
+            picked_is_tight = bool(picked) and (
+                _frame_shot_scale(facts_by_name, os.path.basename(picked)) in _REF_TIGHT_SHOT_SCALES)
+            if not want_tight and (not picked or picked_is_tight):
+                establishing = _nearest_establishing_frame(beats, src_index, rf_dir, facts_by_name)
+                if establishing:
+                    ref_frames_by_beat[image_seq] = establishing
+                    ref_frame_roles[image_seq] = 'establishing'
+                    continue
             if not picked:
                 # 挑不出合规帧就不挂。挂一张空间层/景别对不上的帧比不挂更糟：审查会拿它
                 # 判机位与空间骨架，每轮稳定报一条假违规。
@@ -15180,8 +15427,9 @@ def check_full_sequence_consistency(config, prompt_block, frame_image_paths, deg
     outline_frame_verdicts——灰度期它是这一层判定的**唯一**去处。
     ref_frame_paths: {帧号: 爆款原片同阶段关键帧路径}。给出时逐拍层同时做对标保真度
     与机位审查（见 check_beat_consistency 的 ref_frame_path）。
-    ref_frame_roles: {帧号: 'benchmark' | 'envelope'}。过门梯的子拍原片没拍过，只能挂
-    翻面前后的端点，标 'envelope' 让那一拍不做机位/构图对标（见 ref_frame_role）。
+    ref_frame_roles: {帧号: 'benchmark' | 'envelope' | 'establishing'}。过门梯的子拍原片
+    没拍过，只能挂翻面前后的端点，标 'envelope' 让那一拍不做机位/构图对标；'establishing'
+    是同空间最近的一张全景，反过来只做机位/构图、不判施工进度（见 ref_frame_role）。
     source_collage_path / rendered_collage_path: 爆款原片与本单各自的 5 列拼图。两张
     都在时追加第 4 层 check_collage_macro_alignment（宏观节奏/光影演变对齐）。"""
     if not prompt_block or not frame_image_paths:

@@ -88,13 +88,14 @@ def test_directive_requires_declared_features_to_appear_in_the_image():
     assert '===TRACES===' in directive
 
 
-def test_directive_requires_worker_action_from_zero_without_boundary_choreography():
+def test_directive_requires_off_frame_entry_and_exit_around_person_free_anchors():
     low = _milestone_beat_directive(_beat()).lower()
-    assert 'at t=0' in low
-    assert 'already at the work face' in low
-    assert 'first effective tool contact immediately' in low
-    assert 'no entrance or exit choreography' in low
-    assert 'enters at the start' not in low and 'exits before the final frame' not in low
+    assert 'person-free' in low
+    assert 'enters from off-frame' in low
+    assert 'first effective tool contact' in low
+    assert 'steps fully out of frame' in low
+    # 进出画各只占一拍：不许把片长花在走路和收工闲站上。
+    assert 'one quick move' in low
 
 
 def test_directive_stays_terse():

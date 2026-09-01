@@ -1580,7 +1580,7 @@ def compose_scup_prompts(metadata, clean_mode=False):
             if agents:
                 agent = agents[0]
                 action_loop = naturalize_visual_text(agent.get("action_loop", "performs physical construction labor"))
-                agent_desc = f"At zero seconds, a worker wearing a {naturalize_visual_text(agent.get('hal_profile', 'safety vest and hardhat'))} is already at the work face, uses a {naturalize_visual_text(manual_tool)} to {action_loop} immediately, and continues that visible operation through the final frame without entrance or exit choreography."
+                agent_desc = f"The opening frame is empty of people; immediately after that opening instant a worker wearing a {naturalize_visual_text(agent.get('hal_profile', 'safety vest and hardhat'))} enters from off-frame straight to the work face, uses a {naturalize_visual_text(manual_tool)} to {action_loop} without pausing, continues that visible operation, then steps fully out of frame in the closing moment so the final frame is empty of people again."
             else:
                 agent_desc = "No workers or human agents appear in the video."
                 
@@ -1603,7 +1603,7 @@ def compose_scup_prompts(metadata, clean_mode=False):
                 action_loop = naturalize_visual_text(agent.get("action_loop", "performs physical construction labor"))
                 mtal_clause = f"The worker keeps the same {naturalize_visual_text(manual_tool)} in hand and repeats the same action loop: {action_loop}. "
                 
-                passage_clause = f"At zero seconds, {agent.get('count', 1)} worker is already positioned at the active work face and makes the first effective tool contact immediately; the worker performs the action continuously through the final frame without entrance or exit choreography. "
+                passage_clause = f"The opening frame is empty of people; immediately after that opening instant {agent.get('count', 1)} worker enters from off-frame straight to the active work face and makes the first effective tool contact without pausing; the worker performs the action continuously, then steps fully out of frame in the closing moment so the final frame is empty of people again. "
                 hal_clause = f"The worker remains a simple solid silhouette of {naturalize_visual_text(agent.get('hal_profile', 'solid yellow safety vest, white hardhat, blue pants'))}, with no readable face, logo, or fabric pattern. "
                 tspa_clause = f"Two visible progress cues must unfold naturally: first, {progress_a}; second, {progress_b}. "
             else:
@@ -1959,35 +1959,45 @@ def run_scup_audit(images, videos, fps=3.0, num_analyzed_frames=None, total_fram
             "details": ["All VIDEO prompts enforce rigid composition anchors and adjacent frame bindings."]
         })
         
-    # Gate 3: direct worker action from zero seconds, with no entrance/exit choreography (P0)
+    # Gate 3: person-free anchors, so the worker enters and exits inside the clip (P0).
+    # 这道门 2026-08-31 整个翻了向：旧版要求「零秒工人已在作业面上、禁止进出画」，前提是
+    # IMAGE 锚点帧里本来就有人。净帧策略之后首尾锚点都是空的，旧判据会把唯一正确的写法
+    # 判死。见 references/spatial-consistency-upgrade-protocol.md 的同名条款。
     gate3_fail = []
     for idx, vid in enumerate(videos):
         low = vid.lower()
         if not re.search(r'\bworkers?\b', low):
             continue
-        direct = ("zero seconds" in low or "t=0" in low) and any(
-            phrase in low for phrase in ("already at", "already positioned", "first effective tool contact"))
-        positive_boundary = any(re.search(pattern, low) for pattern in (
-            r'\bworkers?\s+enters?\b', r'\bworkers?\s+exits?\b',
-            r'\bworkers?\s+walks?\s+out\b', r'\bworkers?\s+leaves?\s+the\s+frame\b'))
-        if not direct or positive_boundary:
-            gate3_fail.append(f"VIDEO {idx+1} must begin with the worker already acting at zero seconds and contain no worker entrance or exit")
-            
+        has_entry = bool(re.search(
+            r'\bworkers?\b[^.;]*?\b(?:enters?\b|(?:walks?|steps?|comes?|moves?)\s+(?:\w+\s+){0,2}?(?:in|into|on)\b)', low))
+        has_exit = bool(re.search(
+            r'\b(?:workers?|they|he|she)\b[^.;]*?\b(?:exits?|withdraws?|clears?\s+the\s+frame|'
+            r'(?:walks?|steps?|moves?|backs?)\s+(?:\w+\s+){0,2}?out\b|'
+            r'leaves?\s+(?:\w+\s+){0,2}?(?:frame|shot)\b)', low))
+        immediate = any(phrase in low for phrase in
+                        ("first effective tool contact", "first tool contact", "without pausing", "immediately"))
+        if not has_entry:
+            gate3_fail.append(f"VIDEO {idx+1} must bring the worker in from off-frame after the opening instant — the first-frame anchor is a person-free still")
+        if not has_exit:
+            gate3_fail.append(f"VIDEO {idx+1} must take the worker fully out of frame before the final moment — the last-frame anchor is a person-free still")
+        if not immediate:
+            gate3_fail.append(f"VIDEO {idx+1} must make the first effective tool contact immediately on entry — the entry is one quick move, never a stroll onto the set")
+
     if gate3_fail:
         audit_results["score"] -= 20
         audit_results["gates"].append({
-            "name": "Direct-at-Zero Worker Lock",
+            "name": "Person-Free Anchor & Worker Entry/Exit Lock",
             "status": "FAIL",
             "tier": "P0",
             "details": gate3_fail,
-            "solution": "All video prompts featuring workers must place them at the active work face at zero seconds with immediate effective tool contact and no entrance/exit choreography."
+            "solution": "Every construction video prompt must open on an empty frame, bring the worker in from off-frame for immediate effective tool contact, and take the worker fully out of frame before the final moment so both IMAGE anchors stay person-free."
         })
     else:
         audit_results["gates"].append({
-            "name": "Direct-at-Zero Worker Lock",
+            "name": "Person-Free Anchor & Worker Entry/Exit Lock",
             "status": "PASS",
             "tier": "P0",
-            "details": ["All VIDEO prompts start worker action at zero seconds and reserve no time for entrance or exit."]
+            "details": ["All VIDEO prompts bring the worker in from off-frame for immediate work and take them back out before the final frame."]
         })
         
     # Gate 4: Rigid Container Encapsulation - RCE (P0)

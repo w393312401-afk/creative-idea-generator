@@ -123,7 +123,7 @@ forbidden here.
 Include:
 - full environment, restoration carrier, and weather or ambient motion
 - first-frame anchor match, with no state jump at the opening instant
-- the worker already at the work face, making effective tool contact at zero seconds
+- an empty opening frame, then the worker entering from off-frame and making effective tool contact without pausing, and stepping fully out of frame before the closing moment
 - full-body scale, tool visible, material source visible, real physical weight
 - one dominant physical action, repeated in visible cycles
 - a ladder, scaffold, or standing surface if the task is above arm reach

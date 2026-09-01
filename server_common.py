@@ -2014,12 +2014,6 @@ _PASSTHROUGH_CLIENT_KEYS = (
     # 托管模式下用户选了哪个模型会被整个丢掉，页面上却照常显示已切换——和
     # skillProfile / qaGateLevel 当年是同一个静默失效的口子。
     'frameFactsModel', 'peakVerifyModel', 'reviewModel',
-    # 反推通道（前端「反推通道」单选：'fast' 极速直读 / 'deep' 标准 Pass A+B）。
-    # deepReverse 是它的老写法，两个都放行，run_reverse 按 or 取。
-    'reverseMode', 'deepReverse',
-    # 合成通道（前端「合成通道」单选：'fast' 极速直通 / 'deep' 标准 Phase 1+2），
-    # deepCompose 同为老写法。run_compose 按 or 取。
-    'composeMode', 'deepCompose',
     'reviewConcurrency', 'candidateConcurrency',
     'candidateSelectionMode', 'candidateSelection', 'generation_mode', 'candidate_selection',
 ) + _GATE_KEYS

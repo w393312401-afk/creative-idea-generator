@@ -558,15 +558,16 @@ def build_keyframe_collage(
         indices = sorted(list(dict.fromkeys(indices)))
         paths = [paths[i] for i in indices]
 
+    # An incomplete last row is left to ffmpeg: the tile filter flushes the partial grid
+    # at EOF and fills the empty cells with `color=`. This used to repeat the last frame
+    # instead, which rendered 21 milestones as 4 extra copies of the finished state — and
+    # this collage is handed to the model as the whole-sequence overview, where duplicate
+    # tiles read as "the final state was held for a long time".
     rows = math.ceil(len(paths) / columns)
-    padded = list(paths)
-    # ffmpeg's tile filter needs a full grid; repeat the last frame to fill the tail.
-    while len(padded) < rows * columns:
-        padded.append(padded[-1])
 
     concat_list_path = output_path.parent / f".tmp_concat_{output_path.stem}.txt"
     try:
-        lines = [f"file '{str(p.resolve()).replace('\'', '\'\\\'\'')}'\n" for p in padded]
+        lines = [f"file '{str(p.resolve()).replace('\'', '\'\\\'\'')}'\n" for p in paths]
         concat_list_path.write_text("".join(lines), encoding="utf-8")
 
         scale_w = max(120, tile_width)

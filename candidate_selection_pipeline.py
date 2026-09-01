@@ -969,7 +969,7 @@ def generate_frame_candidates(config, title, item, reference_path, seq, candidat
     return candidate_paths
 
 
-def evaluate_and_select_best_candidate(config, prompt_text, reference_path, candidate_paths, seq, on_progress=None, succeeding_path=None, succeeding_prompt=None, ref_frame_path=None):
+def evaluate_and_select_best_candidate(config, prompt_text, reference_path, candidate_paths, seq, on_progress=None, succeeding_path=None, succeeding_prompt=None, ref_frame_path=None, ref_frame_role='benchmark'):
     """
     Calls multimodal VLM (Gemini 3.7 / 3.5 / Flash) to evaluate all candidates and choose the best one.
     Supports succeeding_path and succeeding_prompt for bidirectional sandwich context binding during frame repair.
@@ -1000,7 +1000,7 @@ def evaluate_and_select_best_candidate(config, prompt_text, reference_path, cand
 
     # 只清理**送进鉴别模型的这份副本**：老单落盘的提示词正文里可能还留着
     # `(cavernous hall, giant space:1.6)` 这类权重标注（合成器与 AGENTS 规则现已一律
-    # 改用自然语句，见 fast_composer 规则 8/9），带着它去问 VLM"这张图符不符合提示词"
+    # 改用自然语句），带着它去问 VLM"这张图符不符合提示词"
     # 会让它把负向词当成正向要求去找。
     #
     # ⚠️ 这里**不是**提示词正文的收口点。交付正文的唯一出口仍是
@@ -1025,7 +1025,18 @@ def evaluate_and_select_best_candidate(config, prompt_text, reference_path, cand
 
     if ref_frame_path and os.path.exists(ref_frame_path) and os.path.getsize(ref_frame_path) > 0:
         ref_img_idx = len(image_paths_to_send) + 1
-        user_text_parts.append(f"附带的第 {ref_img_idx} 张图片为【爆款原片对标参考图 (IMAGE REF)】（来自爆款视频同阶段真实关键帧，用于对标机位视角、构图留白、道具尺度与交付量级）。【绝对基准注意】：所有候选图必须以原片参考图的真实视角与场景形态为准。若原片无圆形管道/隧道黑色画框，候选图绝不可凭空出现黑圈暗角/管道伪影，违者直接大幅扣分！")
+        # 挂帧有三种角色，只有 benchmark 那一档是「这一拍的真实交付帧」，另外两档拿它当
+        # 绝对基准会按一张**不该照的图**扣分：envelope 是硬切另一侧的端点（机位本来就该
+        # 不一样），establishing 是同空间的一张全景但不是本拍的时刻（施工进度本来就该
+        # 不一样）。措辞不分档的话，那几拍的四选一会稳定选错——挑中的是最像那张错图的
+        # 候选（见 prompt_pipeline.find_reference_frames_with_roles 的 ref_frame_roles）。
+        _role = str(ref_frame_role or 'benchmark').strip().lower()
+        if _role == 'envelope':
+            user_text_parts.append(f"附带的第 {ref_img_idx} 张图片为【爆款原片包络端点参考图 (IMAGE REF)】。原片在这里是硬切过门、根本没拍过本拍这个镜头，这只是切点一侧最近的一张幸存帧。【只核连续性】：仅用于确认候选图仍在同一个物理场景、同一空间层与同一材质世界。严禁据此比对机位视角、构图、焦段或景别，更不得因为候选图的机位与它不同而扣分——本拍的机位本来就该不一样。")
+        elif _role == 'establishing':
+            user_text_parts.append(f"附带的第 {ref_img_idx} 张图片为【同空间全景参考图 (IMAGE REF)】。原片在本拍全程是特写，没有可对机位的全景，这是同一个空间里最近的一张全景，但**它不是本拍的时刻**。【只核空间与机位】：用于对标机位视角、构图留白、空间骨架与道具/人物尺度。严禁据此比对施工进度、完成度或已安装的材料，更不得因为候选图比它做得多或少而扣分——本拍的施工量级以提示词与前序基准图为准。")
+        else:
+            user_text_parts.append(f"附带的第 {ref_img_idx} 张图片为【爆款原片对标参考图 (IMAGE REF)】（来自爆款视频同阶段真实关键帧，用于对标机位视角、构图留白、道具尺度与交付量级）。【绝对基准注意】：所有候选图必须以原片参考图的真实视角与场景形态为准。若原片无圆形管道/隧道黑色画框，候选图绝不可凭空出现黑圈暗角/管道伪影，违者直接大幅扣分！")
         image_paths_to_send.append(ref_frame_path)
 
     if succeeding_path and os.path.exists(succeeding_path) and os.path.getsize(succeeding_path) > 0:
@@ -1420,18 +1431,24 @@ def run_candidate_selection_frame_sequence(config, title, prompt_block, on_progr
                 succeeding_frame_path = potential_succ
                 succeeding_prompt_text = prompts_by_seq.get(seq + 1, {}).get('prompt')
 
-        # 爆款原片对标参考关键帧
+        # 爆款原片对标参考关键帧。角色必须跟着一起取：包络端点/同空间全景当绝对基准用
+        # 会按一张不该照的图扣分（见 evaluate_and_select_best_candidate 的分档措辞）。
         ref_frame_path = None
+        ref_frame_role = 'benchmark'
         try:
-            from prompt_pipeline import find_reference_frames_for_project
-            ref_dict, _ = find_reference_frames_for_project(project_dir, len(prompts_by_seq) - 1)
+            from prompt_pipeline import find_reference_frames_with_roles
+            ref_dict, role_dict, _ = find_reference_frames_with_roles(
+                project_dir, len(prompts_by_seq) - 1)
             ref_frame_path = ref_dict.get(seq)
+            ref_frame_role = (role_dict or {}).get(seq) or 'benchmark'
         except Exception:
             ref_frame_path = None
+            ref_frame_role = 'benchmark'
 
         eval_kw = {'on_progress': on_progress}
         if ref_frame_path and os.path.exists(ref_frame_path):
             eval_kw['ref_frame_path'] = ref_frame_path
+            eval_kw['ref_frame_role'] = ref_frame_role
         if succeeding_frame_path:
             eval_kw['succeeding_path'] = succeeding_frame_path
         if succeeding_prompt_text:

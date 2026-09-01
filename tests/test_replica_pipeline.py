@@ -17,11 +17,10 @@ from unittest.mock import MagicMock, patch
 import server_common
 import replica_pipeline as rp
 
-# 这一批用例验的是**标准合成链路**（Pass1 compose_anchor_and_packet + Pass2
-# compose_remaining_beats）。run_compose 的默认通道已经换成 fast_composer 的
-# 一次性直出，所以要测标准链路就得在配置里明说——以前是靠生产代码探测
-# "我是不是正被 mock" 来倒推，那种写法两条链路的真实覆盖都说不清。
-DEEP_COMPOSE = {'composeMode': 'deep'}
+# 这一批用例验的是合成链路（Pass1 compose_anchor_and_packet + Pass2
+# compose_remaining_beats）——极速直通通道退役后这是唯一的一条，不必再在配置里
+# 点名。这个常量留着只是为了不改二十来处调用点。
+DEEP_COMPOSE = {}
 
 
 class ReplicaTempRootCase(unittest.TestCase):

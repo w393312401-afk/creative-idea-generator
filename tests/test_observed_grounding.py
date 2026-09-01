@@ -247,22 +247,13 @@ class TestObservedGrounding(unittest.TestCase):
 
 
 class TestObservedGroundingWiring(unittest.TestCase):
-    """两条链路都要真的把事实卡发出去——只建不发是 2026-08-30 那个坑的形状。"""
+    """事实卡要真的发出去——只建不发是 2026-08-30 那个坑的形状。"""
 
     DIGESTS = {
         'images': {1: 'Observed camera: shot scale: wide', 2: 'IMG2 FACTS'},
         'videos': {1: 'VID1 FACTS'},
         'image_frames': {}, 'video_frames': {},
     }
-
-    def test_fast_composer_user_prompt_carries_the_observed_block(self):
-        from prompt_pipeline.fast_composer import build_fast_composer_user_prompt
-        beats = [{'visible_action': 'a', 'visible_result': 'b'}]
-        text = build_fast_composer_user_prompt('t', 'th', beats, observed_block='OBSERVED-MARKER')
-        self.assertIn('OBSERVED-MARKER', text)
-        # 不传就一字不变（非复刻线走的正是这条）
-        self.assertNotIn('OBSERVED-MARKER',
-                         build_fast_composer_user_prompt('t', 'th', beats))
 
     def test_batch_user_message_carries_the_per_beat_block(self):
         contracts = {1: {'beat': {'operation': 'clearing'}}, 2: {'beat': {'operation': 'flooring'}}}

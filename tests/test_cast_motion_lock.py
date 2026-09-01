@@ -1,20 +1,22 @@
-"""画面里的活物要动起来：人偶/工人/动物从上一拍的姿态动到这一拍的姿态。
+"""帧序列净帧：活物一个都不进 IMAGE，人只活在 VIDEO 里。
 
-2026-08-23 用户实测（run_replica_5a132d86d42d 微缩树桩屋）：交付视频里两个人偶全程
-一个坐姿。beats 里 `cast_action` 每一拍都有值，是下游三层各抹掉它一次：
+这个文件原本锁的是相反的策略——「让 IMAGE 里的人偶动起来」。它是 2026-08-23（微缩树桩屋，
+两个人偶全程一个坐姿）和 2026-08-25（河畔观景室 IMG 011-015，人物贴图五帧像素级重合）
+两次实测之后，往静帧提示词里逐层加人物姿态句加出来的。
 
-  1. 抽包把 "seated couple figurines on compacted soil" 登记成第三个 primary_landmark
-     —— 活物当锚点，姿态还写进了名字；
-  2. fix_primary_landmarks 逐帧复读这句、check_primary_landmarks_exact_match 再要求它
-     逐字出现（连方位一起），于是「坐着」被钉死到全序列，composer 让人偶站起来会被
-     判成锚点漂移、回炉换回原样；
-  3. compile_delta_image_prompt 只保留机位句 + 锚点句，正文按白名单重拼，而白名单里
-     没有 cast_action —— 21 张图里只有第 1 帧（不走这条压缩）写了人偶。
+2026-08-31 用户拍板换路：那几层修复全都是在跟参考图掰手腕。帧序列走链式图生图，上一帧
+里那个人是**像素**，提示词里「换个姿势」是**文字**，文字赢不了——所以再补一层也是白补。
+静帧里根本没有人，就没有可抄的姿态。
 
-于是每一张关键帧里人偶姿态完全一致，首尾帧插值出来必然一动不动。
+于是策略变成两半，必须一起看（见 frame_state.PERSON_FREE_IMAGE_FRAMES）：
+  · IMAGE 一律净帧：活物锚点不进正文、cast_action 不进白名单、静帧事实卡不发人物外形。
+    净帧靠**字段缺席**实现，不靠「画面里没有人」这种否定句——否定句会触发扩散模型的
+    粉色大象效应，fix_image_clean_frame_proactive 专门在删它。
+  · VIDEO 承担全部人物表演，并且自带边界：人从画外入画、干完在最后一刻退回画外，
+    这样每段视频的首尾锚点帧本来就是空的。
 
-口径按 skill 包原文（composers/miniature.py 的 CAST IN FRAME 段）：人偶锁的是**身份、
-服装、比例**，姿态/朝向/站位每一拍都该变。这个文件把三层各自的修复钉住。
+这个文件把两半各自的收口钉住，外加反推侧那条「cast_action 不许写成站位」的体检——那一条
+跟净帧无关，照旧生效：VIDEO 侧仍然要人动起来。
 """
 
 import unittest
@@ -34,7 +36,7 @@ PACKET = {
 
 
 class LivingAnchorTests(unittest.TestCase):
-    """第一、二层：活物锚点不许带姿态，也不许按方位硬判。"""
+    """活物锚点整条不进 IMAGE 正文，fix 与 check 两侧一起退。"""
 
     def test_pose_is_stripped_from_a_living_anchor_name(self):
         lms = pp._family_landmarks(PACKET, 'exterior')
@@ -53,13 +55,27 @@ class LivingAnchorTests(unittest.TestCase):
         clause = pp._canonical_anchor_clause(pp._family_landmarks(PACKET, 'exterior'))
         self.assertIn('massive mossy forest tree trunk in the upper left of the frame', clause)
 
-    def test_living_anchor_locks_scale_and_frees_pose(self):
+    def test_a_living_anchor_never_reaches_the_image_body(self):
+        """锚点句是逐帧复读的：把人写进去就是把他钉回去。"""
         clause = pp._canonical_anchor_clause(pp._family_landmarks(PACKET, 'exterior'))
-        self.assertIn('the same figures in the same costume at the same size', clause)
-        self.assertIn('rising to about a sixth of the frame height', clause)
-        self.assertIn('free to take a new pose and a new spot this frame', clause)
-        # 方位不写：会走动的东西钉方位等于钉站位。
-        self.assertNotIn('couple figurines on compacted soil in the lower left', clause)
+        self.assertNotIn('figurines', clause)
+        self.assertNotIn('the same figures in the same costume at the same size', clause)
+        # 非活物锚点一条不少。
+        self.assertIn('massive mossy forest tree trunk', clause)
+        self.assertIn('dilapidated miniature timber stilt hut', clause)
+
+    def test_a_person_free_stanza_is_not_flagged_for_the_missing_living_anchor(self):
+        """净帧是对的写法，硬校验不许把它判成锚点漂移、回炉一轮把人写回去。"""
+        clause = pp._canonical_anchor_clause(pp._family_landmarks(PACKET, 'exterior'))
+        self.assertEqual(pp.check_primary_landmarks_exact_match(clause, PACKET, 'exterior'), [])
+
+    def test_the_anchor_fix_does_not_append_a_stanza_just_for_the_missing_person(self):
+        """人不在判据里：正文只缺人的时候不该被认成 missing、白拼一条锚点句。"""
+        body = ('Static macro diorama eye-level shot. Locked anchors: massive mossy forest tree '
+                'trunk in the upper left of the frame, rising to about three quarters of the frame '
+                'height; dilapidated miniature timber stilt hut at the centre of the frame, rising '
+                'to about half the frame height.')
+        self.assertEqual(pp.fix_primary_landmarks(body, PACKET, 'exterior'), body)
 
     def test_canonical_clause_passes_its_own_checks(self):
         clause = pp._canonical_anchor_clause(pp._family_landmarks(PACKET, 'exterior'))
@@ -76,14 +92,14 @@ class LivingAnchorTests(unittest.TestCase):
                   'height, now standing at the right edge of the plot facing the new wall.')
         self.assertEqual(pp.check_primary_landmarks_exact_match(prompt, PACKET, 'exterior'), [])
 
-    def test_a_missing_living_anchor_is_still_flagged(self):
-        """放开的只是姿态与方位：人偶整个消失了照样要报。"""
+    def test_a_missing_non_living_anchor_is_still_flagged(self):
+        """退的只是活物那一条：真锚点掉了照样要报。"""
         prompt = ('Static macro diorama eye-level shot. Locked anchors: massive mossy forest tree '
                   'trunk in the upper left of the frame, rising to about three quarters of the frame '
-                  'height; dilapidated miniature timber stilt hut at the centre of the frame, rising '
-                  'to about half the frame height.')
+                  'height.')
         errors = pp.check_primary_landmarks_exact_match(prompt, PACKET, 'exterior')
-        self.assertTrue(any('couple figurines' in e for e in errors), errors)
+        self.assertTrue(any('timber stilt hut' in e for e in errors), errors)
+        self.assertFalse(any('figurines' in e for e in errors), errors)
 
 
 BEAT = {
@@ -101,23 +117,43 @@ ORIGINAL = ('Static macro diorama eye-level shot, 50-85mm macro lens. Locked anc
             'of the frame height. The hand works the trench floor with a hardwood float.')
 
 
-class DeltaPromptCastTests(unittest.TestCase):
-    """第三层：状态压缩的白名单必须收 cast_action。"""
+class PersonFreeDeltaTests(unittest.TestCase):
+    """状态压缩的白名单里没有 cast_action —— 静帧净帧就是这么实现的。"""
 
-    def test_cast_action_survives_the_delta_compile(self):
+    def test_the_cast_never_reaches_the_still(self):
         out = compile_delta_image_prompt(ORIGINAL, BEAT)
-        self.assertIn('Cast in frame:', out)
-        self.assertIn('get up off the stone', out)
+        self.assertNotIn('Cast in frame:', out)
+        self.assertNotIn('figurines', out)
+        self.assertNotIn('get up off the stone', out)
 
-    def test_cast_line_carries_the_identity_lock(self):
+    def test_the_still_never_says_that_nobody_is_there(self):
+        """否定式人物句是粉色大象：说「没有人」的静帧照样会渲出人。"""
+        out = compile_delta_image_prompt(ORIGINAL, BEAT).lower()
+        for phrase in ('no people', 'no person', 'nobody', 'no workers',
+                       'empty of people', 'person-free'):
+            self.assertNotIn(phrase, out)
+
+    def test_the_state_fields_still_all_survive(self):
+        """撤掉的只有人物那一格，其余白名单一条不少。"""
         out = compile_delta_image_prompt(ORIGINAL, BEAT)
-        self.assertIn('same identity, costume and scale as before', out)
-        self.assertIn('never touching the work', out)
+        self.assertIn('Inherited state remains unchanged:', out)
+        self.assertIn('Only visible construction delta in this frame:', out)
+        self.assertIn('Completed terminal state:', out)
+        self.assertIn('Completion extent:', out)
+        self.assertIn('Visible physical evidence remains:', out)
 
-    def test_no_cast_line_when_nothing_alive_is_in_frame(self):
+    def test_the_clean_frame_guard_is_unconditional_again(self):
+        """人物句撤掉之后，'no active construction' 不再需要为它让路。"""
+        for beat in (BEAT, dict(BEAT, cast_action='stands atop ladder grinding overhead beams')):
+            out = compile_delta_image_prompt(ORIGINAL, beat)
+            self.assertIn('no active construction', out)
+            self.assertNotIn('beyond the single cast pose', out)
+
+    def test_a_beat_with_nobody_in_frame_compiles_the_same_way(self):
         beat = dict(BEAT)
         beat.pop('cast_action')
-        self.assertNotIn('Cast in frame:', compile_delta_image_prompt(ORIGINAL, beat))
+        self.assertEqual(compile_delta_image_prompt(ORIGINAL, beat),
+                         compile_delta_image_prompt(ORIGINAL, BEAT))
 
     def test_over_budget_prompts_never_end_mid_sentence(self):
         """旧写法按词硬截，交付过 '…in central soil clearing. Show.' 这样的残句。"""
@@ -127,90 +163,29 @@ class DeltaPromptCastTests(unittest.TestCase):
         self.assertTrue(out.endswith('.'), out[-60:])
         self.assertFalse(out.rstrip().endswith(' Show.'), out[-60:])
 
-    def test_the_cast_line_outranks_the_optional_state_fields(self):
-        """预算紧张时先让位的是 traces / extent，人偶姿态句不让位。"""
-        out = compile_delta_image_prompt(ORIGINAL, BEAT, max_words=90)
-        self.assertIn('Cast in frame:', out)
-        self.assertNotIn('Visible physical evidence remains:', out)
-
-
-class PastedSpriteTests(unittest.TestCase):
-    """2026-08-25 实测（run_replica_06edb8110d5a 河畔观景室）：IMG 011-015 背景从毛石一路
-    换到成品木地板，人物贴图五帧像素级重合。
-
-    这一条与 08-23 那条微缩片的区别在于**工人不是 primary_landmark**——于是
-    _canonical_anchor_clause 那句「free to take a new pose and a new spot this frame」
-    （活物锚点专有）根本没机会出现，整张提示词里关于人的指令只剩「同一身份、同样穿着、
-    同样大小」。纯粹的保持一致 + 上一帧当参考图 = 原样复制。放开姿态的配重不能只挂在
-    锚点那条路上。
-
-    另外两条是同一句话里的自相矛盾：cast_action 是一拍的动线（「先 A、然后 B」），静帧
-    渲不出来；而复刻线的工人本人就在施工，再写 never touching the work / no active
-    construction 就是给模型两条互斥指令——化解矛盾最省力的办法正是两条都不执行。
-    """
-
-    WORKING = dict(BEAT, cast_action=('stands atop ladder grinding overhead beams, '
-                                      'then crouches grinding floor grid welds'))
-
-    def test_pose_change_is_demanded_even_without_a_living_anchor(self):
-        """本体：只写「保持一致」不写「换姿态」，交付出来就是五帧同一张贴图。"""
-        out = compile_delta_image_prompt(ORIGINAL, self.WORKING)
-        self.assertIn('visibly different pose and position from the previous frame', out)
-        self.assertIn('never that posture copied over', out)
-
-    def test_a_motion_line_is_reduced_to_the_pose_the_frame_lands_in(self):
-        """静帧渲不出「先 A 然后 B」，只取落点那一段。"""
-        out = compile_delta_image_prompt(ORIGINAL, self.WORKING)
-        self.assertIn('Cast in frame: crouches grinding floor grid welds', out)
-        self.assertNotIn('stands atop ladder grinding overhead beams', out)
-
-    def test_a_working_cast_is_never_told_it_does_not_touch_the_work(self):
-        """复刻线：工人就是施工者，这句是假话，不许写。"""
-        out = compile_delta_image_prompt(ORIGINAL, self.WORKING)
-        self.assertNotIn('never touching the work', out)
-        self.assertNotIn('no active construction', out)
-        self.assertIn('no construction activity beyond the single cast pose', out)
-
-    def test_a_bystander_cast_keeps_both_miniature_rules(self):
-        """微缩线：人偶只旁观，never touching the work / no active construction 一条不少。"""
+    def test_the_camera_and_anchor_sentences_are_still_preserved_verbatim(self):
         out = compile_delta_image_prompt(ORIGINAL, BEAT)
-        self.assertIn('never touching the work', out)
-        self.assertIn('no active construction', out)
-
-    def test_consecutive_beats_do_not_land_on_the_same_pose_text(self):
-        """连着几拍取到同一句落点，等于什么都没改。"""
-        ladder = [
-            'stands atop ladder grinding overhead beams, then crouches grinding floor grid welds',
-            'sweeps blower nozzle across floor, then climbs ladder to spray ceiling',
-            'steps backward while spraying floor bays, then mounts ladder pressing blue panels',
-        ]
-        poses = [compile_delta_image_prompt(ORIGINAL, dict(BEAT, cast_action=c)).split(
-            'Cast in frame: ')[1].split(' — ')[0] for c in ladder]
-        self.assertEqual(len(set(poses)), len(poses), poses)
-
-    def test_the_cast_line_still_fits_the_image_word_limit(self):
-        """配重句不能把 persistent_traces / completion_extent 挤下车。"""
-        out = compile_delta_image_prompt(ORIGINAL, self.WORKING, max_words=180)
-        self.assertLessEqual(len(out.split()), 180)
-        self.assertIn('Cast in frame:', out)
-        self.assertIn('Visible physical evidence remains:', out)
+        self.assertTrue(out.startswith('Static macro diorama eye-level shot, 50-85mm macro lens.'))
+        self.assertIn('Locked anchors: massive mossy forest tree trunk in the upper left', out)
 
 
 class CastInFrameCheckTests(unittest.TestCase):
-    """VIDEO 侧：漏听了 CAST IN FRAME 要变成一次回炉，不是静默交付。"""
+    """只判 VIDEO。IMAGE 里没有人是对的，判它就是逼着每张静帧写人。"""
 
     VIDEO_WITHOUT = ('Use the provided first frame and last frame as exact composition anchors. '
                      'The oversized hand presses a hardwood float across the trench floor.')
-    VIDEO_WITH = (VIDEO_WITHOUT + ' The two figurines rise off the stone and turn toward the wall.')
-    IMAGE_WITH = 'Cast in frame: the two figurines get up off the stone — same identity, costume and scale.'
+    VIDEO_WITH = (VIDEO_WITHOUT + ' The two figurines walk in from off-frame, rise off the stone '
+                  'and turn toward the wall, then step back out of frame.')
+    IMAGE_PERSON_FREE = 'One clean documentary photograph of the trench floor.'
 
     def test_video_without_the_cast_is_flagged(self):
-        errors = pp.check_cast_in_frame(self.VIDEO_WITHOUT, self.IMAGE_WITH, BEAT)
+        errors = pp.check_cast_in_frame(self.VIDEO_WITHOUT, self.IMAGE_PERSON_FREE, BEAT)
         self.assertEqual(len(errors), 1, errors)
         self.assertTrue(errors[0].startswith('VIDEO'), errors)
 
-    def test_both_carrying_the_cast_is_clean(self):
-        self.assertEqual(pp.check_cast_in_frame(self.VIDEO_WITH, self.IMAGE_WITH, BEAT), [])
+    def test_a_person_free_image_is_never_flagged(self):
+        """本体：静帧不写人是净帧策略要求的，不是漏写。"""
+        self.assertEqual(pp.check_cast_in_frame(self.VIDEO_WITH, self.IMAGE_PERSON_FREE, BEAT), [])
 
     def test_a_beat_with_nobody_in_frame_is_never_flagged(self):
         beat = dict(BEAT)
@@ -256,20 +231,19 @@ if __name__ == '__main__':
 
 
 class CastErrorRoutingTests(unittest.TestCase):
-    """漏了人偶的 VIDEO 要走定向回炉，IMAGE 侧只留痕（它有确定性补句）。"""
+    """漏了人偶的 VIDEO 要走定向回炉；IMAGE 侧一个字都不报。"""
 
     def test_video_cast_omission_is_structural(self):
         errs = pp.check_cast_in_frame('the hand presses a float across the trench floor',
-                                      'Cast in frame: the two figurines get up off the stone.',
+                                      'One clean documentary photograph of the trench floor.',
                                       BEAT)
         structural, rest = pp.split_structural_video_errors(errs)
         self.assertEqual(len(structural), 1, (structural, rest))
         self.assertEqual(rest, [])
 
-    def test_image_cast_omission_only_leaves_a_trace(self):
-        errs = pp.check_cast_in_frame('the two figurines rise off the stone and turn',
+    def test_a_person_free_image_produces_no_error_at_all(self):
+        errs = pp.check_cast_in_frame('the two figurines walk in, rise off the stone and turn, '
+                                      'then step back out of frame',
                                       'One clean documentary photograph of the trench floor.',
                                       BEAT)
-        structural, rest = pp.split_structural_video_errors(errs)
-        self.assertEqual(structural, [])
-        self.assertEqual(len(rest), 1, rest)
+        self.assertEqual(errs, [])

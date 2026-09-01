@@ -322,38 +322,6 @@ const REPLICA_FALLBACK_MODELS = [
 
 const REPLICA_PASS_A_DEFAULT_MODEL = 'gemini-3.7-flash-high';
 
-/* --- 反推通道：极速直读 / 标准深度 ---
- *
- * 后端一直有两条反推链路（replica_pipeline.run_reverse 按 config.reverseMode 分流），
- * 但页面上从来没有入口——所有任务都默认走了极速直读，用户看到细节糊、工序接缝丢，
- * 也没有别的档可换。这里把开关摆到成本确认卡点上：它和送审档位、反推模型是同一个
- * 决定（要多准、愿意花多少），本来就该并排选。
- *
- * 键写两个：新键 reverseMode 与老键 deepReverse 在后端是 or 关系，只写新键的话，
- * localStorage 里残留的 deepReverse=true 会让「极速」这一项永远选不回来。
- */
-function replicaReverseChannel() {
-    const cfg = typeof config !== 'undefined' && config ? config : {};
-    return (cfg.reverseMode === 'deep' || cfg.deepReverse === true) ? 'deep' : 'fast';
-}
-
-/* --- 合成通道：极速直通 / 标准合成 ---
- *
- * 与反推通道同一件事的另一半（replica_pipeline.run_compose 按 config.composeMode 分流），
- * 同样一直没有入口。差距在复刻这条线上比反推那边还大：极速直通的空间锁定包是
- * 一份写死的常量（fast_composer.synthesize_drift_lock_packet，无论什么片子都是
- * 3.2×4.5×2.2m 那一份），而且不跑 ground_anchor_on_reference——那是整条链路上唯一
- * 一次让写手看见原片真实像素的机会。
- */
-function replicaComposeChannel() {
-    const cfg = typeof config !== 'undefined' && config ? config : {};
-    return (cfg.composeMode === 'deep' || cfg.deepCompose === true) ? 'deep' : 'fast';
-}
-
-function replicaComposeChannelLabel() {
-    return replicaComposeChannel() === 'deep' ? '标准合成' : '极速直通';
-}
-
 function replicaModelChoices() {
     const groups = typeof LLM_MODEL_GROUPS !== 'undefined' ? LLM_MODEL_GROUPS : null;
     if (!groups) return REPLICA_FALLBACK_MODELS.slice();
@@ -760,8 +728,6 @@ function replicaRenderBottomBar(state) {
     const errors = violations.filter(v => v.level === 'error');
     const hasBeats = !!(state.beats && (state.beats.beats || []).length);
     const isRunning = !!replicaSSE;
-    // 按下去到底走哪条通道，写在按钮上——通道的选择块在节拍卡片底部，这条栏可能离它很远。
-    const composeChannel = replicaComposeChannelLabel();
 
     // 「清理合成缓存」。合成缓存的键是 brief 指纹（dimensions + 技能 profile +
     // MILESTONE_POLICY_VERSION）——只改了提示词规则而没动节拍时，指纹一个字不变，
@@ -791,9 +757,9 @@ function replicaRenderBottomBar(state) {
                 >保存并重校验${replicaDirty ? '<span class="replica-dirty-dot"></span>' : ''}</button>
             ${resetCacheToggleHtml}
             ${hasPrompt
-                ? `<button type="button" id="replica-bar-recompose-btn" class="action-btn text-btn" ${errors.length ? 'disabled title="先修掉硬伤"' : ''}>重新合成（${composeChannel}）</button>
+                ? `<button type="button" id="replica-bar-recompose-btn" class="action-btn text-btn" ${errors.length ? 'disabled title="先修掉硬伤"' : ''}>重新合成</button>
                    <button type="button" id="replica-bar-project-btn" class="action-btn primary-btn">存入项目并打开激发结果</button>`
-                : `<button type="button" id="replica-bar-compose-btn" class="action-btn primary-btn" ${errors.length ? 'disabled title="先修掉硬伤"' : ''}>合成提示词（${composeChannel}）</button>`}
+                : `<button type="button" id="replica-bar-compose-btn" class="action-btn primary-btn" ${errors.length ? 'disabled title="先修掉硬伤"' : ''}>合成提示词</button>`}
         `;
     } else if (stage === 'audit_failed' || stage === 'compose_failed') {
         mainActionHtml = `
@@ -802,7 +768,7 @@ function replicaRenderBottomBar(state) {
                     ${replicaDirty ? 'title="有改动还没存下来"' : ''}
                 >保存并重校验${replicaDirty ? '<span class="replica-dirty-dot"></span>' : ''}</button>
             ${resetCacheToggleHtml}
-            <button type="button" id="replica-bar-recompose-btn" class="action-btn primary-btn" ${errors.length ? 'disabled title="先修掉硬伤"' : ''}>重新合成（${composeChannel}）</button>
+            <button type="button" id="replica-bar-recompose-btn" class="action-btn primary-btn" ${errors.length ? 'disabled title="先修掉硬伤"' : ''}>重新合成</button>
         `;
     } else if (hasBeats) {
         mainActionHtml = `
@@ -811,7 +777,7 @@ function replicaRenderBottomBar(state) {
                     ${replicaDirty ? 'title="有改动还没存下来"' : ''}
                 >保存并重校验${replicaDirty ? '<span class="replica-dirty-dot"></span>' : ''}</button>
             ${resetCacheToggleHtml}
-            <button type="button" id="replica-bar-compose-btn" class="action-btn primary-btn" ${errors.length ? 'disabled title="先修掉硬伤"' : ''}>合成提示词（${composeChannel}）</button>
+            <button type="button" id="replica-bar-compose-btn" class="action-btn primary-btn" ${errors.length ? 'disabled title="先修掉硬伤"' : ''}>合成提示词</button>
         `;
     }
 
@@ -1804,7 +1770,6 @@ function replicaRenderExtract(state) {
     const startLabel = atCostGate ? '确认并开始反推'
         : (isRetry ? '重试反推' : (hasBeats ? '换档位重跑反推' : '开始反推'));
     const scope = state.review_scope || (state.degraded ? 'degraded' : 'plan');
-    const channel = replicaReverseChannel();
     const fps = replicaCurrentFps(state);
 
     const isCollapsible = !atCostGate && state.stage !== 'extract' && hasBeats;
@@ -1827,7 +1792,6 @@ function replicaRenderExtract(state) {
                 <span>基线 ${fps} fps</span>
                 <span>变化事件 ${ov.change_event_count ?? '—'} 个</span>
                 <span>送审档位 ${scope}</span>
-                <span>反推通道 ${state.reverse_mode === 'deep' ? '标准深度' : (state.reverse_mode ? '极速直读' : '—')}</span>
             </div>
             ${replicaRenderCollageFold(collage, ov.frame_count)}
         ` : `
@@ -1861,34 +1825,9 @@ function replicaRenderExtract(state) {
             <div class="replica-cost">
                 ${atCostGate ? `<p class="replica-hint replica-cost-gate">
                     <b>抽帧已完成，还没有开始花钱。</b>反推是整条线的成本大头——
-                    先选通道（极速直读 / 标准深度），再决定送多少帧给多模态模型，选好再按开始。
+                    先决定送多少帧给多模态模型，选好再按开始。
                 </p>` : ''}
                 ${replicaRenderSpend(state)}
-                <div class="replica-channel-picker">
-                    <div class="replica-card-subtitle">反推通道</div>
-                    <label class="replica-radio">
-                        <input type="radio" name="replica-reverse-channel" value="fast"
-                               ${channel === 'fast' ? 'checked' : ''}>
-                        <span><b>极速直读</b>（1 次视觉调用 · 约 30~45 秒）——
-                              取最多 20 张关键帧、压到 768px，单轮多模态直出整份节拍阶梯。
-                              快且便宜，但<b>不逐帧读、不复核峰值帧</b>；模型没给全的工艺字段由
-                              模板补齐、时间窗按时长均分。适合先看个大概、试主题。</span>
-                    </label>
-                    <label class="replica-radio">
-                        <input type="radio" name="replica-reverse-channel" value="deep"
-                               ${channel === 'deep' ? 'checked' : ''}>
-                        <span><b>标准深度（Deep Mode）</b>（按下面档位的调用次数 · 约 3~6 分钟）——
-                              Pass A 逐帧读事实（10 帧一批，解析失败二分重试并抬到 1024px）→
-                              强模型复核事件峰值帧（含原生尺寸 ROI 特写）→ Pass B 聚类成拍 → 中文对照。
-                              细节、工序接缝与节拍边界都准得多，代价是时间与调用次数。</span>
-                    </label>
-                    <p class="replica-hint">
-                        选「极速直读」时，下面的送审档位与峰值帧复核<b>都不生效</b>——那条通道自己定帧、
-                        也不跑复核，三档预估的调用次数只对深度通道成立。
-                        ${state.reverse_mode ? `上一轮实际走的是<b>${state.reverse_mode === 'deep' ? '标准深度' : '极速直读'}</b>。` : ''}
-                        ${state.reverse_fallback ? `<b>注意：</b>上一轮极速通道失败，已自动降级到标准深度跑完（${escapeHtmlReplica(state.reverse_fallback)}）。` : ''}
-                    </p>
-                </div>
                 <div id="replica-scope-choices" class="replica-scope-choices">
                 <label class="replica-radio">
                     <input type="radio" name="replica-mode" value="all" ${scope === 'all' ? 'checked' : ''}>
@@ -1948,9 +1887,8 @@ function replicaRenderExtract(state) {
                 ${hasBeats && !atCostGate ? `<p class="replica-hint">
                     已经有一份节拍阶梯了。换档位重跑会覆盖它——你在下面改过的内容会丢。
                 </p>` : ''}
-                <button type="button" id="replica-start-btn" class="action-btn primary-btn"
-                        data-label-base="${startLabel}">
-                    ${startLabel}（${channel === 'deep' ? '标准深度' : '极速直读'}）
+                <button type="button" id="replica-start-btn" class="action-btn primary-btn">
+                    ${startLabel}
                 </button>
             </div>
         `}
@@ -2298,40 +2236,6 @@ function replicaRenderLadderOverview(doc, errors, warns) {
     </div>`;
 }
 
-// 合成通道选择块。摆在节拍卡片底部、动作排前面：这里正是「阶梯核对完了，下一步合成」
-// 的那个位置，而吸底栏那颗 CTA 装不下这两条通道的差别说明。
-function replicaRenderComposeChannel(state) {
-    const channel = replicaComposeChannel();
-    return `
-    <div class="replica-section replica-channel-picker" id="replica-sec-compose-channel">
-        <div class="replica-card-subtitle">合成通道</div>
-        <label class="replica-radio">
-            <input type="radio" name="replica-compose-channel" value="fast"
-                   ${channel === 'fast' ? 'checked' : ''}>
-            <span><b>极速直通</b>（1 次调用 · 约 15~30 秒）——
-                  单轮直出全部 N+1 张 IMAGE 与 N 条 VIDEO。快，但
-                  <b>空间锁定包是写死的常量</b>（无论什么片子都是同一份 3.2×4.5×2.2m envelope 与
-                  Grid A2/B2/C2 地标），<b>锚点图不与原片首帧对齐</b>，也没有逐拍确定性修复与断点续传——
-                  那一次调用炸了就整份重来。适合先看提示词大概长什么样。</span>
-        </label>
-        <label class="replica-radio">
-            <input type="radio" name="replica-compose-channel" value="deep"
-                   ${channel === 'deep' ? 'checked' : ''}>
-            <span><b>标准合成（Deep Mode）</b>（8~15 次调用 · 约 3~5 分钟）——
-                  Phase 1 解析维度、按这条片子建空间锁定包、只写 IMAGE 1 锚点 →
-                  <b>拿原片首帧校准锚点</b>并用校准结果回头修 packet →
-                  Phase 2 带 SCUP 协议与模板逐拍写，每拍过确定性修复、每拍存断点。
-                  要贴合原片就选它。</span>
-        </label>
-        <p class="replica-hint">
-            两条通道最后都过同一道禁用元素门禁——「没报硬伤」不代表画面一致性也一样，
-            那道闸只拦禁用元素，拦不住空间漂移。
-            ${state && state.compose_mode ? `上一轮实际走的是<b>${state.compose_mode === 'deep' ? '标准合成' : '极速直通'}</b>。` : ''}
-            ${state && state.compose_fallback ? `<b>注意：</b>上一轮极速通道失败，已自动降级到标准合成跑完（${escapeHtmlReplica(state.compose_fallback)}）。` : ''}
-        </p>
-    </div>`;
-}
-
 function replicaRenderBeats(state) {
     const doc = state.beats;
     if (!doc || !(doc.beats || []).length) return '';
@@ -2397,7 +2301,6 @@ function replicaRenderBeats(state) {
               修复按钮同时还犯了另一条：0 硬伤时横幅里没有它，这一排里却还摆着一枚，
               点下去无事发生。本文件里已有同款判断——「摆一个点了必然报错的按钮比不摆
               更糟」（见下面撤销按钮的条件渲染）。现在它只在有硬伤时、只在硬伤旁边出现。 */''}
-        ${replicaRenderComposeChannel(state)}
         <div class="replica-actions">
             <button type="button" id="replica-refine-craft-btn" class="action-btn text-btn"
                     title="看着证据帧把每一拍的措辞写准：补位置锚、补完成量、拆开结果与状态、补工具/声音/景别/运镜/光照/物料。画面上发生了什么一个字不动，1:1 不受影响。已有的合成提示词会作废，需要重新合成。">✨ 工艺精修（不动 1:1）</button>
@@ -2991,16 +2894,9 @@ function replicaBindEvents() {
         replicaExtractExpanded = !replicaExtractExpanded;
         replicaRender();
     });
-    // 通道与模型选择改一下就落盘，不必等到点「开始反推」
-    root.querySelectorAll('input[name="replica-reverse-channel"]').forEach((el) => {
-        el.addEventListener('change', () => {
-            replicaCaptureReverseSettings();
-            replicaSyncReverseChannelUI();
-        });
-    });
+    // 模型选择改一下就落盘，不必等到点「开始反推」
     on('#replica-frame-model', replicaCaptureReverseSettings, 'change');
     on('#replica-peak-model', replicaCaptureReverseSettings, 'change');
-    replicaSyncReverseChannelUI();
     on('#replica-recompose-btn', replicaCompose);
     on('#replica-project-btn', (e) => replicaSaveToProject(e.currentTarget));
     on('#replica-cancel-btn', replicaCancelRun);
@@ -3370,18 +3266,6 @@ function replicaBindBeatEvents(scope) {
         const el = scope.querySelector(sel);
         if (el) el.addEventListener(evt, fn);
     };
-
-    // 合成通道的单选框长在这张卡片里，所以绑在这里而不是 replicaBindEvents：
-    // 节拍区会被 replicaRefreshBeats 单独重绘（每次保存都会），绑在外面的话保存一次
-    // 这两个单选框就哑了，而它们看上去仍然可点。
-    // 换通道后只重建吸底栏与导航（按钮上写着走哪条通道），不重绘节拍区——那会把
-    // 用户改到一半、还没保存的文本框推回上一次保存的值。
-    scope.querySelectorAll('input[name="replica-compose-channel"]').forEach((el) => {
-        el.addEventListener('change', () => {
-            replicaCaptureComposeChannel();
-            replicaRefreshChrome();
-        });
-    });
 
     // 保存与合成不在这一排里，它们常驻吸底操作栏（见 replicaBindBottomBarEvents）。
     // 精修会作废已有的 prompt_block（beats 一变，旧提示词就是按旧措辞合出来的）。
@@ -4074,61 +3958,17 @@ async function replicaReExtract() {
     await replicaExtract(baseFps, stateDiffThreshold);
 }
 
-// 反推段的通道与模型选择：先落进全局 config（写 localStorage），再随请求体发出去。
+// 反推段的模型选择：先落进全局 config（写 localStorage），再随请求体发出去。
 // 落盘是为了下一条任务、下一次开页面还是这个选择——不落的话每次都回默认值，
 // 用户会以为自己选过了。
 function replicaCaptureReverseSettings() {
     const root = replicaRoot();
     if (!root) return;
-    const chanEl = root.querySelector('input[name="replica-reverse-channel"]:checked');
-    if (chanEl) {
-        const deep = chanEl.value === 'deep';
-        replicaSetConfigValue('reverseMode', deep ? 'deep' : 'fast');
-        // 老键与新键在后端是 or 关系（run_reverse），两个一起写，否则残留的
-        // deepReverse=true 会把「极速」这一项锁死。
-        replicaSetConfigValue('deepReverse', deep);
-    }
     const frameEl = root.querySelector('#replica-frame-model');
     if (frameEl) replicaSetConfigValue('frameFactsModel', frameEl.value);
     const peakEl = root.querySelector('#replica-peak-model');
     // 空值 = 跟随主模型：写空字符串，reverse._peak_verify_model 会回落到 config.model。
     if (peakEl) replicaSetConfigValue('peakVerifyModel', peakEl.value);
-}
-
-// 合成通道写回 config（新老键一起写，理由同反推通道），再由 replicaConfig() 随请求体发出。
-function replicaCaptureComposeChannel() {
-    const root = replicaRoot();
-    if (!root) return;
-    const el = root.querySelector('input[name="replica-compose-channel"]:checked');
-    if (!el) return;
-    const deep = el.value === 'deep';
-    replicaSetConfigValue('composeMode', deep ? 'deep' : 'fast');
-    replicaSetConfigValue('deepCompose', deep);
-}
-
-// 通道一换，卡点上「哪些控件还算数」就变了。这里就地改 DOM 而不是 replicaRender()：
-// 整卡重绘会把用户刚选还没重抽的抽帧密度顶回状态里的旧值。
-function replicaSyncReverseChannelUI() {
-    const root = replicaRoot();
-    if (!root) return;
-    const deep = replicaReverseChannel() === 'deep';
-    const scopeBox = root.querySelector('#replica-scope-choices');
-    if (scopeBox) {
-        scopeBox.classList.toggle('replica-inactive', !deep);
-        scopeBox.querySelectorAll('input[name="replica-mode"]').forEach((el) => {
-            el.disabled = !deep;
-        });
-    }
-    const peakField = root.querySelector('#replica-peak-field');
-    if (peakField) {
-        peakField.classList.toggle('replica-inactive', !deep);
-        const peakEl = peakField.querySelector('select');
-        if (peakEl) peakEl.disabled = !deep;
-    }
-    const btn = root.querySelector('#replica-start-btn');
-    if (btn && btn.dataset.labelBase) {
-        btn.textContent = `${btn.dataset.labelBase}（${deep ? '标准深度' : '极速直读'}）`;
-    }
 }
 
 async function replicaStart() {
