@@ -55,7 +55,8 @@ REVIEW_STAGES = {'confirm_cost', 'review_beats', 'audit_failed', 'compose_failed
 ATTENTION_WAITING_YOU = {'confirm_cost', 'review_beats', 'audit_failed', 'compose_failed', 'mutate_failed'}
 
 VALID_ACTIONS = {'approve', 'variant', 'recluster', 'translate', 'autofix', 'fix_beats',
-                 'autobalance', 'refine_craft', 'archive', 'rename', 'undo_beats'}
+                 'autobalance', 'refine_craft', 'recheck_camera', 'archive', 'rename',
+                 'undo_beats'}
 
 # stage → 中文标签的唯一真源。
 STAGE_LABELS = {
@@ -1393,6 +1394,99 @@ def refine_job_craft(config, job_id, on_progress=None):
     return state, refined_count
 
 
+def recheck_job_camera(config, job_id, on_progress=None):
+    """按帧复核机位：拿 Pass A 的逐帧读数去校 Pass B 转写出来的逐拍机位。
+
+    与 `refine_job_craft` 的分界：那条改措辞，这条只改 `camera_angle` /
+    `camera_bearing` 两栏闭集读数。它是 `mixed_camera_angle` 这条待确认项的解——
+    工艺精修够不着它（不在 `CRAFT_REFINE_CODES` 里），此前只能人工照帧核。
+
+    三层里前两层是纯本地对账、零调用；只有帧票自己分裂的那几拍才升级成看图调用。
+    详见 `reverse.recheck_camera_setups` 的说明。
+
+    翻译不重跑：这两栏是闭集枚举、不在 `reverse.TRANSLATE_FIELDS` 里（界面上的中文由
+    `*_LABELS_ZH` 直接渲染），改了它们不会让任何一条中文对照过期。合成产物则照样作废，
+    但**只在真的订正了读数时**——机位分组一变，`pp.observed_camera_setups` 发出去的
+    SETUP 句就跟着变。只盖了复核戳、一个读数都没改的那一轮不该让用户重付一次合成。
+    """
+    from prompt_pipeline import reverse
+
+    state = _load_state(job_id)
+    if not state:
+        raise ValueError(f'找不到复刻任务 {job_id}')
+    if state.get('is_locked_baseline'):
+        raise ValueError('已加锁为 Gold Baseline，禁止复核机位——'
+                         '母本一改，所有已派生变体的血统就和它对不上了。'
+                         '要改请先解锁，或以此母本派生变体后在变体上改。')
+    beats = state.get('beats')
+    if not beats or not beats.get('beats'):
+        raise ValueError('还没有节拍阶梯，无法复核机位')
+
+    overview = _load_overview(state)
+    # 帧事实与帧文件都在根母本目录下：变体的 reference_frames 指回的是原片的帧。
+    frames_dir = job_dir(find_root_baseline_id(job_id))
+
+    checked_doc, report = reverse.recheck_camera_setups(
+        beats, overview=overview, job_dir=frames_dir, config=config,
+        frames_dir=frames_dir, on_progress=on_progress)
+
+    corrected = report.get('corrected') or []
+    if report.get('skipped'):
+        # 什么都没发生时别动 stage、别清合成产物——那正是「AI 修复硬伤」在 0 硬伤阶梯上
+        # 干过的事（见 autofix_job_beats 的说明）。
+        if on_progress:
+            on_progress('replica_stage', {
+                'stage': state.get('stage'),
+                'message': f'机位复核没有进行：{report["skipped"]}。',
+                'beats': checked_doc,
+                'validation': state.get('validation') or [],
+            })
+        return state, report
+
+    # 复核戳本身也是这份文档的事实（它让已核过的空间不再报 warn），所以即使一个读数都
+    # 没订正也要落盘。落盘走 _write_beats：它顺手留一份上一版，用户点「撤销」能整份退回。
+    if corrected:
+        _invalidate_compose_artifacts(state)
+    _write_beats(state, checked_doc)
+    if corrected:
+        state['stage'] = 'review_beats'
+    _save_state(state)
+
+    if on_progress:
+        bits = []
+        if corrected:
+            by_frames = sum(1 for c in corrected if c.get('by') == 'frames')
+            detail = '；'.join(
+                f'{c["beat_id"]} {"俯仰" if c["field"] == "camera_angle" else "方位"}'
+                f' {c["was_zh"]} → {c["now_zh"]}'
+                f'（{"帧票 " + c["votes"] if c["by"] == "frames" else "看图复核"}）'
+                for c in corrected[:6])
+            more = f'，另有 {len(corrected) - 6} 处' if len(corrected) > 6 else ''
+            bits.append(f'订正 {len(corrected)} 处机位读数（其中 {by_frames} 处是 Pass A 的'
+                        f'逐帧读数与 Pass B 的转写对不上，零调用改回）：{detail}{more}')
+        if report.get('confirmed'):
+            bits.append(f'{report["confirmed"]} 拍按帧确认无误、已盖复核戳，'
+                        f'这几拍不再列入待人工确认')
+        if report.get('escalated'):
+            bits.append(f'{report["escalated"]} 拍帧读数自己不一致，已升级看图复核')
+        unresolved = report.get('unresolved') or []
+        if unresolved:
+            bits.append('仍有 ' + '、'.join(
+                f'{u["beat_id"]}（{u["reason"]}）' for u in unresolved[:4])
+                + (f' 等 {len(unresolved)} 拍' if len(unresolved) > 4 else '')
+                + ' 定不下来，得你照帧看一眼')
+        head = f'机位复核完成（{"、".join(report.get("spaces") or [])}，共 {report.get("checked", 0)} 拍）：'
+        tail = ('已有的合成提示词按旧机位分组产出、已作废，需要重新合成。'
+                if corrected else '没有订正任何读数，合成产物原样保留。')
+        on_progress('replica_stage', {
+            'stage': state.get('stage') or 'review_beats',
+            'message': head + ('；'.join(bits) or '没有发现需要订正的读数') + '。' + tail,
+            'beats': checked_doc,
+            'validation': state.get('validation') or [],
+        })
+    return state, report
+
+
 # ── 二创 ─────────────────────────────────────────────────────────────────────
 
 def run_mutate(state, config, axis_spec, on_progress=None):
@@ -1507,7 +1601,11 @@ def run_mutate(state, config, axis_spec, on_progress=None):
 
 
 def ai_diverge_ideas(config, baseline_job_id, brief=None, count=4, on_progress=None, trend_ref_ids=None):
-    """调用大模型基于黄金母本工序与骨架并结合联网参考，智能发散 4 组完全正交的二创方案。"""
+    """调用大模型基于黄金母本工序与骨架并结合联网参考，智能发散 4 组完全正交的二创方案。
+
+    每次发散会把本母本历次产出的方案作为去重黑名单一并送进模型，
+    并为每个方案锚定一条不同的联网参考（见 mutate._select_diverge_trend_refs）。
+    """
     from prompt_pipeline import mutate
 
     baseline_job_id = validate_job_id(baseline_job_id)
@@ -1524,6 +1622,11 @@ def ai_diverge_ideas(config, baseline_job_id, brief=None, count=4, on_progress=N
     baseline_doc['overview'] = state.get('overview') or {}
     baseline_doc['video_duration_sec'] = state.get('overview', {}).get('duration_sec') or 0.0
 
+    # 这个母本历次发散过什么，作为硬性去重黑名单回灌进 prompt。没有这一层时，
+    # 同一个母本连点 N 次就是 N 次完全相同的请求，出同一批结果是必然的
+    # （主管线激发一直有创意台账去重，二创发散此前是裸的）。
+    history = state.get('ai_diverge_history') or []
+
     ideas = mutate.ai_diverge_orthogonal_ideas(
         config=config,
         baseline_doc=baseline_doc,
@@ -1531,10 +1634,35 @@ def ai_diverge_ideas(config, baseline_job_id, brief=None, count=4, on_progress=N
         count=count,
         on_progress=on_progress,
         trend_ref_ids=trend_ref_ids,
+        avoid_ideas=history,
     )
 
     # 缓存到 state 中，页面刷新时持久化展示
     state['ai_diverged_ideas'] = ideas
+    # 历史只留去重需要的最小骨架（名字 + 环境/材质两轴），封顶 40 条，
+    # 免得 state 随点击次数无限膨胀。
+    merged = list(history)
+    for idea in ideas:
+        if not isinstance(idea, dict):
+            continue
+        axes = idea.get('axes') or {}
+        merged.append({
+            'id': idea.get('id'),
+            'name': idea.get('name'),
+            'axes': {
+                'environment': axes.get('environment'),
+                'material': axes.get('material'),
+            },
+        })
+    seen_keys = set()
+    deduped = []
+    for row in reversed(merged):
+        key = f"{row.get('name')}|{(row.get('axes') or {}).get('environment')}"
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        deduped.append(row)
+    state['ai_diverge_history'] = list(reversed(deduped))[-40:]
     _save_state(state)
 
     return ideas
@@ -2660,7 +2788,8 @@ def start_replica_job(config, job_id, on_progress=None, degraded=False, scope=No
 # 那十来处 on_progress 调用点，是因为前端的判据是「动作期间的每一条事件都带 action」：
 # 逐个 emission 手加字段，漏一条就会在那一瞬间闪回「待人工核对」，而且下次谁再加一条
 # 事件又会漏。包一层之后这条保证是结构性的。
-_ACTION_TAGGED = frozenset({'autofix', 'fix_beats', 'autobalance', 'refine_craft', 'translate', 'variant', 'mutate_orthogonal'})
+_ACTION_TAGGED = frozenset({'autofix', 'fix_beats', 'autobalance', 'refine_craft',
+                            'recheck_camera', 'translate', 'variant', 'mutate_orthogonal'})
 
 
 def _tag_progress_with_action(on_progress, action):
@@ -2687,6 +2816,7 @@ def advance_replica_job(config, job_id, action='approve', payload=None,
     recluster→ 重跑 Pass B（Pass A 的帧事实走缓存，不重付视觉钱）
     translate→ 重做中文对照（纯文本调用，不碰英文原文，也不动 stage）
     refine_craft→ 工艺精修：看着证据帧改措辞，画面内容不动（1:1 不受影响）
+    recheck_camera→ 机位复核：拿 Pass A 的逐帧读数校 Pass B 转写的逐拍机位（前两层零调用）
     """
     if action not in VALID_ACTIONS:
         raise ValueError(f'不支持的 action: {action}，合法值为: {sorted(VALID_ACTIONS)}')
@@ -2729,6 +2859,9 @@ def advance_replica_job(config, job_id, action='approve', payload=None,
             return state
         if action == 'refine_craft':
             state, refined_count = refine_job_craft(config, job_id, on_progress=on_progress)
+            return state
+        if action == 'recheck_camera':
+            state, _report = recheck_job_camera(config, job_id, on_progress=on_progress)
             return state
         if action == 'undo_beats':
             state = undo_beats(job_id)

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import copy
 import json
+import random
 import re
 from typing import Any, Dict, List, Optional
 
@@ -608,7 +609,13 @@ def generate_orthogonal_variant(
 
 
 _AI_DIVERGE_SYSTEM = """你是一位顶尖的纪录片级视觉短视频创意总监与真实极限空间建造设计师（精通 TikTok 爆款叙事心理学、情绪价值曲线与完播率留存钩子）。
-你的任务是根据给定的「1:1 黄金母本延时改造视频」的工序骨架和节奏，在确保物理工序拓扑与分镜完全可复用的前提下，进行四轴正交创意发散（AI Orthogonal Mutation），构思出具备【TikTok 爆款叙事灵魂、有血有肉的情感闭环、黄金 3 秒视觉钩子、极致前后反差】，且【100% 真实写实】的【硬核生存庇护所 / 极限避难所 / 微缩神迹工坊 / 治愈系庇护豪宅】新创意方案。
+你的任务是根据给定的「1:1 黄金母本延时改造视频」的工序骨架和节奏，在确保物理工序拓扑与分镜完全可复用的前提下，进行四轴正交创意发散（AI Orthogonal Mutation），构思出具备【TikTok 爆款叙事灵魂、有血有肉的情感闭环、黄金 3 秒视觉钩子、极致前后反差】，且【100% 真实写实】的全新改造创意方案。题材边界由母本自身的载体与下方【联网爆款参考】共同决定，不由本提示词预设。
+
+★★★★★ NO-TEMPLATE POLICY（反模板准则 — 本节优先级最高，与下文任何表述冲突时以本节为准）：
+1. 本提示词【不提供任何可直接抄用的选题清单】。下面四条轴只定义"维度是什么"和"禁止什么"，绝不定义"应该选什么"。
+2. 严禁套用默认地貌套餐。极地冰原、火山地热、热带雨林、干旱荒漠、溶洞暗河、海蚀崖这六类已被用滥，除非母本载体或联网参考明确指向，否则一律不得出现。
+3. 载体优先级：母本自身的真实载体（车厢、船体、集装箱、老屋、商铺、地下室、棚屋、厂房……）与【联网爆款参考】中出现的载体，永远优先于任何自然极端地貌。
+4. 同批 {count} 个方案必须锚定 {count} 条互不相同的取材角度，严禁四个方案是同一个套路换皮。
 
 ★★★★★ TIKTOK VIRAL NARRATIVE & EMOTION POLICY（爆款叙事与情绪价值准则 — 绝不生成表面无血无肉的冰冷工具展示）：
 1. 黄金 3 秒痛点钩子 (Hook Inception): 绝不平淡开场！每一方案开局必须带有“完全毁坏破烂屋子/暴风雨冲垮废墟/流离失所绝境”的极端视觉痛点，瞬间锁住观众前 3 秒！
@@ -619,36 +626,36 @@ _AI_DIVERGE_SYSTEM = """你是一位顶尖的纪录片级视觉短视频创意�
 ★★★★★ REALISM-ONLY POLICY（去科幻 / 严格真实写实硬约束 — 违反直接废弃）：
 1. 严禁任何科幻、未来机能、太空宇航、外星异星、赛博朋克、全息投影、RGB霓虹灯带、发光科技面板、失重力、虚构魔法或超自然发光生物！
 2. 严禁千篇一律的“小资网红温馨民宿/酒店样板间/咖啡馆/浪漫串灯/反光塑料地板”套路！
-3. 所有方案必须是【现实世界中可以真实施工建造的】极限庇护所、防灾掩体、隐蔽哨所、微缩手工庄园或自持空间改造，具有强烈的工匠手作质感、硬核工程防护逻辑、真实物料触感与自然地理险境美感。
+3. 所有方案必须是【现实世界中可以真实施工建造的】真实空间改造（可以是废弃载具、老旧建筑、微缩手作庄园、防灾掩体或自持庇护所，由母本载体与联网参考决定），具有强烈的工匠手作质感、硬核工程逻辑、真实物料触感与真实场地氛围。
 4. 四大正交发散轴：
-   - 轴 1 地貌险境与水体环境 (Environment & Biome): 真实自然地理极端微气候与环境威胁（如：极地厚积雪冻土裂隙暴风雪、火山熔岩地热热泉与硫磺有毒蒸气、热带雨林红树林季风暴雨洪泛、悬崖岩穴石灰岩溶洞暗河、干旱荒漠红土特大沙尘暴、海边海蚀崖暗礁浪涌）。
-   - 轴 2 结构材质与防护工艺 (Material & Craft): 真实硬核建筑与防护施工材料（如：粗犷芬兰松木原木 + 气凝胶保温层、哑光黑耐候钢构件 + 黑色玄武岩打磨、缅甸老柚木防腐榫卯 + 悬空防洪毛石基座、粗糙天然玄武岩 + 黄铜暗埋构件、传统生土夯土厚墙 + 粗壮胡杨木大梁 + 重型防沙重力门、双层中空防爆夹胶钢化玻璃）。严禁碳纤维RGB、太空合金、全息舱。
-   - 轴 3 庇护所维生功能与硬核软装 (Shelter Function & Survival Systems): 真实自给自足维生与避险设施（如：极地防寒壁炉与气闸保暖舱、地热温差发电组与硫磺过滤新风塔、悬空防洪木作台与雨水多级净化槽、地下恒温水窖与气密粮仓、荒漠太阳能冷凝集水与防沙地下地堡、隐蔽工作台与防潮储物架）。严禁电竞舱、科研实验舱、太空观测台。
-   - 轴 4 终极生物/自然奇观揭示 (Hero Creature / Reveal): 真实自然生态野生动物或宏大自然水景（如：4米野生北极白鲸/独角鲸/极地北极熊、火山熔岩流与清澈溪流高山红点鲑、热带巨骨舌鱼/水豚/黑凯门鳄、溶洞地下暗河岩斑盲鱼群、荒漠绿洲清泉野生双峰驼、高山雪豹）。严禁发光生物、异星怪兽、赛博机械兽。
+   - 轴 1 环境与场地 (Environment & Site): 这次改造发生在什么真实地点、什么气候、什么外部压力之下。必须具体到可勘察的场地特征（地面状况、周边环境、光照、天气、噪音、威胁来源），严禁抽象空泛。严禁外星地表与虚构星球。
+   - 轴 2 结构材质与工艺 (Material & Craft): 主体结构与面层用什么真实可采购、可施工的材料与工法，配什么连接件、保温层与保护层。严禁碳纤维RGB、太空合金、全息舱、自发光材料。
+   - 轴 3 空间功用与硬核软装 (Space Function & Systems): 建成后这个空间靠什么系统运转、解决什么真实生活或生存问题、配什么家具与设备。严禁电竞舱、科研实验舱、太空观测台。
+   - 轴 4 终极揭示 (Hero Reveal): 终拍那个让人起鸡皮疙瘩的揭示物或揭示时刻，可以是真实野生动物、真实自然奇观、真实人物情绪爆发或隐藏机关展开。严禁发光生物、异星怪兽、赛博机械兽。
 
 硬性约束：
-- 构思 {count} 组地貌环境与材质工艺完全正交、绝不撞车、极具视觉冲击力与极限生存反差感的写实庇护所方案。
+- 构思 {count} 组环境场地、材质工艺与空间功用完全正交、绝不撞车、极具视觉冲击力与反差感的写实改造方案。
 - 方案必须符合工序施工的可视化逻辑（破拆 -> 结构 -> 隐蔽 -> 封板 -> 面层 -> 地面 -> 设备 -> 软装 -> 揭示），充满质感与具象细节，严禁空洞虚浮的抽象词汇。
-- 若用户提供了发散方向（User Direction/Brief），必须紧密围绕该方向深度发散出不同层次的方案（若方向中带有科幻词汇，必须将其转化为现实写实建造对应物）；若未提供，则自由发散最吸睛、反差感最强的爆款写实庇护所方向。
-{trend_guidance}
+- 若用户提供了发散方向（User Direction/Brief），必须紧密围绕该方向深度发散出不同层次的方案（若方向中带有科幻词汇，必须将其转化为现实写实建造对应物）；若未提供，则以母本自身的真实载体与下方【联网爆款参考】作为唯一取材来源自由发散，不得回退到任何默认地貌套餐。
+{avoid_block}{trend_guidance}
 
 输出格式：
 严格返回一个 JSON 数组（无任何 Markdown 代码块，无额外废话），包含 {count} 个对象，每个对象结构如下：
 [
   {{
-    "id": "shelter_unique_id",
-    "name": "中文庇护所主题名 (如：极地防风雪避险庇护所)",
-    "icon": "❄️",
-    "hook": "一句话爆款卖点（20字以内，包含痛点钩子与终极反差，如：废墟破屋开局，神之手打造极地松木豪宅与白鲸）",
-    "trend_ref": "说明借鉴了哪条联网参考的哪个要点（如：借鉴极地避难所的双层气凝胶保温木结构与防风雪观察窗）",
+    "id": "英文小写下划线唯一标识，须反映本方案自己的载体与题材",
+    "name": "中文主题名（12 字以内，本方案独有的具体命名，不得套用任何范例）",
+    "icon": "一个贴合本方案的 emoji",
+    "hook": "一句话爆款卖点（20字以内，包含开局痛点钩子与终局极致反差）",
+    "trend_ref": "借鉴了哪一条联网参考的哪个具体要点（中文20字以内，必须非空，且与同批其他方案引用不同条目）",
     "axes": {{
-      "environment": "具体地貌险境与水体环境中文描述",
-      "material": "具体结构材质与防护工艺中文描述",
-      "function": "具体庇护所维生功能与硬核软装中文描述",
-      "hero_reveal": "具体终极生物或事件揭示中文描述"
+      "environment": "具体环境与场地中文描述",
+      "material": "具体结构材质与工艺中文描述",
+      "function": "具体空间功用与硬核软装中文描述",
+      "hero_reveal": "具体终极揭示中文描述"
     }},
-    "scene_signature": "One concise English sentence summarizing the final shelter structure, survival materials, and environment.",
-    "banned_elements": ["sci-fi", "cyberpunk", "neon", "glowing tech", "spaceship", "alien", "generic cozy homestay", "luxury hotel", "glowing fairy lights", "cheap glossy floor"]
+    "scene_signature": "One concise English sentence summarizing the final structure, materials, and site.",
+    "banned_elements": ["针对本方案需要显式禁止的具体元素，英文小写，至少 6 条"]
   }}
 ]"""
 
@@ -657,7 +664,8 @@ def _generate_fallback_ideas(
     baseline_doc: Optional[Dict[str, Any]] = None,
     brief: Optional[str] = None,
     count: int = 4,
-    trend_refs: Optional[List[Dict[str, Any]]] = None
+    trend_refs: Optional[List[Dict[str, Any]]] = None,
+    avoid_ideas: Optional[List[Any]] = None,
 ) -> List[Dict[str, Any]]:
     """当 LLM 不可用或解析失败时的丰富动态写实兜底方案（自适应微缩沙盘与成人庇护所题材）。"""
     ref_ids = [r['id'] for r in (trend_refs or []) if isinstance(r, dict) and r.get('id')]
@@ -740,6 +748,70 @@ def _generate_fallback_ideas(
                 'scene_signature': 'A miniature monolithic rammed-earth and desert timber oasis villa diorama crafted by giant god hand.',
                 'banned_elements': ['adult full scale', 'sci-fi', 'futuristic', 'neon', 'metal spacecraft', 'high-tech panels', 'generic cozy homestay'],
             },
+            {
+                'id': 'miniature_fishing_wharf',
+                'name': '微缩海岬渔村石屋',
+                'icon': '⚓',
+                'hook': '风暴掀翻的破渔棚开局，神来之手为夫妇精雕微缩海岬石屋',
+                'trend_ref': '借鉴旧渔具与浮标旧物再利用的低成本软装手法',
+                'trend_ref_ids': ref_ids,
+                'axes': {
+                    'environment': '微缩海岬礁石与退潮滩涂桌面沙盘',
+                    'material': '微缩毛石干砌墙 + 迷你旧船板拼贴 + 微雕麻绳与黄铜配件',
+                    'function': '微缩渔家石屋 + 夫妻人偶晒网露台与微型储鱼窖',
+                    'hero_reveal': '夫妻俩在微型露台点亮渔灯，相拥望向退潮滩涂',
+                },
+                'scene_signature': 'A miniature dry-stone fishing cottage diorama rebuilt from salvaged boat planks for a figurine couple.',
+                'banned_elements': ['adult full scale', 'sci-fi', 'cyberpunk', 'neon lights', 'hologram', 'spaceship', 'generic cozy homestay'],
+            },
+            {
+                'id': 'miniature_terrace_farmhouse',
+                'name': '微缩山地梯田夯土院',
+                'icon': '🌾',
+                'hook': '塌方冲毁的破土屋开局，巨手为穷困夫妇夯筑微缩梯田院落',
+                'trend_ref': '借鉴生土夯筑与在地材料零运输的低成本建造思路',
+                'trend_ref_ids': ref_ids,
+                'axes': {
+                    'environment': '微缩山地梯田与微观引水石渠沙盘',
+                    'material': '微缩夯土墙 + 迷你竹构屋架 + 微雕青瓦与糯米灰浆',
+                    'function': '微缩梯田农家院 + 夫妻人偶灶间与微型晒谷场',
+                    'hero_reveal': '夫妻俩在微型晒谷场捧起新谷，喜极而泣',
+                },
+                'scene_signature': 'A miniature rammed-earth terraced farmhouse diorama with bamboo framing for a figurine couple.',
+                'banned_elements': ['adult full scale', 'sci-fi', 'futuristic', 'neon', 'glowing tech', 'rgb lighting', 'generic cozy homestay'],
+            },
+            {
+                'id': 'miniature_alley_shophouse',
+                'name': '微缩老巷市井铺屋',
+                'icon': '🏮',
+                'hook': '拆迁废墟破铺开局，神来之手为夫妇精雕微缩市井前店后居',
+                'trend_ref': '借鉴闲置死铺转住宅的前店后居动线改造玩法',
+                'trend_ref_ids': ref_ids,
+                'axes': {
+                    'environment': '微缩老城窄巷与微观青石板路面沙盘',
+                    'material': '微缩老青砖 + 迷你榆木门板 + 微雕水磨石与铸铁花窗',
+                    'function': '微缩前店后居铺屋 + 夫妻人偶柜台与微型天井卧房',
+                    'hero_reveal': '夫妻俩挂上微型招牌点亮灯笼，街坊人偶围观道贺',
+                },
+                'scene_signature': 'A miniature old-alley shophouse diorama converted into a home-and-storefront for a figurine couple.',
+                'banned_elements': ['adult full scale', 'sci-fi', 'cyberpunk', 'neon signage', 'hologram', 'spaceship', 'generic cozy homestay'],
+            },
+            {
+                'id': 'miniature_lakeside_boathouse',
+                'name': '微缩湖心木栈船屋',
+                'icon': '🛶',
+                'hook': '沉水烂船屋开局，巨人之手为夫妇打捞重建微缩湖心木栈居',
+                'trend_ref': '借鉴废弃船体壳改住人的载体爆改与防潮抬升做法',
+                'trend_ref_ids': ref_ids,
+                'axes': {
+                    'environment': '微缩湖心浅滩与微观芦苇荡沙盘',
+                    'material': '微缩防腐落叶松木栈 + 迷你旧船壳钢板 + 微雕沥青麻絮填缝',
+                    'function': '微缩湖上船屋 + 夫妻人偶起居舱与微型钓台',
+                    'hero_reveal': '夫妻俩在微型钓台看野鸭掠过，湖面泛起金光',
+                },
+                'scene_signature': 'A miniature lakeside boathouse diorama rebuilt on a salvaged hull for a figurine couple.',
+                'banned_elements': ['adult full scale', 'sci-fi', 'futuristic', 'neon', 'glowing creature', 'spaceship', 'generic cozy homestay'],
+            },
         ]
     else:
         # 成人硬核写实生存庇护所高分方案
@@ -808,8 +880,196 @@ def _generate_fallback_ideas(
                 'scene_signature': 'A monolithic rammed-earth and desert timber underground sandstorm refuge shelter integrated into desert oasis terrain with deep shaded openings.',
                 'banned_elements': ['sci-fi', 'futuristic', 'neon', 'metal spacecraft', 'high-tech panels', 'generic cozy homestay'],
             },
+            {
+                'id': 'salvaged_school_bus',
+                'name': '废弃校车拖挂宿营车',
+                'icon': '🚌',
+                'hook': '锈穿报废校车开局，改造成硬核长途自持宿营车厢',
+                'trend_ref': '借鉴废弃载具壳体爆改的移动住人载体玩法',
+                'trend_ref_ids': ref_ids,
+                'axes': {
+                    'environment': '废弃车辆堆场碎石地与开阔多风旷野',
+                    'material': '除锈耐候钢蒙皮 + 落叶松内衬板 + 岩棉保温层 + 黄铜暗扣',
+                    'function': '长途自持宿营车厢 + 折叠工作台、水箱与柴炉',
+                    'hero_reveal': '车门推开，旷野落日与迁徙的野雁群同时涌入车厢',
+                },
+                'scene_signature': 'A rusted scrapped school bus rebuilt into a self-sufficient timber-lined camper cabin.',
+                'banned_elements': ['sci-fi', 'cyberpunk', 'neon lights', 'hologram', 'spaceship', 'rgb lighting', 'generic cozy homestay'],
+            },
+            {
+                'id': 'derelict_brick_kiln',
+                'name': '废弃砖窑拱顶工坊',
+                'icon': '🧱',
+                'hook': '坍塌废砖窑开局，拱顶下重建硬核手作陶艺工坊',
+                'trend_ref': '借鉴老工业遗构原状保留与新旧结构对撞的改造思路',
+                'trend_ref_ids': ref_ids,
+                'axes': {
+                    'environment': '废弃轮窑厂区与遍地碎砖的荒草空地',
+                    'material': '原状老砖拱券 + 清水混凝土楼板 + 黑钢门窗 + 老榆木台面',
+                    'function': '陶艺手作工坊 + 柴烧窑炉、晾坯架与料仓',
+                    'hero_reveal': '窑门开启，满窑柴烧陶器在余温中显出窑变色泽',
+                },
+                'scene_signature': 'A collapsed brick kiln rebuilt into a wood-fired ceramics workshop under its restored arches.',
+                'banned_elements': ['sci-fi', 'futuristic', 'neon', 'glowing tech', 'spaceship', 'carbon fiber', 'generic cozy homestay'],
+            },
+            {
+                'id': 'stranded_cargo_hull',
+                'name': '搁浅货轮舱室居所',
+                'icon': '🚢',
+                'hook': '搁浅锈蚀货轮开局，舱室重生为抗风浪海上居所',
+                'trend_ref': '借鉴大型废弃载具壳体转住宅的极端反差爆改',
+                'trend_ref_ids': ref_ids,
+                'axes': {
+                    'environment': '退潮露出的泥质浅滩与常年高盐雾海风',
+                    'material': '除锈舱壁环氧涂装 + 老柚木甲板 + 铜质舷窗 + 岩棉隔舱',
+                    'function': '抗风浪海上居所 + 雨水收集、柴油发电与气密舱门',
+                    'hero_reveal': '舷窗外一群海豚贴着船体游过，浪花拍上甲板',
+                },
+                'scene_signature': 'A stranded rusted cargo hull refitted into a storm-proof teak-lined coastal dwelling.',
+                'banned_elements': ['sci-fi', 'cyberpunk', 'neon', 'hologram', 'alien', 'glowing creature', 'generic cozy homestay'],
+            },
+            {
+                'id': 'abandoned_filling_station',
+                'name': '废弃加油站雨棚居',
+                'icon': '⛽',
+                'hook': '烂尾加油站开局，雨棚下嵌入硬核清水混凝土住所',
+                'trend_ref': '借鉴闲置商业死铺转私宅的空置载体再利用',
+                'trend_ref_ids': ref_ids,
+                'axes': {
+                    'environment': '国道旁废弃加油站与开裂沥青场地、常年过境重卡噪音',
+                    'material': '清水混凝土浇筑 + 原状钢雨棚除锈 + 双层中空玻璃 + 黑钢框',
+                    'function': '公路旁自持住所 + 隔音墙体、地下储水罐与检修工位',
+                    'hero_reveal': '夜幕降临，雨棚灯下暴雨倾泻成幕，屋内一片安静暖光',
+                },
+                'scene_signature': 'An abandoned filling station canopy rebuilt into a board-formed concrete roadside dwelling.',
+                'banned_elements': ['sci-fi', 'futuristic', 'neon signage', 'glowing tech', 'spaceship', 'rgb lighting', 'generic cozy homestay'],
+            },
         ]
-    return defaults[:count]
+
+    # 兜底不再是"永远那四条"。池子扩到 8 条，先滤掉已经出过的，再随机取 count 条:
+    # 网关抽风时用户至少还能看到轮换，而不是第 N 次点开又是同一屏。
+    avoid_names = set()
+    for item in (avoid_ideas or []):
+        if isinstance(item, dict):
+            if item.get('name'):
+                avoid_names.add(str(item['name']).strip())
+            if item.get('id'):
+                avoid_names.add(str(item['id']).strip())
+        elif isinstance(item, str):
+            avoid_names.add(item.strip())
+    fresh = [d for d in defaults
+             if d['name'] not in avoid_names and d['id'] not in avoid_names]
+    pool = fresh if len(fresh) >= min(count, len(defaults)) else list(defaults)
+    take = min(count, len(pool))
+    return random.sample(pool, take)
+
+
+# 每批随机抽一条"换个切入角度"的推力词，和随机指纹一起注入 user prompt。
+# 它不指定选题(那会变成新的固定值)，只指定**从哪个维度切进去**，逼模型每批换脑。
+_DIVERGE_ANGLE_NUDGES = (
+    '本批请优先从"被改造的旧载体本身"切入',
+    '本批请优先从"材质与工法的反差"切入',
+    '本批请优先从"这个空间要解决的真实生活难题"切入',
+    '本批请优先从"完工瞬间的情绪爆点"切入',
+    '本批请优先从"施工现场的声音与触感"切入',
+    '本批请优先从"极低预算下的旧物再利用"切入',
+    '本批请优先从"场地本身的历史与遗留痕迹"切入',
+    '本批请优先从"隐藏机关与终局揭示的设计"切入',
+)
+
+
+def _select_diverge_trend_refs(
+    config: Optional[Dict[str, Any]],
+    trend_ref_ids: Optional[List[str]],
+    count: int,
+) -> List[Dict[str, Any]]:
+    """为一次二创发散挑选 count 条**互不相同**的联网参考。
+
+    此前这里只从本地案例库加权抽 1 条、全批 4 个方案共用，等于联网参考对发散
+    几乎没有区分度（实测抽到"商用死铺转私宅"也照样产出极地避难所）。现在：
+      1) 用户在案例库显式勾选 → 完全尊重勾选；
+      2) 未勾选 → 先走和主管线激发同一套联网取材（6 小时缓存，失败不致命），
+         把新鲜热点沉淀进案例库，保证素材本身不是一潭死水；
+      3) 再按 1/(used_count+1) 加权**无放回**抽 count 条，一个方案锚一条。
+
+    计次仍然不在这里回写：沿用 2026-07-23 的约定，只有真正被合成的那条 idea
+    才算一次真实使用（见 server.py /api/compose 的 mark_trend_refs_used），
+    否则光是点几次发散就会把库里的条目烧到自动归档。
+    """
+    import prompt_pipeline as pp
+
+    if trend_ref_ids:
+        stored = pp.load_trend_refs() or []
+        by_id = {e.get('id'): e for e in stored if isinstance(e, dict)}
+        picked = [by_id[i] for i in trend_ref_ids if i in by_id]
+        if picked:
+            return picked
+
+    # 冷启动/未勾选：先联网取一批新鲜热点。整段非致命——离网或网关抽风时
+    # 静默退回本地案例库，不能让发散因为搜不到东西就失败。
+    try:
+        search = pp._ideation_search_params(config or {})
+        existing_labels = [
+            e.get('label') for e in (pp.load_trend_refs() or []) if isinstance(e, dict)
+        ]
+        snippet = pp.fetch_trend_snippet(
+            config or {},
+            cache_key=search['cache_key'],
+            system_instruction=(search['system_instruction']
+                                + pp._avoid_repeat_labels_suffix(existing_labels)),
+            query=search['query'],
+            timeout=60,
+        )
+        custom = pp.fetch_custom_url_snippet(config or {})
+        pp.persist_trend_refs(
+            pp._build_live_trend_refs(config or {}, search, snippet, custom))
+    except Exception as _se:
+        print(f"[mutate] 发散联网取材失败，退回本地案例库: {_se}")
+
+    pool = [e for e in (pp.load_trend_refs() or []) if isinstance(e, dict)]
+    if not pool:
+        return []
+
+    picked = []
+    for _ in range(min(max(1, count), len(pool))):
+        weights = [1.0 / ((e.get('used_count') or 0) + 1) for e in pool]
+        chosen = random.choices(pool, weights=weights, k=1)[0]
+        picked.append(chosen)
+        pool.remove(chosen)
+    return picked
+
+
+def _build_avoid_block(avoid_ideas: Optional[List[Any]], count: int) -> str:
+    """把这个母本此前已经发散过的方案拼成一段硬性去重黑名单。
+
+    二创发散原本完全无记忆：同一个母本点十次，十次都是同一个 prompt，出同一批
+    结果是必然的。主管线激发早就有创意台账去重（见 run_ideate），这里补上等价的
+    一层。"""
+    if not avoid_ideas:
+        return ''
+    seen = []
+    for item in avoid_ideas:
+        if isinstance(item, dict):
+            name = str(item.get('name') or '').strip()
+            env = str((item.get('axes') or {}).get('environment') or '').strip()
+            mat = str((item.get('axes') or {}).get('material') or '').strip()
+            line = '｜'.join(x for x in (name, env[:36], mat[:28]) if x)
+        elif isinstance(item, str):
+            line = item.strip()
+        else:
+            continue
+        if line:
+            seen.append(line)
+    seen = list(dict.fromkeys(seen))[-40:]
+    if not seen:
+        return ''
+    return (
+        "\n==================== 已出过的方案（硬性去重黑名单）====================\n"
+        f"本母本此前已经发散过下列方案。本批 {count} 个方案与它们在【环境载体】或"
+        "【材质体系】上必须完全不同；同义改写、换个形容词、换个国家或地名都算重复，"
+        "一律不接受：\n"
+        + "\n".join(f"- {x}" for x in seen) + "\n"
+    )
 
 
 def ai_diverge_orthogonal_ideas(
@@ -819,6 +1079,7 @@ def ai_diverge_orthogonal_ideas(
     count: int = 4,
     on_progress: Optional[Any] = None,
     trend_ref_ids: Optional[List[str]] = None,
+    avoid_ideas: Optional[List[Any]] = None,
 ) -> List[Dict[str, Any]]:
     """调用大模型为黄金母本结合联网参考智能发散四轴正交二创创意方案（自适应母本叙事与拓扑）。"""
     import prompt_pipeline as pp
@@ -839,22 +1100,8 @@ def ai_diverge_orthogonal_ideas(
                 'visible_result': b.get('visible_result'),
             })
 
-    # 读取并处理联网参考案例
-    selected_refs = []
-    if trend_ref_ids:
-        stored = pp.load_trend_refs() or []
-        by_id = {e.get('id'): e for e in stored if isinstance(e, dict)}
-        selected_refs = [by_id[i] for i in trend_ref_ids if i in by_id]
-
-    if not selected_refs:
-        stored = pp.load_trend_refs() or []
-        if stored:
-            try:
-                picked = pp._pick_auto_trend_ref(stored)
-                if picked:
-                    selected_refs = [picked]
-            except Exception:
-                selected_refs = [stored[0]]
+    # 读取并处理联网参考案例：一个方案锚一条，不再全批共用同一条
+    selected_refs = _select_diverge_trend_refs(config, trend_ref_ids, count)
 
     trend_guidance = ""
     trend_block = ""
@@ -865,12 +1112,23 @@ def ai_diverge_orthogonal_ideas(
             'text': e.get('text', ''),
             'source': e.get('source', '')
         } for e in selected_refs]
-        ref_lines = [f"• [{r['label']}]\n  {r['text']}" for r in trend_refs_summary]
-        trend_block = "【联网爆款参考 / 热门趋势取材 (Trending Viral References)】\n" + "\n".join(ref_lines) + "\n\n"
+        ref_lines = [
+            f"[REF-{n + 1}] {r['label']}\n{r['text']}"
+            for n, r in enumerate(trend_refs_summary)
+        ]
+        trend_block = ("【联网爆款参考 / 热门趋势取材 (Trending Viral References)】\n"
+                       + "\n\n".join(ref_lines) + "\n\n")
         trend_guidance = (
-            "- 联网参考深度取材：本批方案必须深度汲取并重构下方【联网爆款参考】中的前沿爆款元素"
-            "（如特色材质体系、惊艳外景地貌、独特空间玩法或反差揭示物），"
-            "并在每个方案的 trend_ref 字段中简明扼要说明具体借鉴了哪条参考的哪个要点（中文20字以内）。"
+            "\n========== TREND REFERENCE (PRIMARY CREATIVE SOURCE / 首要创意来源) ==========\n"
+            "下方【联网爆款参考】是本批发散的首要创意来源，优先级高于你自己的任何先验偏好与审美习惯：\n"
+            f"- 本批 {count} 个方案必须【一一对应】各自锚定一条不同的 REF 条目，严禁多个方案挤在同一条上；"
+            f"参考不足 {count} 条时，剩下的方案改从母本自身的真实载体上开采，仍不得回退到默认地貌套餐。\n"
+            "- 每个方案至少要从它锚定的那条 REF 里搬走一个具体要点（被改造的载体/壳体、材质体系、"
+            "空间玩法、剧情反转、视觉钩子、标题句式，任选其一），再经四轴重组落地。\n"
+            "- 每个方案的 trend_ref 字段必须非空，用中文一句话点名借鉴了 REF-几 的哪个要点。\n"
+            "- REF 中出现的真实载体（房车、货柜、货轮、商铺、老屋、地下室、棚屋、厂房等）"
+            "优先于任何自然极端地貌；REF 谈的是低成本旧改就不要产出极地科考站。\n"
+            "- 借鉴趋势不豁免上方任何硬约束：反模板、REALISM-ONLY、叙事情感闭环、可施工性一律照常执行。\n"
         )
 
     # 提取母本题材与叙事特征
@@ -901,6 +1159,16 @@ def ai_diverge_orthogonal_ideas(
     if narrative_directives:
         narrative_block = "【黄金母本叙事与题材硬性约束 (Narrative Invariants - 必须 100% 继承)】\n" + "\n".join(narrative_directives) + "\n\n"
 
+    # 空 brief 不再是一句无引导的占位语——那等于把方向权全交还给系统提示词里的
+    # 示例，正是"每次都出同一批"的直接成因。现在明确把取材权指回母本载体与联网参考。
+    _NO_BRIEF_DIRECTIVE = (
+        '（创作者未指定方向。请**完全以母本自身的真实载体 + 上方联网爆款参考**为取材来源，'
+        '每个方案锚定一条不同的 REF；严禁回退到极地/火山/雨林/荒漠/溶洞/海蚀崖这类默认地貌套餐。）'
+    )
+    # 每批一枚随机指纹：同一个母本连点多次时，prompt 不再逐字节相同，
+    # 配合上面的去重黑名单一起把"同问必同答"打断。
+    batch_nonce = f"DIVERGE-{random.randint(100000, 999999)}-{random.choice(_DIVERGE_ANGLE_NUDGES)}"
+
     user_prompt = (
         f"【黄金母本背景】\n"
         f"- 视频标题/主题：{base_title}\n"
@@ -910,7 +1178,9 @@ def ai_diverge_orthogonal_ideas(
         f"{narrative_block}"
         f"{trend_block}"
         f"【创作者发散偏好】\n"
-        f"{brief.strip() if brief and brief.strip() else '（未指定特定风格，请自由发散最吸睛、反差感极强的 4 种高网感爆款主题）'}\n\n"
+        f"{brief.strip() if brief and brief.strip() else _NO_BRIEF_DIRECTIVE}\n\n"
+        f"【本批发散指纹】{batch_nonce}\n"
+        f"（该指纹只用于强制本批与历次批次取不同的取材角度，不要在任何输出字段中提及或复述它。）\n\n"
         f"请基于以上母本工序骨架并深度结合联网参考与叙事约束，直接输出包含 {count} 个正交方案的 JSON 数组。"
     )
 
@@ -919,9 +1189,15 @@ def ai_diverge_orthogonal_ideas(
     try:
         raw = pp._chat(
             config=config or {},
-            system=_AI_DIVERGE_SYSTEM.format(count=count, trend_guidance=trend_guidance),
+            system=_AI_DIVERGE_SYSTEM.format(
+                count=count,
+                trend_guidance=trend_guidance,
+                avoid_block=_build_avoid_block(avoid_ideas, count),
+            ),
             user=user_prompt,
-            temperature=0.85,
+            # 0.85 -> 0.95：四轴发散要的是铺开，不是收敛；
+            # 真正压住跑偏的是下游 evaluate_variant_compatibility 与 banned_elements。
+            temperature=0.95,
             max_tokens=4096,
             timeout=60,
         )
@@ -955,13 +1231,17 @@ def ai_diverge_orthogonal_ideas(
                     'function': func_text,
                     'hero_reveal': hero_text,
                 }
+                anchor_ref = selected_refs[idx % len(selected_refs)] if selected_refs else None
                 idea_entry = {
                     'id': str(item.get('id') or f'idea_{idx+1}'),
                     'name': name_text,
                     'icon': str(item.get('icon') or '✨'),
                     'hook': hook_text,
-                    'trend_ref': str(item.get('trend_ref') or (selected_refs[idx % len(selected_refs)].get('label') if selected_refs else '')),
-                    'trend_ref_ids': all_ref_ids,
+                    'trend_ref': str(item.get('trend_ref') or (anchor_ref.get('label') if anchor_ref else '')),
+                    # 每条 idea 只带它真正锚定的那条参考:合成时 mark_trend_refs_used
+                    # 才会把计次记在被借鉴的那条上,而不是把整批一起烧掉。
+                    'trend_ref_ids': ([anchor_ref.get('id')] if anchor_ref and anchor_ref.get('id')
+                                      else all_ref_ids),
                     'axes': axes_dict,
                     'scene_signature': str(item.get('scene_signature') or ''),
                     'banned_elements': list(item.get('banned_elements') or []),
@@ -977,7 +1257,9 @@ def ai_diverge_orthogonal_ideas(
     except Exception as e:
         print(f"[mutate] AI 发散模型调用或解析异常，采用高质量自适应兜底方案: {e}")
 
-    fallback_ideas = _generate_fallback_ideas(baseline_doc=baseline_doc, brief=brief, count=count, trend_refs=selected_refs)
+    fallback_ideas = _generate_fallback_ideas(baseline_doc=baseline_doc, brief=brief,
+                                             count=count, trend_refs=selected_refs,
+                                             avoid_ideas=avoid_ideas)
     try:
         from .decision_framework import evaluate_variant_compatibility
         for idea_entry in fallback_ideas:

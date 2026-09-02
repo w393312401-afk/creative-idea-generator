@@ -618,6 +618,16 @@ details[open] > .replica-jobs-summary {
     margin-bottom: 6px;
 }
 
+/* 待确认横幅里那一排定向动作。与 .replica-banner-head 分开，是因为那一行是「标题在左、
+   动作在右」的两端对齐；这里没有标题（标题是 <summary> 自己），只有一颗按钮，跟着
+   space-between 走会看起来像被谁推到了边上。 */
+.replica-banner-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin: 8px 0 2px;
+}
+
 .replica-banner ul {
     margin: 6px 0 0;
     padding-left: 18px;

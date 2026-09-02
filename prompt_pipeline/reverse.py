@@ -3971,17 +3971,25 @@ def _validate_camera_angle_consistency(beats):
             continue
         space = str(beat.get('space') or '').strip() or '（未标空间）'
         bid = str(beat.get('id') or f'B{position:02d}')
-        by_space.setdefault(space, []).append((bid, (angle, bearing)))
+        by_space.setdefault(space, []).append(
+            (bid, (angle, bearing), camera_setup_verified(beat)))
 
     out = []
     for space, rows in by_space.items():
         counts = {}
-        for _bid, pair in rows:
+        for _bid, pair, _ok in rows:
             counts[pair] = counts.get(pair, 0) + 1
         if len(counts) < 2:
             continue
+        # 这个空间里每一拍都按帧复核过，且读数自复核以来没被改过——问题已经回答了：
+        # 原片确实换了机位。继续把它摆在待确认清单里，就是让用户第二遍回答同一个问题。
+        # 「复核过」是逐拍的指纹戳，不是一个全局开关，用户手改任何一拍都会让它自动失效
+        # （见 `camera_setup_verified`），这条 warn 也就随之回来。
+        if all(ok for _bid, _pair, ok in rows):
+            continue
         dominant = max(counts.items(), key=lambda kv: kv[1])[0]
-        odd = [bid for bid, pair in rows if pair != dominant]
+        odd = [bid for bid, pair, _ok in rows if pair != dominant]
+        done = sum(1 for _bid, _pair, ok in rows if ok)
         _label = lambda pair: ' / '.join(
             x for x in (CAMERA_ANGLE_LABELS_ZH.get(pair[0], pair[0]),
                         CAMERA_BEARING_LABELS_ZH.get(pair[1], pair[1])) if x)
@@ -3989,11 +3997,14 @@ def _validate_camera_angle_consistency(beats):
             'mixed_camera_angle',
             f'空间「{space}」里有两种以上拍摄角度：多数拍是{_label(dominant)}，'
             f'而 {"、".join(odd)} 标的是'
-            f'{"；".join(sorted({_label(pair) for bid, pair in rows if pair != dominant}))}。'
+            f'{"；".join(sorted({_label(pair) for _bid, pair, _ok in rows if pair != dominant}))}。'
             f'这几拍会各自生成一句自己的机位声明并按各自的角度出图（见 '
             f'pp.observed_camera_setups）——原片真换了机位就是对的，不用改。'
             f'但每多一个机位就多一把独立的几何锁，原片其实没换机位（读错了）时，'
-            f'那几拍的图会凭空换一次机位、跨帧一致性从这里断开：请照帧核一遍。'))
+            f'那几拍的图会凭空换一次机位、跨帧一致性从这里断开。'
+            + (f'本空间 {len(rows)} 拍里已有 {done} 拍按帧复核过，'
+               f'按「🎥 按帧复核机位」把剩下的核完。' if done else
+               '按「🎥 按帧复核机位」让 Pass A 的逐帧读数替你核一遍。')))
     return out
 
 
@@ -5437,6 +5448,298 @@ def refine_beat_craft(config, beats_doc, overview=None, frames_dir=None, on_prog
     uncovered = sorted({v.get('code') for v in after_violations
                         if v.get('level') != 'error' and v.get('code') not in CRAFT_REFINE_CODES})
     return beats_doc, refined, uncovered
+
+
+# ── 机位复核 ─────────────────────────────────────────────────────────────────
+#
+# `mixed_camera_angle` 是唯一一条工艺精修够不着的待确认项，而它的杠杆比别的 warn 都大：
+# `pp.observed_camera_setups` 的分组键是 (空间, 角度, 方位, 焦段, 景别)，所以一个读错的
+# camera_angle 不是「这拍标签写歪了」，是凭空开出一个 SETUP_n——带一整套自己的几何锁句，
+# 那一拍的图会真的按另一个机位出，跨帧一致性从那里断开。
+#
+# 它此前没有 AI 通路，理由是「原片真换了机位就是对的，模型没法从多数/少数这个统计事实
+# 推出该往哪边改」。这条理由只对「再问一次模型」成立。真正的出路在产地上：逐拍的
+# camera_angle 是 **Pass B** 写的，而 Pass B 是文本模型读摘要（`_facts_digest` 里那句
+# `view=high_angle/three_quarter`）；真正看过帧的是 **Pass A**，逐帧多模态读数，而且早
+# 就落盘在 frame_facts.json 里。这一栏在盘上一直有一份一手读数，从来没人拿它去校二手
+# 转写——所以第一步根本不该是新调用，是对账。
+#
+# 于是这一趟分三层，先免费后花钱：
+#   · 帧票与梯子一致     → 盖复核戳，这条 warn 不再打扰人（零调用）
+#   · 帧票与梯子不一致   → Pass B 转写丢了东西，按帧票改回去（零调用）
+#   · 帧票自己就分裂／这一拍根本没有 Pass A 读数 → 这才是「原片可能真换了机位」，
+#     升级成一次逐拍多模态复核（要钱，且只在这一层要）
+#
+# 只复核**有冲突的空间**里的拍。没冲突的空间即使读错了，全空间读成同一个错角度也只是
+# 少一把锁、不会在空间内部撕开——不值得为它冒一次改写的险。
+
+# (字段, 闭集, 同义词表, 中文标签)。同义词表跟着一起带，是因为第三层拿到的是模型
+# 自由文本，必须走 `_coerce_enum` 收进闭集——收不进就当没读出来，绝不留歪值。
+_CAMERA_RECHECK_AXES = (
+    ('camera_angle', CAMERA_ANGLES, _CAMERA_ANGLE_SYNONYMS, CAMERA_ANGLE_LABELS_ZH),
+    ('camera_bearing', CAMERA_BEARINGS, _CAMERA_BEARING_SYNONYMS, CAMERA_BEARING_LABELS_ZH),
+)
+
+
+def camera_reading_stamp(beat):
+    """这一拍机位读数的指纹：读数本身，**加上它所依据的那个拍窗**。
+
+    拍窗进指纹，是因为 `autobalance_beats` 拆拍与合拍都走 `dict(b)`——复核戳会被原样
+    复制进每一个新拍。读数没变、戳看着还有效，但它当初是在另一个窗上投出来的：一条 6s
+    的拍拆成两条 3s，两半各自继承了一张只在合起来的窗上数过票的证明；合拍更糟，幸存的
+    那一拍拿着一张只覆盖新窗一半的证明。窗进了指纹，任何拆合都让戳自动失效，"先平衡还是
+    先复核"就不再是个需要用户记住的坑——顺序错了只会让这条 warn 回来，不会让它带着一张
+    过期的证明沉默下去。
+    """
+    return '{}/{}@{:.2f}-{:.2f}'.format(
+        str((beat or {}).get('camera_angle') or '').strip(),
+        str((beat or {}).get('camera_bearing') or '').strip(),
+        _num((beat or {}).get('start')), _num((beat or {}).get('end')))
+
+
+def camera_setup_verified(beat):
+    """这一拍是不是已按帧复核过，且读数自那以后没被改过。
+
+    戳里存的是**当时那一对读数**，不是一个布尔。用户在卡点上手改了角度，指纹就对不上，
+    戳自动失效——不需要任何一处记得去清它。一个布尔戳会在用户改完之后继续宣称「已按帧
+    复核」，那比没有戳更坏。
+    """
+    mark = (beat or {}).get('camera_setup_verified')
+    if not isinstance(mark, dict):
+        return False
+    return str(mark.get('reading') or '') == camera_reading_stamp(beat)
+
+
+# 复核戳的失效面：读数被手改、拍窗被拆合，两者都让 `camera_reading_stamp` 对不上。
+# 唯一不失效的是「什么都没动」——那正是戳该继续有效的情形。
+
+
+def camera_conflict_spaces(beats):
+    """哪些空间里落了不止一对 (角度, 方位)。口径与 `_validate_camera_angle_consistency`
+    完全一致——那条 warn 报的是哪几个空间，这里复核的就是哪几个空间。"""
+    by_space = {}
+    for beat in (beats or []):
+        if not isinstance(beat, dict):
+            continue
+        angle = str(beat.get('camera_angle') or '').strip()
+        bearing = str(beat.get('camera_bearing') or '').strip()
+        if not angle and not bearing:
+            continue
+        space = str(beat.get('space') or '').strip() or '（未标空间）'
+        by_space.setdefault(space, set()).add((angle, bearing))
+    return {space for space, pairs in by_space.items() if len(pairs) > 1}
+
+
+def _beat_window_frames(beat, timeline):
+    """这一拍窗内的送审帧名，按时间序。"""
+    lo, hi = sorted((_num(beat.get('start')), _num(beat.get('end'))))
+    if not (hi > lo):
+        return []
+    return [name for ts, name in timeline if lo - 1e-6 <= ts <= hi + 1e-6]
+
+
+def _camera_axis_vote(names, by_frame, field, allowed):
+    """一根轴上的帧票。返回 (胜出值或 None, 得票, 总票)。
+
+    要求**严格过半**才算读出来了：2/1/1 这种三分票不是一个读数，是「这一拍里镜头本来
+    就动过或者帧读不准」，那正是该升级去看图的情形，不该在这里硬投出一个赢家。
+    """
+    votes = {}
+    for name in names:
+        value = str((by_frame.get(name) or {}).get(field) or '').strip()
+        if value in allowed:
+            votes[value] = votes.get(value, 0) + 1
+    total = sum(votes.values())
+    if not total:
+        return None, 0, 0
+    top, count = sorted(votes.items(), key=lambda kv: (-kv[1], kv[0]))[0]
+    if count * 2 <= total:
+        return None, count, total
+    return top, count, total
+
+
+_CAMERA_RECHECK_SYSTEM = """You are reading frames from one beat of a source video to determine WHERE THE CAMERA STANDS.
+
+Report the camera, not the subject. Read it off the frame's own geometry: which way the converging lines run, whether you can see the TOP faces of things (looking down) or their UNDERSIDES and the sky/ceiling behind them (looking up), where the horizon sits, and which face of the subject the lens is pointed at.
+
+camera_angle (VERTICAL) - exactly one of:
+  bird_eye      straight or near-straight down, the ground plane fills the frame
+  high_angle    above the subject looking down, top surfaces visible, horizon high or out of frame
+  eye_level     lens at standing height, frame reads level, horizon near the middle
+  low_angle     below the subject looking up, undersides visible, horizon low
+  worm_eye      lens on or near the ground looking sharply up
+  dutch_angle   the whole frame is rolled off horizontal - the horizon itself is tilted
+
+camera_bearing (HORIZONTAL) - exactly one of:
+  front, three_quarter, side, rear_three_quarter, back
+
+The two axes are INDEPENDENT: a shot can be low_angle AND side at the same time. Judge each on its own.
+
+The frames are in chronological order and all come from the SAME beat. If the camera clearly MOVES between them (a genuine setup change inside one beat), say so with "moved": true and report the setup that holds for most of the beat.
+
+If an axis genuinely cannot be read from these frames, return an empty string for it. An empty string is a correct answer; a guess is not.
+
+Return ONE JSON object, no commentary, no code fences:
+{"camera_angle": "<value or empty>", "camera_bearing": "<value or empty>", "moved": <true|false>}"""
+
+
+def recheck_camera_setups(beats_doc, overview=None, facts=None, job_dir=None,
+                          config=None, frames_dir=None, on_progress=None):
+    """按帧复核有冲突空间里的机位读数。返回 (beats_doc, report)。
+
+    report = {'skipped': 原因或 None, 'spaces': [...], 'checked': n,
+              'confirmed': n, 'corrected': [...], 'escalated': n, 'unresolved': [...]}
+
+    只写 camera_angle / camera_bearing / camera_setup_verified 三个键，别的一个不碰。
+    这两栏是闭集枚举、不在 TRANSLATE_FIELDS 里（中文由 *_LABELS_ZH 直接渲染），所以这
+    一趟**不需要重跑翻译**——但合成产物照样作废，机位分组一变，SETUP 句就跟着变。
+    """
+    beats = (beats_doc or {}).get('beats') or []
+    report = {'skipped': None, 'spaces': [], 'checked': 0, 'confirmed': 0,
+              'corrected': [], 'escalated': 0, 'unresolved': []}
+    if not beats:
+        report['skipped'] = '还没有节拍阶梯'
+        return beats_doc, report
+    if is_variant_doc(beats_doc):
+        # 变体没有自己的原片帧，`reference_frames` 只是机位参考。拿母本的帧去改变体的
+        # 机位，等于用一份不对应的证据改写另一份文档。
+        report['skipped'] = '二创变体没有自己的原片帧，机位复核只在母本上跑'
+        return beats_doc, report
+
+    spaces = camera_conflict_spaces(beats)
+    if not spaces:
+        report['skipped'] = '没有空间落下两个以上机位，无需复核'
+        return beats_doc, report
+    report['spaces'] = sorted(spaces)
+
+    by_frame = _frame_facts_by_name(beats_doc, overview, facts, job_dir)
+    timeline = _review_frame_timeline(overview or {})
+    if not by_frame:
+        report['skipped'] = ('盘上没有 Pass A 的逐帧读数（frame_facts.json），'
+                             '这一趟没有可对账的一手数据')
+        return beats_doc, report
+
+    targets = [b for b in beats
+               if isinstance(b, dict)
+               and (str(b.get('space') or '').strip() or '（未标空间）') in spaces]
+    report['checked'] = len(targets)
+
+    # ── 第一、二层：对账。零调用。
+    pending = []          # 帧票没能定案的 (beat, [定不下来的轴名…], 已定案轴的票数)
+    for beat in targets:
+        names = _beat_window_frames(beat, timeline)
+        unresolved_axes, marks = [], {}
+        for field, allowed, _syn, labels in _CAMERA_RECHECK_AXES:
+            current = str(beat.get(field) or '').strip()
+            winner, count, total = _camera_axis_vote(names, by_frame, field, allowed)
+            if winner is None:
+                # 一票没有 = 这一拍没有 Pass A 读数；有票但不过半 = 帧自己就分裂。
+                # 两种都交给第三层，不在这里硬定。
+                unresolved_axes.append(field)
+                continue
+            if winner == current:
+                marks[field] = f'{count}/{total}'
+                continue
+            # 覆盖一个**已有**读数比补一个空栏险得多：空栏本来就没有下游后果，覆盖会
+            # 把一把几何锁挪到别处。所以覆盖要两票起，一票只够升级去看图。
+            if current and count < 2:
+                unresolved_axes.append(field)
+                continue
+            beat[field] = winner
+            marks[field] = f'{count}/{total}'
+            report['corrected'].append({
+                'beat_id': beat.get('id'), 'field': field, 'was': current,
+                'now': winner, 'votes': f'{count}/{total}', 'by': 'frames',
+                'was_zh': labels.get(current, current or '（空）'),
+                'now_zh': labels.get(winner, winner),
+            })
+        if unresolved_axes:
+            pending.append((beat, unresolved_axes, marks))
+        else:
+            beat['camera_setup_verified'] = {
+                'reading': camera_reading_stamp(beat), 'by': 'frames', 'votes': marks,
+            }
+            report['confirmed'] += 1
+
+    # ── 第三层：升级。只有帧票定不了案的那几拍才走到这里，且只在给了 config 时。
+    if pending and config:
+        total_pending = len(pending)
+        for seq, (beat, axes, marks) in enumerate(pending, 1):
+            pp._raise_if_cancelled(on_progress)
+            bid = beat.get('id')
+            paths = _resolve_frame_paths(frames_dir, beat.get('evidence_frames')
+                                         or beat.get('reference_frames'))
+            if not paths:
+                report['unresolved'].append({
+                    'beat_id': bid, 'axes': axes, 'reason': '找不到这一拍的证据帧文件'})
+                continue
+            if on_progress:
+                on_progress('replica_stage', {
+                    'stage': 'review_beats',
+                    'message': f'机位复核 {seq}/{total_pending}：{bid} 帧读数不一致，正在看图…',
+                    'done': seq - 1, 'total': total_pending,
+                })
+            try:
+                raw = pp._multimodal_chat(
+                    config, _CAMERA_RECHECK_SYSTEM,
+                    f'Beat {bid}. Frames are in chronological order. '
+                    f'Report camera_angle and camera_bearing.',
+                    paths, max_tokens=512, timeout=90)
+                patch = parse_json_reply(raw)
+            except pp.GenerationCancelled:
+                raise
+            except Exception as e:
+                # 单拍失败不拖垮整轮：前面几拍对账出来的订正不能跟着丢。
+                report['unresolved'].append({
+                    'beat_id': bid, 'axes': axes, 'reason': f'复核调用失败：{e}'})
+                continue
+            if isinstance(patch, list):
+                patch = next((x for x in patch if isinstance(x, dict)), None)
+            patch = patch if isinstance(patch, dict) else {}
+            report['escalated'] += 1
+            still = []
+            for field in axes:
+                allowed, syn, labels = next(
+                    (a, s_, l) for f, a, s_, l in _CAMERA_RECHECK_AXES if f == field)
+                value = _coerce_enum(patch.get(field), allowed, syn)
+                if not value:
+                    still.append(field)
+                    continue
+                current = str(beat.get(field) or '').strip()
+                marks[field] = 'model'
+                if value == current:
+                    continue
+                beat[field] = value
+                report['corrected'].append({
+                    'beat_id': bid, 'field': field, 'was': current, 'now': value,
+                    'votes': 'model', 'by': 'model',
+                    'was_zh': labels.get(current, current or '（空）'),
+                    'now_zh': labels.get(value, value),
+                })
+            if still:
+                report['unresolved'].append({
+                    'beat_id': bid, 'axes': still, 'reason': '模型也读不出这两栏'})
+            else:
+                # 模型说这一拍中途换过机位时不盖戳：戳的含义是「这一对读数管住整拍」，
+                # 而它自己刚说了管不住。留着这条 warn，让人去看这一拍该不该拆。
+                if patch.get('moved') is True:
+                    report['unresolved'].append({
+                        'beat_id': bid, 'axes': [],
+                        'reason': '模型判定这一拍内部换过机位，建议按切点拆拍'})
+                else:
+                    beat['camera_setup_verified'] = {
+                        'reading': camera_reading_stamp(beat), 'by': 'model', 'votes': marks,
+                    }
+                    report['confirmed'] += 1
+    elif pending:
+        for beat, axes, _marks in pending:
+            report['unresolved'].append({
+                'beat_id': beat.get('id'), 'axes': axes,
+                'reason': '帧读数不一致，需要看图复核'})
+
+    normalize_beat_craft_fields(beats_doc)
+    beats_doc['validation'] = validate_beats(beats_doc, overview or {})
+    return beats_doc, report
 
 
 def autobalance_beats(beats_doc, overview=None, max_duration=6.0, min_duration=2.0, speed_multiplier=2.0):

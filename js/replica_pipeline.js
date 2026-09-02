@@ -1569,7 +1569,7 @@ function replicaRenderDualWorkbench(state) {
         <div class="replica-diverge-bar">
             <div class="replica-diverge-input-wrap">
                 <input type="text" id="replica-diverge-brief" class="replica-input replica-diverge-input"
-                       placeholder="输入发散灵感/偏好（如：雪山隐世木屋 / 崖壁私汤 / 荒漠夯土工坊 / 雨林树屋，写实建造题材）"
+                       placeholder="留空＝按母本载体＋联网参考自动取材；也可指定方向（如：只做废弃载具 / 城市旧改 / 低成本旧物再生）"
                        value="${escapeHtmlReplica(replicaDivergeBrief || '')}">
             </div>
             <button type="button" id="replica-ai-diverge-btn" class="action-btn primary-btn replica-diverge-btn"
@@ -1945,6 +1945,7 @@ const REPLICA_ACTION_RANGE = {
     autofix: [68, 82],
     fix_beats: [68, 82],
     refine_craft: [68, 86],
+    recheck_camera: [68, 80],
     autobalance: [68, 76],
     translate: [68, 74],
 };
@@ -1958,6 +1959,7 @@ const REPLICA_ACTION_LABELS = {
     autofix: 'AI 修复硬伤',
     fix_beats: 'AI 修复硬伤',
     refine_craft: '工艺精修',
+    recheck_camera: '按帧复核机位',
     autobalance: '自动平衡时序',
     translate: '重做中文对照',
 };
@@ -2255,6 +2257,17 @@ function replicaRenderBeats(state) {
                 >${escapeHtmlReplica(v.message)}</button></li>`
         : `<li>${escapeHtmlReplica(v.message)}</li>`);
 
+    // 机位复核只在 `mixed_camera_angle` 真的在列时露出来，且整屏只此一处——它的证据
+    // （哪个空间、哪几拍角度对不上）就列在这份清单里，按钮离证据越近越不用解释。
+    // 这是这一批 warn 里唯一一条工艺精修够不着的（不在 CRAFT_REFINE_CODES 里），
+    // 此前只能人工照帧核；现在先拿 Pass A 的逐帧读数对账，对不上账的才去看图。
+    const cameraRecheckBtn = warns.some(v => v.code === 'mixed_camera_angle')
+        ? `<div class="replica-banner-actions">
+            <button type="button" id="replica-recheck-camera-btn" class="action-btn text-btn replica-mini-btn"
+                    title="拿 Pass A 的逐帧机位读数，去校 Pass B 转写出来的逐拍机位。一致就盖复核戳、这条不再列入待确认；对不上就按帧票改回（不花钱）；帧读数自己分裂的那几拍才升级成看图复核。只改俯仰角度与机位方位两栏，画面内容与措辞一个字不动。">🎥 按帧复核机位</button>
+        </div>`
+        : '';
+
     const banner = `
         ${errors.length ? `<div class="replica-banner replica-banner-error">
             <div class="replica-banner-head">
@@ -2265,6 +2278,7 @@ function replicaRenderBeats(state) {
         </div>` : `<div class="replica-banner replica-banner-ok">节拍阶梯已通过全部机械校验。</div>`}
         ${warns.length ? `<details class="replica-banner replica-banner-warn">
             <summary>${warns.length} 项待人工确认</summary>
+            ${cameraRecheckBtn}
             <ul>${warns.map(item).join('')}</ul>
         </details>` : ''}`;
 
@@ -3270,6 +3284,14 @@ function replicaBindBeatEvents(scope) {
     // 保存与合成不在这一排里，它们常驻吸底操作栏（见 replicaBindBottomBarEvents）。
     // 精修会作废已有的 prompt_block（beats 一变，旧提示词就是按旧措辞合出来的）。
     // 已经合成过的 job 上这是一次真实的返工，按之前先说清楚。
+    on('#replica-recheck-camera-btn', (e) => {
+        // 只有真订正了读数才会作废合成产物（见 recheck_job_camera）。多数情况下这一趟
+        // 只是盖复核戳、什么都不改，所以这里不像工艺精修那样一律先拦一次——但订正确实
+        // 会改机位分组，所以合成过的单子仍然要问一声。
+        const composed = !!(replicaState && replicaState.prompt_block);
+        if (composed && !confirm('机位复核若订正了读数，会让已经合成好的提示词作废（机位分组变了），需要重新合成一次。没订正则原样保留。继续？')) return;
+        replicaAdvance('recheck_camera', {}, e.currentTarget);
+    });
     on('#replica-refine-craft-btn', (e) => {
         const composed = !!(replicaState && (replicaState.prompt_block || replicaState.stage === 'completed'));
         if (composed && !confirm('工艺精修只改措辞、不动画面内容，但它会让已经合成好的提示词作废，需要重新合成一次。继续？')) return;
@@ -4001,7 +4023,8 @@ async function replicaStart() {
 //
 // recluster 有意不在此列：它按设计就是丢掉这份阶梯重跑 Pass B，先存一次只是白写一遍磁盘。
 const REPLICA_LADDER_CONSUMERS = new Set([
-    'approve', 'autofix', 'fix_beats', 'autobalance', 'refine_craft', 'translate', 'variant',
+    'approve', 'autofix', 'fix_beats', 'autobalance', 'refine_craft', 'recheck_camera',
+    'translate', 'variant',
 ]);
 
 async function replicaAdvance(action, payload = {}, btn) {
