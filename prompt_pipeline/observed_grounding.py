@@ -271,6 +271,10 @@ def build_observed_digests(beats_doc, job_dir, include_micro_traces=True):
     与 build_outline_plan_block 的 micro_traces 门控、apply_observed_craft_fields 的
     include_micro 是同一条口径的三个注入点，判据统一是 active_skill_profile()。
     """
+    # 局部 import：本模块与 reverse 都在 prompt_pipeline 包内、且都在模块级 import pp，
+    # 顶层互相 import 会成环。
+    from prompt_pipeline import reverse
+
     empty = {'images': {}, 'videos': {}, 'image_frames': {}, 'video_frames': {}}
     beats = (beats_doc or {}).get('beats') or []
     if not beats:
@@ -283,13 +287,16 @@ def build_observed_digests(beats_doc, job_dir, include_micro_traces=True):
         names = _coverage_names(beat)
         beat_facts = [facts_by_name[n] for n in names if n in facts_by_name]
 
-        # IMAGE 1 只由第一拍的起点帧决定
+        # IMAGE 1 只由第一拍的起点帧决定。取哪一张不是 names[0] 说了算：原片开头可能
+        # 是完工/半成品先导钩子闪帧，照直取就是把成品画面钉成整条 i2i 链的地基。判据
+        # 与组稿期锚点对齐、渲染期对标帧共用一份（reverse.select_opening_anchor）。
         if idx == 1 and names:
-            head_fact = facts_by_name.get(names[0])
+            head_name = reverse.select_opening_anchor(names, facts_by_name) or names[0]
+            head_fact = facts_by_name.get(head_name)
             digest = _image_digest(head_fact, include_micro=include_micro_traces)
             if digest:
                 images[1] = digest
-            head_path = _frame_path(job_dir, names[0])
+            head_path = _frame_path(job_dir, head_name)
             if head_path:
                 image_frames[1] = [head_path]
 

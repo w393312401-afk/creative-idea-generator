@@ -15227,11 +15227,23 @@ def find_reference_frames_with_roles(project_dir, total_beats=None):
         def _source_beat(ordinal):
             return beats[ordinal - 1] if isinstance(ordinal, int) and 1 <= ordinal <= len(beats) else None
 
-        # IMG 1: Beat 1 起始锚点 (初始毛坯状态)
+        # IMG 1: Beat 1 起始锚点 (初始毛坯状态)。
+        # 取哪一张不是「第一张 coverage」说了算：原片开头可能是完工/半成品先导钩子闪帧，
+        # 照直取就是拿成品画面当 IMG 001 的对标基准——链路守卫会照着它判「首帧不符」并
+        # 触发 autofix 重写，4选1 也会照着它给最像成品的那张候选打高分。判据与组稿期
+        # 锚点对齐、组稿收尾对帧订正共用一份（reverse.select_opening_anchor）。
+        from prompt_pipeline import reverse as _reverse
         b1 = beats[0]
         cov1 = b1.get('coverage_frames') or []
         evi1 = b1.get('evidence_frames') or []
-        start_f = cov1[0]['frame'] if cov1 else (evi1[0] if evi1 else 'review_001.png')
+        head_names = [str(c.get('frame')) for c in cov1
+                      if isinstance(c, dict) and c.get('frame')]
+        if not head_names:
+            head_names = [str(c) for c in cov1 if isinstance(c, str) and c]
+        if not head_names:
+            head_names = [str(x) for x in evi1 if x]
+        start_f = (_reverse.select_opening_anchor(head_names, facts_by_name)
+                   or (head_names[0] if head_names else 'review_001.png'))
         p1 = os.path.join(rf_dir, start_f)
         if not os.path.exists(p1):
             # 兼容 storyboard/scene_001_start.png

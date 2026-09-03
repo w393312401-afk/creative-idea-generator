@@ -335,7 +335,7 @@ def _pass_a_model(config):
     flash 打底 + peak 帧强模型复核（见 verify_peak_frames）。"""
     cfg = config or {}
     return (cfg.get('frameFactsModel') or cfg.get('reviewModel')
-            or cfg.get('model') or 'gemini-3.7-flash-high')
+            or cfg.get('model') or 'gemini-3.8-flash-high')
 
 
 def _facts_cache_path(job_dir):
@@ -1214,7 +1214,7 @@ def _peak_verify_model(config):
             return None
         if text:
             return text
-    return cfg.get('model') or 'gemini-3.7-flash-high'
+    return cfg.get('model') or 'gemini-3.8-flash-high'
 
 
 # 复核结果里"这一项模型没答"和"这一项模型看清了是空的"必须分开。空串/空表/空 dict 一律
@@ -2526,8 +2526,78 @@ def attach_scene_constants(beats_doc, facts):
     return beats_doc['scene_constants']
 
 
+def _stage_text(fact):
+    """一条逐帧读数里能反映「施工到哪一步」的那几栏。
+
+    `completion_extent` 是 Pass A 专门为这件事写的一栏（"Natural cavern basin intact
+    with pool undisturbed" / "Complete room fit-out with all structural, mechanical..."），
+    比 `subject`（写的是「人在干什么」）稳得多；两栏都收，缺一栏不影响判读。
+    """
+    if isinstance(fact, str):
+        return fact
+    if not isinstance(fact, dict):
+        return ''
+    parts = [str(fact.get('completion_extent') or ''),
+             str(fact.get('subject') or fact.get('description') or '')]
+    return ' '.join(p for p in parts if p)
+
+
+# 「这一帧看着已经完工到什么程度」的词表。判据不是命中绝对数量，而是首帧与紧随其后
+# 那几帧的**落差**——一支正常的施工片开头几帧分数都低，先导闪帧则是孤零零的一个高分。
+_LATE_STAGE_RE = re.compile(
+    r'\b(?:finished|completed|complete|fully\s+(?:finished|built|installed|fitted|furnished|clad)|'
+    r'furnished|furniture|cabinetry|fit-?out|fitted\s+out|move-?in|habitable|staged|decorated|'
+    r'installed|cladding|clad|panell?ed|painted|glazed|shingled?|roof\s+deck|flooring\s+laid|'
+    r'lighting\s+(?:installed|fixtures?)|light\s+fixtures?|final\s+state)\b',
+    re.IGNORECASE)
+
+_EARLY_STAGE_RE = re.compile(
+    r'\b(?:untouched|undisturbed|intact|natural|wild|overgrown|pristine|virgin|derelict|abandoned|'
+    r'ruined|empty|vacant|unworked|uncleared|before\s+any\s+work|'
+    r'no\s+(?:work|construction|equipment|structure)|'
+    r'bare\s+(?:ground|earth|soil|rock|site|floor|terrain)|raw\s+(?:ground|earth|site)|'
+    r'debris|rubble|spoil|mud|silt|standing\s+water|stagnant|puddle|weeds?|brush|'
+    r'clearing|excavat\w*|marking|layout\s+line|staking|survey\w*|demoli\w*|stripping|'
+    r'foundation|footing|framing|rough-?in)\b',
+    re.IGNORECASE)
+
+
+def completion_score(text):
+    """一段读数的「完工度」粗分：晚期词计正、早期词计负。
+
+    绝对值没有意义（词表长度本身就带偏），只用来跟同一支片子里的另一帧比大小。
+    """
+    if not text:
+        return 0
+    return len(_LATE_STAGE_RE.findall(text)) - len(_EARLY_STAGE_RE.findall(text))
+
+
+# 首帧要比紧随其后那几帧「超前」这么多分，才算先导闪帧。1 分是噪音（一个 installed
+# 就够了），2 分要求首帧至少有两处独立的完工证据、而后续帧一处都没有。
+_TEASER_SCORE_GAP = 2
+# 往后看几帧作为「真正的起点长什么样」的对照。
+_TEASER_LOOKAHEAD = 5
+# 先导钩子是**闪帧**：0.16s 一闪而过。跳过的那一段必须整个落在这个时间窗内，否则那不是
+# 钩子，而是这支片子真的从一个成品状态开拍——旧房翻新片的「改造前」全景就是这样，它会
+# 持续好几秒、后面紧跟着拆改。少了这一条，翻新题材会被整片砍掉第一拍。
+_TEASER_FLASH_WINDOW_SECONDS = 0.6
+# 最多跳这么多张。抽帧密度约 5fps 时 0.16s 的闪帧只占 1 张，留 2 张余量给更密的抽帧。
+_TEASER_MAX_SKIP = 2
+
+
 def is_teaser_flash_frame(f0_text, f_subsequent_texts):
-    """判断首帧是否为短视频常见的 0.16s 完工/半成品先导钩子闪帧 (Teaser Flash)。"""
+    """首帧是不是短视频常见的完工/半成品先导钩子闪帧 (Teaser Flash)。
+
+    两条判据取或：
+
+      · 旧的词表判据（原样保留）：首帧命中完工词表 **且** 后续帧命中放线/未开发词表。
+        两张表是 2026-08-21 那一单现拧出来的英文关键词，命中即算数——这里只做加法，
+        不动它，免得当初钉住的那一单又漏回去。
+      · 新的阶段落差判据：首帧的完工度分数比后续几帧高出 `_TEASER_SCORE_GAP`。词表判据
+        要求两张窄表**同时**命中，一支海蚀洞抽水清淤的片子（后续帧读数是 pump /
+        suction hose / squeegee，一个放线词都没有）就算首帧真是完工闪帧也判不出来；
+        落差判据只问「首帧是不是明显比后面几帧完工」，不依赖题材词汇。
+    """
     if not f0_text or not f_subsequent_texts:
         return False
 
@@ -2540,8 +2610,72 @@ def is_teaser_flash_frame(f0_text, f_subsequent_texts):
 
     f0_has_adv = any(re.search(p, f0_text, re.I) for p in adv_patterns)
     subs_have_layout = any(re.search(p, text, re.I) for text in f_subsequent_texts for p in layout_patterns)
+    if f0_has_adv and subs_have_layout:
+        return True
 
-    return bool(f0_has_adv and subs_have_layout)
+    lead = completion_score(f0_text)
+    if lead < 1:
+        return False
+    follow = max((completion_score(t) for t in f_subsequent_texts[:_TEASER_LOOKAHEAD]), default=0)
+    return (lead - follow) >= _TEASER_SCORE_GAP
+
+
+def opening_anchor_skip(entries, max_skip=_TEASER_MAX_SKIP):
+    """开场锚点该跳过开头的几张先导闪帧。0 = 首帧就是真起点。
+
+    这是全仓唯一一份先导帧判据。四个注入点（组稿锚点对齐、组稿收尾对帧订正、渲染期
+    链路守卫对标帧、4选1 打分基准）过去各写各的取帧，只有第一个装了这道护栏，于是它
+    前脚跳过的闪帧，后脚被另外三个原样喂回 IMG 001——用户看到的就是「帧序列第一帧又
+    开始读爆款视频的首帧」。口径收在这里，四处一起走。
+
+    entries: [{'name': 帧名, 'timestamp': 秒, 'text': 读数文本}, …]，按时间升序。
+    """
+    rows = [e for e in (entries or []) if isinstance(e, dict)]
+    if len(rows) < 2:
+        return 0
+
+    skip = 0
+    while skip < min(max_skip, len(rows) - 1):
+        nxt = rows[skip + 1]
+        # 闪帧窗：跳完之后落脚的那一帧仍必须在片头一瞬之内。
+        if _num(nxt.get('timestamp'), default=1e9) > _TEASER_FLASH_WINDOW_SECONDS:
+            break
+        f0_text = rows[skip].get('text') or ''
+        f_subs = [r.get('text') or '' for r in rows[skip + 1:skip + 1 + _TEASER_LOOKAHEAD]]
+        if not is_teaser_flash_frame(f0_text, f_subs):
+            break
+        if sys.stdout:
+            print(f'[REVERSE] 检测到片头先导钩子帧 (Teaser Flash: {rows[skip].get("name")})，'
+                  f'跳过并顺延到 {nxt.get("name")}')
+        skip += 1
+    return skip
+
+
+def select_opening_anchor(names, facts_by_name, timestamps=None):
+    """一串按时间排好的候选帧名 → 真正的开场锚点帧名。
+
+    `names` 为空返回 None。读不到任何读数时一律返回 names[0]：判不出是不是闪帧就别跳，
+    宁可读原片首帧，也不能凭空往后挪一帧。
+
+    timestamps: {帧名: 秒}。不给就从 facts_by_name 里取；两处都没有时按 0 处理——闪帧窗
+    于是恒为真，判据完全落在阶段落差上（老单的 coverage 不带时间戳）。
+    """
+    names = [str(n) for n in (names or []) if n]
+    if not names:
+        return None
+    facts_by_name = facts_by_name or {}
+    timestamps = timestamps or {}
+    entries = []
+    for n in names:
+        fact = facts_by_name.get(n)
+        ts = timestamps.get(n)
+        if ts is None and isinstance(fact, dict):
+            ts = fact.get('timestamp')
+        entries.append({'name': n, 'timestamp': _num(ts, default=0.0),
+                        'text': _stage_text(fact)})
+    if not any(e['text'] for e in entries):
+        return names[0]
+    return names[opening_anchor_skip(entries)]
 
 
 def anchor_reference_frame(beats_doc, overview, facts=None):
@@ -2549,8 +2683,9 @@ def anchor_reference_frame(beats_doc, overview, facts=None):
 
     锚点图（IMAGE 1）是整条序列的地基——后面每一拍的画面都从它继承材质与光线。它写歪
     了，后面全歪，而组稿阶段它恰恰是凭文字空想出来的。
-    如果原片在 0.0s 处含有短视频常见的 0.16s 完工/半成品先导钩子帧（Teaser Flash），
-    而后续几帧才是真正的施工放线/未开发原始地面，则自动跳过孤立先导帧，锁定真实起始帧。
+    原片开头若是短视频常见的完工/半成品先导钩子闪帧（Teaser Flash），而后续几帧才是真正
+    的施工放线/未开发原始地面，则自动跳过，锁定真实起始帧——判据见 opening_anchor_skip，
+    与另外三个注入点共用同一份。
     """
     entries = [e for e in ((overview or {}).get('review_sampling') or {}).get('frames') or []
                if e.get('frame_path') and e.get('timestamp') is not None]
@@ -2561,31 +2696,36 @@ def anchor_reference_frame(beats_doc, overview, facts=None):
         return None
     entries.sort(key=lambda e: _num(e['timestamp'], default=1e9))
 
-    # 尝试加载 frame_facts 进行先导帧检测
-    if len(entries) > 1 and _num(entries[0].get('timestamp'), default=0) < 0.25:
-        if facts is None:
-            facts = (beats_doc or {}).get('facts') or (overview or {}).get('facts')
-            if not facts and entries[0].get('frame_path'):
-                job_dir_cand = os.path.dirname(os.path.dirname(entries[0]['frame_path']))
-                ff_path = os.path.join(job_dir_cand, 'frame_facts.json')
-                if os.path.exists(ff_path):
-                    try:
-                        with open(ff_path, 'r', encoding='utf-8') as f:
-                            facts = json.load(f)
-                    except Exception:
-                        facts = None
-        if isinstance(facts, dict):
-            facts = facts.get('facts') or []
+    if facts is None:
+        facts = (beats_doc or {}).get('facts') or (overview or {}).get('facts')
+        if not facts and entries[0].get('frame_path'):
+            job_dir_cand = os.path.dirname(os.path.dirname(entries[0]['frame_path']))
+            ff_path = os.path.join(job_dir_cand, 'frame_facts.json')
+            if os.path.exists(ff_path):
+                try:
+                    with open(ff_path, 'r', encoding='utf-8') as f:
+                        facts = json.load(f)
+                except Exception:
+                    facts = None
+    if isinstance(facts, dict):
+        facts = facts.get('facts') or []
+    facts_list = facts if isinstance(facts, list) else []
 
-        if isinstance(facts, list) and len(facts) > 1:
-            f0_text = str(facts[0].get('subject') or facts[0].get('description') or '')
-            f_subs = [str(f.get('subject') or f.get('description') or '') for f in facts[1:min(6, len(facts))]]
-            if is_teaser_flash_frame(f0_text, f_subs):
-                if sys.stdout:
-                    print(f'[REVERSE] 检测到片头先导钩子帧 (Teaser Flash: {entries[0]["frame_path"]})，自动跳过并锁定真实起始帧: {entries[1]["frame_path"]}')
-                return entries[1]['frame_path']
-
-    return entries[0]['frame_path']
+    # 读数优先按帧名对齐，对不上再退回位置对齐：review_sampling 与 frame_facts 是同一次
+    # 抽帧的两份产物、顺序一致，但只有 frame_facts 那份带 `frame` 字段。
+    facts_by_name = {str(f.get('frame')): f for f in facts_list
+                     if isinstance(f, dict) and f.get('frame')}
+    rows = []
+    for i, e in enumerate(entries[:_TEASER_LOOKAHEAD + _TEASER_MAX_SKIP]):
+        name = os.path.basename(e['frame_path'])
+        fact = facts_by_name.get(name)
+        if fact is None and not facts_by_name and i < len(facts_list):
+            fact = facts_list[i]
+        rows.append({'name': name, 'timestamp': _num(e.get('timestamp'), default=0.0),
+                     'text': _stage_text(fact)})
+    if not any(r['text'] for r in rows):
+        return entries[0]['frame_path']
+    return entries[opening_anchor_skip(rows)]['frame_path']
 
 
 _WEIGHTED_NEGATIVE_RE = re.compile(r'\(\s*[^()]*?:\s*\d+(?:\.\d+)?\s*\)')
