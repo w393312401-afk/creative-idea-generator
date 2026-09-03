@@ -287,11 +287,14 @@ def build_observed_digests(beats_doc, job_dir, include_micro_traces=True):
         names = _coverage_names(beat)
         beat_facts = [facts_by_name[n] for n in names if n in facts_by_name]
 
-        # IMAGE 1 只由第一拍的起点帧决定。取哪一张不是 names[0] 说了算：原片开头可能
-        # 是完工/半成品先导钩子闪帧，照直取就是把成品画面钉成整条 i2i 链的地基。判据
-        # 与组稿期锚点对齐、渲染期对标帧共用一份（reverse.select_opening_anchor）。
-        if idx == 1 and names:
-            head_name = reverse.select_opening_anchor(names, facts_by_name) or names[0]
+        # IMAGE 1 只由第一拍的起点帧决定。取哪一张不是 names[0] 说了算：
+        # 1. 优先认第一拍已核准的证据帧 Triad 起始锚点（evidence_frames[0] 是模型/人工卡点确定的起步帧）。
+        # 2. 原片开头可能是完工/半成品先导钩子闪帧，照直取就是把成品画面钉成整条 i2i 链的地基。
+        #    判据与组稿期锚点对齐、渲染期对标帧共用一份闪帧判据（reverse.select_opening_anchor）。
+        if idx == 1 and (names or beat.get('evidence_frames')):
+            evi = [str(x) for x in (beat.get('evidence_frames') or []) if x]
+            cand_names = (evi + [n for n in names if n not in evi]) if evi else names
+            head_name = reverse.select_opening_anchor(cand_names, facts_by_name) or cand_names[0]
             head_fact = facts_by_name.get(head_name)
             digest = _image_digest(head_fact, include_micro=include_micro_traces)
             if digest:
@@ -852,6 +855,12 @@ def ground_prompt_block_on_observed(config, prompt_block, beats_doc, job_dir,
     if not prompt_block or not beats:
         return prompt_block, report
 
+    if config.get('skipFootageGrounding'):
+        report['skipped'].append('已配置 skipFootageGrounding，跳过后置实拍校对')
+        if sys.stdout:
+            print('[OBSERVED] ⚡ 已开启 skipFootageGrounding，跳过后置实拍校对以提速')
+        return prompt_block, report
+
     if digests is None:
         digests = build_observed_digests(beats_doc, job_dir)
     video_frames = (digests or {}).get('video_frames') or {}
@@ -881,53 +890,99 @@ def ground_prompt_block_on_observed(config, prompt_block, beats_doc, job_dir,
 
     total = len(beats)
     changed_any = False
+
+    # 第 1 拍的取证帧同时管着 IMAGE 1（开场锚点）与 IMAGE 2（本拍终点）。锚点那张
+    # 单独对一次：它的依据是起点帧，跟本拍终点不是同一个画面。
+    if 1 in parsed_images:
+        head_frames = ((digests or {}).get('image_frames') or {}).get(1)
+        if head_frames:
+            if on_progress:
+                on_progress('replica_stage', {
+                    'stage': 'compose',
+                    'message': '正在拿原片起始帧对齐开场锚点（IMAGE 1）…',
+                })
+            new_img, _unused, notes = verify_beat_against_frames(
+                config, 1, 1, _body(parsed_images, 1), '', digests, head_frames)
+            report['checked'] += 1
+            if new_img:
+                _set_body(parsed_images, 1, new_img)
+                report['corrected_images'].append(1)
+                report['notes'].extend(f'IMAGE 1: {n}' for n in notes)
+                changed_any = True
+
+    tasks = []
     for i in range(1, total + 1):
         frames = video_frames.get(i)
         if not frames:
             continue
-        # 第 1 拍的取证帧同时管着 IMAGE 1（开场锚点）与 IMAGE 2（本拍终点）。锚点那张
-        # 单独对一次：它的依据是起点帧，跟本拍终点不是同一个画面。
-        if i == 1 and 1 in parsed_images:
-            head_frames = ((digests or {}).get('image_frames') or {}).get(1)
-            if head_frames:
-                if on_progress:
-                    on_progress('replica_stage', {
-                        'stage': 'compose',
-                        'message': '正在拿原片起始帧对齐开场锚点（IMAGE 1）…',
-                    })
-                new_img, _unused, notes = verify_beat_against_frames(
-                    config, 1, 1, _body(parsed_images, 1), '', digests, head_frames)
-                report['checked'] += 1
-                if new_img:
-                    _set_body(parsed_images, 1, new_img)
-                    report['corrected_images'].append(1)
-                    report['notes'].extend(f'IMAGE 1: {n}' for n in notes)
-                    changed_any = True
-
         image_slot = i + 1
         img_body = _body(parsed_images, image_slot) if image_slot in parsed_images else ''
         vid_body = _body(parsed_videos, i) if i in parsed_videos else ''
         if not img_body and not vid_body:
             continue
+        tasks.append((i, image_slot, img_body, vid_body, frames))
 
-        if on_progress:
-            on_progress('replica_stage', {
-                'stage': 'compose',
-                'message': f'正在拿原片实拍画面校对第 {i}/{total} 拍的提示词…',
-            })
-        new_img, new_vid, notes = verify_beat_against_frames(
-            config, i, image_slot, img_body, vid_body, digests, frames)
-        report['checked'] += 1
-        if new_img:
-            _set_body(parsed_images, image_slot, new_img)
-            report['corrected_images'].append(image_slot)
-            report['notes'].extend(f'IMAGE {image_slot}: {n}' for n in notes)
-            changed_any = True
-        if new_vid:
-            _set_body(parsed_videos, i, new_vid)
-            report['corrected_videos'].append(i)
-            report['notes'].extend(f'VIDEO {i}: {n}' for n in notes)
-            changed_any = True
+    if tasks:
+        import concurrent.futures
+        max_workers = max(1, min(len(tasks), int(config.get('observedGroundingConcurrency', 3))))
+        if max_workers <= 1:
+            for i, image_slot, img_body, vid_body, frames in tasks:
+                if on_progress:
+                    on_progress('replica_stage', {
+                        'stage': 'compose',
+                        'message': f'正在拿原片实拍画面校对第 {i}/{total} 拍的提示词…',
+                    })
+                new_img, new_vid, notes = verify_beat_against_frames(
+                    config, i, image_slot, img_body, vid_body, digests, frames)
+                report['checked'] += 1
+                if new_img:
+                    _set_body(parsed_images, image_slot, new_img)
+                    report['corrected_images'].append(image_slot)
+                    report['notes'].extend(f'IMAGE {image_slot}: {n}' for n in notes)
+                    changed_any = True
+                if new_vid:
+                    _set_body(parsed_videos, i, new_vid)
+                    report['corrected_videos'].append(i)
+                    report['notes'].extend(f'VIDEO {i}: {n}' for n in notes)
+                    changed_any = True
+        else:
+            def _worker(item):
+                i, image_slot, img_body, vid_body, frames = item
+                new_img, new_vid, notes = verify_beat_against_frames(
+                    config, i, image_slot, img_body, vid_body, digests, frames)
+                return i, image_slot, new_img, new_vid, notes
+
+            results = []
+            completed = 0
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_to_item = {executor.submit(_worker, item): item for item in tasks}
+                for future in concurrent.futures.as_completed(future_to_item):
+                    item = future_to_item[future]
+                    try:
+                        res = future.result()
+                        results.append(res)
+                    except Exception as e:
+                        results.append((item[0], item[1], None, None, []))
+                    completed += 1
+                    if on_progress:
+                        on_progress('replica_stage', {
+                            'stage': 'compose',
+                            'message': f'正在拿原片实拍画面校对第 {completed}/{total} 拍的提示词（并发加速中）…',
+                        })
+
+            results.sort(key=lambda r: r[0])
+            for i, image_slot, new_img, new_vid, notes in results:
+                report['checked'] += 1
+                if new_img:
+                    _set_body(parsed_images, image_slot, new_img)
+                    report['corrected_images'].append(image_slot)
+                    report['notes'].extend(f'IMAGE {image_slot}: {n}' for n in notes)
+                    changed_any = True
+                if new_vid:
+                    _set_body(parsed_videos, i, new_vid)
+                    report['corrected_videos'].append(i)
+                    report['notes'].extend(f'VIDEO {i}: {n}' for n in notes)
+                    changed_any = True
 
     if not changed_any:
         return prompt_block, report

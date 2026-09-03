@@ -6063,9 +6063,17 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                     return
                 config['_project_key'] = job_id
 
+                cleanup_old_tasks()
+                with ACTIVE_TASKS_LOCK:
+                    for running_id, running_task in ACTIVE_TASKS.items():
+                        if running_task.get("status") == "running":
+                            dims = running_task.get("dimensions") or {}
+                            if dims.get("replica_job_id") == job_id and dims.get("type") == "replica":
+                                self._send_json({'status': 'ok', 'task_id': running_id, 'already_running': True})
+                                return
+
                 import uuid
                 task_id = f"replica_{uuid.uuid4().hex}"
-                cleanup_old_tasks()
                 get_or_create_task(task_id, replica_task_dims(job_id, 'replica'))
 
                 threading.Thread(
@@ -6095,9 +6103,17 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                     return
                 config['_project_key'] = job_id
 
+                cleanup_old_tasks()
+                with ACTIVE_TASKS_LOCK:
+                    for running_id, running_task in ACTIVE_TASKS.items():
+                        if running_task.get("status") == "running":
+                            dims = running_task.get("dimensions") or {}
+                            if dims.get("replica_job_id") == job_id and dims.get("type") == "replica_advance":
+                                self._send_json({'status': 'ok', 'task_id': running_id, 'already_running': True})
+                                return
+
                 import uuid
                 task_id = body.get('task_id') or f"replica_adv_{uuid.uuid4().hex}"
-                cleanup_old_tasks()
                 _, already_running = prepare_task_for_run(
                     task_id, replica_task_dims(job_id, 'replica_advance'))
                 if already_running:

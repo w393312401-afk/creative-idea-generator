@@ -147,6 +147,49 @@ class TestFourChannelsAgree(unittest.TestCase):
         self.assertEqual(os.path.basename(refs[1]), 'review_002.png')
         self.assertEqual(roles[1], 'benchmark')
 
+    def test_curated_evidence_frames_are_prioritized_over_raw_coverage(self):
+        """当第一拍已经经过 Pass B 或人工核对选定了真实的起步证据帧（如 review_004.png），
+        四条通道都必须以该帧为准，不能被包含 0s 闪帧的 coverage_frames 覆盖回 review_001.png。"""
+        # 第一拍 evidence_frames 明确指向真实的起步帧 review_002.png，
+        # 而 coverage_frames 首张包含了 0s 闪帧 review_001.png 且采样步长拉大到 0.65s
+        self.beats[0]['evidence_frames'] = ['review_002.png', 'review_003.png']
+        self.beats[0]['coverage_frames'] = [
+            {'frame': 'review_001.png', 'timestamp': 0.0},
+            {'frame': 'review_004.png', 'timestamp': 0.65}
+        ]
+        with open(os.path.join(self.tmp, 'timelapse_beats.json'), 'w', encoding='utf-8') as f:
+            json.dump({'beats': self.beats}, f)
+
+        # 通道 1
+        picked = reverse.anchor_reference_frame({'beats': self.beats}, self._overview())
+        self.assertEqual(os.path.basename(picked), 'review_002.png')
+
+        # 通道 2
+        d = og.build_observed_digests({'beats': self.beats}, self.tmp)
+        self.assertTrue(d['image_frames'][1][0].endswith('review_002.png'))
+
+        # 通道 3 & 4
+        refs, roles, _ = pp.find_reference_frames_with_roles(self.tmp, total_beats=2)
+        self.assertEqual(os.path.basename(refs[1]), 'review_002.png')
+        self.assertEqual(roles[1], 'benchmark')
+
+    def test_sparse_coverage_alone_also_skips_teaser_across_0_6s_step(self):
+        """即使没有 evidence_frames，coverage_frames 均分采样跨度略大于 0.6s（如 0.628s）时，
+        先导闪帧护栏也必须正常识别并顺延，绝不能卡在 0.6s 死线退回成品首帧。"""
+        self.beats[0].pop('evidence_frames', None)
+        self.beats[0]['coverage_frames'] = [
+            {'frame': 'review_001.png', 'timestamp': 0.0},
+            {'frame': 'review_002.png', 'timestamp': 0.65},
+            {'frame': 'review_003.png', 'timestamp': 1.3}
+        ]
+        with open(os.path.join(self.tmp, 'timelapse_beats.json'), 'w', encoding='utf-8') as f:
+            json.dump({'beats': self.beats}, f)
+
+        refs, roles, _ = pp.find_reference_frames_with_roles(self.tmp, total_beats=2)
+        self.assertEqual(os.path.basename(refs[1]), 'review_002.png')
+        self.assertEqual(roles[1], 'benchmark')
+
+
     def test_without_frame_facts_every_channel_falls_back_to_the_first_frame(self):
         """读不到读数时四条通道一致退回原片首帧——判据缺席不该让任何一条自己发挥。"""
         os.remove(os.path.join(self.tmp, 'frame_facts.json'))
@@ -161,3 +204,4 @@ class TestFourChannelsAgree(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+

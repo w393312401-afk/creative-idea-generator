@@ -193,9 +193,9 @@ _PASS_A_BATCH_SIZE = 10
 # 在 `extent=左三分之二已涂` 这种一行摘要里全丢了，模型只能靠文本相邻性猜哪几帧属于
 # 同一个里程碑。给它整页拼图，节拍边界就是一次感知，不必从文字里重建。
 #
-# 5 列 × 4 行 = 20 帧一页：再密单帧就小到读不出完成范围，再稀页数上去、载荷和钱一起涨。
+# 5 列 × 8 行 = 40 帧一页：单帧紧凑清晰，大幅减少拼图页数并降低多模态视觉开销。
 _PASS_B_SHEET_COLUMNS = 5
-_PASS_B_SHEET_PAGE_SIZE = 20
+_PASS_B_SHEET_PAGE_SIZE = 40
 _PASS_B_SHEET_DIRNAME = '.pass_b_sheets'
 
 _FRAME_FACTS_FILENAME = 'frame_facts.json'
@@ -1412,7 +1412,8 @@ def _digest_frame_paths(overview, facts):
 
 
 def build_pass_b_sheets(job_dir, overview, facts,
-                        columns=_PASS_B_SHEET_COLUMNS, page_size=_PASS_B_SHEET_PAGE_SIZE):
+                        columns=_PASS_B_SHEET_COLUMNS, page_size=None,
+                        config=None):
     """把送审帧按 facts 顺序拼成分页拼图。
 
     返回 `[{'path': 拼图路径, 'start': 首格在 facts 里的下标, 'facts': 该页的事实切片}]`。
@@ -1426,6 +1427,9 @@ def build_pass_b_sheets(job_dir, overview, facts,
     等于让后面每一格都错位一位，模型会把 A 帧的画面当成 B 帧的事实来读，这比没有拼图
     坏得多。
     """
+    effective_page_size = page_size if page_size is not None else int((config or {}).get('passBSheetPageSize', _PASS_B_SHEET_PAGE_SIZE))
+    tile_width = int((config or {}).get('passBSheetTileWidth', 280)) if config else 280
+
     try:
         from pathlib import Path
         from tools.collage import build_keyframe_collage
@@ -1453,8 +1457,8 @@ def build_pass_b_sheets(job_dir, overview, facts,
     try:
         os.makedirs(sheet_dir, exist_ok=True)
         for run_start, run_paths in runs:
-            for offset in range(0, len(run_paths), page_size):
-                chunk = run_paths[offset:offset + page_size]
+            for offset in range(0, len(run_paths), effective_page_size):
+                chunk = run_paths[offset:offset + effective_page_size]
                 lo = run_start + offset
                 out_path = os.path.join(sheet_dir, f'sheet_{lo + 1:03d}_{lo + len(chunk):03d}.jpg')
                 # max_frames=0 关掉降采样：build_keyframe_collage 默认会把超过 25 张的
@@ -1462,10 +1466,9 @@ def build_pass_b_sheets(job_dir, overview, facts,
                 # 契约**的——第 k 格必须恰好是 FRAME FACTS 第 lo+k 条，_sheet_layout_block
                 # 就是照这个对应关系写给模型的。抽掉任何一张，后面每一格都错位一位，
                 # 模型会把 A 帧的画面当成 B 帧的事实来读，正是本函数 docstring 说的
-                # 「比没有拼图坏得多」。page_size 现在是 20，侥幸没撞上默认值 25；
-                # 但那是巧合不是保证，把它显式钉死。
+                # 「比没有拼图坏得多」。
                 made = build_keyframe_collage([Path(p) for p in chunk], Path(out_path),
-                                              columns=columns, max_frames=0)
+                                              columns=columns, max_frames=0, tile_width=tile_width)
                 if not made:
                     return []   # ffmpeg 不可用：别交出半套拼图，那比没有更难对齐
                 sheets.append({'path': str(made), 'start': lo,
@@ -1515,6 +1518,10 @@ You are given:
 - TIME WINDOWS: the same footage summarised again on a fixed five-second grid — what entered the frame, what left it, and the concrete state at the end of each window. Computed mechanically from the frame facts, so it is evidence, not opinion.
 
 RULES
+- BREVITY, TOKEN BUDGET & BEAT DENSITY (CRITICAL):
+  - Output compact, tightly-scoped JSON directly on your very first attempt. Keep total tokens well within capacity. Do NOT produce verbose commentary.
+  - TARGET DENSITY: Aim for 10 to 18 concise, distinct production beats for the whole video. Merge tightly coupled micro-actions into coherent milestones.
+  - Every prose sentence field (visual_subject, visible_action, visible_result, state_before, state_after, cast_action, material_flow) MUST remain strictly under fifteen to twenty words.
 - Every five-second window must fall inside some beat. A window whose NEW/GONE items appear in no beat's narration is work you have skipped — go back and widen a beat or claim it. The windows exist to catch exactly that.
 - Every change event must be claimed by exactly one beat, via source_event_ids. Zero unclaimed, zero double-claimed. A single beat may and often should claim SEVERAL adjacent events — events are detected state jumps, not production beats.
 - A beat is a PRODUCTION MILESTONE, not a state jump. It must declare TWO OR THREE tightly coupled operations in package_operations that share ONE terminal product (for example ["cut", "fit", "fasten"] all producing one boarded ceiling). A beat carrying only one operation is under-scoped — widen its window and merge the adjacent events that belong to the same milestone.
@@ -1757,7 +1764,7 @@ def cluster_beats(config, job_dir, facts_payload=None, on_progress=None, max_rew
 
     # 拼图拿得到就走多模态。拿不到（ffmpeg 缺失、帧文件不在）退回纯文本，产出会粗一档
     # 但不该因此跑不完——所以这里是分支，不是断言。
-    sheets = build_pass_b_sheets(job_dir, overview, facts)
+    sheets = build_pass_b_sheets(job_dir, overview, facts, config=config)
     sheet_paths = [s['path'] for s in sheets]
     if sheets:
         user += _sheet_layout_block(sheets)
@@ -1773,15 +1780,16 @@ def cluster_beats(config, job_dir, facts_payload=None, on_progress=None, max_rew
     def _ask_pass_b(prompt):
         # 预估输出 token 预算：基线 65536，确保长片多拍（20+ 拍）与结构回炉提示词不撞硬上限
         target_tokens = 65536
+        cluster_model = (config or {}).get('clusterBeatsModel') or (config or {}).get('model')
         if sheet_paths:
             # `_multimodal_chat` 的 temperature 固定 0.1，比纯文本路径的 0.2 还低——
             # 聚类要的是稳定复现，不是花样，低一点正合适。
             return pp._multimodal_chat(
                 config, _PASS_B_SYSTEM, prompt, sheet_paths,
-                model=(config or {}).get('model'), max_tokens=target_tokens, timeout=360,
+                model=cluster_model, max_tokens=target_tokens, timeout=360,
             )
         return pp._chat(config, _PASS_B_SYSTEM, prompt, temperature=0.2,
-                        max_tokens=target_tokens, timeout=240)
+                        model=cluster_model, max_tokens=target_tokens, timeout=240)
 
     violations = []
     beats_doc = None
@@ -1991,6 +1999,11 @@ def translate_beats(config, beats_doc, on_progress=None):
     纯文本调用，不带任何帧图：Pass A 的反注入不变量与它无关（此时 beats 已经产出，
     主题信息也不会倒流回帧事实提取）。
     """
+    if (config or {}).get('skipBeatTranslation'):
+        if sys.stdout:
+            print('[REVERSE] ⚡ 已配置 skipBeatTranslation，跳过中文对照翻译以提速')
+        return 0
+
     beats = [b for b in (beats_doc or {}).get('beats') or [] if isinstance(b, dict)]
     payload = _beat_translation_payload(beats)
     if not payload:
@@ -2001,11 +2014,37 @@ def translate_beats(config, beats_doc, on_progress=None):
             'message': f'正在把 {len(payload)} 拍的英文观察译成中文对照…',
         })
     try:
-        raw = pp._chat(
-            config, _TRANSLATE_SYSTEM,
-            json.dumps(payload, ensure_ascii=False),
-            temperature=0.1, max_tokens=8192, timeout=180)
-        data = parse_json_reply(raw)
+        if len(payload) > 8:
+            # 超过 8 拍时采用并发分片翻译，提速 2 倍以上
+            import concurrent.futures
+            mid = (len(payload) + 1) // 2
+            chunks = [payload[:mid], payload[mid:]]
+            data = {}
+
+            def _translate_chunk(chunk):
+                raw = pp._chat(
+                    config, _TRANSLATE_SYSTEM,
+                    json.dumps(chunk, ensure_ascii=False),
+                    temperature=0.1, max_tokens=4096, timeout=120)
+                res = parse_json_reply(raw)
+                return res if isinstance(res, dict) else {}
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+                futures = [executor.submit(_translate_chunk, c) for c in chunks]
+                for f in concurrent.futures.as_completed(futures):
+                    try:
+                        part = f.result()
+                        if isinstance(part, dict):
+                            data.update(part)
+                    except Exception as e:
+                        if sys.stdout:
+                            print(f'[REVERSE] 分片翻译失败: {e}')
+        else:
+            raw = pp._chat(
+                config, _TRANSLATE_SYSTEM,
+                json.dumps(payload, ensure_ascii=False),
+                temperature=0.1, max_tokens=8192, timeout=180)
+            data = parse_json_reply(raw)
     except Exception as e:
         # 翻译只是可读性增强，炸了就保持英文原样。
         if sys.stdout:
@@ -2577,10 +2616,11 @@ def completion_score(text):
 _TEASER_SCORE_GAP = 2
 # 往后看几帧作为「真正的起点长什么样」的对照。
 _TEASER_LOOKAHEAD = 5
-# 先导钩子是**闪帧**：0.16s 一闪而过。跳过的那一段必须整个落在这个时间窗内，否则那不是
+# 先导钩子是**闪帧**：0.16s~2.0s 一闪而过。跳过的那一段必须落在时间窗内，否则那不是
 # 钩子，而是这支片子真的从一个成品状态开拍——旧房翻新片的「改造前」全景就是这样，它会
-# 持续好几秒、后面紧跟着拆改。少了这一条，翻新题材会被整片砍掉第一拍。
-_TEASER_FLASH_WINDOW_SECONDS = 0.6
+# 持续好几秒（>=3.0s）、后面紧跟着拆改。
+# 抽帧密度或 coverage_frames 稀疏采样下首帧到次帧间隔常在 0.6s~1.2s，放宽至 2.0s 避免采样步长误拦截。
+_TEASER_FLASH_WINDOW_SECONDS = 2.0
 # 最多跳这么多张。抽帧密度约 5fps 时 0.16s 的闪帧只占 1 张，留 2 张余量给更密的抽帧。
 _TEASER_MAX_SKIP = 2
 
@@ -2715,6 +2755,17 @@ def anchor_reference_frame(beats_doc, overview, facts=None):
     # 抽帧的两份产物、顺序一致，但只有 frame_facts 那份带 `frame` 字段。
     facts_by_name = {str(f.get('frame')): f for f in facts_list
                      if isinstance(f, dict) and f.get('frame')}
+
+    # 优先认第一拍已核准的证据帧 Triad 起始锚点（evidence_frames）
+    b1 = ((beats_doc or {}).get('beats') or [{}])[0] if isinstance(beats_doc, dict) else {}
+    evi1 = [str(x) for x in (b1.get('evidence_frames') or []) if x]
+    if evi1 and facts_by_name:
+        picked_evi = select_opening_anchor(evi1, facts_by_name)
+        if picked_evi:
+            for e in entries:
+                if os.path.basename(e['frame_path']) == picked_evi:
+                    return e['frame_path']
+
     rows = []
     for i, e in enumerate(entries[:_TEASER_LOOKAHEAD + _TEASER_MAX_SKIP]):
         name = os.path.basename(e['frame_path'])
@@ -3627,11 +3678,12 @@ def ensure_three_evidence_frames(beats_doc, overview):
     return beats_doc
 
 
-def attach_coverage_frames(beats_doc, overview):
+def attach_coverage_frames(beats_doc, overview, facts=None):
     """给每一拍挂上 `coverage_frames`。派生数据，每次都重算。
 
     重算而不是「缺了才补」：用户在卡点上拆拍/并拍会改动时间窗，留着上一版的覆盖帧
     等于让人对着**别的拍窗**的画面核对这一拍——比没有覆盖帧更坏。
+    如果片头存在先导闪帧 (Teaser Flash)，自动剔除闪帧，绝不将完工闪帧塞入第一拍施工覆盖帧中。
     """
     timeline = _review_frame_timeline(overview)
     beats = beats_doc.get('beats') or []
@@ -3640,10 +3692,33 @@ def attach_coverage_frames(beats_doc, overview):
             if isinstance(beat, dict):
                 beat.pop('coverage_frames', None)
         return beats_doc
+
+    filtered_timeline = timeline
+    entries = [e for e in ((overview or {}).get('review_sampling') or {}).get('frames') or [] if e.get('frame_path')]
+    if entries:
+        facts_list = (facts or {}).get('facts', []) if isinstance(facts, dict) else (facts if isinstance(facts, list) else [])
+        if not facts_list and entries[0].get('frame_path'):
+            cand_job = os.path.dirname(os.path.dirname(entries[0]['frame_path']))
+            ff_p = os.path.join(cand_job, 'frame_facts.json')
+            if os.path.exists(ff_p):
+                try:
+                    with open(ff_p, 'r', encoding='utf-8') as f:
+                        facts_list = json.load(f).get('facts') or []
+                except Exception:
+                    pass
+        facts_by_name = {str(f.get('frame')): f for f in facts_list if isinstance(f, dict) and f.get('frame')}
+        rows = [{'name': os.path.basename(e['frame_path']),
+                 'timestamp': _num(e.get('timestamp'), default=0.0),
+                 'text': _stage_text(facts_by_name.get(os.path.basename(e['frame_path'])))}
+                for e in entries[:_TEASER_LOOKAHEAD + _TEASER_MAX_SKIP]]
+        skip = opening_anchor_skip(rows)
+        if skip > 0 and len(timeline) > skip:
+            filtered_timeline = timeline[skip:]
+
     for beat in beats:
         if isinstance(beat, dict):
             beat['coverage_frames'] = coverage_frames_for_window(
-                timeline, beat.get('start'), beat.get('end'))
+                filtered_timeline, beat.get('start'), beat.get('end'))
     return beats_doc
 
 
@@ -6268,6 +6343,23 @@ def banned_element_hits(prompt_block, banned_elements):
         prefix = r'\b' if re.match(r'^[a-zA-Z0-9_]', needle) else ''
         suffix = r'\b' if re.search(r'[a-zA-Z0-9_]$', needle) else ''
         regex = f'{prefix}{pattern}{suffix}'
+
+        # 特例防假阳性：
+        # 'oven' 旨在拦截现代厨房家用电器（residential appliances），
+        # 但在荒野庇护所/泥工搭建场景下，原生态手工泥塑烤炉/火塘（domed oven / cob oven / clay oven / earthen oven / wood-fired oven）
+        # 属于真实的土工/砌筑工序，并非幻觉出的现代厨房电器。
+        if needle.lower() == 'oven':
+            matches = list(re.finditer(regex, text, re.IGNORECASE))
+            real_hits = []
+            for m in matches:
+                before = text[max(0, m.start() - 30):m.start()].lower()
+                if re.search(r'\b(cob|clay|earth|earthen|mud|brick|stone|wood-fired|wood fired|domed)\s*$', before):
+                    continue
+                real_hits.append(m)
+            if real_hits:
+                hits.append(item)
+            continue
+
         if re.search(regex, text, re.IGNORECASE):
             hits.append(item)
     return hits

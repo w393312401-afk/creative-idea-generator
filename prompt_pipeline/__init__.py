@@ -7583,11 +7583,17 @@ def check_stylistic_repetition(curr_prompt, prev_prompt, packet, is_video=True):
 
         # Standard boilerplates to strip
         boilerplates = [
+            "one clean documentary photograph: no unrelated work, no later-stage result, no regression of any previously completed feature, no active construction, no text artifacts",
+            "one clean documentary photograph",
+            "no unrelated work, no later-stage result, no regression of any previously completed feature, no active construction, no text artifacts",
             "use the provided first frame and last frame as exact composition anchors",
             "use image as the actual first-frame image and image as the actual last-frame image",
             "every visible action must interpolate between those two frame images without inventing a third layout",
             "continuous construction time-lapse, not real-time footage",
             "the transformation advances continuously and at an even rate across the entire clip duration",
+            "the transformation advances continuously and at an even rate across the clip duration",
+            "material path: uncovered area decreases, finished area increases",
+            "uncovered area decreases, finished area increases",
             "at every moment something is visibly progressing",
             "no interval of the clip is static or paused",
             "no part of the change is deferred and then delivered as a single sudden step",
@@ -7707,6 +7713,33 @@ def check_stylistic_repetition(curr_prompt, prev_prompt, packet, is_video=True):
         # ——没有 'boundary' 这个词，所以上面按关键词的白名单抓不到它。改按结构判：
         # 一句里同时点名三条以上画幅边就是边界复述，不是内容重复。
         if len(_BOUNDARY_EDGE_RE.findall(sentence_low)) >= 3:
+            return True
+
+        # 流水线契约注入的标准纪实与运镜/动作规范句（跨拍逐字保持一致，非内容剽窃）
+        standard_boilerplate_phrases = [
+            "one clean documentary photograph",
+            "no unrelated work",
+            "no later-stage result",
+            "no regression of any previously completed feature",
+            "no active construction",
+            "no text artifacts",
+            "transformation advances continuously",
+            "even rate across the entire clip duration",
+            "even rate across the clip duration",
+            "first visible contact before any state changes",
+            "material path: uncovered area decreases",
+            "material path:",
+            "uncovered area decreases, finished area increases",
+            "first-frame state:",
+            "last-frame state:",
+            "repeated physical actions execute only this delta:",
+            "at every moment something is visibly progressing",
+            "no interval of the clip is static or paused",
+            "no part of the change is deferred",
+            "displays blurred diffused reflections",
+            "polished floor displays",
+        ]
+        if any(bp in sentence_low for bp in standard_boilerplate_phrases):
             return True
 
 
@@ -9015,7 +9048,8 @@ def rework_structural_video_beat(config, i, video_prompt, structural_errs, packe
             " Fix that specific problem and try again, still following the hard rules above."
         )
         try:
-            resp = _chat(config, system, user, temperature=0.5, timeout=90)
+            repair_timeout = min(45, int(config.get('composeRepairTimeoutSeconds', 45)))
+            resp = _chat(config, system, user, temperature=0.5, timeout=repair_timeout)
             fixed = _strip_markdown_fences_only(resp).strip()
             fixed = _strip_leading_label_line(fixed)
             if not fixed:
@@ -9732,7 +9766,8 @@ def rework_milestone_prompt_pair(config, i, video_prompt, image_prompt, beat,
         f"\n\nCurrent VIDEO:\n{video_prompt}\n\nCurrent IMAGE:\n{image_prompt}"
     )
     try:
-        data = json.loads(_strip_code_fences(_chat(config, system, user, temperature=0.3, timeout=90)))
+        repair_timeout = min(45, int(config.get('composeRepairTimeoutSeconds', 45)))
+        data = json.loads(_strip_code_fences(_chat(config, system, user, temperature=0.3, timeout=repair_timeout)))
         new_video = _strip_leading_label_line(str(data.get('video') or '').strip())
         new_image = _strip_leading_label_line(str(data.get('image') or '').strip())
         if not new_video or not new_image:
@@ -10516,7 +10551,8 @@ def repair_image_defects(config, i, image_prompt, defects, beat=None, packet=Non
             base_user + "\n\nYour previous attempt was rejected: " + rejection +
             " Fix that specific problem and try again, still following the hard rules above.")
         try:
-            resp = _chat(config, system, user, temperature=0.55, timeout=90)
+            repair_timeout = min(45, int(config.get('composeRepairTimeoutSeconds', 45)))
+            resp = _chat(config, system, user, temperature=0.55, timeout=repair_timeout)
             fixed = _strip_leading_label_line(_strip_markdown_fences_only(resp).strip())
         except GenerationCancelled:
             raise
@@ -11542,7 +11578,7 @@ Space Type: {space_type}
     # 就是这么来的），那几轮不能省。收手时交付的是**最好的那一版**，不是当前这版。
     _best_key = None
     _best_snapshot = None
-    beat_ladder_max_attempts = 4
+    beat_ladder_max_attempts = max(2, int(config.get('beatLadderMaxAttempts', 4)))
     for attempt in range(beat_ladder_max_attempts):
         try:
             _raise_if_cancelled(on_progress)
@@ -11817,7 +11853,8 @@ Space Type: {space_type}
                     #  2. 这一轮没能超过已有最好成绩；
                     #  3. 最好的那一版已经没有阻塞级违规（即它本来就过得了宽松验收）。
                     #     还有阻塞级违规时，末轮往往才把阻塞项清干净，那一轮省不得。
-                    _stop_early = (attempt >= 2) and not _improved and _best_key[0] == 0
+                    _min_early_attempt = 1 if config.get('fastLadderPlanning') else 2
+                    _stop_early = (attempt >= _min_early_attempt) and not _improved and _best_key[0] == 0
                     if _stop_early:
                         # 交付最好的那一版，而不是刚刚这一版更差的。最好那一版可能出自
                         # 第 1/2 轮、还没经过上面那道确定性 package 修复，所以补跑一次
@@ -15251,20 +15288,19 @@ def find_reference_frames_with_roles(project_dir, total_beats=None):
             return beats[ordinal - 1] if isinstance(ordinal, int) and 1 <= ordinal <= len(beats) else None
 
         # IMG 1: Beat 1 起始锚点 (初始毛坯状态)。
-        # 取哪一张不是「第一张 coverage」说了算：原片开头可能是完工/半成品先导钩子闪帧，
-        # 照直取就是拿成品画面当 IMG 001 的对标基准——链路守卫会照着它判「首帧不符」并
-        # 触发 autofix 重写，4选1 也会照着它给最像成品的那张候选打高分。判据与组稿期
-        # 锚点对齐、组稿收尾对帧订正共用一份（reverse.select_opening_anchor）。
+        # 取哪一张不是「第一张 coverage」说了算：
+        # 1. 优先认第一拍已核准的证据帧 Triad 起始锚点（evidence_frames[0] 是模型/人工卡点确定的起步帧）。
+        # 2. 原片开头可能是完工/半成品先导钩子闪帧，照直取就是拿成品画面当 IMG 001 的对标基准——
+        #    链路守卫会照着它判「首帧不符」并触发 autofix 重写，4选1 也会照着它给最像成品的那张候选打高分。
+        #    判据与组稿期锚点对齐、组稿收尾对帧订正共用一份（reverse.select_opening_anchor）。
         from prompt_pipeline import reverse as _reverse
         b1 = beats[0]
-        cov1 = b1.get('coverage_frames') or []
-        evi1 = b1.get('evidence_frames') or []
-        head_names = [str(c.get('frame')) for c in cov1
-                      if isinstance(c, dict) and c.get('frame')]
-        if not head_names:
-            head_names = [str(c) for c in cov1 if isinstance(c, str) and c]
-        if not head_names:
-            head_names = [str(x) for x in evi1 if x]
+        evi1 = [str(x) for x in (b1.get('evidence_frames') or []) if x]
+        cov1_raw = b1.get('coverage_frames') or []
+        cov1 = [str(c.get('frame')) for c in cov1_raw if isinstance(c, dict) and c.get('frame')]
+        if not cov1:
+            cov1 = [str(c) for c in cov1_raw if isinstance(c, str) and c]
+        head_names = (evi1 + [c for c in cov1 if c not in evi1]) if evi1 else cov1
         start_f = (_reverse.select_opening_anchor(head_names, facts_by_name)
                    or (head_names[0] if head_names else 'review_001.png'))
         p1 = os.path.join(rf_dir, start_f)

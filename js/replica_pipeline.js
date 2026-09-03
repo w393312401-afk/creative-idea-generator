@@ -3993,7 +3993,7 @@ function replicaCaptureReverseSettings() {
 }
 
 async function replicaStart() {
-    if (!replicaState) return;
+    if (!replicaState || replicaBusy) return;
     const modeEl = replicaRoot().querySelector('input[name="replica-mode"]:checked');
     const scope = replicaScopeFromMode(modeEl && modeEl.value);
     replicaCaptureReverseSettings();
@@ -4027,7 +4027,7 @@ const REPLICA_LADDER_CONSUMERS = new Set([
 ]);
 
 async function replicaAdvance(action, payload = {}, btn) {
-    if (!replicaState) return;
+    if (!replicaState || replicaBusy) return;
     // 落盘失败就地中止：宁可让用户看见「保存失败」，也不能让一次静默的旧版本改写跑出去。
     if (REPLICA_LADDER_CONSUMERS.has(action) && (replicaState.beats || {}).beats) {
         if (!(await replicaSaveBeats(false, btn))) {

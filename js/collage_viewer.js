@@ -440,7 +440,7 @@ function openCollageViewer(opts = {}) {
         }
     }
 
-    if ((!hasRefs || !sourceCollageUrl) && (projTitle || replicaJobId)) {
+    if (projTitle || replicaJobId) {
         const fetchUrl = `/api/project/references?title=${encodeURIComponent(projTitle)}&job_id=${encodeURIComponent(replicaJobId)}&total_beats=${beatAxis.length || ''}`;
         fetch(fetchUrl)
             .then(res => res.json())
@@ -452,28 +452,35 @@ function openCollageViewer(opts = {}) {
                             const num = parseInt(k, 10);
                             if (!isNaN(num) && v) {
                                 const u = String(v);
-                                collageViewerState.refFrames[num] = u.indexOf('/outputs/') !== -1 ? u.substring(u.indexOf('/outputs/')) : u;
+                                const normU = u.indexOf('/outputs/') !== -1 ? u.substring(u.indexOf('/outputs/')) : u;
+                                if (collageViewerState.refFrames[num] !== normU) {
+                                    collageViewerState.refFrames[num] = normU;
+                                    changed = true;
+                                }
                             }
                         });
                         if (idea) {
                             idea.ref_frames = collageViewerState.refFrames;
                             if (idea.frameRun) idea.frameRun.ref_frames = collageViewerState.refFrames;
                         }
-                        collageViewerState.beatAxis = buildBeatAxis(collageViewerState.idea, collageViewerState.frames, collageViewerState.refFrames, collageViewerState.totalBeats);
-                        if (collageViewerState.mode === 'compare' && collageViewerState.compareType === 'adjacent' && !opts.compareType) {
-                            collageViewerState.compareType = 'benchmark';
+                        if (changed) {
+                            collageViewerState.beatAxis = buildBeatAxis(collageViewerState.idea, collageViewerState.frames, collageViewerState.refFrames, collageViewerState.totalBeats);
+                            if (collageViewerState.mode === 'compare' && collageViewerState.compareType === 'adjacent' && !opts.compareType) {
+                                collageViewerState.compareType = 'benchmark';
+                            }
                         }
-                        changed = true;
                     }
                     if (data.source_collage_url) {
                         const cu = String(data.source_collage_url);
                         const normCu = cu.indexOf('/outputs/') !== -1 ? cu.substring(cu.indexOf('/outputs/')) : cu;
-                        collageViewerState.sourceCollageUrl = normCu;
+                        if (collageViewerState.sourceCollageUrl !== normCu) {
+                            collageViewerState.sourceCollageUrl = normCu;
+                            changed = true;
+                        }
                         if (idea) {
                             idea.source_collage = normCu;
                             if (idea.frameRun) idea.frameRun.source_collage = normCu;
                         }
-                        changed = true;
                     }
                     if (changed && collageViewerState.open) {
                         renderCollageViewerModal();

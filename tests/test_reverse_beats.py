@@ -1126,6 +1126,14 @@ class TestHandoffToComposer(unittest.TestCase):
         real_violating_text = 'Worker installs an oven on the counter and platform bed.'
         self.assertEqual(sorted(reverse.banned_element_hits(real_violating_text, banned)), ['bed', 'oven'])
 
+    def test_banned_hits_distinguishes_rustic_earthen_oven_from_residential_oven(self):
+        """庇护所土工泥炉（domed oven / cob oven）属于手工建造工序，不应被针对现代厨房电器的 oven 误拦。"""
+        banned = ['kitchen cabinetry', 'oven', 'refrigerator']
+        cob_text = 'craftsman moulds the cohesive dried cob clay structure into a domed oven and ignites firewood'
+        self.assertEqual(reverse.banned_element_hits(cob_text, banned), [])
+        appliance_text = 'craftsman installs a stainless steel oven under the counter'
+        self.assertEqual(reverse.banned_element_hits(appliance_text, banned), ['oven'])
+
     def test_banned_hits_cjk_support(self):
         """中文禁用词支持自然匹配。"""
         text = '在厨房吧台角落安装了微波炉和电磁炉'
