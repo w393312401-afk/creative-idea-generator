@@ -2058,7 +2058,7 @@ def effective_config(client_config):
     merged = {
         'baseUrl': SERVER_CONFIG.get('baseUrl') or 'http://127.0.0.1:8046/v1',
         'apiKey': SERVER_CONFIG.get('apiKey') or '',
-        'model': SERVER_CONFIG.get('model') or 'gemini-3.7-flash-high',
+        'model': SERVER_CONFIG.get('model') or 'gemini-3.8-flash-high',
         'imageModel': SERVER_CONFIG.get('imageModel') or 'gemini-3.1-flash-image',
     }
     # cheapModel/auxModel 此前在托管模式下被静默丢弃（example 配置里承诺了
@@ -2078,14 +2078,22 @@ def effective_config(client_config):
     for k in ('cheapModel', 'auxModel', 'imageEditTransport'):
         if SERVER_CONFIG.get(k):
             merged[k] = SERVER_CONFIG.get(k)
+    _DEPRECATED_MODELS = {
+        'gemini-3-flash', 'gemini-3-flash-agent',
+        'gemini-3.6-flash-high', 'gemini-3.6-flash-low',
+        'gemini-3.5-flash', 'gemini-3.5-flash-low', 'gemini-3.5-flash-extra-low',
+        'gemini-3.1-pro-high', 'gemini-3.1-pro-low',
+    }
     if ALLOW_CLIENT_MODEL:
         if client_config.get('model'):
-            merged['model'] = client_config['model']
+            cm = client_config['model']
+            merged['model'] = 'gemini-3.8-flash-high' if cm in _DEPRECATED_MODELS else cm
         if client_config.get('imageModel'):
             merged['imageModel'] = client_config['imageModel']
         for k in ('cheapModel', 'auxModel'):
             if client_config.get(k):
-                merged[k] = client_config[k]
+                cm = client_config[k]
+                merged[k] = 'gemini-3.8-flash-high' if cm in _DEPRECATED_MODELS else cm
     # skillProfile 同批（2026-08-01）：激发页脚的「提示词链路」选择器就是靠它把
     # base/omni 送到服务端的（active_skill_profile 读的正是 config['skillProfile']）。
     # 不进这份白名单，托管模式下前端选了哪条链路会被整个丢掉——用户以为切了，
@@ -2146,6 +2154,27 @@ def resolve_gateway(model_name, config):
         if not api_key and sys.stdout:
             print("Warning: codex-routed model requested but no codexApiKey configured in server_config.json")
     return base_url, api_key
+
+
+_UPSTREAM_MODEL_MAP = {
+    'gemini-3-flash': 'gemini-3.8-flash-high',
+    'gemini-3-flash-agent': 'gemini-3.8-flash-high',
+    'gemini-3.6-flash-high': 'gemini-3.8-flash-high',
+    'gemini-3.6-flash-low': 'gemini-3.8-flash-high',
+    'gemini-3.5-flash': 'gemini-3.8-flash-high',
+    'gemini-3.5-flash-low': 'gemini-3.8-flash-high',
+    'gemini-3.5-flash-extra-low': 'gemini-3.8-flash-high',
+    'gemini-3.1-pro-high': 'gemini-3.8-flash-high',
+    'gemini-3.1-pro-low': 'gemini-3.8-flash-high',
+}
+
+
+def resolve_chat_model(model_name):
+    """Normalize project model names to the upstream gateway model name.
+    Preserves valid models (e.g. gemini-3.8-flash-high, gemini-3.7-flash-high),
+    and redirects obsolete/offline models to gemini-3.8-flash-high."""
+    m = (model_name or '').strip()
+    return _UPSTREAM_MODEL_MAP.get(m, m)
 
 
 def _safe_project_name(title):
@@ -5989,7 +6018,7 @@ def filter_projects(rows, state=None, query=None, sort='newest'):
 
 
 def ping_proxy(config):
-    model = config.get('model') or 'gemini-3.7-flash-high'
+    model = config.get('model') or 'gemini-3.8-flash-high'
     base_url, api_key = resolve_gateway(model, config)
     req = urllib.request.Request(
         f'{base_url}/models',
@@ -6013,10 +6042,10 @@ def ping_proxy(config):
 
 
 def ping_model_completion(config):
-    model = config.get('model') or 'gemini-3.7-flash-high'
+    model = config.get('model') or 'gemini-3.8-flash-high'
     base_url, api_key = resolve_gateway(model, config)
     payload = json.dumps({
-        'model': model,
+        'model': resolve_chat_model(model),
         'messages': [{'role': 'user', 'content': 'ping'}],
         'max_tokens': 5,
     }).encode('utf-8')

@@ -49,7 +49,7 @@ def _compose_task(task_id='1785458877351', status='completed', project_key=PK,
             'project_key': project_key,
             'image_count': 12,
             'video_count': 12,
-            'model': 'gemini-3.6-flash-high',
+            'model': 'gemini-3.8-flash-high',
             'timings': {'total_duration_seconds': 321.5},
         }
     return task

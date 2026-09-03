@@ -315,12 +315,11 @@ const REPLICA_MAX_AXES = 4;
  * 自动就有）。state.js 没加载时退回一份最小清单，保证选择器不会变成空下拉。
  */
 const REPLICA_FALLBACK_MODELS = [
+    { value: 'gemini-3.8-flash-high', label: 'gemini-3.8-flash-high' },
     { value: 'gemini-3.7-flash-high', label: 'gemini-3.7-flash-high' },
-    { value: 'gemini-3.6-flash-high', label: 'gemini-3.6-flash-high' },
-    { value: 'gemini-3.1-pro-high', label: 'gemini-3.1-pro-high' },
 ];
 
-const REPLICA_PASS_A_DEFAULT_MODEL = 'gemini-3.7-flash-high';
+const REPLICA_PASS_A_DEFAULT_MODEL = 'gemini-3.8-flash-high';
 
 function replicaModelChoices() {
     const groups = typeof LLM_MODEL_GROUPS !== 'undefined' ? LLM_MODEL_GROUPS : null;

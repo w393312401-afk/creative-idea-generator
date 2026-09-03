@@ -139,7 +139,7 @@ class TestPromptFixes(unittest.TestCase):
         self.assertIn("IMAGE 3", fixed_partial)
 
     def test_aux_model_defaults_to_low_cost_for_reasoning_agent(self):
-        self.assertEqual(_aux_model({'model': 'gemini-3-flash-agent'}), 'gemini-3.5-flash-low')
+        self.assertEqual(_aux_model({'model': 'gemini-3-flash-agent'}), 'gemini-3.8-flash-high')
         self.assertEqual(_aux_model({'model': 'gemini-3-flash-agent', 'cheapModel': 'cheap-json-model'}), 'cheap-json-model')
         self.assertEqual(_aux_model({'model': 'gpt-5.5'}), 'gpt-5.5')
 
@@ -168,7 +168,7 @@ class TestPromptFixes(unittest.TestCase):
         self.assertIn(3, failures)
         self.assertIn("Monotonic state regression", failures[2][0])
         self.assertIn("Static frame violation", failures[3][0])
-        self.assertEqual(mocked_chat.call_args.kwargs['model'], 'gemini-3.5-flash-low')
+        self.assertEqual(mocked_chat.call_args.kwargs['model'], 'gemini-3.8-flash-high')
 
     def test_fix_primary_landmarks_no_replacement(self):
         from prompt_pipeline import fix_primary_landmarks

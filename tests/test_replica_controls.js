@@ -78,10 +78,10 @@ assert.ok(peak.includes('value="off" selected'));
 
 // 选择写回全局 config + localStorage：不落盘的话下次开页面又回默认值，
 // 而 recluster 这类路径读的正是 config。
-call(`config = {}; replicaSetConfigValue('frameFactsModel', 'gemini-3.1-pro-high')`);
-assert.equal(call(`config.frameFactsModel`), 'gemini-3.1-pro-high');
+call(`config = {}; replicaSetConfigValue('frameFactsModel', 'gemini-3.8-flash-high')`);
+assert.equal(call(`config.frameFactsModel`), 'gemini-3.8-flash-high');
 assert.equal(JSON.parse(call(`localStorage.getItem('spark_config')`)).frameFactsModel,
-             'gemini-3.1-pro-high');
+             'gemini-3.8-flash-high');
 assert.equal(call(`replicaConfigValue('peakVerifyModel', 'fallback')`), 'fallback');
 
 // ── 4. 节拍阶梯硬伤时的 AI 修复按钮渲染 ──────────────────────────────────────

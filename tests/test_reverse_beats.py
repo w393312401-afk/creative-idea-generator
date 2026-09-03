@@ -605,19 +605,19 @@ class TestPassAModelSelection(unittest.TestCase):
 
     def test_frame_facts_model_overrides_the_review_and_main_model(self):
         self.assertEqual(
-            reverse._pass_a_model({'frameFactsModel': 'gemini-3.1-pro-high',
+            reverse._pass_a_model({'frameFactsModel': 'gemini-3.8-flash-high',
                                    'reviewModel': 'r', 'model': 'm'}),
-            'gemini-3.1-pro-high')
+            'gemini-3.8-flash-high')
         self.assertEqual(reverse._pass_a_model({'reviewModel': 'r', 'model': 'm'}), 'r')
         self.assertEqual(reverse._pass_a_model({'model': 'm'}), 'm')
 
     def test_model_keys_survive_the_anti_priming_scrub(self):
         """剥 config 是为了挡主题，不是挡模型名——剥掉了选择器就等于没接上。"""
         clean = reverse._scrub_config_for_pass_a({
-            'frameFactsModel': 'gemini-3.1-pro-high', 'peakVerifyModel': 'off',
+            'frameFactsModel': 'gemini-3.8-flash-high', 'peakVerifyModel': 'off',
             'dimensions': {'theme': 'leak'},
         })
-        self.assertEqual(clean, {'frameFactsModel': 'gemini-3.1-pro-high',
+        self.assertEqual(clean, {'frameFactsModel': 'gemini-3.8-flash-high',
                                  'peakVerifyModel': 'off'})
 
     def test_peak_verify_can_be_switched_off_and_follows_the_main_model_by_default(self):

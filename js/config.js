@@ -200,6 +200,18 @@ function loadConfig() {
                 config.googleFxImageModel = normalizedFxModel;
                 localStorage.setItem('spark_config', JSON.stringify(config));
             }
+
+            // 自动迁移废弃旧模型（3.6 / 3.5 / 3.1 pro / gemini-3-flash）到新推荐模型 gemini-3.8-flash-high
+            const DEPRECATED_MODELS = new Set([
+                'gemini-3-flash', 'gemini-3-flash-agent',
+                'gemini-3.6-flash-high', 'gemini-3.6-flash-low',
+                'gemini-3.5-flash', 'gemini-3.5-flash-low', 'gemini-3.5-flash-extra-low',
+                'gemini-3.1-pro-high', 'gemini-3.1-pro-low'
+            ]);
+            if (DEPRECATED_MODELS.has(config.model)) {
+                config.model = DEFAULT_CONFIG.model;
+                localStorage.setItem('spark_config', JSON.stringify(config));
+            }
         } catch (e) {
             console.error("Failed to parse stored config, using defaults", e);
         }

@@ -85,13 +85,13 @@ def test_reverse_model_choices_survive_the_managed_mode_config_whitelist():
     import unittest.mock as mock
     import server_common
 
-    client = {'frameFactsModel': 'gemini-3.1-pro-high', 'peakVerifyModel': 'off'}
+    client = {'frameFactsModel': 'gemini-3.8-flash-high', 'peakVerifyModel': 'off'}
     with mock.patch.object(server_common, 'SERVER_MANAGED', True):
         merged = server_common.effective_config(client)
-    assert merged.get('frameFactsModel') == 'gemini-3.1-pro-high'
+    assert merged.get('frameFactsModel') == 'gemini-3.8-flash-high'
     assert merged.get('peakVerifyModel') == 'off'
     # 送到 Pass A 的调用里也要还在（反注入的剥壳不该把模型名一起剥掉）。
-    assert reverse._pass_a_model(merged) == 'gemini-3.1-pro-high'
+    assert reverse._pass_a_model(merged) == 'gemini-3.8-flash-high'
     assert reverse._peak_verify_model(merged) is None
 
 

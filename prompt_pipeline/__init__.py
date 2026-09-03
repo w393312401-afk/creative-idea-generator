@@ -21,7 +21,7 @@ except ImportError:
 from datetime import datetime
 
 from server_common import (
-    SERVER_CONFIG, resolve_gateway, effective_config,
+    SERVER_CONFIG, resolve_gateway, resolve_chat_model, effective_config,
     OUTPUT_ROOT, SKILL_DIR, skill_dir, skill_reference_path, skill_contract_report,
     skill_reference_fallback,
     DEFAULT_SKILL_PROFILE, active_skill_profile, ensure_used_topic_ledger,
@@ -268,15 +268,15 @@ SEARCH_SNIPPET_TTL_SECONDS = 6 * 3600
 
 def _aux_model(config):
     """Return the low-cost model for mechanical parsing/audit tasks.
-    Defaults to gemini-3.5-flash-low if the main model is gemini-3-flash-agent."""
+    Defaults to gemini-3.8-flash-high if the main model is gemini-3-flash-agent."""
     if not isinstance(config, dict):
-        return 'gemini-3.5-flash-low'
+        return 'gemini-3.8-flash-high'
     explicit = (config.get('cheapModel') or config.get('auxModel') or '').strip()
     if explicit:
         return explicit
     main_model = (config.get('model') or '').strip()
     if 'agent' in main_model.lower() or not main_model:
-        return 'gemini-3.5-flash-low'
+        return 'gemini-3.8-flash-high'
     return main_model
 
 
@@ -896,11 +896,11 @@ def refresh_trend_refs(config):
 
 def _chat(config, system, user, temperature=0.85, max_tokens=65536, timeout=240, on_chunk=None, model=None, enable_search=False):
     if not model:
-        model = config.get('model') or 'gemini-3.7-flash-high'
+        model = config.get('model') or 'gemini-3.8-flash-high'
     base_url, api_key = resolve_gateway(model, config)
 
     payload = {
-        'model': model,
+        'model': resolve_chat_model(model),
         'messages': [
             {'role': 'system', 'content': system},
             {'role': 'user', 'content': user},
@@ -917,8 +917,8 @@ def _chat(config, system, user, temperature=0.85, max_tokens=65536, timeout=240,
     # tool_calls 等回传,这里没接那层循环,所以两边必须分别用各自的原生形状。
     m_lower = model.lower()
     if enable_search and 'gemini' in m_lower:
-        # 8046 网关上的整族 gemini 模型都会自解析(实测 gemini-3-flash-agent 与
-        # 便宜档 gemini-3.5-flash-low 均生效,不止 "-agent" 后缀那一档)：得声明一个
+        # 8046 网关上的整族 gemini 模型都会自解析(实测 gemini-3-flash 与
+        # gemini-3.8-flash-high 均生效,不止 "-agent" 后缀那一档)：得声明一个
         # 名为 web_search 的 function-calling 工具,背后的 agent 认出这个名字后
         # 会自己执行搜索。
         payload['tools'] = [{
@@ -1053,7 +1053,7 @@ def _chat(config, system, user, temperature=0.85, max_tokens=65536, timeout=240,
 
 def _multimodal_chat(config, system, user_text, image_paths, model=None, max_tokens=1000, timeout=90):
     if not model:
-        model = config.get('model') or 'gemini-3.7-flash-high'
+        model = config.get('model') or 'gemini-3.8-flash-high'
     base_url, api_key = resolve_gateway(model, config)
 
     content_list = [{"type": "text", "text": user_text}]
@@ -1080,7 +1080,7 @@ def _multimodal_chat(config, system, user_text, image_paths, model=None, max_tok
         })
 
     payload = {
-        'model': model,
+        'model': resolve_chat_model(model),
         'messages': [
             {'role': 'system', 'content': system},
             {'role': 'user', 'content': content_list},
