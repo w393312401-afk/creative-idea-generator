@@ -6798,14 +6798,27 @@ _LOCKED_ANCHOR_STANZA_PATTERN = re.compile(
     r'(?::|\bare\b)', re.IGNORECASE)
 
 
-def _canonical_anchor_clause(landmarks):
+def _canonical_anchor_clause(landmarks, ref_camera_text=None, cur_camera_text=None):
     """One canonical 'Locked anchors:' sentence from a landmark list — name, screen bearing,
     and the packet's z_depth_scale, all rendered as prose.
 
     2026-08-05: this used to emit 'name at Grid B1 holding 65 percent of frame height'. The
     grid cell and the numeral both reached the image model verbatim and were rendered into
     the frame as literal letters (see scrub_spatial_notation's note). The packet still stores
-    grid + percent; only their *rendering* changed."""
+    grid + percent; only their *rendering* changed.
+
+    2026-09-03: the stored percentage is now **re-projected onto this beat's own camera**
+    instead of being copied. It was measured at the packet's reference framing; copying it
+    verbatim asserted that one landmark holds the same share of frame height at 20mm/2.6m
+    and at 35mm/1.6m — impossible, and it happened on every beat of every delivered set.
+    Re-projection needs both focal lengths; when either is unreadable the stored value is
+    kept unchanged (see anchor_geometry.reproject_scale — a guessed focal makes it worse,
+    not better)."""
+    from .anchor_geometry import parse_camera, reproject_scale
+
+    ref_cam = parse_camera(ref_camera_text) if ref_camera_text else None
+    cur_cam = parse_camera(cur_camera_text) if cur_camera_text else None
+
     parts = []
     for lm in landmarks or []:
         if not isinstance(lm, dict):
@@ -6813,7 +6826,12 @@ def _canonical_anchor_clause(landmarks):
         name = str(lm.get('name', '')).strip()
         if not name:
             continue
-        prose = scale_prose(lm.get('z_depth_scale'))
+        scale = lm.get('z_depth_scale')
+        if ref_cam and cur_cam:
+            projected = reproject_scale(scale, ref_cam, cur_cam)
+            if projected is not None:
+                scale = projected
+        prose = scale_prose(scale)
         if _is_living_landmark(name):
             # 活物锚点整条不进 IMAGE 正文（frame_state.PERSON_FREE_IMAGE_FRAMES）。
             # 帧序列一律净帧，静帧里没有这个人，把他写进逐帧复读的锚点句就是把他钉回去
@@ -6951,7 +6969,12 @@ def fix_primary_landmarks(prompt, packet, family='exterior'):
     if not stanza_present and not missing:
         return prompt
 
-    clause = _canonical_anchor_clause(landmarks)
+    # 参考机位来自 packet 的 camera_dna（z_depth_scale 就是在它下面量的），当前机位
+    # 直接从这一拍的正文里读——正文里本来就写着 "wide 22mm lens feel, camera height
+    # 2.5m looking down thirty-five degrees"。两者都读得出才重投影。
+    ref_camera_text = (packet.get('camera_dna') or packet.get('camera')
+                       or packet.get('interior_camera_dna') or '')
+    clause = _canonical_anchor_clause(landmarks, ref_camera_text, body or prompt)
     if not clause:
         return body
     if body and not body.endswith(('.', '!', '?')):

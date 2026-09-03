@@ -19,7 +19,17 @@ import copy
 import json
 import random
 import re
+import sys
 from typing import Any, Dict, List, Optional
+
+from . import ontology
+from .ontology import build_pack, infer_role, render_beat_title, MaterialPack
+from .object_ledger import (
+    validate_object_ledger,
+    diagnose_object_ledger,
+    format_violations,
+)
+from .topology import build_topology, validate_isomorphism
 
 # 四大正交轴定义与元数据
 ORTHOGONAL_AXES = {
@@ -236,9 +246,25 @@ def map_asmr_audio(operation_type: str, material: str = '', action: str = '') ->
 
 
 def apply_slot_replacement(text: str, mutation_axes: Dict[str, Any]) -> str:
-    """对文本中的环境、材质、功用、生物进行正交槽位替换（支持通用母本词汇）。"""
+    """【已退役 / DEPRECATED】母本专用词典的正则替换。
+
+    留着只为兼容仍在 import 它的调用方（`prompt_pipeline.__init__` 的再导出、
+    老测试）。**新代码一律走 `render_beat_from_role`**，理由见 `ontology` 模块的
+    docstring：在已渲染的散文上跑正则，天然做不到「同一构件全链同一材料」，也拦不住
+    词典外的母本名词。
+
+    行为已经改了两处：
+      1. 命中母本载体名词（railcar / container / scrapyard …）的文本直接返回空串，
+         由调用方退回按角色渲染，而不是交付一句带着别人载体的句子；
+      2. 剩下的仍走旧词典，但那张词典**不再扩充** —— 它是遗留物，不是接口。
+    """
     if not text or not isinstance(text, str):
         return ''
+
+    scrubbed = scrub_carrier_leak(text)
+    if not scrubbed:
+        return ''
+    text = scrubbed
 
     env = mutation_axes.get('environment') or ''
     mat = mutation_axes.get('material') or ''
@@ -311,10 +337,124 @@ def apply_trace_mapping(traces: Any, mutation_axes: Dict[str, Any]) -> List[str]
     return out_traces if out_traces else [f'{mat or "主体"}结构安装锁紧留存压痕', f'{mat or "表面"}接缝密封防水胶打胶留存细线']
 
 
+# ── 按角色渲染（替代在母本散文上跑正则）────────────────────────────────────
+#
+# 这是 LLM 重写失败时的兜底路径。它**从零写**，不改写母本的任何一句话，所以母本的
+# 载体名词没有可以搭便车的载体。代价是文风不如 LLM 路径丰满 —— 但一句朴素而自洽的
+# 交付，永远好过一句漂亮却把 railcar 带进海蚀洞的交付。
+_ROLE_ACTION_ZH = {
+    'site': '清理并找平作业面，标出结构基准线',
+    'demolition': '撬除朽坏构件与积存杂物，清空作业面',
+    'subfloor': '分层摊铺骨料并夯压至标高，用刮尺找平',
+    'structure': '吊装并校正主体构件，逐点锁紧紧固件',
+    'enclosure': '逐块就位围护板，沿缝固定并做密封',
+    'opening': '按放线切割洞口，修整洞边并加固',
+    'window': '安装窗框、打胶固定，校正开启扇',
+    'door': '挂装门扇，调整合页与锁具至平齐',
+    'membrane': '铺展防潮层并压实搭接，逐条贴缝密封',
+    'service': '固定管线与接线盒，沿结构走线并卡固',
+    'batten': '按间距铺设龙骨并校平，交点处逐点固定',
+    'insulation': '将保温材料压入格栅腔体，做到满填无缝',
+    'sheathing': '排版铺钉基层板，逐块压紧对缝',
+    'flooring': '企口拼装面层板，逐块敲紧并暗钉固定',
+    'cladding': '按竖向排布固定饰面条，对齐缝宽',
+    'coating': '分道涂布保护层，搭接均匀不留刷痕',
+    'paving': '铺设铺装块并橡皮锤找平，扫填接缝料',
+    'heating': '就位炉体、连接烟道，密封穿顶节点',
+    'cabinetry': '组装并校平柜体，安装台面与五金',
+    'furnishing': '布置软装陈设，整理织物与摆件',
+    'hero': '撤除全部工具，静场',
+}
+
+_ROLE_RESULT_ZH = {
+    'site': '作业面清理完毕、标高已定',
+    'demolition': '朽坏构件全部清除，作业面见底',
+    'subfloor': '垫层满铺压实、通面找平',
+    'structure': '主体骨架全部就位并锁紧',
+    'enclosure': '围护面完整封闭、接缝密实',
+    'opening': '洞口成型、洞边加固完成',
+    'window': '窗体安装到位、开启顺畅',
+    'door': '门扇挂装完成、启闭平齐',
+    'membrane': '防潮层连续闭合、搭接全部密封',
+    'service': '管线敷设完成、接点固定',
+    'batten': '龙骨网格满铺校平、节点固定',
+    'insulation': '腔体满填保温、面层齐平',
+    'sheathing': '基层板满铺固定、板缝平整',
+    'flooring': '成品地面满铺完成、通面平整',
+    'cladding': '饰面满铺完成、缝宽一致',
+    'coating': '保护层通面覆盖、色泽均匀',
+    'paving': '铺装满铺完成、接缝填实',
+    'heating': '炉具就位、烟道贯通并密封',
+    'cabinetry': '柜体与台面安装完成、五金到位',
+    'furnishing': '软装布置完成、场面整洁',
+    'hero': '全场完工、无施工痕迹',
+}
+
+
+def render_beat_from_role(beat: Dict[str, Any], role: str, pack: MaterialPack,
+                          mutation_axes: Dict[str, Any]) -> Dict[str, Any]:
+    """从角色 + 材质包重新写出一拍的全部散文字段。"""
+    material = pack.resolve(role)
+    env = str((mutation_axes or {}).get('environment') or '').strip()
+    func = str((mutation_axes or {}).get('function') or '').strip()
+    hero = str((mutation_axes or {}).get('hero_reveal') or '').strip()
+    tool = pack.tools[ontology.ROLE_RANK.get(role, 0) % len(pack.tools)] if pack.tools else ''
+
+    action = _ROLE_ACTION_ZH.get(role, f'安装{material}')
+    result = _ROLE_RESULT_ZH.get(role, f'{material}安装完成')
+
+    # 主材必须**出现在字面上**。site / demolition / hero 这几个角色的材料模板里没有
+    # `{m}`（一块找平过的作业面不由墙体材料构成），如果就这么交付，整拍散文会一个
+    # 新材质词都不带 —— 变体读起来和母本换了个说法而已。
+    mention = material if pack.primary and pack.primary in material else f'{material}（{pack.primary}）'
+    # 环境同理：破拆、场地、铺装、揭示这几拍的画面主体本来就是场地本身。
+    env_prefix = f'在{env}，' if env and role in ('site', 'demolition', 'paving', 'hero') else ''
+
+    if role == 'hero' and hero:
+        result = f'{result}；{hero}'
+    subject = f'{env_prefix}{mention}'.rstrip('，') if role != 'hero' else (hero or mention)
+
+    action_line = f'{env_prefix}{action}；{mention}'
+    if tool:
+        action_line = f'{action_line}，使用{tool}'
+
+    return {
+        'visual_subject': subject,
+        'visible_action': action_line,
+        'visible_result': f'{env_prefix}{result}；{mention}'.rstrip('；'),
+        'state_before': f'{mention}尚未施作',
+        'state_after': f'{result}；{mention}' + (f'，位于{env}' if env and role in ('site', 'paving', 'hero') else ''),
+        'visible_details': [material, pack.primary] + ([func] if func and role in ('cabinetry', 'furnishing', 'hero') else []),
+        'persistent_traces': [
+            f'{material}固定点留存的{pack.fastening[0]}压痕' if pack.fastening else f'{material}固定点压痕',
+            f'{material}接缝处留存的施工痕迹',
+        ],
+        'produced_objects': [role],
+        'inherited_objects': [],
+    }
+
+
 _LLM_MUTATE_BEATS_SYSTEM = """你是一位顶尖的纪录片级视觉短视频创意总监与极限空间建造设计师。
-你的任务是将给定的「N 拍母本工序阶梯 (Beat Ladder)」严格重构为全新的「四轴正交二创变体阶梯」。
+你拿到的**不是**一份母本文案，而是一副抽掉了所有材料与场景名词的「角色骨架」：每一拍
+只告诉你它在建造逻辑里承担什么职能（role）、属于哪个空间、持续多久、以及它必须产出和
+必须继承哪些构件。你的任务是照着这副骨架，用给定的材质包重新写出 N 拍变体阶梯。
+
+【为什么看不到母本原文】：母本的措辞里带着它自己的载体名词（车厢 / 集装箱 / 河岸 / 棚屋
+之类）。只要那些词进入你的上下文，它们就会顺着句式漏进新方案 —— 一个海蚀洞里的钢构小屋
+会莫名其妙地被写成 railcar、scrapyard、camper。所以你只拿得到角色，拿不到原文。**不要
+试图猜测母本是什么载体**，按角色和材质包直接写。
 
 【必须严格遵守的铁律 (Strict Constraints)】：
+0. 【物件账必须闭合 —— 违反直接废弃】：
+   - 每一拍的 `produced_objects` 写这一拍**新建成**的构件，`inherited_objects` 写它
+     **沿用前面某一拍成果**的构件。
+   - 任何写进 `inherited_objects` 的东西，必须在**更早的某一拍**的 `produced_objects`
+     里出现过。凭空继承一个从没建造过的构件（例如全片没开过窗洞却处处引用「窗」）是
+     本条最常见的死法。
+   - 已经在 `produced_objects` 里交付过的构件，后面的拍不许再去加工它（不许重新找平
+     已经压实的垫层、不许重新涂刷已经装好的五金）。要它出现就写进 `inherited_objects`。
+   - 有物理前置的构件必须排在前置之后：窗要有洞口、烟囱管要有穿顶领圈、灯具要有线路、
+     水槽要有给排水、炉具要有铺好的成品地面。
 1. 【1:1 节拍同构与因果锁死】：输入几拍就输出几拍（精确 N 拍，Beat 1 到 Beat N），每一拍的物理施工因果阶段（破拆清场 -> 地基基础 -> 结构龙骨 -> 封闭保温 -> 面层饰面 -> 软装设备 -> 终极揭示）必须与原拍 100% 拓扑对齐！
 2. 【全量四轴正交置换】：
    - 轴 1 环境地貌 (Environment): 将原环境全部替换为目标新环境（如极地冻土、冰雪裂隙、荒漠红岩等）。
@@ -339,9 +479,32 @@ _LLM_MUTATE_BEATS_SYSTEM = """你是一位顶尖的纪录片级视觉短视频�
     "state_before": "动工前的状态",
     "state_after": "完工后的状态",
     "visible_details": ["具体新材质1", "具体新材质2"],
-    "persistent_traces": ["留存物理压痕/接缝胶线"]
+    "persistent_traces": ["留存物理压痕/接缝胶线"],
+    "produced_objects": ["本拍新建成的构件，用输入给你的 role 词汇或具体构件名"],
+    "inherited_objects": ["本拍沿用的、更早某拍已建成的构件"]
   }
 ]"""
+
+
+# 母本载体名词的通用清洗。四轴替换只认自己词典里的词，词典外的母本名词会原样留在
+# 变体里 —— railcar / carriage / scrapyard / camper / blast doors 全是这么来的。
+# 这里不做替换，只做**拦截**：这些词一旦出现在变体产物里，说明模型在凭空复原它想象
+# 中的母本载体，该条字段作废退回规则渲染。
+_CARRIER_LEAK = re.compile(
+    r'\b(?:railcar|rail\s*car|carriage|boxcar|caboose|locomotive|shipping\s+container|'
+    r'container\s+(?:box|unit)|scrapyard|junkyard|camper|caravan|motorhome|rv\b|'
+    r'blast\s+doors?|bunker\s+hatch|airlock|silo|fuselage|airstream)\b', re.I)
+
+
+def scrub_carrier_leak(text: str) -> str:
+    """把母本载体名词从一段变体散文里摘掉；摘不干净就返回空串。
+
+    返回空串是**故意**的：调用方据此退回按角色渲染，而不是交付一段带着别人载体的
+    句子。半修半留的句子（"the rusted  beneath the overhang"）比原样泄漏更难发现。
+    """
+    if not text or not isinstance(text, str):
+        return ''
+    return '' if _CARRIER_LEAK.search(text) else text
 
 
 def _llm_mutate_beats(
@@ -359,43 +522,50 @@ def _llm_mutate_beats(
     import prompt_pipeline as pp
     from prompt_pipeline.reverse import parse_json_reply
 
+    # ── 母本散文一个字都不进上下文 ────────────────────────────────────────
+    #
+    # 改动前这里把每一拍的 visible_action / state_before / state_after 原文 JSON 整个
+    # 塞给模型。模型看着母本句子写新句子，必然抄句式、抄残留名词——2026-09-03 那批
+    # 海蚀洞变体里的 railcar / carriage / scrapyard / camper / blast doors /
+    # "distant open overcast mountain skyline"，全部由这一段喂出来。
+    #
+    # 现在只喂**角色骨架**：这一拍干什么职能、在哪个空间、多长、要产出和继承什么。
+    # 反注入的纪律和 reverse.py Pass A 是同一条 —— 那边连形参都不给主题留位置。
+    pack = build_pack(effective_axes)
     beats_input = []
     for i, b in enumerate(source_beats):
         if not isinstance(b, dict):
             continue
+        role = infer_role(b)
         beats_input.append({
             'index': i + 1,
             'id': b.get('id') or f'B{i+1:02d}',
-            'stage': b.get('stage') or b.get('operation_type') or 'construction',
-            'operation': b.get('operation') or '',
-            'visible_action': b.get('visible_action') or '',
-            'visible_result': b.get('visible_result') or '',
-            'state_before': b.get('state_before') or '',
-            'state_after': b.get('state_after') or '',
-            'visible_details': b.get('visible_details') or [],
-            'persistent_traces': b.get('persistent_traces') or [],
+            'role': role,
+            'role_label': ontology.CONSTRUCTION_ROLES.get(role, {}).get('zh', role),
+            'target_material': pack.resolve(role),
+            'suggested_title': render_beat_title(role, pack),
             'space': b.get('space') or 'exterior',
+            'duration_sec': round(float(b.get('duration_sec') or 0.0), 2),
+            'workers_present': bool(b.get('workers_present') or b.get('workers')),
         })
 
-    carrier = baseline_doc.get('carrier') or baseline_doc.get('video_name') or '母本建筑'
-    scene_sig = baseline_doc.get('scene_signature') or ''
     cast_id = baseline_doc.get('cast_identity') or []
 
     user_prompt = (
-        f"【母本背景】\n"
-        f"- 载体/项目名: {carrier}\n"
-        f"- 原始场景特征: {scene_sig}\n"
-        f"- 常驻演员/比例尺: {', '.join(str(c) for c in cast_id) if cast_id else '未特指'}\n"
-        f"- 节拍总数: {len(beats_input)} 拍\n\n"
+        f"【本次骨架】\n"
+        f"- 节拍总数: {len(beats_input)} 拍\n"
+        f"- 常驻演员/比例尺: {', '.join(str(c) for c in cast_id) if cast_id else '未特指'}\n\n"
         f"【四轴正交目标设定 (Target 4-Axis Settings)】\n"
         f"- 轴 1 环境地貌 (Environment): {effective_axes.get('environment', '')}\n"
         f"- 轴 2 材质工艺 (Material): {effective_axes.get('material', '')}\n"
         f"- 轴 3 空间功能 (Function): {effective_axes.get('function', '')}\n"
         f"- 轴 4 终极揭示 (Hero Reveal): {effective_axes.get('hero_reveal', '')}\n"
         f"- 创作者补充指示 (Brief): {brief or '（无）'}\n\n"
-        f"【母本 {len(beats_input)} 拍工序输入】\n"
+        f"【材质包 —— 同一 role 在全片只许解析成同一种材料】\n"
+        f"{json.dumps(pack.as_dict(), ensure_ascii=False, indent=2)}\n\n"
+        f"【{len(beats_input)} 拍角色骨架（无母本原文）】\n"
         f"{json.dumps(beats_input, ensure_ascii=False, indent=2)}\n\n"
-        f"请直接输出包含精确 {len(beats_input)} 拍正交重写结果的 JSON 数组。"
+        f"请直接输出包含精确 {len(beats_input)} 拍的 JSON 数组。"
     )
 
     if on_progress:
@@ -432,6 +602,9 @@ def generate_orthogonal_variant(
     brief: Optional[str] = None,
     config: Optional[Dict[str, Any]] = None,
     on_progress: Optional[Any] = None,
+    *,
+    strict: bool = True,
+    beat_tolerance: int = 0,
 ) -> Dict[str, Any]:
     """通过词槽正交映射与大模型智能重构生成二创变体，严格确保物理骨架零坍塌、零漂移。
 
@@ -442,6 +615,11 @@ def generate_orthogonal_variant(
         brief: 用户补充指示
         config: LLM 配置 (可选)
         on_progress: 进度回调函数 (可选)
+        strict: 物件账/拓扑硬闸命中时是否抛错。默认 True —— 这道闸在 spec 层，
+            拦下来的代价是零，而放过去的代价是一整条已经抽完卡的链。传 False 只
+            记诊断不拦单（给「先看看变体长什么样」的探查路径用）。
+        beat_tolerance: 允许的拍数偏差，交给 topology.validate_isomorphism。默认 0
+            即维持既有的 1:1 拍数冻结；放宽是调用方的显式决定。
 
     返回:
         variant_beats_doc: 派生的变体節拍阶梯数据字典
@@ -491,20 +669,29 @@ def generate_orthogonal_variant(
         on_progress=on_progress,
     )
 
+    # 材质包：这次变体里 role → 材料的唯一权威解析，构造一次全链复用。
+    pack = build_pack(effective_axes)
+
     # 1. 骨架硬冻结 (Skeleton Freeze)
     # 节拍总数 N 恒定、相机焦段恒定、工序拓扑先后恒定、时间戳恒定
     variant_beats = []
     for idx, beat in enumerate(source_beats):
         v_beat = copy.deepcopy(beat)
         llm_beat = (llm_mutated_list[idx] if llm_mutated_list and idx < len(llm_mutated_list) and isinstance(llm_mutated_list[idx], dict) else None)
-        
+        role = infer_role(beat)
+        fallback = render_beat_from_role(beat, role, pack, effective_axes)
+
         # 1.1 继承硬约束
         v_beat['id'] = beat.get('id') or f'B{idx+1:02d}'
         v_beat['start'] = beat.get('start', beat.get('start_sec', 0.0))
         v_beat['end'] = beat.get('end', beat.get('end_sec', 0.0))
         v_beat['duration_sec'] = beat.get('duration_sec', round(float(v_beat['end'] - v_beat['start']), 3))
         v_beat['stage'] = beat.get('stage', beat.get('operation_type', 'demolition'))
-        v_beat['operation'] = (llm_beat.get('operation') if llm_beat and llm_beat.get('operation') else beat.get('operation', v_beat['stage']))
+        # beat 名从 role + 材质包渲染，**不再从母本继承**。继承那个字符串是
+        # `erect timber portal` 底下站着三道 Corten 钢拱的直接原因：名字停在母本材质，
+        # body 被换成了新材质，两者从此各说各话。
+        v_beat['role'] = role
+        v_beat['operation'] = render_beat_title(role, pack)
         v_beat['space'] = beat.get('space', 'interior')
         v_beat['camera_framing'] = beat.get('camera_framing', '14mm ultra-wide, eye-level 1.6m, horizon 50%')
         v_beat['grid_anchors'] = beat.get('grid_anchors', 'Grid B2 (Center), Grid B1-B3 across horizontal')
@@ -515,37 +702,32 @@ def generate_orthogonal_variant(
         v_beat['reference_frames'] = list(ev_frames)
         v_beat.pop('evidence_frames', None)
 
-        # 1.3 正交槽位注入替换 (若有 LLM 重写产物则优先使用，否则走规则替换)
-        if llm_beat:
-            v_beat['visual_subject'] = llm_beat.get('visual_subject') or apply_slot_replacement(beat.get('visual_subject', ''), effective_axes)
-            v_beat['visible_action'] = llm_beat.get('visible_action') or apply_slot_replacement(beat.get('visible_action', ''), effective_axes)
-            v_beat['visible_result'] = llm_beat.get('visible_result') or apply_slot_replacement(beat.get('visible_result', ''), effective_axes)
-            v_beat['state_before'] = llm_beat.get('state_before') or apply_slot_replacement(beat.get('state_before', ''), effective_axes)
-            v_beat['state_after'] = llm_beat.get('state_after') or apply_slot_replacement(beat.get('state_after', ''), effective_axes)
-            v_beat['visible_details'] = llm_beat.get('visible_details') or [apply_slot_replacement(d, effective_axes) for d in (beat.get('visible_details') or [])]
-            v_beat['persistent_traces'] = llm_beat.get('persistent_traces') or apply_trace_mapping(beat.get('persistent_traces', []), effective_axes)
-        else:
-            v_beat['visual_subject'] = apply_slot_replacement(
-                beat.get('visual_subject', beat.get('visible_subject', '')),
-                effective_axes
-            )
-            v_beat['visible_details'] = [
-                apply_slot_replacement(d, effective_axes)
-                for d in (beat.get('visible_details') or [])
-            ]
-            if not v_beat['visible_details']:
-                v_beat['visible_details'] = [effective_axes.get('material', '高强度结构材料')]
+        # 1.3 散文字段：LLM 产物优先，逐字段过载体泄漏检查，漏了就退回按角色渲染。
+        #
+        # 关键在于兜底**不再是**「把母本原文正则替换一遍」——那条路是泄漏的主干道。
+        # 现在两条路都不碰母本散文：LLM 路径的上下文里根本没有它，兜底路径从角色
+        # 从零写。母本的载体名词因此没有任何可以搭的便车。
+        _TEXT_FIELDS = ('visual_subject', 'visible_action', 'visible_result',
+                        'state_before', 'state_after')
+        for field in _TEXT_FIELDS:
+            value = scrub_carrier_leak(str((llm_beat or {}).get(field) or '')) if llm_beat else ''
+            v_beat[field] = value or fallback[field]
 
-            v_beat['visible_action'] = apply_slot_replacement(beat.get('visible_action', ''), effective_axes)
-            v_beat['visible_result'] = apply_slot_replacement(beat.get('visible_result', ''), effective_axes)
-            v_beat['state_before'] = apply_slot_replacement(beat.get('state_before', ''), effective_axes)
-            v_beat['state_after'] = apply_slot_replacement(beat.get('state_after', ''), effective_axes)
-            
-            # 1.4 遗留痕迹映射
-            v_beat['persistent_traces'] = apply_trace_mapping(
-                beat.get('persistent_traces', []),
-                effective_axes
-            )
+        details = [scrub_carrier_leak(str(d)) for d in ((llm_beat or {}).get('visible_details') or [])]
+        details = [d for d in details if d]
+        v_beat['visible_details'] = details or list(fallback['visible_details'])
+
+        traces = [scrub_carrier_leak(str(t)) for t in ((llm_beat or {}).get('persistent_traces') or [])]
+        traces = [t for t in traces if t]
+        v_beat['persistent_traces'] = traces or list(fallback['persistent_traces'])
+
+        # 1.4 物件申报 —— 账本硬闸的判据。模型不给就按角色兜一个最小申报。
+        v_beat['produced_objects'] = [
+            str(x) for x in ((llm_beat or {}).get('produced_objects') or fallback['produced_objects']) if str(x).strip()
+        ]
+        v_beat['inherited_objects'] = [
+            str(x) for x in ((llm_beat or {}).get('inherited_objects') or fallback['inherited_objects']) if str(x).strip()
+        ]
 
         # 1.5 动态刷新 ASMR 音效特征
         v_beat['sfx'] = map_asmr_audio(
@@ -579,6 +761,22 @@ def generate_orthogonal_variant(
         _items = [str(x).strip() for x in (_baseline_constants.get(_key) or []) if str(x).strip()]
         if _items:
             baseline_carry[_key] = _items
+    # ── spec 层硬闸 ───────────────────────────────────────────────────────
+    #
+    # 这里判，是因为**这时候一张图都还没抽**，改的代价是零。改动前变体是裸奔到下游
+    # 的：`mutate.py` 全文件没有一处 validate，`replica_pipeline.py` 也从没调用过
+    # frame_state 的账本校验（那道闸只挂在母本线的 __init__.py:12062）。于是「窗户
+    # 从没被建造却当了 12 张图的锚点」这类跨十几拍的账目缺口，一路走到了成片——
+    # chain_guard 只比对相邻两帧像素，看不见它。
+    ledger_violations = validate_object_ledger(variant_beats)
+    ledger_notes = diagnose_object_ledger(variant_beats)
+    topology_issues = validate_isomorphism(
+        source_beats, variant_beats, beat_tolerance=int(beat_tolerance or 0))
+
+    blocking = ([v for v in ledger_violations if v.get('severity') == 'blocking']
+                + [v for v in topology_issues if v.get('severity') == 'blocking'])
+    warnings = (ledger_notes + [v for v in topology_issues if v.get('severity') != 'blocking'])
+
     variant_doc = {
         'pipeline_id': pipeline_id,
         'variant_of': pipeline_id,
@@ -592,9 +790,19 @@ def generate_orthogonal_variant(
         'scene_signature': scene_sig,
         'banned_elements': banned_elems,
         'scene_constants': dict(baseline_carry),
+        'material_pack': pack.as_dict(),
         'beats': variant_beats,
-        'validation': [],
+        'validation': list(blocking) + list(warnings),
+        'ledger_violations': ledger_violations,
+        'topology_issues': topology_issues,
     }
+
+    if blocking and strict:
+        raise ValueError(
+            f'变体的物件账没有闭合，共 {len(blocking)} 条硬性问题，'
+            f'在 spec 层就被拦下了（此时还没有产生任何图像开销）：\n'
+            + format_violations(blocking, limit=12)
+        )
 
     if on_progress:
         on_progress('replica_stage', {

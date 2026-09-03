@@ -205,6 +205,16 @@ class BaseComposer:
         """单拍兜底生成的 system prompt。"""
         beat = contract['beat']
 
+        # 人物占比按**这一拍自己的机位**算，不再写死。写死的那个 '~35%' 曾被逐字抄进
+        # 一整套 19 段视频，横跨 20mm 俯拍全景和 22mm 侧身平视——两者相差近一倍。
+        # 机位读不出焦段时退回原来的例子（见 anchor_geometry.cast_scale_hint）。
+        from ..anchor_geometry import cast_scale_hint
+        _camera_text = (contract.get('camera_dna') or (packet or {}).get('camera_dna')
+                        or (packet or {}).get('camera') or '')
+        _cast_scale_example = cast_scale_hint(_camera_text) or (
+            'one lone male worker, 1.78m tall, occupying ~35% of frame height, '
+            'realistically proportioned to the 2.2m ceiling')
+
         prior_prompts_block = ""
         if i > 1:
             prior_prompts_block = f"""
@@ -275,7 +285,7 @@ Instructions:
   1. Strict Metric Dimensions: Every space MUST declare explicit 3D metric dimensions (e.g. excavation pit: 3.2m diameter, 1.8m deep; interior room: 3.0m diameter, strict 2.2m ceiling clearance). Never use vague relative terms like 'spacious' or 'waist-deep'.
   2. Ergonomic Prop Scale: In compact structures (diameter <= 3.5m), FORBID oversized residential furniture (e.g. two-tier bunk beds, large sectional sofas) that causes AI to hallucinate cavernous halls. Use compact ergonomic furniture (low-profile single platform daybed with under-bed storage, recessed berth, compact 80cm workbench).
   3. Camera Normalization: Default to 24mm wide-angle lens feel at 1.3m chest height, horizon/vanishing axis at 45%-50% frame height.
-  4. Video Worker Scale Figure: VIDEO {i} must declare the worker's metric scale (e.g. 'one lone male worker, 1.78m tall, occupying ~35% of frame height, realistically proportioned to the 2.2m ceiling').
+  4. Video Worker Scale Figure: VIDEO {i} must declare the worker's metric scale, computed for THIS beat's lens and camera height — never copied from another beat (e.g. '{_cast_scale_example}'). A longer lens or a closer camera means a LARGER share of frame height; restating one beat's percentage on a differently-framed beat is a contradiction the renderer cannot resolve.
 - LIVING CAST & DYNAMIC WORKER CHOREOGRAPHY (P0):
   1. Zero Frozen Figures: Never describe workers, figurines, characters, or animals as static, holding still, unmoving, or holding their previous posture (FORBIDDEN: 'remain standing', 'stay put', 'static in place', 'unchanged', 'standing still', 'holding position', 'where they were', 'same posture').
   2. Action-Reaction Causal Chain: Every beat's VIDEO must describe active, continuous physical kinetic labor and bodily posture transitions from the starting image's pose to the resulting image's settled pose (e.g. Inception Reflex -> Active Tool/Hand Movement -> Settled Landing Posture).

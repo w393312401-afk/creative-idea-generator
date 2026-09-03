@@ -1084,10 +1084,27 @@ def _write_beats(state, beats):
         except OSError:
             # 备份失败不该拦住正事：没有上一版可回退，比写不进新版本轻。
             pass
+    # 物件账诊断挂在每一次落盘上，母本与变体一视同仁。
+    #
+    # 母本是原片的记录，账不平通常意味着**反推漏了一拍**（原片里有的施工步骤没被
+    # 聚出来），而不是原片有问题——那同样值得在卡点上告诉用户，因为下游所有变体
+    # 都会继承这个缺口。变体那边已经在 mutate 里硬拦过一次，这里只是留档。
+    try:
+        from prompt_pipeline.object_ledger import (
+            validate_object_ledger, diagnose_object_ledger, format_violations,
+        )
+        beat_list = beats.get('beats') or []
+        ledger_issues = validate_object_ledger(beat_list) + diagnose_object_ledger(beat_list)
+    except Exception:
+        ledger_issues = []
+    if ledger_issues:
+        beats.setdefault('ledger_diagnostics', ledger_issues)
+
     with open(path, 'w', encoding='utf-8') as f:
         json.dump(beats, f, ensure_ascii=False, indent=2)
     state['beats'] = beats
     state['validation'] = beats.get('validation') or []
+    state['ledger_diagnostics'] = ledger_issues
     return path
 
 
@@ -2668,7 +2685,8 @@ def run_audit(state, on_progress=None):
     这条路径与合成器侧的负面清单（composers/base.banned_elements_block）是两道，前者在
     写之前约束、后者在交付前复核；前者失手时后者必须真的拦得住，否则前者也就白加了。
     """
-    from prompt_pipeline import reverse
+    from prompt_pipeline import reverse, prompt_slots_list
+    from prompt_pipeline.object_ledger import validate_video_objects, format_violations
 
     state['stage'] = 'audit'
     _save_state(state)
@@ -2689,6 +2707,44 @@ def run_audit(state, on_progress=None):
                             f'把它们从节拍阶梯的「禁用元素」里删掉再重跑。'),
                 'title': state.get('title'),
                 'banned_hits': hits,
+            })
+        return state
+
+    # ── 视频差量守恒 ─────────────────────────────────────────────────────
+    #
+    # 规范 2.3 的 Zero Phantom Changes 此前只是 composers/base.py 里写给模型看的
+    # 一句自然语言。VIDEO 1 因此能凭空铺一层木地板：它的末帧明写着「完全排空、
+    # 刮擦干净」，视频却把工人写成在铺 timber planks，还宣称那就是那一帧。
+    # 这里把它变成集合运算 —— 视频里的建造产物必须 ⊆ 相邻两帧差量 ∪ 已建成的东西。
+    #
+    # 判死还是记诊断，由 beats 有没有**申报**物件决定（见 object_ledger 的
+    # beats_declare_objects）：申报式账本精确，可以拦单；推断式账本靠散文捞词，
+    # 实测两成误报，只能记诊断——那不是纪律松了，是判据本身不够格当闸。
+    try:
+        slots = prompt_slots_list(state.get('prompt_block') or '')
+        video_bodies = {v['index']: v['body'] for v in (slots.get('videos') or [])}
+        beat_list = (state.get('beats') or {}).get('beats') or []
+        ghosts = validate_video_objects(beat_list, video_bodies)
+    except Exception:
+        # 差量检查失手不该拦住一条本来合格的交付：它是新增的一道守卫，不是主干。
+        ghosts = []
+
+    state['video_delta_issues'] = ghosts
+    blocking_ghosts = [g for g in ghosts if g.get('severity') == 'blocking']
+
+    if blocking_ghosts:
+        state['stage'] = 'audit_failed'
+        _save_state(state)
+        if on_progress:
+            on_progress('replica_stage', {
+                'stage': 'audit_failed',
+                'message': (f'有 {len(blocking_ghosts)} 段视频描写了首尾帧差量之外的构件'
+                            f'（幽灵变化），已拦下交付：\n'
+                            f'{format_violations(blocking_ghosts, limit=8)}\n'
+                            f'把这些动作删掉，或者在节拍阶梯里补上对应的建造拍再重跑合成。'),
+                'title': state.get('title'),
+                'banned_hits': [],
+                'video_delta_issues': blocking_ghosts,
             })
         return state
 
