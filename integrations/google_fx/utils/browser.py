@@ -6,11 +6,13 @@ AdsPower 连接、Playwright 页面管理、下载、粘贴等通用功能。
 """
 
 import os
+import sys
 import time
 import random
 import base64
 import requests
 import socket
+import glob
 from urllib.parse import urlparse
 from pathlib import Path
 
@@ -159,20 +161,118 @@ def fast_paste(page, selector, text):
         except: pass
 
 
-def _is_ws_port_open(ws_url: str) -> bool:
-    """🛠️ 检测 WebSocket URL 对应的端口是否已启用并且可以建立 TCP 连接。"""
+def _is_ws_port_open(ws_url: str, *args, **kwargs) -> bool:
+    """🛠️ 检测 WebSocket URL 对应的端口是否已启用并且可以建立 TCP 连接。
+
+    支持短时重试，避免 Chromium 进程刚启动尚未完成端口绑定时被误判为未就绪。
+    """
+    max_retries = kwargs.get("max_retries", 4)
+    retry_interval = kwargs.get("retry_interval", 0.3)
     try:
         parsed = urlparse(ws_url)
         host = parsed.hostname or "127.0.0.1"
         port = parsed.port
         if not port:
             return False
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.settimeout(2.0)
-            s.connect((host, port))
-            return True
+        for attempt in range(max(1, max_retries)):
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                    s.settimeout(0.25)
+                    s.connect((host, port))
+                    return True
+            except Exception:
+                if attempt < max_retries - 1:
+                    time.sleep(retry_interval)
+        return False
     except Exception:
         return False
+
+
+def _find_running_browser_ws(user_id: str) -> str | None:
+    """🔍 当 AdsPower Local API 无法连接或响应异常时，尝试从本地缓存目录探测已在运行的浏览器调试端口。"""
+    if not user_id:
+        return None
+    try:
+        roots = [
+            r"C:\.ADSPOWER_GLOBAL\cache",
+            os.path.expanduser("~/.ADSPOWER_GLOBAL/cache"),
+            os.path.expanduser(r"~\AppData\Roaming\adspower_global\cache"),
+        ]
+        for root in roots:
+            if not os.path.exists(root):
+                continue
+            pattern = os.path.join(root, f"{user_id}_*", "DevToolsActivePort")
+            for port_file in glob.glob(pattern):
+                try:
+                    with open(port_file, "r", encoding="utf-8", errors="ignore") as f:
+                        lines = f.read().splitlines()
+                        if len(lines) >= 2:
+                            port_num = int(lines[0].strip())
+                            path = lines[1].strip()
+                            candidate_ws = f"ws://127.0.0.1:{port_num}{path}"
+                            if _is_ws_port_open(candidate_ws, max_retries=1):
+                                return candidate_ws
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    return None
+
+
+def _try_revive_adspower(port: int | str = 50325, timeout: float = 8.0) -> bool:
+    """当 AdsPower Local API 未响应时，尝试在 Windows 上自愈拉起客户端。"""
+    if sys.platform != "win32":
+        return False
+    try:
+        import subprocess
+
+        # 先检查是否已有运行中的 AdsPower 进程
+        try:
+            import psutil
+            for p in psutil.process_iter(["name"]):
+                if "adspower" in (p.info.get("name") or "").lower():
+                    deadline = time.time() + 3.0
+                    while time.time() < deadline:
+                        try:
+                            if requests.get(f"http://127.0.0.1:{port}/status", timeout=1).status_code == 200:
+                                return True
+                        except Exception:
+                            time.sleep(0.5)
+                    return False
+        except Exception:
+            pass
+
+        patterns = [
+            r"D:\*Ads*\AdsPower Global\AdsPower Global.exe",
+            r"C:\Program Files*\*Ads*\AdsPower Global.exe",
+            r"C:\Program Files (x86)*\*Ads*\AdsPower Global.exe",
+            r"C:\Users\*\AppData\Local\Programs\*Ads*\AdsPower Global.exe",
+        ]
+        exe_path = None
+        for pat in patterns:
+            matches = glob.glob(pat)
+            if matches:
+                exe_path = matches[0]
+                break
+
+        if not exe_path:
+            return False
+
+        log(f"🚀 检测到 AdsPower 未启动，尝试自动拉起: {exe_path}", "浏览器启动")
+        cmd = f"$p = '{exe_path}'; Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{{CommandLine = '\"' + $p + '\"'}}"
+        subprocess.run(["powershell", "-NoProfile", "-Command", cmd], timeout=5)
+
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                if requests.get(f"http://127.0.0.1:{port}/status", timeout=1).status_code == 200:
+                    log("✅ AdsPower 自愈拉起成功，本地 API 服务已就绪", "浏览器启动")
+                    return True
+            except Exception:
+                time.sleep(1.0)
+    except Exception as e:
+        log(f"⚠️ 尝试自愈拉起 AdsPower 失败: {e}", "浏览器启动")
+    return False
 
 
 def _macos_frontmost_app() -> str:
@@ -354,13 +454,36 @@ def get_ads_ws_url(user_id=None, port=None, auto_rotate_proxy=True,
             pass
 
         try:
-            resp = requests.get(api_start_url, timeout=start_timeout).json()
-            if resp["code"] != 0:
+            try:
+                resp = requests.get(api_start_url, timeout=start_timeout).json()
+            except requests.exceptions.ConnectionError as conn_err:
+                running_ws = _find_running_browser_ws(user_id)
+                if running_ws and _is_ws_port_open(running_ws):
+                    log(f"⚡ AdsPower 本地 API 暂未就绪，但账号 {user_id} 浏览器已在运行，直接复用: {running_ws}", "浏览器启动")
+                    if mac_suppress:
+                        suppress_browser_window(running_ws, previous_app, hide=(mac_window_mode == "hide"))
+                    return running_ws
+
+                if attempt == 1 and _try_revive_adspower(port):
+                    resp = requests.get(api_start_url, timeout=start_timeout).json()
+                else:
+                    raise Exception(
+                        f"AdsPower 本地 API 服务无法连接 (http://127.0.0.1:{port})。"
+                        "请确认 AdsPower 客户端已启动，且已在「设置 -> 本地 API」开启服务。"
+                    ) from conn_err
+
+            if resp.get("code") != 0:
+                running_ws = _find_running_browser_ws(user_id)
+                if running_ws and _is_ws_port_open(running_ws):
+                    log(f"⚡ AdsPower 启动提示 ({resp.get('msg')})，检测到账号 {user_id} 浏览器已在运行，直接复用: {running_ws}", "浏览器启动")
+                    if mac_suppress:
+                        suppress_browser_window(running_ws, previous_app, hide=(mac_window_mode == "hide"))
+                    return running_ws
                 raise Exception(resp.get("msg", "未知错误"))
 
             ws_url = resp["data"]["ws"]["puppeteer"]
 
-            # 校验端口是否可用
+            # 校验端口是否可用（带短时重试等待，防止端口尚未就绪）
             if _is_ws_port_open(ws_url):
                 if attempt > 1:
                     log(f"✅ 第 {attempt} 次尝试成功启动浏览器，端口已启用: {ws_url}", "浏览器启动")
@@ -369,8 +492,15 @@ def get_ads_ws_url(user_id=None, port=None, auto_rotate_proxy=True,
                                             hide=(mac_window_mode == "hide"))
                 return ws_url
 
-            log(f"⚠️ AdsPower 返回的 WebSocket 端口未启用 (尝试 {attempt}/{max_start_attempts}): {ws_url}，尝试强制关闭并重启...", "浏览器启动")
+            log(f"⚠️ AdsPower 返回的 WebSocket 端口未就绪 (尝试 {attempt}/{max_start_attempts}): {ws_url}，尝试强制关闭并重启...", "浏览器启动")
         except Exception as start_err:
+            running_ws = _find_running_browser_ws(user_id)
+            if running_ws and _is_ws_port_open(running_ws):
+                log(f"⚡ 启动异常 ({start_err})，检测到账号 {user_id} 浏览器已在本地运行，直接复用: {running_ws}", "浏览器启动")
+                if mac_suppress:
+                    suppress_browser_window(running_ws, previous_app, hide=(mac_window_mode == "hide"))
+                return running_ws
+
             log(f"⚠️ 启动浏览器失败 (尝试 {attempt}/{max_start_attempts}): {start_err}", "浏览器启动")
             if attempt == max_start_attempts:
                 raise Exception(
