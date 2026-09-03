@@ -2274,14 +2274,22 @@ def generate_video_chain_worker(task_id, config, title, prompt_block, target_slo
 
 
 def generate_cover_worker(task_id, config, parent_task_id, title, theme, prompt_block,
-                          project_key=None):
+                          project_key=None, concurrent=False, count=4):
     t = get_or_create_task(task_id)
     set_log_context(task_id)
     # 封面落进项目自己的目录（outputs/<项目>/cover_*.webp），跟帧/视频/成片同住：
     # 与帧任务同款的线程级命名空间，标题只用于提示词与日志。
     set_project_key_context(project_key or None)
-    log('INFO', 'COVER', "开始封面任务", title=title)
+
+    def run_cancelled():
+        with ACTIVE_TASKS_LOCK:
+            cur = ACTIVE_TASKS.get(task_id)
+            return bool(cur and cur.get("status") == "cancelled")
+
+    log('INFO', 'COVER', f"开始封面任务{' (并发模式: ' + str(count) + ' 并发)' if (concurrent and count > 1) else ''}", title=title)
     try:
+        if run_cancelled():
+            raise GenerationCancelled("Generation cancelled by user")
         # Generate a catchy, viral English title/hook for TikTok US cover
         title_prompt = (
             f"You are a TikTok US marketing expert. Convert this Chinese project title '{title}' (Theme: '{theme}') "
@@ -2367,29 +2375,121 @@ def generate_cover_worker(task_id, config, parent_task_id, title, theme, prompt_
             f"- The text MUST use a clean, solid, ultra-bold, high-contrast sans-serif font (similar to Montserrat Bold or Impact) in solid white or solid bright yellow with a subtle, clean black outline or drop shadow to ensure extreme legibility and professional graphic design look.\n"
             f"- Keep the font style clean, simple, and standard. Avoid messy, irregular, hand-drawn, graffiti, or low-contrast text styles. The layout must be perfectly centered and balanced."
         )
-        
-        target_path = project_cover_path(project_key or title)
 
-        if sys.stdout:
-            print(f"[DEBUG] Generating cover image via _generate_text_image to {target_path}...")
+        if concurrent and count > 1:
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            pdir = _get_project_dir(project_key or title)
+            os.makedirs(pdir, exist_ok=True)
+            base_ts = int(time.time() * 1000)
 
-        # 配额耗尽不再自动切兜底模型（原先切 gpt-image-2）：封面是整单的门面，
-        # 换模型出来的画风与帧序列对不上，宁可明确报错等补额度后重出。
-        _generate_text_image(config, image_prompt, target_path)
+            tasks = []
+            for i in range(count):
+                c_idx = i + 1
+                cand_path = os.path.join(pdir, f"{COVER_FILENAME_PREFIX}{base_ts}_{c_idx}.webp")
+                var_prompt = image_prompt
+                if i > 0:
+                    var_prompt = f"{image_prompt}\n\n[Variation #{c_idx}]"
+                tasks.append((c_idx, cand_path, var_prompt))
 
-        rel_path = os.path.relpath(target_path, os.path.dirname(os.path.abspath(__file__))).replace('\\', '/')
-        image_content = '/' + rel_path
-        
+            notify_listeners(task_id, 'cover_generating', {
+                'completed': 0,
+                'total': count,
+                'message': f"正在并发生成 {count} 张封面图..."
+            })
+
+            def _worker(c_idx, path, prompt):
+                set_log_context(task_id)
+                set_project_key_context(project_key or None)
+                try:
+                    if run_cancelled():
+                        raise GenerationCancelled("Generation cancelled by user")
+                    _generate_text_image(config, prompt, path)
+                    if os.path.exists(path) and os.path.getsize(path) > 0:
+                        rel = os.path.relpath(path, os.path.dirname(os.path.abspath(__file__))).replace('\\', '/')
+                        return c_idx, '/' + rel
+                    raise RuntimeError(f"Cover candidate #{c_idx} file is missing or empty")
+                finally:
+                    set_log_context(None)
+                    set_project_key_context(None)
+
+            generated_results = {}
+            errors = []
+            completed_count = 0
+
+            with ThreadPoolExecutor(max_workers=count) as pool:
+                futures = {
+                    pool.submit(_worker, c_idx, path, prompt): (c_idx, path)
+                    for c_idx, path, prompt in tasks
+                }
+                for fut in as_completed(futures):
+                    c_idx, path = futures[fut]
+                    if run_cancelled():
+                        for f in futures:
+                            f.cancel()
+                        raise GenerationCancelled("Generation cancelled by user")
+                    try:
+                        res_idx, rel_url = fut.result()
+                        generated_results[res_idx] = rel_url
+                        completed_count += 1
+                        notify_listeners(task_id, 'cover_generating', {
+                            'completed': completed_count,
+                            'total': count,
+                            'cover_url': rel_url,
+                            'message': f"正在并发生成封面图 ({completed_count}/{count})..."
+                        })
+                        log('INFO', 'COVER', f"封面候选 #{res_idx} 生成完成 ({completed_count}/{count}): {rel_url}")
+                    except GenerationCancelled:
+                        for f in futures:
+                            f.cancel()
+                        raise
+                    except Exception as gen_err:
+                        log('ERROR', 'COVER', f"封面候选 #{c_idx} 生成失败: {gen_err}")
+                        errors.append(gen_err)
+
+            if not generated_results:
+                raise RuntimeError(f"所有封面并发生成均失败: {errors[0] if errors else '未知错误'}")
+
+            generated_covers = [generated_results[k] for k in sorted(generated_results.keys())]
+            image_content = generated_covers[0]
+            target_path = os.path.join(pdir, os.path.basename(image_content.lstrip('/')))
+        else:
+            target_path = project_cover_path(project_key or title)
+            if sys.stdout:
+                print(f"[DEBUG] Generating cover image via _generate_text_image to {target_path}...")
+            _generate_text_image(config, image_prompt, target_path)
+            rel_path = os.path.relpath(target_path, os.path.dirname(os.path.abspath(__file__))).replace('\\', '/')
+            image_content = '/' + rel_path
+            generated_covers = [image_content]
+
+        # 就地登记进 manifest。`resolve_cover_reference` 的文档写着「manifest 里登记的
+        # cover_roles.frame1 / 主封面——无头调用与断线恢复只认磁盘上的这份」，可这个字段
+        # 一直只有前端手选封面那条路（/api/project/covers）会写：自动生成的封面从来没被
+        # 登记过，谁想找它都只能靠「按项目目录 listdir 挑 mtime 最新的一张」，键一对不上
+        # 就静默找不到。这里补上那个缺失的写入方。
+        # 只写 active_cover，不碰 cover_roles：后者是用户对具体用途的明确指定，而
+        # manifest_cover_role 先读 frame1 再读 active_cover，用户选过的那张始终优先。
+        try:
+            cover_project_dir = os.path.dirname(target_path)
+            with manifest_lock(cover_project_dir):
+                mdata = read_manifest(cover_project_dir) or {}
+                mdata['active_cover'] = image_content
+                write_manifest(cover_project_dir, mdata)
+        except Exception as reg_err:
+            # 登记失败不影响这张封面本身——回落的 listdir 那条路仍在。
+            log('WARN', 'COVER', f"封面登记进 manifest 失败（不影响出图）: {reg_err}")
+
         # Persist cover details in parent task result
         if parent_task_id:
             with ACTIVE_TASKS_LOCK:
                 task = ACTIVE_TASKS.get(str(parent_task_id)) or ACTIVE_TASKS.get(parent_task_id)
-                if task and task.get("result"):
+                if task:
+                    if not task.get("result") or not isinstance(task["result"], dict):
+                        task["result"] = {}
                     if "covers" not in task["result"] or not isinstance(task["result"]["covers"], list):
                         task["result"]["covers"] = []
-                    cover_rel_url = image_content
-                    if cover_rel_url not in task["result"]["covers"]:
-                        task["result"]["covers"].append(cover_rel_url)
+                    for c_url in generated_covers:
+                        if c_url not in task["result"]["covers"]:
+                            task["result"]["covers"].append(c_url)
                     task["result"]["english_title"] = english_title
                     if social.get('tiktok') and not task["result"].get("social_title_en"):
                         task["result"]["social_title_en"] = social['tiktok']
@@ -2398,6 +2498,7 @@ def generate_cover_worker(task_id, config, parent_task_id, title, theme, prompt_
 
         result_data = {
             'content': image_content,
+            'covers': generated_covers,
             'english_title': english_title
         }
         if social.get('tiktok'):
@@ -2411,8 +2512,15 @@ def generate_cover_worker(task_id, config, parent_task_id, title, theme, prompt_
             t["events"].append(('result', result_data))
 
         notify_listeners(task_id, 'result', result_data)
-        log('INFO', 'COVER', "封面任务完成", title=title)
+        log('INFO', 'COVER', f"封面任务完成，共生成 {len(generated_covers)} 张封面", title=title)
 
+    except GenerationCancelled as ce:
+        with ACTIVE_TASKS_LOCK:
+            t["status"] = "cancelled"
+            t["error"] = str(ce)
+            t["events"].append(('error', {'message': '封面任务已被用户取消'}))
+        notify_listeners(task_id, 'error', {'message': '封面任务已被用户取消'})
+        log('WARN', 'COVER', "封面任务已被用户取消", title=title)
     except Exception as e:
         log_exception('COVER')
         with ACTIVE_TASKS_LOCK:
@@ -8143,18 +8251,27 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 # title 只进提示词与日志。老客户端不发 project_key 时回落到标题
                 # （_get_project_dir 认得标题派生的那三套历史目录名）。
                 project_key = body.get('project_key') or title
+                concurrent = bool(body.get('concurrent') or body.get('candidate_selection'))
+                count = body.get('count') or body.get('candidate_count') or config.get('candidateConcurrency') or 4
+                try:
+                    count = int(count)
+                except (TypeError, ValueError):
+                    count = 4
+                count = max(1, min(8, count))
 
                 import uuid
                 task_id = f"cover_{uuid.uuid4().hex}"
 
                 cleanup_old_tasks()
                 get_or_create_task(task_id, {"type": "cover", "theme": theme,
-                                             "project_key": project_key or None})
+                                             "project_key": project_key or None,
+                                             "concurrent": concurrent,
+                                             "count": count})
 
                 threading.Thread(
                     target=generate_cover_worker,
                     args=(task_id, config, parent_task_id, title, theme, prompt_block,
-                          project_key),
+                          project_key, concurrent, count),
                     daemon=True
                 ).start()
 
@@ -8345,8 +8462,7 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                     return
                 body = self._read_json_body()
                 model_name = body.get('model') or ''
-                if model_name.startswith('gemini-3.5-flash') and not model_name.endswith('-low'):
-                    body['model'] = 'gemini-3.5-flash-low'
+                body['model'] = resolve_chat_model(model_name)
                 config = effective_config(body.get('config'))
                 if 'config' in body:
                     del body['config']

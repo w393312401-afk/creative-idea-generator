@@ -356,7 +356,9 @@ def guard_anchor(config, title, prompt_block, project_dir, on_progress=None,
     # 不是 project_dir——传目录进去会在 outputs/ 下凭空造出一个同名的垃圾项目目录，
     # 返回的路径又永远不存在，COVER 比对分支于是恒为死代码。
     try:
-        cover_path = resolve_cover_reference(config, title)
+        # project_dir 是这一趟守卫正在读帧的那个目录，比按标题重算靠谱
+        # （复刻线的磁盘命名空间是 run_<job>__<标题>，标题算不出来）。
+        cover_path = resolve_cover_reference(config, title, project_dir=project_dir)
     except Exception:
         cover_path = None
 

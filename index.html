@@ -424,6 +424,7 @@
                                     <span class="section-icon">🖼️</span>
                                     <h3>TikTok 9:16 视频封面</h3>
                                     <div class="section-tools">
+                                        <button type="button" id="generate-cover-concurrent-btn" class="action-btn text-btn mini-btn" style="color:var(--accent-orange, #f59e0b); border-color:rgba(245,158,11,0.4);" title="并发生成封面：跟帧序列并发生成设置的数量一致，一次性并发生成多张封面供挑选">🎯 并发生成封面</button>
                                         <button type="button" class="section-tool-btn" data-pop="cover-info-pop" title="说明">ⓘ</button>
                                     </div>
                                 </div>
@@ -1319,7 +1320,7 @@
                                 <option value="6">6 并发</option>
                                 <option value="8">8 并发（最大）</option>
                             </select>
-                            <small class="settings-hint">4选1 智能优选模式下 API 候选图并发生成数量（1~8，默认 4 并发）。多候选并行发起请求大幅缩短生成耗时；若网关限流可调小或设 1 退回串行。</small>
+                            <small class="settings-hint">4选1 智能优选模式下 API 候选图与封面图并发生成数量（1~8，默认 4 并发）。多候选并行发起请求大幅缩短生成耗时；若网关限流可调小或设 1 退回串行。</small>
                         </div>
                         <div class="form-group settings-field" id="fx-image-model-group" style="display: none;">
                             <label for="settings-fx-image-model">FX 生图模型</label>

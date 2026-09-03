@@ -2156,7 +2156,7 @@ def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=
 
         if chunk[0] == 1:
             _fx_clear_frame_reference(frames_dir, 1)
-            cover_src = resolve_cover_reference(config, title)
+            cover_src = resolve_cover_reference(config, title, project_dir=project_dir)
             if cover_src:
                 ref_path = _fx_cover_ref_jpg(cover_src, frames_dir)
                 cover_ref_src = cover_src
@@ -2803,7 +2803,7 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
         is_cut_head = ('CUT' in incoming_meta) and ('BRIDGE' not in incoming_meta)
         is_continuity_transition = is_transition_frame(
             seq, item.get('meta', ''), incoming_meta, _continuity_beat(manifest, seq))
-        cover_ref = (resolve_cover_reference(config, title)
+        cover_ref = (resolve_cover_reference(config, title, project_dir=project_dir)
                      if seq == 1 and not skip_api_call else None)
         # 跨空间层守卫（2026-08-02 复盘）：首帧的图参考只能是**同层**的封面。
         # 封面是"左 before / 右 after"的营销拼接图或用户随手选的一张内景图时，

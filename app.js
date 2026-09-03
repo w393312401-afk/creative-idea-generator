@@ -1309,6 +1309,18 @@ function setupEventListeners() {
     // （页脚 LLM 模型选择器的折叠开关已移除：#ideation-llm-toggle / #ideation-model-picker
     //   随「激发维度」页一起下线。模型切换现在只在配置中心，见 syncSettingsLlmModelPicker。）
     document.getElementById('make-cover-btn').addEventListener('click', () => generateCover());
+    const makeCoverConcBtn = document.getElementById('generate-cover-concurrent-btn');
+    if (makeCoverConcBtn) {
+        makeCoverConcBtn.addEventListener('click', () => {
+            markCandidateSelectionMode(true);
+            generateCover({ concurrent: true });
+        });
+    }
+    const coverPlaceholder = document.getElementById('cover-image-placeholder');
+    if (coverPlaceholder) {
+        coverPlaceholder.style.cursor = 'pointer';
+        coverPlaceholder.addEventListener('click', () => generateCover());
+    }
     document.getElementById('generate-frames-btn').addEventListener('click', () => generateFrames());
     const genSelBtn = document.getElementById('generate-frames-selection-btn');
     if (genSelBtn) genSelBtn.addEventListener('click', () => generateFramesSelection());
@@ -3080,6 +3092,7 @@ async function streamCoverProgress(taskId, ownerIdea) {
     const placeholderEl = document.getElementById('cover-image-placeholder');
     const displayEl = document.getElementById('cover-img-display');
     const makeBtn = document.getElementById('make-cover-btn');
+    const concBtn = document.getElementById('generate-cover-concurrent-btn');
     if (!loadingEl || !placeholderEl || !displayEl || !makeBtn) return;
 
     const isViewing = () => isViewingIdea(ownerId);
@@ -3090,6 +3103,7 @@ async function streamCoverProgress(taskId, ownerIdea) {
         placeholderEl.style.display = 'none';
         displayEl.style.display = 'none';
         makeBtn.disabled = true;
+        if (concBtn) concBtn.disabled = true;
     }
 
     const controller = new AbortController();
@@ -3098,7 +3112,17 @@ async function streamCoverProgress(taskId, ownerIdea) {
 
     let disconnectedCover = false;
     try {
-        const watch = await watchTaskUntilTerminal(taskId, { label: 'cover', signal: controller.signal });
+        const watch = await watchTaskUntilTerminal(taskId, {
+            label: 'cover',
+            signal: controller.signal,
+            onEvent: (type, data) => {
+                if (!isCurrent()) return;
+                if (type === 'cover_generating' && data && data.message) {
+                    const p = loadingEl.querySelector('p');
+                    if (p) p.textContent = data.message;
+                }
+            }
+        });
 
         if (!isCurrent()) return;
 
@@ -3116,17 +3140,32 @@ async function streamCoverProgress(taskId, ownerIdea) {
         }
 
         const data = watch.result;
-        const imageUrl = extractImageUrl(data.content);
         const englishTitle = data.english_title;
-
-        if (!imageUrl) {
-            throw new Error("无法从模型响应中解析出有效的封面图片 URL");
-        }
 
         if (!ownerIdea.covers) {
             ownerIdea.covers = [];
         }
-        ownerIdea.covers.push(imageUrl);
+
+        let newCovers = [];
+        if (Array.isArray(data.covers) && data.covers.length > 0) {
+            newCovers = data.covers;
+        } else if (data.content) {
+            const parsed = extractImageUrl(data.content);
+            if (parsed) newCovers = [parsed];
+        }
+
+        if (newCovers.length === 0) {
+            throw new Error("无法从模型响应中解析出有效的封面图片 URL");
+        }
+
+        const addedUrls = [];
+        newCovers.forEach(url => {
+            if (!ownerIdea.covers.includes(url)) {
+                ownerIdea.covers.push(url);
+                addedUrls.push(url);
+            }
+        });
+
         if (englishTitle) {
             ownerIdea.english_title = englishTitle;
         }
@@ -3158,7 +3197,10 @@ async function streamCoverProgress(taskId, ownerIdea) {
         }
 
         if (isViewing()) renderCoversForIdea(ownerIdea, ownerIdea.covers.length - 1);
-        showToast(`${titleTag()}封面图制作成功！`, "success");
+        const successMsg = addedUrls.length > 1
+            ? `${titleTag()}成功并发生成 ${addedUrls.length} 张封面图！`
+            : `${titleTag()}封面图制作成功！`;
+        showToast(successMsg, "success");
     } catch (e) {
         if (!isCurrent()) return;
         console.error("Failed to generate cover:", e);
@@ -3177,6 +3219,8 @@ async function streamCoverProgress(taskId, ownerIdea) {
             if (isViewing()) {
                 loadingEl.style.display = 'none';
                 makeBtn.disabled = false;
+                const concBtnCurrent = document.getElementById('generate-cover-concurrent-btn');
+                if (concBtnCurrent) concBtnCurrent.disabled = false;
             }
         }
     }
@@ -4841,7 +4885,7 @@ function renderMergeBlocked(data) {
 // Function retrySingleVideo moved to modular JS file
 
 // Generate TikTok 9:16 Video Cover using gemini-3.1-flash-image
-async function generateCover() {
+async function generateCover(options = {}) {
     if (!currentIdea) {
         showToast("请先激发一个创意点子！", "error");
         return;
@@ -4856,13 +4900,33 @@ async function generateCover() {
     const placeholderEl = document.getElementById('cover-image-placeholder');
     const displayEl = document.getElementById('cover-img-display');
     const makeBtn = document.getElementById('make-cover-btn');
+    const concBtn = document.getElementById('generate-cover-concurrent-btn');
     if (!loadingEl || !placeholderEl || !displayEl || !makeBtn) return;
+
+    // 与帧序列并发生成设置的数量一致（candidateConcurrency，默认 4）
+    const candidateConcurrency = (typeof config !== 'undefined' && config && config.candidateConcurrency)
+        ? (parseInt(config.candidateConcurrency, 10) || 4)
+        : 4;
+
+    const isConcurrent = (options && typeof options.concurrent === 'boolean')
+        ? options.concurrent
+        : (typeof isCandidateSelectionMode === 'function' && isCandidateSelectionMode());
+
+    const concurrencyCount = isConcurrent ? candidateConcurrency : 1;
 
     // Set loading state
     loadingEl.style.display = 'flex';
     placeholderEl.style.display = 'none';
     displayEl.style.display = 'none';
     makeBtn.disabled = true;
+    if (concBtn) concBtn.disabled = true;
+
+    const loadingP = loadingEl.querySelector('p');
+    if (loadingP) {
+        loadingP.textContent = isConcurrent
+            ? `正在后台并发生成 ${concurrencyCount} 张封面图...`
+            : '正在后台生成封面图...';
+    }
 
     try {
         const response = await fetch('/api/generate_cover', {
@@ -4876,7 +4940,9 @@ async function generateCover() {
                 // 必须把磁盘命名空间一起交上去——与 generateFrames 的 title 字段同源
                 project_key: getIdeaSaveTitle(ownerIdea),
                 theme: ownerIdea.theme,
-                prompt_block: ownerIdea.prompt_block
+                prompt_block: ownerIdea.prompt_block,
+                concurrent: isConcurrent,
+                count: concurrencyCount
             })
         });
 
@@ -4902,6 +4968,7 @@ async function generateCover() {
             }
             loadingEl.style.display = 'none';
             makeBtn.disabled = false;
+            if (concBtn) concBtn.disabled = false;
         }
     }
 }
@@ -5196,7 +5263,10 @@ function updatePipelineBar() {
         const partial = state[next].have > 0 && (next === 'frames' || next === 'videos');
         const isCand = isCandidateSelectionMode();
         const framesLabel = isCand ? '4选1 生成帧序列' : PIPELINE_NEXT_LABEL['frames'];
-        const label = next === 'frames' ? framesLabel : PIPELINE_NEXT_LABEL[next];
+        const coverLabel = isCand ? '并发生成封面图' : PIPELINE_NEXT_LABEL['cover'];
+        let label = PIPELINE_NEXT_LABEL[next];
+        if (next === 'frames') label = framesLabel;
+        else if (next === 'cover') label = coverLabel;
         nextText.textContent = partial ? `继续${label}` : label;
     }
 }

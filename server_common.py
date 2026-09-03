@@ -2559,15 +2559,22 @@ def manifest_cover_role(project_dir, *roles):
     return None
 
 
-def resolve_cover_reference(config, title, project_key=None):
+def resolve_cover_reference(config, title, project_key=None, project_dir=None):
     """Resolve the cover used only as frame 1's image reference.
 
     A client-selected cover wins; headless callers fall back to this project's newest cover.
     Request paths are restricted to outputs/ so arbitrary local files cannot be uploaded.
 
-    回落查找顺序：本次请求指定的那张 → manifest 里登记的 cover_roles.frame1 / 主封面
-    （无头调用与断线恢复只认磁盘上的这份）→ 项目目录里的 cover_*（新布局）→ 全局封面池
-    里以 <安全标题>_cover_ 开头的那批（迁移前的历史封面）。后两处都按 mtime 取最新的一张。
+    回落查找顺序：本次请求指定的那张 → **调用方自己给的 project_dir** → manifest 里登记的
+    cover_roles.frame1 / 主封面（无头调用与断线恢复只认磁盘上的这份）→ 项目目录里的
+    cover_*（新布局）→ 全局封面池里以 <安全标题>_cover_ 开头的那批（迁移前的历史封面）。
+    后两处都按 mtime 取最新的一张。
+
+    project_dir：调用方**正在往里写帧的那个目录**。它比标题/键靠谱：这里的项目目录一律
+    由 `_get_project_dir(标题或键)` 现算，而复刻线的磁盘命名空间是 `run_<job>__<标题>`
+    经 `_safe_project_name` 截到 60 字符之后的样子——只拿到人类标题的调用方算出来的是
+    另一个（不存在的）目录，封面于是「就在盘上却找不到」，链头静默退化成纯文生图。
+    渲染层已经算过一次那个目录了，直接传进来，不要在这里重算。
     """
     if isinstance(config, dict) and (
         config.get('skipCoverReference')
@@ -2586,20 +2593,30 @@ def resolve_cover_reference(config, title, project_key=None):
     found = []
 
     p_key = project_key or ((config.get('_project_key') if isinstance(config, dict) else None)) or title
-    project_dir = _get_project_dir(p_key)
-    project_dir = (project_dir if os.path.isabs(project_dir)
-                   else os.path.join(root, project_dir))
-    if os.path.isdir(project_dir):
-        registered = manifest_cover_role(project_dir, 'frame1', 'active_cover')
+    search_dirs = []
+    if project_dir:
+        given = (project_dir if os.path.isabs(project_dir)
+                 else os.path.join(root, project_dir))
+        search_dirs.append(os.path.abspath(given))
+    derived = _get_project_dir(p_key)
+    derived = (derived if os.path.isabs(derived) else os.path.join(root, derived))
+    if os.path.abspath(derived) not in search_dirs:
+        search_dirs.append(os.path.abspath(derived))
+    project_dir = search_dirs[0]
+
+    for cdir in search_dirs:
+        if not os.path.isdir(cdir):
+            continue
+        registered = manifest_cover_role(cdir, 'frame1', 'active_cover')
         if registered:
             return registered
-        found += [os.path.join(project_dir, name) for name in os.listdir(project_dir)
+        found += [os.path.join(cdir, name) for name in os.listdir(cdir)
                   if _is_cover_filename(name)]
 
     if title and title != p_key:
         alt_dir = _get_project_dir(title)
         alt_dir = alt_dir if os.path.isabs(alt_dir) else os.path.join(root, alt_dir)
-        if os.path.isdir(alt_dir) and alt_dir != project_dir:
+        if os.path.isdir(alt_dir) and os.path.abspath(alt_dir) not in search_dirs:
             registered = manifest_cover_role(alt_dir, 'frame1', 'active_cover')
             if registered:
                 return registered
