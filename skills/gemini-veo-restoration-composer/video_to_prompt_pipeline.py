@@ -27,6 +27,14 @@ from datetime import datetime
 from typing import Optional
 from PIL import Image, ImageChops, ImageStat
 
+# Reconfigure stdout/stderr to UTF-8 on Windows to prevent UnicodeEncodeError
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
 # =====================================================================
 # Constants & Defaults
 # =====================================================================

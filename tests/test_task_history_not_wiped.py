@@ -33,6 +33,7 @@ from server_common import (
 def _isolated(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     os.makedirs('tasks', exist_ok=True)
+    monkeypatch.setattr(server_common, 'TASKS_DIR', 'tasks')
     monkeypatch.setattr(server_common, 'ACTIVE_TASKS', {})
     monkeypatch.setattr(server_common, 'TASKS_LOADED_FROM_DISK', False)
     monkeypatch.setattr(server_common, '_TASK_FLUSHED_EVENTS', {})

@@ -54,7 +54,7 @@ const DEFAULT_CONFIG = {
     frameContinuityLocalEdit: 'off',
     strictPromptPipelineV2: true,
     composeBatchSize: 5,
-    composeRequestTimeoutSeconds: 120,
+    composeRequestTimeoutSeconds: 45,
     composeBatchRetryCount: 1,
     composeNoProgressTimeoutSeconds: 180,
     composeTaskSoftTimeoutSeconds: 480,

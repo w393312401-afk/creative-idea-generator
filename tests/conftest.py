@@ -83,3 +83,27 @@ def _isolate_used_topic_ledger(tmp_path_factory, monkeypatch):
     # load_reference_file 拿到空台账）会因为这些真实内容而断言反转。
     path.write_text('', encoding='utf-8')
     monkeypatch.setattr(server_common, 'USED_TOPIC_LEDGER_FILE', str(path))
+
+
+@pytest.fixture(autouse=True)
+def _isolate_tasks_dir(tmp_path_factory, monkeypatch):
+    """把 tasks 目录以及内存任务表在所有 pytest 测试中重定向到临时目录。
+
+    与 _isolate_library_dir 同一个理由（2026-09-04 真实事故）：测试直接调用
+    server.get_or_create_task 触发 save_task_to_disk，往真实的 tasks/ 目录下写下
+    test_cover_* 与 test_vid_task_* 等桩任务，导致工作台加载到一堆「未命名项目」
+    与「孤立作业」。写路径一旦存在，隔离就必须是默认行为，不能靠每个测试自觉。
+    """
+    import server_common
+    tasks_dir = str(tmp_path_factory.mktemp('tasks'))
+    monkeypatch.setattr(server_common, 'TASKS_DIR', tasks_dir, raising=True)
+    if 'server' in sys.modules:
+        import server
+        monkeypatch.setattr(server, 'TASKS_DIR', tasks_dir, raising=False)
+    orig_tasks = dict(server_common.ACTIVE_TASKS)
+    server_common.ACTIVE_TASKS.clear()
+    monkeypatch.setattr(server_common, 'TASKS_LOADED_FROM_DISK', False)
+    monkeypatch.setattr(server_common, '_TASK_FLUSHED_EVENTS', {})
+    yield
+    server_common.ACTIVE_TASKS.clear()
+    server_common.ACTIVE_TASKS.update(orig_tasks)

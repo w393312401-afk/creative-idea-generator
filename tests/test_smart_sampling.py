@@ -97,6 +97,20 @@ class TestSmartSampling(unittest.TestCase):
         self.assertIn("triad=[pre:review_002.png, action:review_005.png, post:review_008.png]", digest)
         self.assertIn("audio_sfx=[spike@2.45s, +11.2dB]", digest)
 
+    def test_safe_print_unicode_emoji(self):
+        # Must not throw even when string contains emojis like 🛠️
+        emoji_str = "collage: outputs/🛠️_test/sample_collage.jpg"
+        atv._safe_print(emoji_str)
+
+        # Explicitly simulate a GBK stream that raises UnicodeEncodeError
+        mock_stdout = MagicMock()
+        mock_stdout.encoding = "gbk"
+        def fake_print(*args, **kwargs):
+            raise UnicodeEncodeError("gbk", "🛠️", 0, 1, "illegal multibyte sequence")
+        with patch("builtins.print", side_effect=fake_print):
+            # Should catch UnicodeEncodeError and fallback cleanly without throwing
+            atv._safe_print(emoji_str)
+
 
 if __name__ == "__main__":
     unittest.main()

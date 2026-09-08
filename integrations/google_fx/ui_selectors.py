@@ -12,7 +12,7 @@
 """
 
 # 📌 选择器版本号 — 每次 UI 变更时更新此值，方便追踪
-SELECTOR_VERSION = "2026-04-16"  # 基于 2026-04-16 实测 DOM 更新
+SELECTOR_VERSION = "2026-09-05"  # 基于 2026-09-05 实测 DOM 更新（Flow 迁 flow.google.com + Angular Material）
 
 # ==============================================================================
 # 🎯 UI 选择器字典
@@ -25,8 +25,11 @@ UI_SELECTORS = {
     "google_fx": {
         # --- 导航 ---
         "new_project_btn": [
+            "button.new-project-button",
+            "button:has(.new-project-button)",
             # 先用明确文案定位。项目内的“创建媒体”按钮也使用 add_2，裸图标
             # 选择器会误点它，并把一次无效 click 误报成“新建项目成功”。
+            "button:has(mat-icon:text-is('add_2')):has-text('New project')",
             "button:has(i.google-symbols:text-is('add_2')):has-text('New project')",
             "button:has(i:text-is('add_2')):has-text('New project')",
             "button:has-text('New project')",
@@ -53,13 +56,18 @@ UI_SELECTORS = {
         # 所以选择器探针探的和生产代码点的是同一批选择器。
         "add_media_btn": [
             "button[aria-haspopup='dialog']:has(span:text('Create'))",
+            "button[aria-label='Add media menu']",
+            "button[mattooltip='Add media']",
+            "button:has(mat-icon:text('add'))",
+            "button[aria-label*='Add media' i]",
+            "button[aria-label*='添加媒体']",
             "button[aria-haspopup='dialog']:has(i.google-symbols:text('add_2'))",
             "button[aria-haspopup='dialog']:has(i:text('add_2'))",
             "button[aria-haspopup='dialog']",
             "button[aria-haspopup='menu']:has(span:text('Create'))",
             "button[aria-haspopup='menu']:has(span:text('添加媒体'))",
+            "button[aria-haspopup='menu']:has(mat-icon:text('add'))",
             "button[aria-haspopup='menu']:has(i:text('add'))",
-            "button[aria-haspopup='menu']",
         ],
 
         # --- 配置面板: 比例/数量/模型 Tab 按钮 ---
@@ -83,6 +91,12 @@ UI_SELECTORS = {
             ".DropdownMenuContent[role='menu'][data-state='open']",
             "[role='menu'].DropdownMenuContent[data-state='open']",
             "[role='menu'][data-state='open']",
+            ".cdk-overlay-pane:has(.settings-content)",
+            ".cdk-overlay-pane:has(mat-button-toggle-group)",
+            ".cdk-overlay-pane:has-text('360p')",
+            ".cdk-overlay-pane:has-text('720p')",
+            ".cdk-overlay-pane",
+            ".settings-content",
         ],
 
         # --- 配置按钮 (底部工具栏) ---
@@ -139,11 +153,22 @@ UI_SELECTORS = {
         ],
         "account_menu_trigger": [
             "button:has(img[alt='User profile image'])",
+            ".header-user-button",
+            "[role='button'].header-user-button",
+            "[role='button'][aria-label*='Account details' i]",
+            "[role='button'][aria-label*='账号详情']",
+            "[aria-label*='Account details' i]",
+            "[aria-label*='账号详情']",
+            "[role='button']:has(flow-user-tier-chip)",
             "button:has(img[alt='用户头像'])",
             "button:has(img[alt*='头像'])",
             "button:has(img[src*='googleusercontent.com'])",
+            "button:has(img.user-avatar)",
+            "button:has(img[class*='avatar'])",
             "button[aria-label*='Google Account']",
+            "button[aria-label*='Google 账号']",
             "button[aria-label*='Account']",
+            "button[aria-label*='账号']",
             "button[aria-label*='account' i]",
             "button[aria-label*='profile' i]",
             "button[aria-haspopup='menu']:has(img)",
@@ -155,13 +180,42 @@ UI_SELECTORS = {
         # 全页 text=/N credits/，否则会把套餐宣传的 monthly credits 当成余额。
         "account_menu_surface": [
             "div[role='dialog']",
+            ".panel",
+            ".panel.panel-mobile",
+            ".panel[role='dialog']",
+            "[aria-label*='账号设置']",
+            "[aria-label*='Account settings' i]",
+            ".credits-info-wrapper",
             "div[role='menu']",
             "[data-radix-popper-content-wrapper]",
             ".cdk-overlay-pane",
         ],
+        # --- 画布结果卡片 ---
+        # 2026-09-05 血泪：这一族此前**根本不在 UI_SELECTORS 里**，选择器只以
+        # 硬编码 JS 字符串的形式散落在 helpers 里。于是 Flow 把卡片从
+        # div[data-tile-id] 换成 <flow-grid-tile-container> 那天，选择器探针
+        # 结构上就看不见这处故障——而它恰恰是"点了 Generate 却永远等不到新卡片、
+        # 反复重传参考图烧积分"的唯一根因。
+        #
+        # 顺序即优先级：第 0 层是当前线上 DOM，探针把命中第 0 层报成 primary、
+        # 命中靠后层报成 fallback。helpers 的 FLOW_TILE_SELECTOR / _FLOW_TILE_JS
+        # 直接读这张表，运行期真实命中层级记进 selector_stats('canvas_tile')，
+        # 所以"探针说的"和"生产代码用的"永远是同一份东西。
+        "canvas_tile": [
+            "flow-grid-tile-container",   # 2026-09-05 起的 Angular Material 版
+            "div[data-tile-id]",          # 旧版 Radix/React（保留：回滚/灰度时还会遇到）
+            "flow-tile-container",
+            "flow-image-tile",
+        ],
+
         "credit_display": [
+            ".credits-count",
+            "a.credits-link",
             "a[href*='flow_ai_credits_page']",
             "a[href*='credits']",
+            "[aria-label*='点数']",
+            "[aria-label*='Credits' i]",
+            ".credits-info",
         ],
     },
 

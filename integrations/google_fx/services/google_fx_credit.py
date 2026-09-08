@@ -40,25 +40,26 @@ from ..utils.browser import (
     get_ads_ws_url, find_or_create_page, ensure_flow_workspace,
     flow_onboarding_required, _flow_project_crashed, is_google_login_page, random_sleep,
     attempt_auto_login, BrowserSessionClosedError, _browser_session_is_closed,
-    wait_for_login_redirect,
+    wait_for_login_redirect, FLOW_HOME_URL, FLOW_HOST_HINTS,
 )
 from ..utils.browser_gate import browser_slot
 from ..utils.logger import log, set_task_label, reset_task_label
 from ..ui_selectors import UI_SELECTORS
 
 # 真实文案是 "1050 Google Flow credits"（数字和 "credits" 之间隔着 1~3 个单词），
-# 兜底同时兼容更简单的 "N credits" / "N 积分" / "Credits: N" 措辞。
+# 中文改版后是 "1,050 个 Google Flow 点数"（含量词「个」），
+# 兜底同时兼容更简单的 "N credits" / "N 积分" / "Credits: N" / "Credits display: N" 等措辞。
 _CREDIT_LINE_PATTERN = re.compile(
     r"^\s*(\d[\d,]*)\s+(?:(?:Google\s+)?Flow\s+)?credits?"
     r"(?:\s+(?:remaining|left|available))?\s*$",
     re.IGNORECASE,
 )
 _CREDIT_ZH_LINE_PATTERN = re.compile(
-    r"^\s*(?:剩余\s*)?(\d[\d,]*)\s*(?:Google\s*Flow\s*)?(?:积分|点数)(?:余额|剩余)?\s*$",
+    r"^\s*(?:剩余\s*)?(\d[\d,]*)\s*(?:个\s*)?(?:(?:Google\s*)?Flow\s*)?(?:积分|点数|credits?)(?:余额|剩余)?\s*$",
     re.IGNORECASE,
 )
 _CREDIT_LABEL_PATTERN = re.compile(
-    r"^\s*(?:Credits?|积分|点数)[:：]?\s*(\d[\d,]*)\s*$",
+    r"^\s*(?:(?:Google\s*)?Flow\s*)?(?:Credits?(?:\s+display)?|积分|点数(?:显示)?)[:：]?\s*(\d[\d,]*)\s*$",
     re.IGNORECASE,
 )
 _PROBE_ERRORS = {}
@@ -253,8 +254,8 @@ _ZERO_CREDIT_REGEXES = [
     # 严格数字边界：仅匹配独立的 0，绝不匹配 100/500/1000 等以 0 结尾的正数
     re.compile(r"(?<!\d)0\s*(?:(?:google\s+)?flow\s+|ai\s+)?credits?\b", re.IGNORECASE),
     re.compile(r"(?:credits?|credit\s+balance|flow\s+credits?|ai\s+credits?|积分|点数|额度|配额|余额)[:：=为是]\s*0(?!\d)", re.IGNORECASE),
-    re.compile(r"(?:剩余|left|remaining|balance\s+is|available)\s*0\s*(?:(?:google\s+)?flow\s+|ai\s+)?(?:credits?|积分|点数)?(?!\d)", re.IGNORECASE),
-    re.compile(r"(?<!\d)0\s*(?:google\s*flow\s*)?(?:积分|点数|额度|配额)(?:余额|剩余)?(?!\d)", re.IGNORECASE),
+    re.compile(r"(?:剩余|left|remaining|balance\s+is|available)\s*0\s*(?:个\s*)?(?:(?:google\s+)?flow\s+|ai\s+)?(?:credits?|积分|点数)?(?!\d)", re.IGNORECASE),
+    re.compile(r"(?<!\d)0\s*(?:个\s*)?(?:google\s*flow\s*)?(?:积分|点数|额度|配额)(?:余额|剩余)?(?!\d)", re.IGNORECASE),
     re.compile(r"\b(?:insufficient|out\s+of|not\s+enough|run\s+out\s+of)\s+(?:\w+\s+){0,3}credits?\b", re.IGNORECASE),
     re.compile(r"\bget\s+(?:more\s+)?(?:ai|flow|google\s+flow)\s+credits?\b", re.IGNORECASE),
     re.compile(r"\b(?:used\s+when\s+you'?re\s+out\s+of\s+(?:google\s+)?flow\s+credits?)\b", re.IGNORECASE),
@@ -487,6 +488,8 @@ def detect_page_credit_exhaustion(page, deep: bool = False) -> Optional[str]:
                     "div[aria-live='assertive']",
                 ]},
                 { balance: true, selectors: [
+                    ".credits-count",
+                    "a.credits-link",
                     "a[href*='flow_ai_credits_page']",
                     "a[href*='credits']",
                     "[data-test-id*='credit']",
@@ -563,22 +566,52 @@ def detect_page_credit_exhaustion(page, deep: bool = False) -> Optional[str]:
     return None
 
 
+# 最近一次"实读余额"的读数。只在本进程内存着，供**矛盾信号**判定使用：
+# 余额在掉 = Flow 那边真的在生成、积分真的在扣；如果同时又一段视频都拿不到，
+# 那问题必然出在我们这边的识别层，而不是提交层。
+# 2026-09-05 复盘：那天余额从 891 掉到 884，同一秒的日志里每个任务都在报
+# "Generate 后未检测到新 tile"——两个事实就摆在相邻两行，但没有任何代码把它们
+# 对撞一次，于是白白重试、重传、又烧一轮积分。
+_LAST_CREDIT_READING = {"credit": None, "at": 0.0}
+
+
+def last_credit_reading():
+    """返回 (余额, 读数时间戳)；从没读到过时返回 (None, 0.0)。"""
+    return _LAST_CREDIT_READING["credit"], _LAST_CREDIT_READING["at"]
+
+
+def note_credit_reading(credit):
+    """登记一次真实余额读数（只认真读出来的数字，None 不登记）。"""
+    if credit is None:
+        return
+    try:
+        _LAST_CREDIT_READING["credit"] = int(credit)
+        _LAST_CREDIT_READING["at"] = time.time()
+    except (TypeError, ValueError):
+        pass
+
+
 def read_page_credit_via_menu(page, budget_seconds: float = 12.0) -> Optional[int]:
     """在**已经打开的** Flow 页面上点开头像菜单读一次真实余额，返回数字或 None。
 
     与 probe_flow_credit() 的区别：那个是完整探针（自己连 AdsPower、抢浏览器槽位、
     开页面），用于号池刷新；这个只借用调用方手里现成的 page，几秒就回来，供生成
     过程中的复核/失败诊断用——生成中途去抢浏览器槽位会死锁（那个槽位正被自己占着）。
+
+    每次读到数字都会登记进 _LAST_CREDIT_READING，供"余额在掉却拿不到成品"的
+    矛盾判定使用（见 note_credit_reading 的注释）。
     """
     if not page:
         return None
     try:
-        return _read_credit_from_account_menu(page, overall_timeout_seconds=budget_seconds)
+        credit = _read_credit_from_account_menu(page, overall_timeout_seconds=budget_seconds)
     except BrowserSessionClosedError:
         raise
     except Exception as e:
         log(f"⚠️ 头像菜单实读积分失败: {type(e).__name__}: {e}", "GoogleFX")
         return None
+    note_credit_reading(credit)
+    return credit
 
 
 def _deep_probe_credit_via_menu(page, budget_seconds: float = 12.0) -> Optional[str]:
@@ -736,9 +769,9 @@ def probe_flow_credit(
                 with sync_playwright() as p:
                     browser = p.chromium.connect_over_cdp(ws_url, timeout=int(_step_timeout(20.0) * 1000))
                     context = browser.contexts[0]
-                    flow_url = "https://labs.google/fx/tools/flow"
+                    flow_url = FLOW_HOME_URL
                     page = find_or_create_page(
-                        context, "/fx/tools/flow", fallback_url=flow_url,
+                        context, FLOW_HOST_HINTS, fallback_url=flow_url,
                         user_id=user_id,
                         auto_login_timeout_seconds=_step_timeout(45.0),
                         cancel_check=_cancelled,
@@ -924,6 +957,21 @@ def _read_credit_from_account_menu(page, overall_timeout_seconds: float = 30.0,
             credit = _scan_menu_for_credit(page, timeout_seconds=min(8.0, remaining))
             try:
                 page.keyboard.press("Escape")
+            except Exception:
+                pass
+            try:
+                for close_sel in [
+                    "button[aria-label='关闭账号面板']",
+                    "button[aria-label='Close account panel']",
+                    "button[aria-label*='关闭']",
+                    "button[aria-label*='Close' i]",
+                    ".panel button.close-btn",
+                    "button.close-btn",
+                ]:
+                    close_btn = page.locator(close_sel).first
+                    if close_btn.count() and close_btn.is_visible(timeout=100):
+                        close_btn.click(timeout=1000, force=True)
+                        break
             except Exception:
                 pass
             if credit is not None:

@@ -1840,6 +1840,14 @@ def replica_mutate_orthogonal_worker(task_id, config, baseline_job_id, mutation_
                     task_type='replica_mutate')
 
 
+def replica_autofix_ledger_worker(task_id, config, job_id):
+    """二创变体物件账 AI 一键深度自愈 Worker。"""
+    from replica_pipeline import autofix_variant_ledger
+    _replica_worker(task_id, config, job_id, '物件账 AI 深度自愈闭合',
+                    lambda cb: autofix_variant_ledger(config, job_id, on_progress=cb),
+                    task_type='replica_autofix')
+
+
 # FX 浏览器串行锁 —— FX_CONTROL 是唯一 admission 入口。
 #
 # 2026-07-26 修复（清单 S1）：这里原来是「先排 FX_CONTROL 队列，再裸 acquire 一把
@@ -1967,6 +1975,60 @@ def _fx_queue_account_pin():
 
 _FX_WATCHDOG_STARTED = threading.Event()
 _FX_HARD_STUCK_REPORTED = set()
+_FX_SELECTOR_DRIFT_STARTED = threading.Event()
+
+
+def _fx_selector_drift_interval_seconds():
+    """选择器漂移巡检间隔（小时）。设 0 / 负数 = 关闭。"""
+    try:
+        hours = float(os.environ.get('GOOGLE_FX_SELECTOR_DRIFT_INTERVAL_HOURS', '24'))
+    except (TypeError, ValueError):
+        hours = 24.0
+    return hours * 3600.0 if hours > 0 else 0.0
+
+
+def _fx_selector_drift_watchdog():
+    """定期跑只读选择器探针，和上次的基线对比，退化就告警。
+
+    2026-09-05 复盘的第 3 条：探针和自检此前只有手动 HTTP 入口，没人定时跑，
+    于是"Flow 改版了"这件事只能靠下一单真任务失败 + 烧一批积分来通知我们。
+
+    三条自我约束，免得巡检自己变成故障源：
+      * 只在 FX 空闲时跑——真任务正占着浏览器时直接跳过，等下一轮；
+      * 只读探针，不提交、不改配置，不花积分；
+      * 任何异常都只记日志，绝不影响主服务。
+    """
+    interval = _fx_selector_drift_interval_seconds()
+    if interval <= 0:
+        return
+    # 启动后先等一会儿再跑第一次：服务刚起来时 AdsPower 往往还没就绪，
+    # 而且开机那几分钟通常有真任务要跑，别去抢浏览器。
+    time.sleep(min(interval, 600))
+    while True:
+        try:
+            if FX_CONTROL.snapshot().get('busy'):
+                log('INFO', 'FX_SELECTOR', '选择器巡检：FX 正忙，本轮跳过')
+            else:
+                from integrations.google_fx.services import google_fx_diagnostics
+                outcome = google_fx_diagnostics.run_selector_drift_check()
+                if outcome.get('status') != 'ok':
+                    log('WARN', 'FX_SELECTOR',
+                        f"选择器巡检未成功: {outcome.get('message')}")
+                else:
+                    changes = outcome.get('changes') or []
+                    alerts = outcome.get('alerts') or []
+                    if changes or alerts:
+                        log('ERROR', 'FX_SELECTOR',
+                            f"选择器巡检发现 {len(changes)} 处退化、{len(alerts)} 条必需族告警，"
+                            f"疑似 Flow 改版；详情见「选择器巡检」日志与 "
+                            f"runtime/selector_baseline.json")
+                        FX_CONTROL.audit('diagnostics.selector_drift', details={
+                            'changes': [c.get('message') for c in changes],
+                            'alerts': [a.get('message') for a in alerts],
+                        }, actor='watchdog')
+        except Exception as e:
+            log('WARN', 'FX_SELECTOR', f"选择器巡检异常: {type(e).__name__}: {e}")
+        time.sleep(interval)
 
 
 def _cancel_fx_task(task_id, reason, actor='local'):
@@ -2061,6 +2123,10 @@ def bootstrap_fx_runtime():
         _FX_WATCHDOG_STARTED.set()
         threading.Thread(target=_fx_timeout_watchdog, name='fx-timeout-watchdog',
                          daemon=True).start()
+    if not _FX_SELECTOR_DRIFT_STARTED.is_set() and _fx_selector_drift_interval_seconds() > 0:
+        _FX_SELECTOR_DRIFT_STARTED.set()
+        threading.Thread(target=_fx_selector_drift_watchdog,
+                         name='fx-selector-drift-watchdog', daemon=True).start()
 
 
 def generate_videos_worker(task_id, config, title, prompt_block, target_slots, override_flagged=False):
@@ -2573,7 +2639,12 @@ def restart_server_process():
 
     if sys.platform == 'win32':
         import subprocess
-        subprocess.Popen(args)
+        flags = 0
+        if hasattr(subprocess, 'CREATE_NEW_PROCESS_GROUP'):
+            flags |= subprocess.CREATE_NEW_PROCESS_GROUP
+        if hasattr(subprocess, 'DETACHED_PROCESS'):
+            flags |= subprocess.DETACHED_PROCESS
+        subprocess.Popen(args, creationflags=flags)
         os._exit(0)
     else:
         # macOS / Linux
@@ -4320,6 +4391,46 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
             except Exception as e:
                 self._send_json({'status': 'error', 'message': str(e)}, status=500)
 
+        elif path == '/api/google-fx/canvas-snapshot':
+            # 把**当前画布**原样存一份现场（截图 + 去样式 HTML + DOM 骨架 +
+            # 画布卡片结构 dump）。只读：不点击、不导航、不新建项目——这次取证的
+            # 全部价值就在于画布上那批已生成的视频，把画布弄没了就白跑了。
+            if not self._gate(with_rate=True, rate_action='fx_selector_probe'):
+                return
+            try:
+                body = self._read_json_body()
+                allowed, message = FX_CONTROL.admission()
+                if not allowed:
+                    self._send_json({'status': 'error', 'code': 'FX_NOT_ACCEPTING',
+                                     'message': message}, status=503)
+                    return
+                FX_CONTROL.audit('diagnostics.canvas_snapshot', actor=_client_ip(self))
+                from integrations.google_fx.services import google_fx_diagnostics
+                self._send_json(google_fx_diagnostics.capture_canvas_snapshot(
+                    user_id=(body.get('user_id') or '').strip() or None))
+            except Exception as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
+
+        elif path == '/api/google-fx/selector-drift':
+            # 跑一次只读探针并与基线对比，报出"比上次更差了"的族。
+            # 不提交、不改配置、不花积分。定时巡检走的是同一个函数。
+            if not self._gate(with_rate=True, rate_action='fx_selector_probe'):
+                return
+            try:
+                body = self._read_json_body()
+                allowed, message = FX_CONTROL.admission()
+                if not allowed:
+                    self._send_json({'status': 'error', 'code': 'FX_NOT_ACCEPTING',
+                                     'message': message}, status=503)
+                    return
+                FX_CONTROL.audit('diagnostics.selector_drift_manual', actor=_client_ip(self))
+                from integrations.google_fx.services import google_fx_diagnostics
+                self._send_json(google_fx_diagnostics.run_selector_drift_check(
+                    user_id=(body.get('user_id') or '').strip() or None,
+                    save=bool(body.get('save', True))))
+            except Exception as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
+
         elif path == '/api/google-fx/selector-stats/reset':
             # 修好选择器之后清掉历史 miss/兜底记录，否则漂移警告会永远挂着
             if not self._gate():
@@ -4526,7 +4637,8 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                     }, status=409)
                     return
                 pool = _get_account_pool()
-                entry = pool.refresh_credit(user_id, force=True)
+                # 人亲手点的「立即探测」：连失败退避一起跳过，必须真探一次。
+                entry = pool.refresh_credit(user_id, force=True, ignore_backoff=True)
                 if entry is None:
                     self._send_json({'status': 'error', 'message': '账号不存在'}, status=404)
                     return
@@ -6201,6 +6313,35 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
             except Exception as e:
                 self._send_json({'status': 'error', 'message': str(e)}, status=500)
 
+        elif path == '/api/replica/autofix_ledger':
+            # 针对二创变体进行物件账 AI 一键深度自愈
+            try:
+                if not self._gate(with_rate=True, rate_action='compose'):
+                    return
+                body = self._read_json_body()
+                config = effective_config(body.get('config'))
+                job_id = (body.get('job_id') or '').strip()
+                if not job_id:
+                    self._send_json({'status': 'error', 'message': 'job_id 不能为空'}, status=400)
+                    return
+                config['_project_key'] = job_id
+
+                import uuid
+                task_id = body.get('task_id') or f"replica_fix_{uuid.uuid4().hex}"
+                cleanup_old_tasks()
+                prepare_task_for_run(task_id, replica_task_dims(job_id, 'replica_autofix'))
+
+                threading.Thread(
+                    target=replica_autofix_ledger_worker,
+                    args=(task_id, config, job_id),
+                    daemon=True
+                ).start()
+                self._send_json({'status': 'ok', 'task_id': task_id})
+            except ValueError as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=400)
+            except Exception as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
+
         elif path == '/api/replica/ai_diverge':
             # 基于母本工序与骨架，调用 LLM 智能发散四轴正交创意方案
             try:
@@ -6308,11 +6449,27 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 body = self._read_json_body()
                 job_id = (body.get('job_id') or '').strip()
                 prompt_block = body.get('prompt_block')
+                force = bool(body.get('force', False))
                 if not job_id:
                     self._send_json({'status': 'error', 'message': 'job_id 不能为空'}, status=400)
                     return
                 from replica_pipeline import save_prompt
-                state = save_prompt(job_id, prompt_block)
+                state = save_prompt(job_id, prompt_block, force=force)
+                self._send_json({'status': 'ok', 'job_state': state})
+            except Exception as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
+
+        elif path == '/api/replica/force_deliver':
+            try:
+                if not self._gate():
+                    return
+                body = self._read_json_body()
+                job_id = (body.get('job_id') or '').strip()
+                if not job_id:
+                    self._send_json({'status': 'error', 'message': 'job_id 不能为空'}, status=400)
+                    return
+                from replica_pipeline import force_deliver_prompt
+                state = force_deliver_prompt(job_id)
                 self._send_json({'status': 'ok', 'job_state': state})
             except Exception as e:
                 self._send_json({'status': 'error', 'message': str(e)}, status=500)
@@ -8964,7 +9121,7 @@ def run():
     _start_auto_reload_watcher()
     try:
         httpd.serve_forever()
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, OSError):
         pass
     if sys.stdout:
         print("Stopping server...")

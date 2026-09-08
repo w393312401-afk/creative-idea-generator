@@ -28,6 +28,16 @@ if sys.platform.startswith("win"):
     except Exception:
         pass
 
+    # Force UTF-8 on Windows stdout/stderr to prevent UnicodeEncodeError with emojis or multi-byte chars
+    for _stream in (sys.stdout, sys.stderr):
+        if hasattr(_stream, "reconfigure"):
+            try:
+                _stream.reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+    os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+    os.environ.setdefault("PYTHONUTF8", "1")
+
 
 def get_subprocess_window_flags() -> dict:
     """Returns extra kwargs for subprocess.run/Popen to prevent console windows and focus-stealing on Windows."""
@@ -1436,10 +1446,13 @@ def stamp_manifest_capabilities(manifest, stage):
 SERVICE_START_TIME = time.time()
 
 _CORE_SOURCE_GLOBS = (
-    'server.py', 'server_common.py', 'frame_generator.py', 'frame_continuity.py',
+    'server.py', 'server_common.py', 'replica_pipeline.py', 'frame_generator.py', 'frame_continuity.py',
     'pipeline_orchestrator.py', 'video_generator.py',
     os.path.join('prompt_pipeline', '*.py'),
     os.path.join('prompt_pipeline', 'composers', '*.py'),
+    os.path.join('integrations', 'google_fx', '*.py'),
+    os.path.join('integrations', 'google_fx', 'services', '*.py'),
+    os.path.join('integrations', 'google_fx', 'utils', '*.py'),
 )
 
 
@@ -1997,9 +2010,16 @@ def _next_unused_account(config, pool, ring, exclude):
 # 让它覆盖服务端就会出现"在控制台改了模型但不生效"的静默失效。
 # 配置中心（index.html）改这些项时会同步 POST /api/google-fx/config 写服务端，
 # 所以"服务端优先"不会把用户刚在配置中心选的值顶回去。
+# 合成预算由服务端配置优先；浏览器可能仍携带旧的 45 秒默认值。
+_COMPOSE_RUNTIME_KEYS = (
+    'composeRequestTimeoutSeconds', 'composeBatchSize', 'composeBatchRetryCount',
+    'composeRepairTimeoutSeconds', 'composeNoProgressTimeoutSeconds',
+    'composeTaskSoftTimeoutSeconds', 'composeTaskHardTimeoutSeconds',
+)
+
 _SERVER_AUTHORITATIVE_KEYS = frozenset({
     'videoModel', 'googleFxImageModel', 'videoDuration', 'videoResolution', 'videoRefMode',
-})
+}) | frozenset(_COMPOSE_RUNTIME_KEYS)
 
 # 托管模式（配了 apiKey 即是）下允许从浏览器/请求 config 透传的键。门禁那一段由
 # GATE_SETTINGS 派生，其余是模型/画幅/激发参考等非门禁项。
@@ -2016,7 +2036,7 @@ _PASSTHROUGH_CLIENT_KEYS = (
     'frameFactsModel', 'peakVerifyModel', 'reviewModel',
     'reviewConcurrency', 'candidateConcurrency',
     'candidateSelectionMode', 'candidateSelection', 'generation_mode', 'candidate_selection',
-) + _GATE_KEYS
+) + _GATE_KEYS + _COMPOSE_RUNTIME_KEYS
 
 
 # 号池调度这一族字段的权威来源只有服务端配置（Google FX 服务管理中心 / 号池管理界面
@@ -5329,7 +5349,7 @@ def notify_listeners(task_id, event_type, data):
 
 
 def cleanup_old_tasks():
-    """删除 7 天前的终态任务。
+    """删除 7 天前的终态任务以及单元测试残留桩任务。
 
     老实现是"从内存里摘掉 → 调 save_tasks_to_disk() 靠孤儿扫描顺手删文件"。
     现在显式删这几条自己的文件，不再让一次清理动作有能力扫掉整个目录。
@@ -5338,7 +5358,9 @@ def cleanup_old_tasks():
     to_delete = []
     with ACTIVE_TASKS_LOCK:
         for tid, t in ACTIVE_TASKS.items():
-            if t["status"] in _TASK_TERMINAL_STATUSES and now - t["last_active"] > 604800:
+            if str(tid).startswith('test_'):
+                to_delete.append(tid)
+            elif t["status"] in _TASK_TERMINAL_STATUSES and now - t["last_active"] > 604800:
                 to_delete.append(tid)
         for tid in to_delete:
             del ACTIVE_TASKS[tid]
@@ -5863,9 +5885,13 @@ def build_projects_index(tasks=None, library_items=None, ledger_rows=None,
     def result_of(task):
         return task.get('result') if isinstance(task.get('result'), dict) else {}
 
+    def _is_synthetic_test_task(task):
+        tid = str(task.get('id') or '')
+        return tid.startswith('test_')
+
     # ── 1. 激发任务：项目表的脊柱，project_key 由它产生 ──────────────────
     for task in tasks:
-        if _is_replica_task(task):
+        if _is_replica_task(task) or _is_synthetic_test_task(task):
             continue
         dims = dims_of(task)
         if dims.get('type') in MEDIA_TASK_TYPES:
@@ -5929,7 +5955,7 @@ def build_projects_index(tasks=None, library_items=None, ledger_rows=None,
     # ── 3. 媒体子作业：挂回母项目；挂不上的自成一行（否则失败的帧/视频任务
     #      像现在的任务抽屉那样被整类过滤掉，用户永远看不见）──────────────
     for task in tasks:
-        if _is_replica_task(task):
+        if _is_replica_task(task) or _is_synthetic_test_task(task):
             continue
         dims = dims_of(task)
         job_type = dims.get('type')

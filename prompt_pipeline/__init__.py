@@ -15146,6 +15146,100 @@ def _load_delivered_beat_ladder(cand_dirs):
     return []
 
 
+def is_variant_project(project_dir, manifest=None, dims=None):
+    """判断当前项目是否为二创变体（非 1:1 黄金母本克隆）。
+    变体特征：
+      - manifest / dimensions 中有 job_type == 'variant', is_variant, variant_of, parent_baseline_id, mutation_axes
+      - 目录名或标题中含有 '二创变体' / 'variant'
+      - 绑定的 replica_job 元数据表明其为 variant
+    """
+    if manifest is None and project_dir:
+        mpath = os.path.join(project_dir, 'manifest.json')
+        if os.path.exists(mpath):
+            try:
+                with open(mpath, 'r', encoding='utf-8') as f:
+                    manifest = json.load(f)
+            except Exception:
+                manifest = {}
+        else:
+            manifest = {}
+    manifest = manifest or {}
+    dims = dims or (manifest.get('dimensions') or {})
+
+    # 1. 显式 baseline 标记最高优先：如果明确声明为 baseline，绝不误判为变体
+    if manifest.get('job_type') == 'baseline' or dims.get('job_type') == 'baseline':
+        if not (manifest.get('is_variant') or dims.get('is_variant')):
+            return False
+    if manifest.get('is_variant') is False or dims.get('is_variant') is False:
+        return False
+
+    # 2. 检查目录下的 timelapse_beats.json 显式 job_type
+    if project_dir:
+        tb_path = os.path.join(project_dir, 'timelapse_beats.json')
+        if os.path.exists(tb_path):
+            try:
+                with open(tb_path, 'r', encoding='utf-8') as f:
+                    tb_data = json.load(f)
+                if tb_data.get('job_type') == 'baseline' and not (tb_data.get('parent_baseline_id') or tb_data.get('variant_of')):
+                    return False
+                if tb_data.get('job_type') == 'variant' or tb_data.get('parent_baseline_id') or tb_data.get('variant_of') or tb_data.get('mutation_axes'):
+                    return True
+            except Exception:
+                pass
+
+    # 3. 显式变体字段标记
+    if manifest.get('is_variant') or dims.get('is_variant'):
+        return True
+    if manifest.get('job_type') == 'variant' or dims.get('job_type') == 'variant':
+        return True
+    if manifest.get('variant_of') or dims.get('variant_of'):
+        return True
+    if manifest.get('parent_baseline_id') or dims.get('parent_baseline_id'):
+        return True
+    if manifest.get('mutation_axes') or dims.get('mutation_axes'):
+        return True
+
+    # 4. 目录名或标题中显式带有「二创变体」或单词 variant
+    if project_dir:
+        pname = os.path.basename(project_dir)
+        if '二创变体' in pname or re.search(r'(?:^|[_\W])variant(?:[_\W]|$)', pname, re.I):
+            return True
+    title = str(manifest.get('title') or '')
+    if '二创变体' in title or re.search(r'(?:^|[_\W])variant(?:[_\W]|$)', title, re.I):
+        return True
+
+    # 5. 绑定的 replica_job 元数据
+    job_id = str(dims.get('replica_job_id') or manifest.get('replica_job_id') or manifest.get('source_job_id') or '').strip()
+    if not job_id and project_dir:
+        m_job = re.search(r'replica_([a-f0-9]{12})', os.path.basename(project_dir))
+        if m_job:
+            job_id = f"replica_{m_job.group(1)}"
+    if job_id:
+        try:
+            from replica_pipeline import job_dir, validate_job_id
+            if validate_job_id(job_id):
+                j_dir = job_dir(job_id)
+                for meta_name in ('.summary.json', '.replica_pipeline.json', 'timelapse_beats.json'):
+                    meta_path = os.path.join(j_dir, meta_name)
+                    if os.path.exists(meta_path):
+                        try:
+                            with open(meta_path, 'r', encoding='utf-8') as f:
+                                data = json.load(f)
+                            if data.get('job_type') == 'baseline' and not (data.get('parent_baseline_id') or data.get('variant_of')):
+                                return False
+                            if (data.get('job_type') == 'variant'
+                                    or data.get('parent_baseline_id')
+                                    or data.get('variant_of')
+                                    or data.get('mutation_axes')):
+                                return True
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+
+    return False
+
+
 def find_reference_frames_with_roles(project_dir, total_beats=None):
     """根据 project_dir（或其绑定的 replica_job_id）自动检索爆款原片抽出来的关键帧。
 
@@ -15251,6 +15345,15 @@ def find_reference_frames_with_roles(project_dir, total_beats=None):
                 break
         if source_collage_path:
             break
+
+    # 变体防护：二创变体的环境、材质与功能已发生正交发散，无自身的原片物理抽帧。
+    # 严禁将母本的 review_frames 挂为逐像素/空间骨架 benchmark 对标帧（否则审查器会强行
+    # 比对母本地貌，将新环境误判为"核心地貌完全缺失"并触发停链）。
+    # 保留母本的 5 列拼图（source_collage_path），仅供双轨拼图横向快检与宏观节奏对齐。
+    if is_variant_project(project_dir, manifest=manifest, dims=dims):
+        if sys.stdout:
+            print(f"[REF] ℹ️ 当前任务为二创变体（Variant），已阻断挂载母本逐拍抽帧作为视觉对标基准，保留拼图供宏观比对。")
+        return {}, {}, source_collage_path
 
     # 2. 寻找抽帧目录与关键帧，优先从 timelapse_beats.json 精准提取每拍交付帧
     tb_data = None

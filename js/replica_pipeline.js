@@ -11,6 +11,7 @@ let replicaTaskId = null;
 let replicaSSE = null;
 let replicaBusy = false;
 let replicaPromptEditing = false;   // 提示词包是否处于手动编辑态
+let replicaLoadVersion = 0;
 
 // stage → 中文标签的**兜底**副本。真源在 replica_pipeline.py 的 STAGE_LABELS，
 // 后端随 job 行下发 stage_label；这里只在拿不到时顶上（例如渲染一条本地拼出来的
@@ -490,8 +491,10 @@ async function replicaLoadJob(jobId) {
         && !window.confirm('当前任务有改动还没保存，切走就没了。确定切换？')) {
         return replicaState;
     }
+    const version = ++replicaLoadVersion;
     const data = await replicaFetch(`/api/replica/status?job_id=${encodeURIComponent(jobId)}`,
         { headers: replicaHeaders() });
+    if (version !== replicaLoadVersion) return replicaState;
     const switched = !replicaState || replicaState.job_id !== jobId;
     if (switched) replicaMarkDirty(false);
     replicaState = data.job_state;
@@ -1441,8 +1444,10 @@ function replicaIsMutateRunning() {
     return !!(replicaSSE && replicaProgress && (
         replicaProgress.actionLabel === '⚡ 正交二创变体派生' ||
         replicaProgress.actionLabel === '🧬 派生二创变体' ||
+        replicaProgress.actionLabel === '🛠️ AI 深度自愈物件账' ||
         replicaProgress.stage === 'mutate_beats' ||
-        (replicaProgress.actionLabel && replicaProgress.actionLabel.includes('变体'))
+        (replicaProgress.actionLabel && replicaProgress.actionLabel.includes('变体')) ||
+        (replicaProgress.actionLabel && replicaProgress.actionLabel.includes('自愈'))
     ));
 }
 
@@ -1683,6 +1688,14 @@ function replicaRenderJob(state) {
         ${isMutateFailed ? `
             <div class="replica-banner replica-banner-error">
                 <b>二创生成失败</b>：${escapeHtmlReplica(state.error || '变体改写异常')}
+                <div class="replica-autofix-actions" style="margin-top:10px; display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+                    <button type="button" id="replica-autofix-ledger-btn" class="action-btn primary-btn" title="调用 AI 深度自愈闭合依赖倒置与未建锚点，自动推进至核验阶段">
+                        🛠️ AI 一键深度自愈物件账并推进
+                    </button>
+                    <button type="button" id="replica-retry-mutate-btn" class="action-btn text-btn" title="按当前配置重新尝试派生">
+                        🔄 重新尝试派生
+                    </button>
+                </div>
             </div>` : ''}
         ${state.error && !isComposeFailed && !isMutateFailed ? `<div class="replica-banner replica-banner-error">${escapeHtmlReplica(state.error)}</div>` : ''}
         ${replicaRenderDualWorkbench(state)}
@@ -1941,6 +1954,7 @@ const REPLICA_ACTION_RANGE = {
     peak_verify: [38, 45],
     mutate_orthogonal: [45, 68],
     variant: [45, 68],
+    autofix_ledger: [45, 80],
     autofix: [68, 82],
     fix_beats: [68, 82],
     refine_craft: [68, 86],
@@ -1955,6 +1969,7 @@ const REPLICA_ACTION_LABELS = {
     peak_verify: '强模型复核峰值帧',
     mutate_orthogonal: '⚡ 正交二创变体派生',
     variant: '🧬 派生二创变体',
+    autofix_ledger: '🛠️ AI 深度自愈物件账',
     autofix: 'AI 修复硬伤',
     fix_beats: 'AI 修复硬伤',
     refine_craft: '工艺精修',
@@ -2839,6 +2854,7 @@ function replicaHighlightPromptBlock(text, hits) {
 function replicaRenderOutput(state) {
     if (!state.prompt_block) return '';
     const hits = state.banned_hits || [];
+    const ghosts = state.video_delta_issues || [];
     const blocked = state.stage === 'audit_failed';
     const highlightedHtml = replicaHighlightPromptBlock(state.prompt_block, hits);
 
@@ -2848,18 +2864,30 @@ function replicaRenderOutput(state) {
         ${blocked ? `<div class="replica-banner replica-banner-error">
             <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
                 <div>
-                    <b>已拦截交付：命中 ${hits.length} 个禁用元素</b>（原片里并不存在）：
-                    ${hits.map(h => `<span class="replica-hit-badge">${escapeHtmlReplica(h)}</span>`).join(' ')}。
+                    ${hits.length > 0
+                        ? `<b>已拦截交付：命中 ${hits.length} 个禁用元素</b>（原片里并不存在）：
+                           ${hits.map(h => `<span class="replica-hit-badge">${escapeHtmlReplica(h)}</span>`).join(' ')}。`
+                        : `<b>已拦截交付：发现 ${ghosts.length} 处视频首尾帧差量冲突（幽灵构件变化）</b>`}
                 </div>
-                <div style="display:flex; gap:8px;">
-                    <button type="button" id="replica-purge-banned-btn" class="action-btn primary-btn" style="padding:4px 12px; font-size:12px; background:#ff4d4f; border-color:#ff7875;" title="自动从提示词中剥离所有命中词并重新校验">🪄 一键自动剔除并交付</button>
+                <div style="display:flex; gap:8px; flex-wrap:wrap;">
+                    ${hits.length > 0 ? `<button type="button" id="replica-purge-banned-btn" class="action-btn primary-btn" style="padding:4px 12px; font-size:12px; background:#ff4d4f; border-color:#ff7875;" title="自动从提示词中剥离所有命中词并重新校验">🪄 一键自动剔除并交付</button>` : ''}
+                    <button type="button" id="replica-force-deliver-btn" class="action-btn primary-btn" style="padding:4px 12px; font-size:12px; background:#fa8c16; border-color:#ffa940;" title="忽略当前校验拦截，强制将提示词包写入创意库并开放渲染">⚡ 忽略警告并强制交付</button>
                 </div>
             </div>
+            ${ghosts.length > 0 ? `
+            <div style="margin-top:10px; padding:8px 12px; background:rgba(0,0,0,0.25); border-radius:4px; font-size:12px;">
+                <div style="font-weight:700; color:#ffc069; margin-bottom:4px;">⚠️ 差量检测提示（视频中描写的构件未在对应帧差量或前置工序中申报）：</div>
+                <ul style="margin:0; padding-left:18px; line-height:1.6;">
+                    ${ghosts.slice(0, 6).map(g => `<li>第 ${g.beat} 拍视频: 构件「<b>${escapeHtmlReplica(g.object)}</b>」 - ${escapeHtmlReplica(g.message || '')}</li>`).join('')}
+                    ${ghosts.length > 6 ? `<li>…另有 ${ghosts.length - 6} 条问题</li>` : ''}
+                </ul>
+            </div>` : ''}
             <div style="margin-top:8px; font-size:12.5px; line-height:1.6;">
-                这份提示词<b>没有写入创意库</b>，也不能送去渲染。你可以：<br>
-                1. 📍 <b>点击下方按钮快速定位到问题点，就地编辑删除该词并保存</b>；<br>
-                2. 🪄 <b>点击右上角「一键自动剔除并交付」一秒完成修复</b>；<br>
-                3. 或者点击「重新合成」让模型重新写一份。
+                这份提示词<b>暂未写入创意库</b>。你可以：<br>
+                1. ✏️ <b>点击下方「手动修改提示词」就地修改保存并自动复核</b>；<br>
+                ${hits.length > 0 ? `2. 🪄 <b>点击右上角「一键自动剔除并交付」一秒完成修复</b>；<br>` : ''}
+                3. ⚡ <b>点击右上角「忽略警告并强制交付」直接入库并开放渲染</b>；<br>
+                4. 或者点击「重新合成」让模型重新写一份。
             </div>
             ${hits.length > 0 ? `
             <div style="margin-top:10px; display:flex; align-items:center; flex-wrap:wrap; gap:6px;">
@@ -2869,6 +2897,7 @@ function replicaRenderOutput(state) {
         </div>` : `<div class="replica-banner replica-banner-ok">
             已通过禁用元素门禁，并写入创意库${state.library_id
                 ? `（项目工作台可见：${escapeHtmlReplica(state.title || state.library_id)}）` : ''}。
+            ${ghosts.length > 0 ? `<span style="color:#d48806; font-size:12px; margin-left:6px;">(检测到 ${ghosts.length} 项软性差量提示已记录)</span>` : ''}
             下一步按「存入项目并打开激发结果」：渲染（分步合成 / 一键合成）、手动改提示词、
             补主题与话题，都在那一页上。
         </div>`}
@@ -2978,6 +3007,31 @@ function replicaBindEvents() {
             }
         } catch (err) {
             replicaToast(`自动清理失败: ${err.message}`, true);
+        }
+    });
+
+    // 忽略警告并强制交付
+    on('#replica-force-deliver-btn', async () => {
+        if (!replicaState) return;
+        if (!confirm('确定要忽略警告并强制交付提示词包入库吗？')) return;
+        try {
+            const data = await replicaFetch('/api/replica/force_deliver', {
+                method: 'POST',
+                headers: replicaHeaders(),
+                body: JSON.stringify({ job_id: replicaState.job_id }),
+            });
+            if (data && data.job_state) {
+                replicaState = data.job_state;
+                replicaPromptEditing = false;
+                replicaRender();
+                if (replicaState.stage === 'completed') {
+                    replicaToast('⚡ 已强制交付入库！现可送去渲染或存入项目。');
+                } else {
+                    replicaToast('强制交付完成，状态：' + replicaState.stage);
+                }
+            }
+        } catch (err) {
+            replicaToast(`强制交付失败: ${err.message}`, true);
         }
     });
 
@@ -3185,6 +3239,8 @@ function replicaBindEvents() {
     on('#replica-lock-baseline-btn', () => replicaToggleBaselineLock(true));
     on('#replica-unlock-baseline-btn', () => replicaToggleBaselineLock(false));
     on('#replica-mutate-orthogonal-btn', (e) => replicaMutateOrthogonal(e.currentTarget));
+    on('#replica-autofix-ledger-btn', (e) => replicaAutofixLedger(e.currentTarget));
+    on('#replica-retry-mutate-btn', (e) => replicaMutateOrthogonal(e.currentTarget));
     on('#replica-toggle-comparator-btn', () => replicaToggleComparator());
     on('#replica-close-comparator-btn', () => replicaToggleComparator(false));
     on('#replica-pane-handoff-btn', (e) => replicaHandoffToStepped(e.currentTarget));
@@ -4028,9 +4084,11 @@ const REPLICA_LADDER_CONSUMERS = new Set([
 
 async function replicaAdvance(action, payload = {}, btn) {
     if (!replicaState || replicaBusy) return;
+    replicaSetBusy(true, btn);
     // 落盘失败就地中止：宁可让用户看见「保存失败」，也不能让一次静默的旧版本改写跑出去。
-    if (REPLICA_LADDER_CONSUMERS.has(action) && (replicaState.beats || {}).beats) {
-        if (!(await replicaSaveBeats(false, btn))) {
+    if (REPLICA_LADDER_CONSUMERS.has(action) && (replicaState.beats || {}).beats
+        && (!replicaState.is_locked_baseline || replicaDirty)) {
+        if (!(await replicaSaveBeats(false))) {
             replicaToast('改动没能存下来，这一步已中止——请再点一次「保存并重校验」看服务端说了什么', true);
             replicaSetBusy(false);
             return;
@@ -4272,7 +4330,7 @@ async function replicaToggleBaselineLock(lock) {
 }
 
 async function replicaMutateOrthogonal(btn) {
-    if (!replicaState) return;
+    if (!replicaState || replicaBusy) return;
     const root = replicaRoot() || document;
     const env = (root.querySelector('#replica-axis-env') || {}).value || '';
     const mat = (root.querySelector('#replica-axis-mat') || {}).value || '';
@@ -4301,6 +4359,11 @@ async function replicaMutateOrthogonal(btn) {
     }
 
     replicaSetBusy(true, btn);
+    if (replicaDirty && !(await replicaSaveBeats(false))) {
+        replicaToast('母本改动保存失败，已停止派生二创', true);
+        replicaSetBusy(false);
+        return;
+    }
     replicaResetProgress();
     replicaProgress.stage = 'mutate_beats';
     replicaProgress.actionLabel = '⚡ 正交二创变体派生';
@@ -4323,6 +4386,34 @@ async function replicaMutateOrthogonal(btn) {
         replicaTaskId = data.task_id;
         replicaOpenSSE(replicaTaskId);
         replicaToast('⚡ 正在执行四轴正交派生（100% 锁死母本节拍骨架与机位）...');
+    } catch (e) {
+        replicaToast(e.message, true);
+        replicaSetBusy(false);
+    }
+}
+
+async function replicaAutofixLedger(btn) {
+    if (!replicaState || !replicaState.job_id) return;
+    replicaSetBusy(true, btn);
+    replicaResetProgress();
+    replicaProgress.stage = 'mutate_beats';
+    replicaProgress.actionLabel = '🛠️ AI 深度自愈物件账';
+    replicaProgress.range = [45, 80];
+    replicaProgressUpdate(45, '正在启动 AI 深度自愈闭合变体物件账...', 'mutate_beats');
+    replicaRender();
+
+    try {
+        const data = await replicaFetch('/api/replica/autofix_ledger', {
+            method: 'POST',
+            headers: replicaHeaders(),
+            body: JSON.stringify({
+                job_id: replicaState.job_id,
+                config: replicaConfig(),
+            }),
+        });
+        replicaTaskId = data.task_id;
+        replicaOpenSSE(replicaTaskId);
+        replicaToast('🛠️ 正在执行 AI 深度自愈（自动修复依赖倒置与未建锚点）...');
     } catch (e) {
         replicaToast(e.message, true);
         replicaSetBusy(false);
@@ -4399,12 +4490,15 @@ function replicaCollectBeats() {
 async function replicaSaveBeats(rerender, btn) {
     const doc = replicaCollectBeats();
     if (!doc) return false;
+    const jobId = replicaState.job_id;
+    const loadVersion = replicaLoadVersion;
     if (btn) replicaSetBusy(true, btn);
     try {
         const data = await replicaFetch('/api/replica/beats', {
             method: 'POST', headers: replicaHeaders(),
-            body: JSON.stringify({ job_id: replicaState.job_id, beats: doc }),
+            body: JSON.stringify({ job_id: jobId, beats: doc }),
         });
+        if (replicaState?.job_id !== jobId || replicaLoadVersion !== loadVersion) return false;
         replicaState = data.job_state;
         replicaMarkDirty(false);
         if (rerender) {

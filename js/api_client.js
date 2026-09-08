@@ -330,20 +330,21 @@ function renderVideoSlotPending(slotIdx, text) {
     renderSlotPending('video', slotIdx, text);
 }
 
-function renderVideoSlotDone(idx, video) {
+function renderVideoSlotDone(idx, video, ownerIdea = currentIdea) {
     if (!video) return;
-    const busy = isIdeaTaskActive(currentIdea && currentIdea.id, 'videos');
-    if (currentIdea && currentIdea.frameRun) {
-        if (!Array.isArray(currentIdea.frameRun.videos)) currentIdea.frameRun.videos = [];
+    const busy = isIdeaTaskActive(ownerIdea && ownerIdea.id, 'videos');
+    if (ownerIdea && ownerIdea.frameRun) {
+        if (!Array.isArray(ownerIdea.frameRun.videos)) ownerIdea.frameRun.videos = [];
         const slotNum = Number(video.slot) || idx;
-        const existIdx = currentIdea.frameRun.videos.findIndex(v => (Number(v && v.slot) || 0) === slotNum);
+        const existIdx = ownerIdea.frameRun.videos.findIndex(v => (Number(v && v.slot) || 0) === slotNum);
         if (existIdx >= 0) {
-            currentIdea.frameRun.videos[existIdx] = video;
+            ownerIdea.frameRun.videos[existIdx] = video;
         } else {
-            currentIdea.frameRun.videos.push(video);
+            ownerIdea.frameRun.videos.push(video);
         }
-        currentIdea.frameRun.videos.sort((a, b) => (Number(a && a.slot) || 0) - (Number(b && b.slot) || 0));
+        ownerIdea.frameRun.videos.sort((a, b) => (Number(a && a.slot) || 0) - (Number(b && b.slot) || 0));
     }
+    if (!ownerIdea || !isViewingIdea(ownerIdea.id)) return;
     renderSlotById('video', idx, videoSlotState(video, { seq: Number(video.slot) || idx, busy }));
 }
 
@@ -2179,11 +2180,14 @@ async function retrySingleVideo(slot) {
             label: `retry-video-${slot}`,
             signal: controller.signal,
             onEvent: (type, evData) => {
+                if (type === 'video_done') {
+                    renderVideoSlotDone(evData.index, evData.video, ownerIdea);
+                    return;
+                }
                 if (!isViewingIdea(ownerIdea.id)) return;
                 if (type === 'video_start') {
                     meta.textContent = `正在生成视频: 正在处理第 ${evData.index} 段视频...`;
-                } else if (type === 'video_done') {
-                    renderVideoSlotDone(evData.index, evData.video);
+
                 } else if (type === 'video_error') {
                     renderVideoSlotFailed(evData.index, evData.message || '生成失败');
                 } else if (type === 'queue') {
@@ -3038,11 +3042,14 @@ async function retryMissingVideos(slots) {
             label: `retry-missing-videos`,
             signal: controller.signal,
             onEvent: (type, evData) => {
+                if (type === 'video_done') {
+                    renderVideoSlotDone(evData.index, evData.video, ownerIdea);
+                    return;
+                }
                 if (!isViewingIdea(ownerIdea.id)) return;
                 if (type === 'video_start') {
                     meta.textContent = `正在生成视频: 正在处理第 ${evData.index} 段视频...`;
-                } else if (type === 'video_done') {
-                    renderVideoSlotDone(evData.index, evData.video);
+
                 } else if (type === 'video_error') {
                     renderVideoSlotFailed(evData.index, evData.message || '生成失败', '生成失败', true);
                 } else if (type === 'queue') {

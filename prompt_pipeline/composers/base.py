@@ -18,6 +18,7 @@
 """
 
 import json
+import re
 import sys
 
 import prompt_pipeline as pp
@@ -351,6 +352,70 @@ Instructions:
         新的 profile 违规，而不是照单全收地把稿子判死。"""
         return []
 
+    @staticmethod
+    def patch_milestone_video_prompt(video_prompt, beat):
+        """确定性补齐 VIDEO 里程碑骨架中缺失的起首动作、进度线与物料流向。
+        避免因细微关键词遗漏触发沉重的多轮网络回炉或退回单拍重试。"""
+        if not isinstance(beat, dict) or beat.get('operation') in ('threshold', 'reward') \
+                or beat.get('bridge_stage') or beat.get('hard_cut'):
+            return video_prompt
+        v = video_prompt or ''
+        additions = []
+        before = beat.get('before_state')
+        if before and not pp._field_has_keyword_overlap(v, before):
+            additions.append(f'In the opening frame, the visible state is {before}.')
+        prim = beat.get('primary_progress')
+        if prim and not pp._field_has_keyword_overlap(v, prim, minimum=2):
+            additions.append(f'The primary progression shows {prim}.')
+        sec = beat.get('secondary_progress')
+        if sec and not pp._field_has_keyword_overlap(v, sec, minimum=2):
+            additions.append(f'Simultaneously, secondary progress shows stock materials: {sec}.')
+        after = beat.get('after_state')
+        if after and not pp._field_has_keyword_overlap(v, after, minimum=2):
+            additions.append(f'By the final moment, {after}.')
+        low = v.lower()
+        if not re.search(r'\b(first|very first|at t=0|initial)\b', low):
+            additions.append('At the opening instant, the first effective tool contact begins.')
+        if not re.search(r'\b(repeated|repeatedly|cycles|cycle by cycle|one by one|course by course|row by row)\b', low):
+            additions.append('Repeated work cycles continue cycle by cycle.')
+        if not re.search(r'\b(stock|bundle|stack|crate|bucket|barrow|carrier|container|pile|rack|bag|tray|source|carried in|delivered)\b', low):
+            additions.append('Materials are drawn from a stock container and carried along a movement path.')
+        if additions:
+            v = v.rstrip()
+            if v and not v.endswith(('.', '!', '?')):
+                v += '.'
+            v = f"{v} {' '.join(additions)}".strip()
+        return v
+
+    @staticmethod
+    def patch_milestone_image_prompt(image_prompt, beat):
+        """确定性补齐 IMAGE 里程碑骨架中缺失的产品锚点、收工状态、全域覆盖及持久痕迹。"""
+        if not isinstance(beat, dict) or beat.get('operation') in ('threshold', 'reward') \
+                or beat.get('bridge_stage') or beat.get('hard_cut'):
+            return image_prompt
+        im = image_prompt or ''
+        additions = []
+        mname = beat.get('milestone_name')
+        if mname and not pp._field_has_keyword_overlap(im, mname):
+            additions.append(f'The finished scene centers on the {mname}.')
+        after = beat.get('after_state')
+        if after and not pp._field_has_keyword_overlap(im, after, minimum=2):
+            additions.append(f'The completed visible state reveals {after}.')
+        extent = beat.get('completion_extent')
+        if extent and not pp._field_has_keyword_overlap(im, extent):
+            additions.append(f'Across the full area: {extent}.')
+        declared = [t for t in (beat.get('persistent_traces') or []) if str(t).strip()]
+        missing = [t for t in declared if not pp._field_has_keyword_overlap(im, t)]
+        req = min(2, len(declared))
+        if len(declared) - len(missing) < req and missing:
+            additions.append(f'Persistent contact traces remain visibly embedded: {", ".join(missing[:req])}.')
+        if additions:
+            im = im.rstrip()
+            if im and not im.endswith(('.', '!', '?')):
+                im += '.'
+            im = f"{im} {' '.join(additions)}".strip()
+        return im
+
     def repair_beat_prompts(self, config, i, v_p, i_p, contract, packet, beat_ladder,
                             parsed_traces, prev_image, structural, style_errs, reworked,
                             log_prefix):
@@ -371,6 +436,10 @@ Instructions:
         """
         beat = contract['beat']
         image_reworked = None
+
+        # 先做确定性里程碑就地对齐：补齐次要材料线、起首动作或痕迹点缀，避免非必要网络回炉
+        v_p = self.patch_milestone_video_prompt(v_p, beat)
+        i_p = self.patch_milestone_image_prompt(i_p, beat)
 
         milestone_video_errs = pp.check_milestone_video_prompt(v_p, beat)
         milestone_image_errs = pp.check_milestone_image_prompt(i_p, beat)
@@ -543,12 +612,14 @@ Instructions:
             # 硬门没过、但已经是**真实稿**的最好一版（里程碑措辞差几条，不含终帧倒退）。
             # 全部重试用完后拿它兜底，见下面 best_effort 的采纳分支。
             best_effort = None
+            last_failure_reason = ''
 
             for attempt in range(max(0, int(config.get('composeBatchRetryCount', 1))) + 1):
+                pp._raise_if_cancelled(on_progress)
                 request_started = pp.time.time()
                 try:
-                    pp._raise_if_cancelled(on_progress)
-                    resp = pp._chat(config, beat_system, beat_user, temperature=0.8, timeout=90)
+                    timeout_sec = int(config.get('composeRequestTimeoutSeconds', 45))
+                    resp = pp._chat(config, beat_system, beat_user, temperature=0.8, timeout=timeout_sec)
                     config.setdefault('_compose_request_timings', []).append({
                         'kind': 'single', 'beat': i, 'attempt': attempt + 1,
                         'started_at': request_started, 'ended_at': pp.time.time(),
@@ -558,6 +629,9 @@ Instructions:
                     v_p = secs.get('===VIDEO===', '').strip()
                     i_p = secs.get('===IMAGE===', '').strip()
                     if not (v_p and i_p):
+                        missing = [name for name, value in (('VIDEO', v_p), ('IMAGE', i_p)) if not value]
+                        last_failure_reason = 'LLM response missing required sections: ' + ', '.join(missing)
+                        config['_compose_request_timings'][-1]['failure_reason'] = last_failure_reason
                         if sys.stdout:
                             print(f"[DEBUG] Beat {i} attempt {attempt+1}: response missing VIDEO/IMAGE sections, retrying.")
                         continue
@@ -630,6 +704,7 @@ Instructions:
                     hard_gate_errors = list(dict.fromkeys(
                         remaining_milestone_errors + payoff_blocking))
                     if hard_gate_errors:
+                        last_failure_reason = '; '.join(hard_gate_errors)
                         if sys.stdout:
                             print(f"[DIRECT] Beat {i} 硬门仍未通过，重试整拍: {hard_gate_errors}")
                         # 终帧倒退不留后路（整条序列最贵的失败）；纯里程碑措辞差的这版
@@ -669,6 +744,7 @@ Instructions:
                         f"shipping placeholder output. Fix the bug rather than retrying."
                     ) from e
                 except Exception as e:
+                    last_failure_reason = str(e) or type(e).__name__
                     config.setdefault('_compose_request_timings', []).append({
                         'kind': 'single', 'beat': i, 'attempt': attempt + 1,
                         'started_at': request_started, 'ended_at': pp.time.time(),
@@ -705,6 +781,8 @@ Instructions:
                 if not allow_placeholders:
                     raise pp.ComposeFailure(
                         f"Beat {i} failed prompt generation; validated checkpoint retained. "
+                        f"Cause: {last_failure_reason or 'No complete IMAGE/VIDEO prompt pair was produced'}. "
+                        "Retry to resume from the retained checkpoint. "
                         "Production mode forbids placeholder IMAGE/VIDEO prompts.",
                         'BEAT_GENERATION_FAILED')
                 fallback_count += 1
@@ -820,7 +898,7 @@ Instructions:
                     'beat_start': batch_beats[0], 'beat_end': batch_beats[-1],
                     'attempt': 1, 'attempt_total': 2,
                     'elapsed_seconds': 0,
-                    'deadline_remaining_seconds': int(config.get('composeRequestTimeoutSeconds', 120)),
+                    'deadline_remaining_seconds': int(config.get('composeRequestTimeoutSeconds', 45)),
                 })
             if sys.stdout:
                 print(f"[DEBUG] Step 5: Batch-composing window {batch_index}/{len(batch_windows)} "
@@ -828,7 +906,7 @@ Instructions:
             pp._raise_if_cancelled(on_progress)
             def _request_batch():
                 retry_count = max(0, int(config.get('composeBatchRetryCount', 1)))
-                timeout_seconds = int(config.get('composeRequestTimeoutSeconds', 120))
+                timeout_seconds = int(config.get('composeRequestTimeoutSeconds', 45))
                 last_error = None
                 for attempt in range(retry_count + 1):
                     started = pp.time.time()
@@ -989,12 +1067,16 @@ Instructions:
                 remaining_milestone_errors = (
                     pp.check_milestone_video_prompt(v_p, contract['beat'])
                     + pp.check_milestone_image_prompt(i_p, contract['beat']))
+                if remaining_milestone_errors:
+                    v_p = self.patch_milestone_video_prompt(v_p, contract['beat'])
+                    i_p = self.patch_milestone_image_prompt(i_p, contract['beat'])
+                    remaining_milestone_errors = (
+                        pp.check_milestone_video_prompt(v_p, contract['beat'])
+                        + pp.check_milestone_image_prompt(i_p, contract['beat']))
                 payoff_blocking = pp.payoff_blocking_residual(residual, contract['is_last'])
                 if style_errs and sys.stdout:
                     print(f"[DIRECT] Batch beat {i} 校验有瑕疵（直出模式仅记录，不重写）: {style_errs}")
-                # 同上：批量稿的硬门也只有里程碑骨架 + 终帧倒退两类。把整份 residual
-                # 算进来会让批量结果几乎全军覆没、每拍都退回单拍通路重做（实测 10/10 拍
-                # 都走了「Individually composing」），是撞硬时限的主要成本来源。
+                # 同上：批量稿已有完整内容，硬门仅阻断终帧严重倒退（payoff_blocking）及彻底无法修复的里程碑硬伤
                 hard_gate_errors = list(dict.fromkeys(
                     remaining_milestone_errors + payoff_blocking))
                 if not hard_gate_errors:

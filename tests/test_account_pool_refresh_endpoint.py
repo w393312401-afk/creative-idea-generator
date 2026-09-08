@@ -51,8 +51,8 @@ class _Pool:
         self.entry = entry
         self.calls = []
 
-    def refresh_credit(self, user_id, force=False):
-        self.calls.append((user_id, force))
+    def refresh_credit(self, user_id, force=False, ignore_backoff=False):
+        self.calls.append((user_id, force, ignore_backoff))
         return self.entry
 
 
@@ -91,7 +91,8 @@ class TestRefreshAdmission:
         body, status = sent[0]
         assert status == 200
         assert body['account']['credit'] == 1050
-        assert pool.calls == [('u1', True)]
+        # ignore_backoff=True：人亲手点的「立即探测」必须真探，不受失败退避约束。
+        assert pool.calls == [('u1', True, True)]
 
     def test_same_account_probe_already_running_is_not_queued_twice(self, monkeypatch):
         monkeypatch.setattr(server, 'FX_CONTROL', _Control([

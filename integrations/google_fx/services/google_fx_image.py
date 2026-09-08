@@ -23,6 +23,7 @@ from ..models import ImageBatchRequest
 from ..utils.logger import log
 from ..utils.browser import (
     random_sleep, clean_path, ensure_flow_workspace, _flow_project_crashed,
+    FLOW_HOME_URL, is_flow_url, is_flow_project_url, flow_project_id,
 )
 from ..utils.ui_helpers import inject_batch_image_observer
 from ..utils import account_binding, cancel_flag, media_ledger
@@ -59,6 +60,7 @@ from .google_fx_helpers import (
     fx_pacing_bounds,
     note_fx_submit,
     _click_new_project_button,
+    _FLOW_TILE_JS,
 )
 
 
@@ -172,17 +174,24 @@ def _record_current_generation_failure(reason):
 
 
 def _flow_project_id(url):
-    """Return the ``/project/<id>`` segment of a Flow URL, or "" when route-less."""
-    match = re.search(r"/project/([^/?#]+)", str(url or ""))
-    return match.group(1).strip().lower() if match else ""
+    """这张 Flow 画布的项目 id；不是画布就返回 ""。
+
+    以前这里只认 `/project/<id>`。新版 Flow 的项目页实测也出现过直接挂在根下的
+    `flow.google.com/<uuid>` 形状，那种地址在这里取不到 id，于是
+    `_open_image_flow_canvas` 明明开出了画布也只回传 None，调用方记不下
+    project_url，下一批只能重新开一张——同一组任务因此每批一张新画布，i2i 续链
+    每批断一次、参考图每批重传。判据现在与"新建项目成功确认"（helpers）、
+    "本批次项目页记录"（video）共用 utils.browser 的同一个函数。
+    """
+    return flow_project_id(url)
 
 
 def _canvas_media_tile_count(page):
     """How many media tiles the canvas currently shows; -1 when unknown."""
     try:
-        return int(page.evaluate("""() => {
+        return int(page.evaluate("() => {" + _FLOW_TILE_JS + """
             let count = 0;
-            for (const tile of document.querySelectorAll('div[data-tile-id]')) {
+            for (const tile of sparkTiles()) {
                 if (tile.querySelector('img, video')) count += 1;
             }
             return count;
@@ -206,7 +215,7 @@ def _create_fresh_flow_canvas(page, stale_url=""):
     stale_project = _flow_project_id(stale_url)
     try:
         page.goto(
-            "https://labs.google/fx/tools/flow",
+            FLOW_HOME_URL,
             timeout=60000,
             wait_until="domcontentloaded",
         )
@@ -319,7 +328,7 @@ def _open_image_flow_canvas(page, requested_project_url=None, require_fresh_canv
     task leave it False and keep reusing the canvas they established.
     """
     requested_project_url = str(requested_project_url or "").strip()
-    target_url = requested_project_url or "https://labs.google/fx/tools/flow"
+    target_url = requested_project_url or FLOW_HOME_URL
     current_url = str(getattr(page, "url", "") or "")
 
     if require_fresh_canvas and not requested_project_url:
@@ -339,10 +348,13 @@ def _open_image_flow_canvas(page, requested_project_url=None, require_fresh_canv
     # test used to accept the previous task's `/fx/tools/flow/project/<id>` as a
     # "restored workspace" and bind it to the new task (2026-08-05 事故).  Only a
     # route-less workspace may be adopted without an explicit request.
+    # 判"是不是某张画布"必须走 is_flow_project_url：新版 Flow 的项目页可能是
+    # flow.google.com/<uuid>（没有 /project/ 这一段），拿子串判会把上一个任务的
+    # 画布重新认成"工作台首页"就地采纳——正是 08-05 那条串图路径。
     restored_workspace = bool(
         not requested_project_url
-        and "/fx/tools/flow" in current_url
-        and "/project/" not in current_url
+        and is_flow_url(current_url)
+        and not is_flow_project_url(current_url)
     )
     if same_project or restored_workspace:
         # 刚跑完上一帧的画布常常还在收尾（结果 tile 挂载、编辑器重挂），此刻
@@ -361,7 +373,7 @@ def _open_image_flow_canvas(page, requested_project_url=None, require_fresh_canv
         if editor is not None:
             current_url = str(getattr(page, "url", "") or "")
             log("♻️ 复用当前标签页里已打开的 Flow 画布（不刷新、不新建）", "GoogleFX")
-            return current_url if "/project/" in current_url else None
+            return current_url if is_flow_project_url(current_url) else None
 
     # _connect_fx_page() has already entered the Flow workspace.  The normal
     # workspace home has a visible "New project" button but no prompt editor.
@@ -373,7 +385,7 @@ def _open_image_flow_canvas(page, requested_project_url=None, require_fresh_canv
         created = _click_new_project_button(page)
         if created or _find_fx_prompt_input(page, announce=False) is not None:
             current_url = str(getattr(page, "url", "") or "")
-            return current_url if "/project/" in current_url else None
+            return current_url if is_flow_project_url(current_url) else None
 
         # The page may still be a product landing/onboarding screen.  Let the
         # shared workspace entry routine finish that transition, then retry the
@@ -381,11 +393,11 @@ def _open_image_flow_canvas(page, requested_project_url=None, require_fresh_canv
         if ensure_flow_workspace(page, timeout_seconds=30):
             if _find_fx_prompt_input(page, announce=False) is not None:
                 current_url = str(getattr(page, "url", "") or "")
-                return current_url if "/project/" in current_url else None
+                return current_url if is_flow_project_url(current_url) else None
             created = _click_new_project_button(page)
             if created or _find_fx_prompt_input(page, announce=False) is not None:
                 current_url = str(getattr(page, "url", "") or "")
-                return current_url if "/project/" in current_url else None
+                return current_url if is_flow_project_url(current_url) else None
         raise RuntimeError(
             "FLOW_CANVAS_UNAVAILABLE: Flow 工作台已打开，但无法进入或新建可用画布"
         )
@@ -395,7 +407,7 @@ def _open_image_flow_canvas(page, requested_project_url=None, require_fresh_canv
         # 换到一块空白新画布上）。
         landed = _enter_bound_project(page, requested_project_url)
         if landed is not None:
-            return landed if "/project/" in landed else None
+            return landed if is_flow_project_url(landed) else None
         # A persisted project can be deleted, expire, or become inaccessible to
         # the same account.  The local reference files are durable and will be
         # uploaded into a replacement canvas below, so a dead project URL must
@@ -434,7 +446,7 @@ def _open_image_flow_canvas(page, requested_project_url=None, require_fresh_canv
             )
 
     current_url = str(getattr(page, "url", "") or "")
-    return current_url if "/project/" in current_url else None
+    return current_url if is_flow_project_url(current_url) else None
 
 
 def _extract_media_uuid(value):
@@ -450,12 +462,16 @@ def _is_blocked_media_candidate(url, blocked_uuids):
     return bool(media_uuid and media_uuid in blocked)
 
 
-def _absolute_media_url(src):
+def _absolute_media_url(src, page_url=""):
     """把 tile 扫描拿到的 img src 转成服务端可下载的绝对 URL；取不到就返回 ""。
 
-    只有两种 src 能下载：已经是绝对的 http(s)，以及「/」开头的 labs.google 站内相对
-    路径。`blob:` / `data:image/` 是页面内存对象，_download_image 那边的 requests /
+    只有两种 src 能下载：已经是绝对的 http(s)，以及「/」开头的站内相对路径。
+    `blob:` / `data:image/` 是页面内存对象，_download_image 那边的 requests /
     browser fetch 都取不到——而 tile 扫描的 looksLikeMedia 现在恰恰会放它们进来。
+
+    站内相对路径的前缀必须取**当前页面所在站点**，不能写死 labs.google：
+    Flow 2026-09-05 搬到 flow.google.com 之后，写死旧域名会拼出一个跨站地址，
+    带的还是旧站 cookie，下载必然失败（表现为"图生成了却落不了盘"）。
     """
     src = str(src or "").strip()
     if not src:
@@ -464,8 +480,18 @@ def _absolute_media_url(src):
     if lowered.startswith("http://") or lowered.startswith("https://"):
         return src
     if src.startswith("/"):
-        return f"https://labs.google{src}"
+        return _flow_site_origin(page_url) + src
     return ""
+
+
+def _flow_site_origin(page_url=""):
+    """当前 Flow 页面的 scheme://host；取不到就退回新版站点主页。"""
+    candidate = str(page_url or "").strip()
+    if is_flow_url(candidate):
+        match = re.match(r"^(https?://[^/]+)", candidate)
+        if match:
+            return match.group(1)
+    return FLOW_HOME_URL.rstrip("/")
 
 
 def _is_generated_candidate_stable(submit_ts, *, now=None, confirmed_new_tile=False):
@@ -864,10 +890,13 @@ def _generate_images_batch_google_fx_single_attempt(req: ImageBatchRequest):
                         log(f"  ⚠️ Canvas解码失败: {e}", "GoogleFX")
                         return None
 
-                # ── labs.google URL (getMediaUrlRedirect) 需要 cookie → 用 browser fetch ──
+                # ── Flow 站内 URL (getMediaUrlRedirect) 需要 cookie → 用 browser fetch ──
                 # ── 其他非 http URL → 也用 browser fetch ──
+                # 判据走 is_flow_url（新旧域名都认）：只认 labs.google 的话，
+                # flow.google.com 的 getMediaUrlRedirect 会被当成公开直链交给
+                # requests，无 cookie 必然 302 到登录页或 403。
                 use_browser_fetch = (
-                    "labs.google" in img_url
+                    is_flow_url(img_url)
                     or not img_url.startswith("http")
                 )
 
@@ -885,7 +914,7 @@ def _generate_images_batch_google_fx_single_attempt(req: ImageBatchRequest):
                         log(f"  ⚠️ 直链下载失败，降级 browser fetch: {e}", "GoogleFX")
                         use_browser_fetch = True
 
-                # ── browser fetch (带 cookie，适用于 labs.google 及直链失败的兜底) ──
+                # ── browser fetch (带 cookie，适用于 Flow 站内 URL 及直链失败的兜底) ──
                 if use_browser_fetch:
                     try:
                         b64_data = page.evaluate("""async (url) => {
@@ -910,7 +939,7 @@ def _generate_images_batch_google_fx_single_attempt(req: ImageBatchRequest):
             def _scan_new_result_tiles(known_tile_ids=None):
                 """一次 evaluate 同时取回「新 tile 里的媒体」「全页媒体 src」「新 tile 是否已报错」。"""
                 try:
-                    result = page.evaluate("""(beforeIds) => {
+                    result = page.evaluate("(beforeIds) => {" + _FLOW_TILE_JS + """
                         const before = new Set(beforeIds || []);
                         const rows = [];
                         const mediaSrcs = [];
@@ -940,8 +969,8 @@ def _generate_images_batch_google_fx_single_attempt(req: ImageBatchRequest):
                             return true;
                         };
 
-                        for (const tile of document.querySelectorAll('div[data-tile-id]')) {
-                            const tileId = tile.getAttribute('data-tile-id') || '';
+                        for (const tile of sparkTiles()) {
+                            const tileId = sparkTileId(tile);
                             if (!tileId || before.has(tileId)) continue;
 
                             for (const img of tile.querySelectorAll('img')) {
@@ -1110,7 +1139,7 @@ def _generate_images_batch_google_fx_single_attempt(req: ImageBatchRequest):
                     """
                     before_ids = known_tile_ids if known_tile_ids is not None else known_tile_ids_before_submit
                     try:
-                        result = page.evaluate("""(beforeIds) => {
+                        result = page.evaluate("(beforeIds) => {" + _FLOW_TILE_JS + """
                             const before = new Set(beforeIds || []);
                             const rows = [];
                             const mediaSrcs = [];
@@ -1140,8 +1169,8 @@ def _generate_images_batch_google_fx_single_attempt(req: ImageBatchRequest):
                                 return true;
                             };
 
-                            for (const tile of document.querySelectorAll('div[data-tile-id]')) {
-                                const tileId = tile.getAttribute('data-tile-id') || '';
+                            for (const tile of sparkTiles()) {
+                                const tileId = sparkTileId(tile);
                                 if (!tileId || before.has(tileId)) continue;
 
                                 for (const img of tile.querySelectorAll('img')) {
@@ -1285,7 +1314,8 @@ def _generate_images_batch_google_fx_single_attempt(req: ImageBatchRequest):
                     # 再出现一次，所以这里不 return、继续往下走本轮的路径C 和等待。
                     for row in acceptable_rows:
                         new_src = row["src"]
-                        full_url = _absolute_media_url(new_src)
+                        full_url = _absolute_media_url(
+                            new_src, getattr(page, "url", ""))
                         if not full_url:
                             if new_src not in ignored_candidates:
                                 ignored_candidates.add(new_src)
@@ -1462,7 +1492,8 @@ def _generate_images_batch_google_fx_single_attempt(req: ImageBatchRequest):
                         if src and src not in known_dom_srcs:
                             m_uuid = _extract_media_uuid(src)
                             if m_uuid and m_uuid not in seen_uuids and not _is_blocked_media_candidate(src, blocked_media_uuids):
-                                full_url = _absolute_media_url(src)
+                                full_url = _absolute_media_url(
+                                    src, getattr(page, "url", ""))
                                 if full_url:
                                     seen_uuids.add(m_uuid)
                                     collected.append(full_url)
@@ -1507,10 +1538,8 @@ def _generate_images_batch_google_fx_single_attempt(req: ImageBatchRequest):
 
                 random_sleep(1.0, 2.0)
                 try:
-                    pre_submit_tile_ids = set(page.evaluate("""() => {
-                        return Array.from(document.querySelectorAll('div[data-tile-id]'))
-                            .map(card => card.getAttribute('data-tile-id') || '')
-                            .filter(Boolean);
+                    pre_submit_tile_ids = set(page.evaluate("() => {" + _FLOW_TILE_JS + """
+                        return sparkTiles().map(sparkTileId).filter(Boolean);
                     }"""))
                 except Exception:
                     pre_submit_tile_ids = set()
@@ -1605,7 +1634,7 @@ def _generate_images_batch_google_fx_single_attempt(req: ImageBatchRequest):
                     result["message"] = f"成功生成 {len(local_paths)} 张候选图"
                     try:
                         final_url = str(getattr(page, "url", "") or "")
-                        if "/project/" in final_url:
+                        if is_flow_project_url(final_url):
                             result["project_url"] = final_url
                             req.project_url = final_url
                     except Exception:
@@ -1728,10 +1757,8 @@ def _generate_images_batch_google_fx_single_attempt(req: ImageBatchRequest):
                 random_sleep(1.2, 2.8)
 
                 try:
-                    pre_submit_tile_ids = set(page.evaluate("""() => {
-                        return Array.from(document.querySelectorAll('div[data-tile-id]'))
-                            .map(card => card.getAttribute('data-tile-id') || '')
-                            .filter(Boolean);
+                    pre_submit_tile_ids = set(page.evaluate("() => {" + _FLOW_TILE_JS + """
+                        return sparkTiles().map(sparkTileId).filter(Boolean);
                     }"""))
                 except Exception as e:
                     log(f"  ⚠️ 记录提交前 tile 基线失败: {type(e).__name__}", "GoogleFX")
@@ -1900,7 +1927,7 @@ def _generate_images_batch_google_fx_single_attempt(req: ImageBatchRequest):
 
     try:
         final_url = str(getattr(page, "url", "") or "")
-        if "/project/" in final_url:
+        if is_flow_project_url(final_url):
             result["project_url"] = final_url
             req.project_url = final_url
     except Exception:

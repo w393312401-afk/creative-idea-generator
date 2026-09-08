@@ -116,9 +116,20 @@ def test_recover_creates_a_page_only_when_every_tab_is_dead():
 # ── P1-4: tile 扫描接受 blob:/data: 后，绝对化拼接会拼出无法下载的垃圾 URL ────
 
 def test_relative_flow_path_is_absolutized():
+    """站内相对路径拼的是**当前页面所在站点**，不是写死的旧域名。
+
+    2026-09-05 Flow 搬到 flow.google.com 之后，写死 labs.google 会拼出一个跨站
+    地址、带错 cookie，下载必然失败（表现为"图生成了却落不了盘"）。
+    """
+    rel = "/fx/api/trpc/media.getMediaUrlRedirect?name=abc"
     assert image_service._absolute_media_url(
-        "/fx/api/trpc/media.getMediaUrlRedirect?name=abc"
-    ) == "https://labs.google/fx/api/trpc/media.getMediaUrlRedirect?name=abc"
+        rel, "https://labs.google/fx/tools/flow/project/a"
+    ) == "https://labs.google" + rel
+    assert image_service._absolute_media_url(
+        rel, "https://flow.google.com/project/a"
+    ) == "https://flow.google.com" + rel
+    # 页面 URL 拿不到时退回新站，而不是退回已经搬走的旧站。
+    assert image_service._absolute_media_url(rel) == "https://flow.google.com" + rel
 
 
 def test_absolute_url_is_passed_through():

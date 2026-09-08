@@ -72,10 +72,10 @@ ROLE_RANK: Dict[str, int] = {r: i for i, r in enumerate(ROLE_ORDER)}
 # 排在笼统的前面**：`floor batten` 必须在 `floor` 之前，否则龙骨会被读成成品地面，
 # 依赖检查会认为地面比保温层还早，整条梯子判死。
 _ROLE_CUES: List[tuple] = [
-    ('demolition', r'demolit|strip[- ]out|tear[- ]out|clear(?:ing)?\s+debris|dewater|de-water|rubble|dismantl|remov(?:e|es|ed|al)|lifts?\s+away|clears?\s+away|破拆|清场|拆除|排水'),
+    ('demolition', r'demolit|excavat|strip[- ]out|tear[- ]out|clear(?:ing)?\s+debris|dewater|de-water|rubble|dismantl|remov(?:e|es|ed|al)|lifts?\s+away|clears?\s+away|破拆|清场|拆除|排水|开挖|开凿|掏凿'),
     ('batten',     r'\b(?:floor\s+)?(?:batten|sleeper|noggin|furring|joist\s+grid)s?\b|龙骨|木楞|搁栅'),
     ('subfloor',   r'sub-?floor|sub-?base|aggregate|hardcore|screed|levelling\s+layer|leveling\s+layer|ballast|垫层|找平|碎石|级配'),
-    ('membrane',   r'vapou?r\s+barrier|damp[- ]proof|waterproof|membrane|防潮|防水卷材|隔汽'),
+    ('membrane',   r'vapou?r\s+barrier|damp[- ]proof|waterproof|radiant\s+barrier|reflective\s+barrier|barrier\s+foil|foil\s+membrane|membrane|防潮|防水卷材|隔汽|隔热膜|辐射阻隔|反辐射'),
     ('insulation', r'insulat|rockwool|mineral\s+wool|batt\b|aerogel|保温|岩棉'),
     ('sheathing',  r'sheathing|plywood|osb|backing\s+(?:board|panel)|基层板|衬板'),
     ('flooring',   r'floorboard|tongue[- ]and[- ]groove\s+floor|finish\s+floor|hardwood\s+floor|地板铺装|成品地面'),
@@ -84,14 +84,14 @@ _ROLE_CUES: List[tuple] = [
     ('window',     r'\bwindows?\b|glazing|glazed|窗'),
     ('door',       r'\bdoors?\b|door\s+lea(?:f|ves)|门扇|挂门'),
     ('opening',    r'\bopenings?\b|apertures?|cut-?outs?|洞口|开洞'),
-    ('structure',  r'\bframe|framing|portal|arch|stud|rafter|truss|beam|column|upright|骨架|框架|立柱|梁|拱'),
+    ('structure',  r'\bframe|framing|portal\s+(?:frame|arch)|arch|stud|rafter|truss|beam|column|upright|骨架|框架|立柱|梁|拱'),
     ('service',    r'conduit|wiring|electric|plumb|duct|rough-?in|junction\s+box|管线|布线|水电'),
     ('coating',    r'passivat|sealer|clear\s+coat|varnish|paint|stain|oil\s+finish|涂层|上漆|封闭剂'),
     ('paving',     r'flagstone|paver|patio|landing|walkway|apron|铺装|石板|露台'),
+    ('hero',       r'\breveal\b|hero|final\s+shot|reward|终极|揭示'),
     ('heating',    r'stove|hearth|flue|chimney|fireplace|炉|烟囱|壁炉'),
     ('cabinetry',  r'cabinet|joinery|worktop|countertop|kitchenette|shelving|bench|橱柜|台面|操作台'),
     ('furnishing', r'furnish|mattress|bed\s+platform|textile|styling|soft\s+goods|软装|床|陈设'),
-    ('hero',       r'\breveal\b|hero|final\s+shot|终极|揭示'),
     ('site',       r'\bsite\b|ground|terrain|excavat|场地|地表|开挖'),
 ]
 
@@ -106,7 +106,7 @@ _STAGE_TO_ROLE = {
     'surface': 'cladding', 'paneling': 'sheathing', 'drywall': 'sheathing',
     'floor': 'flooring', 'flooring': 'flooring',
     'fixtures': 'cabinetry', 'furnishing': 'furnishing',
-    'reveal': 'hero', 'lighting': 'service',
+    'reveal': 'hero', 'reward': 'hero', 'lighting': 'service',
 }
 
 

@@ -14,12 +14,28 @@ class TestCoverConcurrency(unittest.TestCase):
         self.tmp_dir = tempfile.mkdtemp()
         self.old_output_root = server_common.OUTPUT_ROOT
         server_common.OUTPUT_ROOT = self.tmp_dir
+        self.old_tasks_dir = server_common.TASKS_DIR
+        self.tasks_dir = os.path.join(self.tmp_dir, "tasks")
+        os.makedirs(self.tasks_dir, exist_ok=True)
+        server_common.TASKS_DIR = self.tasks_dir
+        if hasattr(server, 'TASKS_DIR'):
+            self.old_server_tasks_dir = server.TASKS_DIR
+            server.TASKS_DIR = self.tasks_dir
+        else:
+            self.old_server_tasks_dir = None
+        self.orig_active_tasks = dict(server_common.ACTIVE_TASKS)
+        server_common.ACTIVE_TASKS.clear()
         self.project_key = "test_concurrent_cover_project"
         self.project_dir = os.path.join(self.tmp_dir, self.project_key)
         os.makedirs(self.project_dir, exist_ok=True)
 
     def tearDown(self):
         server_common.OUTPUT_ROOT = self.old_output_root
+        server_common.TASKS_DIR = self.old_tasks_dir
+        if self.old_server_tasks_dir is not None:
+            server.TASKS_DIR = self.old_server_tasks_dir
+        server_common.ACTIVE_TASKS.clear()
+        server_common.ACTIVE_TASKS.update(self.orig_active_tasks)
         shutil.rmtree(self.tmp_dir, ignore_errors=True)
 
     def test_concurrent_cover_worker_generates_multiple_candidates(self):

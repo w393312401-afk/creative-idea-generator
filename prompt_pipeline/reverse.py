@@ -19,6 +19,7 @@ banned_elements 里本该出现的东西反而被写进了 beats。
 """
 
 import copy
+import hashlib
 import json
 import math
 import os
@@ -1067,7 +1068,10 @@ def extract_frame_facts(config, job_dir, on_progress=None, degraded=False,
             pp._raise_if_cancelled(on_progress)
             try:
                 return _ask(batch, max_tokens=4096, timeout=180)
-            except (ValueError, pp.ResponseTruncated):
+            except pp.ResponseTruncated:
+                if len(batch) > 1 or remaining == 0:
+                    break
+            except ValueError:
                 if remaining == 0:
                     break
 
@@ -1100,7 +1104,10 @@ def extract_frame_facts(config, job_dir, on_progress=None, degraded=False,
                         bisection_salvaged.update(sub_res)
                         sub_ok = True
                         break
-                    except (ValueError, pp.ResponseTruncated):
+                    except pp.ResponseTruncated:
+                        if len(sub_batch) > 1 or sub_rem == 0:
+                            break
+                    except ValueError:
                         if sub_rem == 0:
                             break
                 if not sub_ok:
@@ -1274,22 +1281,43 @@ def verify_peak_frames(config, job_dir, facts_payload, on_progress=None):
     if not peak_names:
         return facts_payload
 
+    # Independent of Pass A: a restart must not pay again for successful ROI reads.
+    # Content hashes invalidate overwritten frames even if their names are reused.
+    cache_path = os.path.join(job_dir, '.peak_facts_cache.json')
+    try:
+        with open(cache_path, encoding='utf-8') as f:
+            peak_cache = json.load(f)
+        if not isinstance(peak_cache, dict):
+            peak_cache = {}
+    except (OSError, ValueError):
+        peak_cache = {}
+    cache_keys = {}
+    for name in peak_names:
+        with open(by_name[name]['frame_path'], 'rb') as f:
+            digest = hashlib.sha256(f.read()).hexdigest()
+        cache_keys[name] = hashlib.sha256(json.dumps(
+            [model, PASS_A_PROMPT_VERSION, _PASS_A_SYSTEM, 'roi512x2-full1024-v1',
+             name, digest], ensure_ascii=False).encode('utf-8')).hexdigest()
+    cached = {n: peak_cache[cache_keys[n]] for n in peak_names
+              if isinstance(peak_cache.get(cache_keys[n]), dict)}
+    pending_peaks = [n for n in peak_names if n not in cached]
+
     # action 让前端把这一段挂到自己的进度区间上：它跟逐帧提取同属 review_frames，
     # 但发生在它之后——共用一个区间的话，"只增不减"的进度条会把它整段吃掉。
     if on_progress:
         on_progress('replica_stage', {
             'stage': 'review_frames',
             'action': 'peak_verify',
-            'message': f'强模型复核 {len(peak_names)} 张事件峰值帧（{model}）',
-            'done': 0,
+            'message': f'强模型复核 {len(peak_names)} 张事件峰值帧（{model}），缓存命中 {len(cached)} 张',
+            'done': len(cached),
             'total': len(peak_names),
         })
 
     clean_config = _scrub_config_for_pass_a(config)
     roi_dir = os.path.join(job_dir, 'roi_patches')
     os.makedirs(roi_dir, exist_ok=True)
-    batches = [peak_names[i:i + _PEAK_BATCH_SIZE]
-               for i in range(0, len(peak_names), _PEAK_BATCH_SIZE)]
+    batches = [pending_peaks[i:i + _PEAK_BATCH_SIZE]
+               for i in range(0, len(pending_peaks), _PEAK_BATCH_SIZE)]
 
     def _run_peak_batch(batch):
         pp._raise_if_cancelled(on_progress)
@@ -1356,10 +1384,17 @@ def verify_peak_frames(config, job_dir, facts_payload, on_progress=None):
                 print(f'[REVERSE] 峰值帧复核失败，这批沿用 Pass A 的读数 {batch}: {e}')
             return {}
 
-    refined = {}
-    peak_done = {'n': 0}
+    refined = dict(cached)
+    peak_done = {'n': len(cached)}
 
     def _on_peak_done(_key, result):
+        if result:
+            for name, fact in result.items():
+                peak_cache[cache_keys[name]] = fact
+            # Called on the parent thread; persist each successful batch for resume.
+            with open(cache_path + '.tmp', 'w', encoding='utf-8') as f:
+                json.dump(peak_cache, f, ensure_ascii=False)
+            os.replace(cache_path + '.tmp', cache_path)
         peak_done['n'] += len(result or {})
         if on_progress:
             on_progress('replica_stage', {

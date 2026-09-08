@@ -2943,7 +2943,7 @@ async function streamVideosProgress(taskId, ownerIdea, targetSlots) {
                 } else if (type === 'video_done') {
                     applyVideoProgress('video_done', data);
                     setMeta(`正在生成视频: ${data.current}/${data.total}...`);
-                    if (isViewing()) renderVideoSlotDone(data.index, data.video);
+                    renderVideoSlotDone(data.index, data.video, ownerIdea);
                 } else if (type === 'video_error') {
                     applyVideoProgress('video_error', data);
                     const msg = (data && data.message) || '生成失败';
