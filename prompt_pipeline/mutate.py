@@ -30,6 +30,8 @@ from .object_ledger import (
     validate_object_ledger,
     diagnose_object_ledger,
     format_violations,
+    get_object_pattern,
+    REGRESSION_VERBS,
 )
 
 # 四大正交轴定义与元数据
@@ -303,6 +305,36 @@ _ROLE_RESULT_ZH = {
 }
 
 
+_ROLE_DEFAULT_OBJECTS: Dict[str, List[str]] = {
+    'structure': ['structural_frame'],
+    'subfloor': ['sub_base'],
+    'membrane': ['vapour_barrier'],
+    'enclosure': ['exterior_cladding'],
+    'opening': ['opening'],
+    'door': ['door_leaf'],
+    'window': ['window'],
+    'batten': ['floor_batten'],
+    'flooring': ['finish_floor'],
+    'heating': ['stove'],
+    'paving': ['paving'],
+    'service': ['conduit'],
+    'cabinetry': ['cabinetry'],
+    'insulation': ['insulation'],
+    'coating': ['protective_coating'],
+    'furnishing': ['furnishing'],
+    'hero': ['hero'],
+}
+
+_ROLE_DEFAULT_INHERITED: Dict[str, List[str]] = {
+    'door': ['structural_frame'],
+    'window': ['structural_frame'],
+    'flooring': ['floor_batten'],
+    'batten': ['vapour_barrier'],
+    'membrane': ['sub_base'],
+    'enclosure': ['structural_frame'],
+}
+
+
 def render_beat_from_role(beat: Dict[str, Any], role: str, pack: MaterialPack,
                           mutation_axes: Dict[str, Any]) -> Dict[str, Any]:
     """从角色 + 材质包重新写出一拍的全部散文字段。"""
@@ -341,10 +373,10 @@ def render_beat_from_role(beat: Dict[str, Any], role: str, pack: MaterialPack,
             f'{material}固定点留存的{pack.fastening[0]}压痕' if pack.fastening else f'{material}固定点压痕',
             f'{material}接缝处留存的施工痕迹',
         ],
-        # 申报的是 role —— 账本会把它展开成这个角色名下的 canonical id
+        # 申报的是 role 或其标准构件 —— 账本会把 role 展开成名下的 canonical id
         # （object_ledger.ROLE_OBJECTS）。读不出角色时不申报：宁可这一拍在账上没有
         # 产出，也不要申报一个连自己都不知道是什么的东西。
-        'produced_objects': [] if role == UNKNOWN_ROLE else [role],
+        'produced_objects': [] if role == UNKNOWN_ROLE else list(_ROLE_DEFAULT_OBJECTS.get(role, [role])),
         'inherited_objects': [],
     }
 
@@ -513,6 +545,254 @@ def _llm_mutate_beats(
     return None
 
 
+_LLM_AUTOFIX_BEATS_SYSTEM = """你是一位精通工程建造因果律的纪录片级视觉短视频创意总监与工程审查专家。
+用户生成的 N 拍建造变体阶梯在「物件账本 (Object Ledger)」校验中触发了硬性阻断违规（依赖倒置、凭空出现或已完工回归）。
+你的任务是根据给定的违规清单，定向修正对应节拍的散文描述、produced_objects 与 inherited_objects，使整条阶梯的物件账 100% 闭合。
+
+【硬性修正原则】：
+1. 依赖倒置纠偏 (Inversion Fix)：
+   - 早期清场/开挖拍（demolition / site / clearing）绝对不得提前描述结构门拱 (portal arch / structural frame)、门窗洞口 (door opening) 或围护构件；必须严格遵循物理工序：
+     清场 (demolition/site) -> 基础骨料垫层 (subfloor) -> 结构骨架 (structure) -> 围护外壳 (enclosure) -> 门窗洞口 (opening) -> 门扇/窗扇 (door/window) -> 防潮层 (membrane) -> 龙骨 (batten) -> 地板 (flooring) -> 软装 (furnishing)。
+   - 被依赖的构件必须排在依赖它的构件前面。
+2. 凭空出现纠偏 (Phantom Fix)：
+   - 任何写在 inherited_objects 或 state_before 中的锚点构件，必须在前序某一拍的 produced_objects 或 visible_result 中被明确建造交付过。
+   - 若某构件从未在前面拍建造过（例如 ceiling_rib / 窗户），严禁将其作为已存在的锚点继承，必须将其从 inherited_objects 和 state_before 中彻底移除，或替换为前面真正建造过的基础地貌/已完工构件。
+3. 已完成回归纠偏 (Regression Fix)：
+   - 前序已经完工找平的构件（如垫层 sub_base），后续拍不得再用耙平、铲平、重新摊铺等回归动词去加工它。
+4. 保持拍数 N 绝对恒定（输入多少拍就输出多少拍，精确 N 拍，Beat 1 到 Beat N，1:1 拓扑对齐）。
+
+【输出格式】：
+严格返回一个 JSON 数组，包含修复后的精确 N 拍对象，无 Markdown 标记，无多余文字：
+[
+  {
+    "id": "B01",
+    "visual_subject": "...",
+    "visible_action": "...",
+    "visible_result": "...",
+    "state_before": "...",
+    "state_after": "...",
+    "visible_details": [...],
+    "persistent_traces": [...],
+    "produced_objects": [...],
+    "inherited_objects": [...]
+  }
+]"""
+
+
+def _autofix_variant_beats_with_llm(
+    config: Optional[Dict[str, Any]],
+    variant_beats: List[Dict[str, Any]],
+    blocking: List[Dict[str, Any]],
+    effective_axes: Dict[str, Any],
+    pack: MaterialPack,
+    source_beats: List[Dict[str, Any]],
+    on_progress: Optional[Any] = None,
+) -> Optional[List[Dict[str, Any]]]:
+    """通过大模型定向反思自愈，闭合物件账本违规项。"""
+    if not config:
+        return None
+
+    import prompt_pipeline as pp
+    from prompt_pipeline.reverse import parse_json_reply
+
+    violations_summary = []
+    for i, v in enumerate(blocking, 1):
+        rule = v.get('rule')
+        beat_idx = v.get('beat')
+        obj = v.get('object')
+        msg = v.get('message')
+        violations_summary.append(f"{i}. [第 {beat_idx} 拍] 规则: {rule} | 物件/角色: {obj} | 问题: {msg}")
+    violations_text = '\n'.join(violations_summary)
+
+    current_summary = []
+    for i, b in enumerate(variant_beats):
+        current_summary.append({
+            'index': i + 1,
+            'id': b.get('id') or f'B{i+1:02d}',
+            'role': b.get('role') or infer_role(source_beats[i] if i < len(source_beats) else {}),
+            'visual_subject': b.get('visual_subject', ''),
+            'visible_action': b.get('visible_action', ''),
+            'visible_result': b.get('visible_result', ''),
+            'state_before': b.get('state_before', ''),
+            'state_after': b.get('state_after', ''),
+            'produced_objects': b.get('produced_objects', []),
+            'inherited_objects': b.get('inherited_objects', []),
+        })
+
+    user_prompt = (
+        f"【本次物件账硬性违规列表（必须 100% 修复闭合）】\n"
+        f"{violations_text}\n\n"
+        f"【四轴材质包设定】\n"
+        f"- 轴 1 环境 (Environment): {effective_axes.get('environment', '')}\n"
+        f"- 轴 2 材质 (Material): {effective_axes.get('material', '')}\n"
+        f"- 轴 3 功能 (Function): {effective_axes.get('function', '')}\n"
+        f"- 轴 4 揭示 (Hero Reveal): {effective_axes.get('hero_reveal', '')}\n"
+        f"{json.dumps(pack.as_dict(), ensure_ascii=False, indent=2)}\n\n"
+        f"【当前 {len(variant_beats)} 拍变体草稿（请重点修复违规涉事拍，其余拍保持原样）】\n"
+        f"{json.dumps(current_summary, ensure_ascii=False, indent=2)}\n\n"
+        f"请直接输出包含精确 {len(variant_beats)} 拍的修复后 JSON 数组。"
+    )
+
+    if on_progress:
+        on_progress('replica_stage', {
+            'stage': 'mutate_beats',
+            'action': 'mutate_orthogonal',
+            'message': f'正在调用 AI 定向反思修复 {len(blocking)} 项物件账硬性违规...',
+            'done': 3,
+            'total': 5,
+        })
+
+    try:
+        raw = pp._chat(
+            config=config,
+            system=_LLM_AUTOFIX_BEATS_SYSTEM,
+            user=user_prompt,
+            temperature=0.3,
+            max_tokens=8192,
+            timeout=90,
+        )
+        parsed = parse_json_reply(raw)
+        if isinstance(parsed, list) and len(parsed) == len(variant_beats):
+            fixed_beats = []
+            for idx, orig in enumerate(variant_beats):
+                merged = copy.deepcopy(orig)
+                patch = parsed[idx] if idx < len(parsed) and isinstance(parsed[idx], dict) else {}
+                for f in ('visual_subject', 'visible_action', 'visible_result', 'state_before', 'state_after'):
+                    if patch.get(f):
+                        val = scrub_carrier_leak(str(patch[f]))
+                        if val:
+                            merged[f] = val
+                if 'produced_objects' in patch and isinstance(patch['produced_objects'], list):
+                    merged['produced_objects'] = [str(x).strip() for x in patch['produced_objects'] if str(x).strip()]
+                if 'inherited_objects' in patch and isinstance(patch['inherited_objects'], list):
+                    merged['inherited_objects'] = [str(x).strip() for x in patch['inherited_objects'] if str(x).strip()]
+                fixed_beats.append(merged)
+            return fixed_beats
+    except Exception as e:
+        if sys.stdout:
+            print(f"[mutate] LLM 定向自愈异常: {e}")
+    return None
+
+
+def _autofix_variant_beats_deterministic(
+    source_beats: List[Dict[str, Any]],
+    variant_beats: List[Dict[str, Any]],
+    blocking: List[Dict[str, Any]],
+    effective_axes: Dict[str, Any],
+    pack: MaterialPack,
+) -> List[Dict[str, Any]]:
+    """通过确定性拓扑与角色映射安全气囊，彻底消除物件账硬性违规。"""
+    fixed_beats = copy.deepcopy(variant_beats)
+
+    for _pass in range(3):
+        violations = validate_object_ledger(fixed_beats)
+        curr_issues = [v for v in violations if v.get('severity') in ('blocking', 'warning')]
+        if not curr_issues:
+            break
+
+        for v in curr_issues:
+            rule = v.get('rule')
+            beat_idx = int(v.get('beat') or 1)
+            if beat_idx < 1 or beat_idx > len(fixed_beats):
+                continue
+            beat = fixed_beats[beat_idx - 1]
+            obj = str(v.get('object') or '')
+
+            if rule == 'phantom':
+                # 1. 从 inherited_objects 中抹去
+                if 'inherited_objects' in beat and isinstance(beat['inherited_objects'], list):
+                    beat['inherited_objects'] = [
+                        x for x in beat['inherited_objects']
+                        if str(x).strip().lower() != obj.lower()
+                        and not (get_object_pattern(obj) and get_object_pattern(obj).search(str(x)))
+                    ]
+                # 2. 从 state_before / 锚点文本中剔除
+                pat = get_object_pattern(obj)
+                for f in ('state_before', 'before_state', 'inherited_state', 'locked_anchors', 'anchors'):
+                    if f in beat and isinstance(beat[f], str):
+                        if pat:
+                            beat[f] = pat.sub('', beat[f])
+                        elif obj:
+                            beat[f] = re.sub(re.escape(obj), '', beat[f], flags=re.I)
+                        cleaned = re.sub(r'[,;，；\s]+', ' ', beat[f]).strip(' ;,，；')
+                        beat[f] = cleaned or '基底清理平整，承接前置工序'
+                # 3. 从 visible_details / persistent_traces 中剔除
+                for f in ('visible_details', 'persistent_traces'):
+                    if f in beat and isinstance(beat[f], list):
+                        cleaned_list = []
+                        for item in beat[f]:
+                            item_str = str(item)
+                            if pat:
+                                item_str = pat.sub('', item_str)
+                            elif obj:
+                                item_str = re.sub(re.escape(obj), '', item_str, flags=re.I)
+                            item_str = re.sub(r'[,;，；\s]+', ' ', item_str).strip(' ;,，；')
+                            if item_str:
+                                cleaned_list.append(item_str)
+                        beat[f] = cleaned_list
+
+            elif rule == 'inversion':
+                src_beat = source_beats[beat_idx - 1] if beat_idx <= len(source_beats) else {}
+                src_role = infer_role(src_beat)
+
+                # 1. 检查是否为硬物件依赖缺失 (HARD_OBJECT_DEPENDENCIES)
+                from prompt_pipeline.object_ledger import HARD_OBJECT_DEPENDENCIES, extract_objects, _produced_text
+                hard_reqs = HARD_OBJECT_DEPENDENCIES.get(obj)
+                if hard_reqs:
+                    prior_produced = set()
+                    for p_b in fixed_beats[:beat_idx - 1]:
+                        prior_produced.update(extract_objects(_produced_text(p_b)))
+
+                    # 若前置依赖从未在前面建造过，不能直接装配 obj，定向清洗该构件
+                    if not any(req in prior_produced for req in hard_reqs):
+                        pat = get_object_pattern(obj)
+                        for f in ('visual_subject', 'visible_action', 'visible_result', 'state_before', 'state_after', 'description', 'operation'):
+                            if f in beat and isinstance(beat[f], str):
+                                if pat:
+                                    beat[f] = pat.sub('', beat[f])
+                                else:
+                                    beat[f] = re.sub(re.escape(obj), '', beat[f], flags=re.I)
+                                cleaned = re.sub(r'[,;，；\s]+', ' ', beat[f]).strip(' ;,，；')
+                                beat[f] = cleaned or '工序衔接与精细校准'
+                        for f in ('visible_details', 'persistent_traces'):
+                            if f in beat and isinstance(beat[f], list):
+                                cleaned_list = []
+                                for item in beat[f]:
+                                    item_str = str(item)
+                                    if pat:
+                                        item_str = pat.sub('', item_str)
+                                    else:
+                                        item_str = re.sub(re.escape(obj), '', item_str, flags=re.I)
+                                    item_str = re.sub(r'[,;，；\s]+', ' ', item_str).strip(' ;,，；')
+                                    if item_str:
+                                        cleaned_list.append(item_str)
+                                beat[f] = cleaned_list
+                        if 'produced_objects' in beat and isinstance(beat['produced_objects'], list):
+                            beat['produced_objects'] = [x for x in beat['produced_objects'] if str(x).lower() != obj.lower()]
+                        if 'inherited_objects' in beat and isinstance(beat['inherited_objects'], list):
+                            beat['inherited_objects'] = [x for x in beat['inherited_objects'] if str(x).lower() != obj.lower()]
+
+                # 2. 若当前拍角色发生倒置或散文为空，使用母本角色标准安全气囊重塑
+                if src_role and (src_role != beat.get('role') or not beat.get('visual_subject')):
+                    fallback = render_beat_from_role(src_beat, src_role, pack, effective_axes)
+                    for f in ('visual_subject', 'visible_action', 'visible_result', 'state_before', 'state_after'):
+                        beat[f] = fallback[f]
+                    beat['visible_details'] = list(fallback['visible_details'])
+                    beat['persistent_traces'] = list(fallback['persistent_traces'])
+                    beat['produced_objects'] = list(fallback['produced_objects'])
+                    beat['inherited_objects'] = list(fallback['inherited_objects'])
+                    beat['role'] = src_role
+                    beat['operation'] = render_beat_title(src_role, pack)
+
+            elif rule == 'regression':
+                act = str(beat.get('visible_action') or '')
+                if REGRESSION_VERBS.search(act):
+                    fixed_act = REGRESSION_VERBS.sub('checks and aligns', act)
+                    beat['visible_action'] = fixed_act
+
+    return fixed_beats
+
+
 def generate_orthogonal_variant(
     baseline_doc: Dict[str, Any],
     mutation_axes: Optional[Dict[str, Any]] = None,
@@ -522,6 +802,8 @@ def generate_orthogonal_variant(
     on_progress: Optional[Any] = None,
     *,
     strict: bool = True,
+    autofix: bool = False,
+    beat_tolerance: int = 0,
 ) -> Dict[str, Any]:
     """通过词槽正交映射与大模型智能重构生成二创变体，严格确保物理骨架零坍塌、零漂移。
 
@@ -700,6 +982,86 @@ def generate_orthogonal_variant(
     warnings = (ledger_notes + [v for v in ledger_violations
                                 if v.get('severity') != 'blocking'])
 
+    autofixed_issues: List[str] = []
+    topology_issues: List[Dict[str, Any]] = []
+    if blocking and autofix:
+        if on_progress:
+            on_progress('replica_stage', {
+                'stage': 'mutate_beats',
+                'action': 'mutate_orthogonal',
+                'message': f'检测到 {len(blocking)} 项物件账问题，正在启动 AI 深度自动修复闭环...',
+                'done': 3,
+                'total': 5,
+            })
+
+        # 1. 优先尝试大模型反思定向自愈
+        if config:
+            try:
+                llm_fixed = _autofix_variant_beats_with_llm(
+                    config=config,
+                    variant_beats=variant_beats,
+                    blocking=blocking,
+                    effective_axes=effective_axes,
+                    pack=pack,
+                    source_beats=source_beats,
+                    on_progress=on_progress,
+                )
+                if llm_fixed:
+                    v_vio = validate_object_ledger(llm_fixed, baseline_beats=source_beats)
+                    new_blocking = [v for v in v_vio if v.get('severity') == 'blocking']
+                    if not new_blocking:
+                        variant_beats = llm_fixed
+                        autofixed_issues.extend([b.get('message', '') for b in blocking])
+                        blocking = []
+                    else:
+                        variant_beats = llm_fixed
+                        blocking = new_blocking
+            except Exception as e:
+                if sys.stdout:
+                    print(f"[mutate] LLM 自愈重写异常: {e}")
+
+        # 2. 若仍有 blocking，启动确定性规则级修复安全气囊
+        if blocking:
+            det_fixed = _autofix_variant_beats_deterministic(
+                source_beats=source_beats,
+                variant_beats=variant_beats,
+                blocking=blocking,
+                effective_axes=effective_axes,
+                pack=pack,
+            )
+            v_vio = validate_object_ledger(det_fixed, baseline_beats=source_beats)
+            new_blocking = [v for v in v_vio if v.get('severity') == 'blocking']
+            for b in blocking:
+                if b not in new_blocking:
+                    autofixed_issues.append(b.get('message', ''))
+            variant_beats = det_fixed
+            blocking = new_blocking
+
+        # 重新刷新校验结果
+        ledger_violations = validate_object_ledger(variant_beats, baseline_beats=source_beats)
+        ledger_notes = diagnose_object_ledger(variant_beats)
+        blocking = [v for v in ledger_violations if v.get('severity') == 'blocking']
+        warnings = (ledger_notes + [v for v in ledger_violations
+                                    if v.get('severity') != 'blocking'])
+
+        # 刷新 ASMR 音效
+        for vb in variant_beats:
+            vb['sfx'] = map_asmr_audio(
+                vb['stage'],
+                effective_axes.get('material', ''),
+                vb['visible_action']
+            )
+            vb['audio_asmr_cues'] = list(vb['sfx'])
+
+        if autofixed_issues and on_progress:
+            on_progress('replica_stage', {
+                'stage': 'mutate_beats',
+                'action': 'mutate_orthogonal',
+                'message': f'✓ AI 深度自愈成功闭合 {len(autofixed_issues)} 项物件账问题！',
+                'done': 3,
+                'total': 5,
+            })
+
     variant_doc = {
         'pipeline_id': pipeline_id,
         'variant_of': pipeline_id,
@@ -717,6 +1079,8 @@ def generate_orthogonal_variant(
         'beats': variant_beats,
         'validation': list(blocking) + list(warnings),
         'ledger_violations': ledger_violations,
+        'topology_issues': topology_issues,
+        'autofixed_issues': autofixed_issues,
     }
 
     if blocking and strict:

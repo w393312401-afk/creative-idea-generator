@@ -277,11 +277,23 @@ class TestPipelineGateIntegration(unittest.TestCase):
         self.project_title = "test_pipeline_opt"
         self.project_dir = os.path.join(self.tmp_dir, self.project_title)
         os.makedirs(self.project_dir, exist_ok=True)
+        self.old_output_root = server_common.OUTPUT_ROOT
+        server_common.OUTPUT_ROOT = self.tmp_dir
+        self.old_tasks_dir = server_common.TASKS_DIR
+        self.tasks_dir = os.path.join(self.tmp_dir, "tasks")
+        os.makedirs(self.tasks_dir, exist_ok=True)
+        server_common.TASKS_DIR = self.tasks_dir
+        self.orig_active_tasks = dict(server_common.ACTIVE_TASKS)
+        server_common.ACTIVE_TASKS.clear()
         self.patch_dir = patch.object(server_common, '_get_project_dir', return_value=self.project_dir)
         self.patch_dir.start()
 
     def tearDown(self):
         self.patch_dir.stop()
+        server_common.OUTPUT_ROOT = self.old_output_root
+        server_common.TASKS_DIR = self.old_tasks_dir
+        server_common.ACTIVE_TASKS.clear()
+        server_common.ACTIVE_TASKS.update(self.orig_active_tasks)
         shutil.rmtree(self.tmp_dir, ignore_errors=True)
 
     def test_orchestrator_autonomous_calls_optimization(self):

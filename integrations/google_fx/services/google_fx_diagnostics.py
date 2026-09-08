@@ -21,6 +21,7 @@
 而不是推断出来的。浏览器互斥由 browser_gate（宿主接 FX_CONTROL 队列）保证。
 """
 
+import json
 import os
 import re
 import socket
@@ -228,6 +229,38 @@ def _summarize(families):
     }
 
 
+def _collect_alerts(families):
+    """把"必需族没走主选择器"挑出来，作为**改版预警**返回。
+
+    2026-09-05 复盘：Flow 改版当天，add_media_btn 已经掉到第 2 层兜底
+    (`button[aria-label='Add media menu']`)，探针数据里明明白白写着，但结果只有
+    一份 primary/fallback 计数摘要，没有任何一条"这个族出事了"的显式结论，
+    于是没人注意到。兜底命中就是改版的**前兆**——主选择器已经死了，只是恰好还有
+    一层接住；下一次改版把兜底也带走时就是整链失败。这里让它自己喊出来。
+    """
+    alerts = []
+    for row in families:
+        if row.get("group") != "google_fx":
+            continue
+        if row.get("family") not in _REQUIRED_WORKSPACE_FAMILIES:
+            continue
+        state = row.get("state")
+        if state == "missing":
+            alerts.append({
+                "family": row["family"], "level": "critical", "state": state,
+                "message": f"必需选择器族 {row['family']} 全部 {row['total_layers']} 层均未命中，"
+                           f"该功能在当前 Flow UI 上已不可用",
+            })
+        elif state == "fallback":
+            alerts.append({
+                "family": row["family"], "level": "warning", "state": state,
+                "hit_index": row.get("hit_index"),
+                "message": f"必需选择器族 {row['family']} 靠第 {row.get('hit_index', 0) + 1} 层兜底命中"
+                           f"（{row.get('hit_selector', '')}），主选择器已失效，疑似 Flow 改版",
+            })
+    return alerts
+
+
 def probe_selectors(page, groups=None, deep=False):
     """对 UI_SELECTORS 逐族逐层探测当前页面的命中情况。
 
@@ -270,6 +303,10 @@ def probe_selectors(page, groups=None, deep=False):
         result["deep_scenarios"] = _run_deep_probe(page, result["families"])
 
     result["summary"] = _summarize(result["families"])
+    result["alerts"] = _collect_alerts(result["families"])
+    for alert in result["alerts"]:
+        log(("🚨 " if alert["level"] == "critical" else "⚠️ ") + alert["message"],
+            "选择器探针")
     return result
 
 
@@ -480,15 +517,23 @@ def probe_count_config(page, scope=None):
             continue
 
     if not matched:
-        for val in ["1x", "2x", "3x", "4x", "1", "2", "4"]:
+        for val in ["1x", "2x", "3x", "4x", "x1", "x2", "x3", "x4", "1", "2", "4"]:
             try:
-                loc = scope.locator("button[role='tab']").filter(
+                loc = scope.locator("button[role='tab'], button[role='radio'], .mat-button-toggle-button, mat-button-toggle, flow-toggles[aria-label='Output count'] button").filter(
                     has_text=re.compile(rf"^\s*{re.escape(val)}\s*$", re.I)
                 ).first
                 if loc.is_visible(timeout=300):
                     matched.append(val)
             except Exception:
                 continue
+
+    if not matched:
+        try:
+            count_toggles = scope.locator("flow-toggles[aria-label='Output count'], [aria-label='Output count']").first
+            if count_toggles.is_visible(timeout=300):
+                matched.append("flow-toggles:Output count")
+        except Exception:
+            pass
 
     if matched:
         return f"数量配置可定位 (命中: {', '.join(matched)})"
@@ -606,6 +651,10 @@ def probe_upload_config(page):
         "button[aria-label*='Upload']",
         "button:has-text('Upload')",
         "button:has-text('上传')",
+        "button.empty-chip:has-text('Start')",
+        "button.empty-chip:has-text('End')",
+        "button:has-text('Start')",
+        "button:has-text('End')",
         "div:has-text('Start frame')",
         "div:has-text('End frame')",
         "div:has-text('首帧')",
@@ -637,7 +686,7 @@ def _selftest_browser(steps, level, user_id=None, cancel_check=None):
 
     from ..utils.browser import get_ads_ws_url, find_or_create_page, ensure_flow_workspace
     from ..utils.forensics import capture
-    from .google_fx_helpers import _find_fx_prompt_input, find_fx_config_button, _get_open_fx_config_panel
+    from .google_fx_helpers import _find_fx_prompt_input, find_fx_config_button, _get_open_fx_config_panel, FLOW_HOST_HINTS
     from .google_fx_dom import _safe_press_escape
 
     holder = {}
@@ -650,7 +699,7 @@ def _selftest_browser(steps, level, user_id=None, cancel_check=None):
     def open_flow():
         context = holder["browser"].contexts[0]
         holder["page"] = find_or_create_page(
-            context, "labs.google", fallback_url="https://labs.google/fx/tools/flow",
+            context, FLOW_HOST_HINTS, fallback_url="https://flow.google.com/",
             user_id=user_id, cancel_check=cancel_check, context_label="Google FX 自检浏览器启动")
         ensure_flow_workspace(holder["page"], user_id=user_id)
         return holder["page"].url
@@ -703,9 +752,11 @@ def _selftest_browser(steps, level, user_id=None, cancel_check=None):
             try:
                 btn, _ = find_fx_config_button(holder["page"])
                 if btn:
-                    btn.click()
-                    time.sleep(0.8)
                     panel_scope = _get_open_fx_config_panel(holder["page"], btn)
+                    if not panel_scope or not panel_scope.is_visible():
+                        btn.click()
+                        holder["page"].wait_for_timeout(1200)
+                        panel_scope = _get_open_fx_config_panel(holder["page"], btn)
             except Exception:
                 pass
 
@@ -771,14 +822,15 @@ def probe_selectors_live(user_id=None, cancel_check=None, deep=False):
     except ImportError:
         return {"status": "error", "message": "playwright 未安装"}
     from ..utils.browser import get_ads_ws_url, find_or_create_page, ensure_flow_workspace
+    from .google_fx_helpers import FLOW_HOST_HINTS
 
     with browser_slot('selector_probe', cancel_check=cancel_check, priority=35,
                       task_id=f'selector_probe_{int(time.time())}'):
         with sync_playwright() as pw:
             ws_url = get_ads_ws_url(user_id=user_id, auto_rotate_proxy=False)
             browser = pw.chromium.connect_over_cdp(ws_url, timeout=20000)
-            page = find_or_create_page(browser.contexts[0], "labs.google",
-                                       fallback_url="https://labs.google/fx/tools/flow",
+            page = find_or_create_page(browser.contexts[0], FLOW_HOST_HINTS,
+                                       fallback_url="https://flow.google.com/",
                                        user_id=user_id, cancel_check=cancel_check,
                                        context_label="选择器探针浏览器启动")
             ensure_flow_workspace(page, user_id=user_id)
@@ -787,6 +839,301 @@ def probe_selectors_live(user_id=None, cancel_check=None, deep=False):
             probe = probe_selectors(page, deep=deep)
     probe["status"] = "ok"
     return probe
+
+
+# ── 画布卡片结构取证 ──────────────────────────────────────────────────────
+# 2026-09-06：视频在 Flow 上明明生成完了，代码却一直判成"还在生成"，直到单任务
+# 300s 超时。原因是提交之后就把卡片跟丢了——Angular 把"加载中占位"整块换成结果
+# 卡片时销毁重建了节点，我们盖的 data-spark-tile-id 随之消失，两条兜底（按首尾帧
+# UUID 反查、按提示词文本匹配）在新版结果卡上都不成立。
+#
+# 要修就必须先看清楚"新版结果卡片到底长什么样"：它带不带稳定 id？带不带首尾帧的
+# img？显不显示提示词？完成后的视频是 <video src> 还是 blob/MSE？
+# 这个 dump 就是回答这几个问题用的，**只读**：不点击、不导航、不改配置。
+_CANVAS_TILES_JS = r"""({ maxTiles, textLimit }) => {
+    const SEL = 'flow-grid-tile-container, div[data-tile-id], flow-tile-container, flow-image-tile';
+    const cut = (v, n) => {
+        const s = String(v == null ? '' : v);
+        return s.length > n ? s.slice(0, n) + '…' : s;
+    };
+    const attrsOf = (el) => {
+        const out = {};
+        for (const a of Array.from(el.attributes || [])) out[a.name] = cut(a.value, 160);
+        return out;
+    };
+    // 卡片内部的元素骨架：只保留标签 + 关键属性，不含文本与样式。
+    const skeleton = (root, maxNodes) => {
+        const rows = [];
+        const KEEP = /^(id|class|role|type|href|src|alt|title|poster|download|controls)$/;
+        const walk = (el, depth) => {
+            if (rows.length >= maxNodes) return;
+            const parts = [];
+            for (const a of Array.from(el.attributes || [])) {
+                if (KEEP.test(a.name) || a.name.startsWith('data-') || a.name.startsWith('aria-')) {
+                    parts.push(a.name + '=' + JSON.stringify(cut(a.value, 100)));
+                }
+            }
+            rows.push('  '.repeat(Math.min(depth, 20)) + el.tagName.toLowerCase()
+                      + (parts.length ? ' ' + parts.join(' ') : ''));
+            for (const c of Array.from(el.children)) walk(c, depth + 1);
+        };
+        walk(root, 0);
+        return rows.join('\n');
+    };
+
+    const all = Array.from(document.querySelectorAll(SEL))
+        .filter((el) => !el.parentElement || !el.parentElement.closest(SEL));
+    const tiles = all.slice(0, maxTiles).map((el, i) => {
+        const rect = el.getBoundingClientRect();
+        return {
+            index: i,
+            tag: el.tagName.toLowerCase(),
+            attrs: attrsOf(el),
+            rect: { w: Math.round(rect.width), h: Math.round(rect.height),
+                    top: Math.round(rect.top), left: Math.round(rect.left) },
+            innerText: cut((el.innerText || '').replace(/\s+/g, ' '), textLimit),
+            imgs: Array.from(el.querySelectorAll('img')).slice(0, 8).map((img) => ({
+                src: cut(img.currentSrc || img.src || img.getAttribute('src'), 240),
+                mediaId: img.getAttribute('data-media-id') || null,
+                alt: cut(img.getAttribute('alt'), 80),
+                w: img.offsetWidth, h: img.offsetHeight,
+            })),
+            videos: Array.from(el.querySelectorAll('video')).slice(0, 4).map((v) => ({
+                src: cut(v.getAttribute('src'), 240),
+                currentSrc: cut(v.currentSrc, 240),
+                poster: cut(v.getAttribute('poster'), 240),
+                readyState: v.readyState,
+                duration: (isFinite(v.duration) ? v.duration : null),
+                sources: Array.from(v.querySelectorAll('source')).map(
+                    (s) => cut(s.getAttribute('src') || s.src, 240)),
+            })),
+            anchors: Array.from(el.querySelectorAll('a[href]')).slice(0, 6).map(
+                (a) => cut(a.getAttribute('href'), 240)),
+            // 所有 data-* / aria-* 属性（含后代）：找"稳定 id"就靠这张表
+            dataAttrs: (() => {
+                const seen = {};
+                for (const node of [el, ...Array.from(el.querySelectorAll('*')).slice(0, 400)]) {
+                    for (const a of Array.from(node.attributes || [])) {
+                        if (a.name.startsWith('data-') || a.name.startsWith('aria-')) {
+                            if (!(a.name in seen)) seen[a.name] = cut(a.value, 120);
+                        }
+                    }
+                }
+                return seen;
+            })(),
+            buttons: Array.from(el.querySelectorAll('button')).slice(0, 12).map((b) => ({
+                label: cut(b.getAttribute('aria-label') || (b.innerText || '').trim(), 60),
+                haspopup: b.getAttribute('aria-haspopup') || null,
+            })),
+            skeleton: skeleton(el, 120),
+        };
+    });
+
+    return {
+        url: location.href,
+        at: new Date().toISOString(),
+        counts: {
+            'flow-grid-tile-container': document.querySelectorAll('flow-grid-tile-container').length,
+            'div[data-tile-id]': document.querySelectorAll('div[data-tile-id]').length,
+            'flow-tile-container': document.querySelectorAll('flow-tile-container').length,
+            'flow-image-tile': document.querySelectorAll('flow-image-tile').length,
+            'video': document.querySelectorAll('video').length,
+            'img[data-media-id]': document.querySelectorAll('img[data-media-id]').length,
+            'outermost-tiles': all.length,
+        },
+        tiles: tiles,
+        truncated: all.length > tiles.length,
+    };
+}"""
+
+
+def dump_canvas_tiles(page, max_tiles=12, text_limit=400):
+    """只读 dump 画布上每张卡片的结构。返回 dict；失败时返回 {'error': ...}。"""
+    try:
+        return page.evaluate(_CANVAS_TILES_JS,
+                             {"maxTiles": int(max_tiles), "textLimit": int(text_limit)})
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
+def canvas_tiles_collector(max_tiles=12, text_limit=400):
+    """给 forensics.capture(collectors=...) 用的 collector。"""
+    def _collect(page):
+        return dump_canvas_tiles(page, max_tiles=max_tiles, text_limit=text_limit)
+    return _collect
+
+
+def capture_canvas_snapshot(user_id=None, cancel_check=None, bucket="canvas_snapshot",
+                            why="手动取证：画布卡片结构"):
+    """连一次浏览器，把**当前画布**原样存一份现场。只读。
+
+    刻意不调 find_or_create_page / ensure_flow_workspace：那两个会导航、会关掉
+    多余标签页、崩溃页还会点"新建项目"——而这次取证的全部价值就在于画布上那批
+    已经生成好的视频，把画布弄没了就白跑了。找不到 Flow 标签页时如实报错，
+    让人先把画布打开。
+    """
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return {"status": "error", "message": "playwright 未安装"}
+    from ..utils.browser import get_ads_ws_url, is_flow_url
+
+    with browser_slot('canvas_snapshot', cancel_check=cancel_check, priority=35,
+                      task_id=f'canvas_snapshot_{int(time.time())}'):
+        with sync_playwright() as pw:
+            ws_url = get_ads_ws_url(user_id=user_id, auto_rotate_proxy=False)
+            browser = pw.chromium.connect_over_cdp(ws_url, timeout=20000)
+            pages = []
+            for ctx in browser.contexts:
+                pages.extend(getattr(ctx, "pages", []) or [])
+            target = None
+            for pg in reversed(pages):
+                try:
+                    if is_flow_url(pg.url):
+                        target = pg
+                        break
+                except Exception:
+                    continue
+            if target is None:
+                return {"status": "error",
+                        "message": "浏览器里没有打开着的 Flow 标签页——请先在 AdsPower 里"
+                                   "打开那张有已生成视频的画布，再重跑一次取证"}
+            from ..utils import forensics
+            slot = forensics.capture(
+                target, "canvas_snapshot", why, bucket=bucket,
+                collectors={"canvas_tiles.json": canvas_tiles_collector()},
+            )
+            summary = dump_canvas_tiles(target, max_tiles=1)
+    return {
+        "status": "ok",
+        "slot": slot,
+        "url": summary.get("url"),
+        "counts": summary.get("counts"),
+        "message": f"现场已保存到 {slot}；重点看 canvas_tiles.json 与 dom_skeleton.txt",
+    }
+
+
+# ── 选择器基线与漂移巡检 ──────────────────────────────────────────────────
+# 2026-09-05 复盘的第 3 条：探针和自检都只有手动 HTTP 入口，没有任何定时触发。
+# 于是 Flow 改版这件事只能靠"下一单真任务失败 + 烧掉一批积分"来通知我们。
+# 这里补上：定期跑一次只读探针，和上一次的结果**逐族对比**，命中层级往后退、
+# 或者从命中变成未命中，都当场喊出来。整个过程不提交、不花积分。
+
+def selector_baseline_path():
+    override = os.environ.get("GOOGLE_FX_SELECTOR_BASELINE_FILE", "").strip()
+    if override:
+        return override
+    return str(AI_DIR / "runtime" / "selector_baseline.json")
+
+
+def _families_by_key(probe):
+    rows = {}
+    for row in (probe or {}).get("families", []) or []:
+        rows[f"{row.get('group')}/{row.get('family')}"] = row
+    return rows
+
+
+def load_selector_baseline():
+    try:
+        with open(selector_baseline_path(), "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def save_selector_baseline(probe):
+    """把这次探针结果存成新基线。写失败只记日志，绝不影响调用方。"""
+    path = selector_baseline_path()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(probe, f, ensure_ascii=False, indent=2, default=str)
+        os.replace(tmp, path)
+        return True
+    except Exception as e:
+        log(f"⚠️ 写选择器基线失败: {type(e).__name__}: {e}", "选择器巡检")
+        return False
+
+
+# 状态的"健康度"排序：越大越糟。用来判断这次比上次是变好还是变坏。
+_STATE_RANK = {"primary": 0, "fallback": 1, "conditional": 2, "missing": 3}
+
+
+def diff_selector_baseline(probe, baseline=None):
+    """把本次探针结果和基线逐族对比，返回**变坏了**的族。
+
+    只报退化（primary→fallback、fallback→missing、命中层级往后退），不报好转——
+    好转不需要人管，混在一起只会稀释信号。
+    """
+    baseline = baseline if baseline is not None else load_selector_baseline()
+    if not baseline:
+        return []
+    old_rows = _families_by_key(baseline)
+    changes = []
+    for key, row in _families_by_key(probe).items():
+        old = old_rows.get(key)
+        if not old:
+            continue
+        old_state, new_state = old.get("state"), row.get("state")
+        old_rank = _STATE_RANK.get(old_state, 9)
+        new_rank = _STATE_RANK.get(new_state, 9)
+        old_index, new_index = old.get("hit_index", -1), row.get("hit_index", -1)
+        degraded_state = new_rank > old_rank
+        # 命中层级往后退 = 主选择器死了、靠更后面的兜底接住，是改版的前兆
+        degraded_layer = (old_index >= 0 and new_index > old_index)
+        if not (degraded_state or degraded_layer):
+            continue
+        changes.append({
+            "family": key,
+            "was": {"state": old_state, "hit_index": old_index,
+                    "hit_selector": old.get("hit_selector", "")},
+            "now": {"state": new_state, "hit_index": new_index,
+                    "hit_selector": row.get("hit_selector", "")},
+            "message": (f"{key}: {old_state}(第 {old_index + 1} 层) → "
+                        f"{new_state}(第 {new_index + 1} 层)"
+                        if new_index >= 0 else
+                        f"{key}: {old_state}(第 {old_index + 1} 层) → {new_state}(全未命中)"),
+        })
+    return changes
+
+
+def run_selector_drift_check(user_id=None, cancel_check=None, save=True):
+    """跑一次只读探针 → 和基线对比 → 记日志 → 更新基线。返回结构化结果。
+
+    定时巡检和手动排查都走这里。不提交、不改配置、不花积分，唯一成本是占用
+    浏览器槽位几十秒，所以调用方应挑 FX 空闲的时候调。
+    """
+    probe = probe_selectors_live(user_id=user_id, cancel_check=cancel_check)
+    if probe.get("status") != "ok":
+        return {"status": "error", "message": probe.get("message", "探针未成功"),
+                "probe": probe}
+    baseline = load_selector_baseline()
+    changes = diff_selector_baseline(probe, baseline)
+    alerts = probe.get("alerts") or []
+
+    if baseline is None:
+        log("📌 选择器巡检：首次运行，已建立基线（本次不做对比）", "选择器巡检")
+    elif changes:
+        log(f"🚨 选择器巡检：{len(changes)} 个族比上次更差了，疑似 Flow 又改版了", "选择器巡检")
+        for change in changes:
+            log("   ↳ " + change["message"], "选择器巡检")
+    else:
+        log(f"✅ 选择器巡检：{len(probe.get('families', []))} 个族与基线一致，无退化",
+            "选择器巡检")
+
+    if save:
+        save_selector_baseline(probe)
+    return {
+        "status": "ok",
+        "checked_at": probe.get("checked_at"),
+        "url": probe.get("url"),
+        "summary": probe.get("summary"),
+        "alerts": alerts,
+        "changes": changes,
+        "had_baseline": baseline is not None,
+    }
 
 
 # ── Dry-run ────────────────────────────────────────────────────────────────

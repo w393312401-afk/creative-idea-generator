@@ -8,6 +8,8 @@ refresh_credit 的真实探测部分用 monkeypatch 打桩。
 
 
 
+from datetime import timedelta
+
 import pytest
 from integrations.google_fx.utils import account_pool as ap
 
@@ -611,3 +613,82 @@ def test_tasks_since_check_triggers_stale_probe(monkeypatch):
     # The active account should have been probed because tasks ran since last check, found to have 0 credits, and skipped
     assert "user_active" in probed
     assert chosen is None
+
+
+# ── 探测退避：修"积分探测一直刷新"（2026-09-05）───────────────────
+# 失败的探测不写 last_checked_at，_credit_is_stale() 只看 last_checked_at，
+# 于是探不动的账号永远"过期"——每次选号/复核都真开一次浏览器重探，无限循环。
+
+
+def _fail_probe(monkeypatch, counter):
+    from integrations.google_fx.services import google_fx_credit as credit_module
+    monkeypatch.setattr(credit_module, "probe_flow_credit",
+                        lambda user_id, port=None: (counter.append(user_id), None)[1])
+
+
+def test_failed_probe_is_not_reprobed_within_backoff(monkeypatch):
+    """连着选两次号，探不动的账号只该真探一次——第二次走退避。"""
+    monkeypatch.setattr(ap, "PROBE_RETRY_AFTER_SECONDS", 600)
+    pool = ap.AccountPool()
+    pool.add_account("dead")
+    probed = []
+    _fail_probe(monkeypatch, probed)
+
+    assert pool.pick_account(min_credit=1) is None
+    assert pool.pick_account(min_credit=1) is None
+    assert pool.pick_account(min_credit=1) is None
+    assert probed == ["dead"]
+
+    # 账号仍然被判为不可用——退避只省掉重复探测，不会把它当成有额度。
+    assert pool.account_is_usable("dead", min_credit=1) is False
+    assert probed == ["dead"]
+
+
+def test_probe_backoff_expires_and_allows_retry(monkeypatch):
+    monkeypatch.setattr(ap, "PROBE_RETRY_AFTER_SECONDS", 600)
+    pool = ap.AccountPool()
+    pool.add_account("dead")
+    probed = []
+    _fail_probe(monkeypatch, probed)
+
+    assert pool.pick_account(min_credit=1) is None
+    # 把上次探测时间推回 20 分钟前：退避窗口过了，就该再探一次。
+    state = ap._read_state()
+    state["dead"]["last_probe_at"] = (ap._now() - timedelta(minutes=20)).isoformat()
+    ap._write_state(state)
+
+    assert pool.pick_account(min_credit=1) is None
+    assert probed == ["dead", "dead"]
+
+
+def test_blocked_probe_uses_shorter_backoff(monkeypatch):
+    """浏览器忙（blocked）不是账号的问题，退避窗口比 failed 短。"""
+    monkeypatch.setattr(ap, "PROBE_RETRY_AFTER_SECONDS", 600)
+    monkeypatch.setattr(ap, "PROBE_BLOCKED_RETRY_AFTER_SECONDS", 120)
+    info = {"last_probe_status": "blocked",
+            "last_probe_at": (ap._now() - timedelta(seconds=200)).isoformat()}
+    assert ap._probe_backoff_remaining(info) == 0.0
+    info["last_probe_status"] = "failed"
+    assert ap._probe_backoff_remaining(info) > 0
+
+
+def test_manual_refresh_ignores_backoff(monkeypatch):
+    """控制台的「立即探测」是人点的，必须真探——退避只挡自动路径。"""
+    monkeypatch.setattr(ap, "PROBE_RETRY_AFTER_SECONDS", 600)
+    pool = ap.AccountPool()
+    pool.add_account("dead")
+    probed = []
+    _fail_probe(monkeypatch, probed)
+
+    pool.refresh_credit("dead", force=True)
+    pool.refresh_credit("dead", force=True)             # 自动路径：被退避挡住
+    assert probed == ["dead"]
+    pool.refresh_credit("dead", force=True, ignore_backoff=True)
+    assert probed == ["dead", "dead"]
+
+
+def test_ok_probe_never_hits_backoff(monkeypatch):
+    """成功探测不设退避：该重探的时候（缓存过期/跑过任务）照常重探。"""
+    monkeypatch.setattr(ap, "PROBE_RETRY_AFTER_SECONDS", 600)
+    info = {"last_probe_status": "ok", "last_probe_at": ap._now_iso()}
+    assert ap._probe_backoff_remaining(info) == 0.0

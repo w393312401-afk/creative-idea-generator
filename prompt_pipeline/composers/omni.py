@@ -95,21 +95,44 @@ OMNI_THRESHOLD_REFERENCE = 'omni-threshold-bridge.md'
 Rung = namedtuple('Rung', 'key variants label phrase weight role')
 
 _R_MAIN = Rung(
-    'main', ('wide working shot',), '主镜 wide working shot',
+    'main', (
+        'wide working shot', 'opening wide working shot', 'opening wide shot',
+        'wide work shot', 'working wide shot', 'wide staging shot', 'wide shot',
+        'master shot', 'wide action shot'
+    ), '主镜 wide working shot',
     'a wide working shot', 1.5,
     '贯穿本段的主工作镜，画面开在起始 IMAGE 上、工人已经在作业面，0 秒立即发生第一次'
     '有效工具接触；第一次动作完整可见后转入重复循环，本拍改动在这一镜内推进到约四分之三，'
     '全程用 -ing / partially / growing 这类进行态措辞，不出现完成态描述')
 _R_CLOSE = Rung(
-    'close', ('close up',), '特写插入 close-up insert', 'a close-up insert', 1.0,
+    'close', (
+        'close up', 'close up insert', 'macro insert', 'macro detail insert',
+        'macro shot', 'tight insert', 'detail insert', 'insert shot',
+        'medium close up', 'tight close up', 'first close up insert', 'first insert'
+    ), '特写插入 close-up insert', 'a close-up insert', 1.0,
     '从主镜切进来的特写插入：工具接触点与材料物理（形变、碎屑、粉尘、纤维、飞溅），'
     '不产生新的推进量，切回主镜时完成度与切走那一刻一致')
 _R_XCLOSE = Rung(
-    'xclose', ('extreme close up',), '第二处特写插入 extreme close-up insert',
+    'xclose', (
+        'extreme close up', 'extreme close up insert', 'extreme macro insert',
+        'second close up insert', 'second insert', 'extreme detail insert',
+        'macro detail', 'extreme close', 'second macro insert'
+    ), '第二处特写插入 extreme close-up insert',
     'an extreme close-up insert', 0.9,
     '第二个插入镜，至少两处本次操作特有的持久痕迹与微观质感，同样不产生推进量')
 _R_RETURN = Rung(
-    'return', ('returning wide shot',), '切回主镜 returning wide shot',
+    'return', (
+        'returning wide shot', 'return to wide shot', 'returns to wide shot',
+        'returning to the wide shot', 'returning wide working shot',
+        'cutting back to wide shot', 'cut back to wide shot',
+        'cutting back to the opening wide shot', 'cutting back to the same wide shot',
+        'cutting back to the wide shot', 'returns to the wide shot',
+        'returns to the opening wide shot', 'returning to wide shot',
+        'final wide working shot', 'returning wide', 'returns to wide',
+        'returns to the same wide shot', 'cutting back to wide',
+        'cut back to wide', 'returning to the same camera setup',
+        'cutting back to the same camera setup'
+    ), '切回主镜 returning wide shot',
     'a returning wide shot', 1.3,
     '切回**与主镜完全相同的机位与构图**（正文要写明 the same camera setup as the opening '
     'wide working shot），剩余重复动作在这个剪辑点上做 same-way 压缩，工人继续施工至镜头'
@@ -130,25 +153,31 @@ _R_OUTRO = Rung(
     'a wide outro shot', 1.1, '（旧语法，已废弃）')
 
 _R_APPROACH = Rung(
-    'approach', ('wide approach shot',), '逼近远景 wide approach shot',
+    'approach', ('wide approach shot', 'approach shot', 'exterior approach shot', 'wide approach'),
+    '逼近远景 wide approach shot',
     'a wide approach shot', 1.0,
     '画面等同起始 IMAGE，镜头在开口外侧逼近，开口与两处被窥见的室内地标已可辨，全程零施工')
 _R_THRESHOLD = Rung(
-    'threshold', ('threshold shot',), '门槛 threshold shot', 'a threshold shot', 1.1,
+    'threshold', ('threshold shot', 'portal shot', 'entryway shot', 'crossing shot'),
+    '门槛 threshold shot', 'a threshold shot', 1.1,
     '推进到门槛处，门框在画面里滑出，曝光与白平衡开始从室外滚向室内，被窥见的地标占比放大')
 _R_ARRIVAL = Rung(
-    'arrival', ('interior wide shot',), '落定 interior wide shot',
+    'arrival', ('interior wide shot', 'arrival shot', 'interior settling shot', 'settling wide shot'),
+    '落定 interior wide shot',
     'an interior wide shot', 1.2,
     '完全落定在室内，画面精确等同结果 IMAGE，被窥见的地标已成为室内主地标，无工人无工具')
 
 _R_DETAIL = Rung(
-    'detail', ('detail shot',), '细部 detail shot', 'a detail shot', 1.0,
+    'detail', ('detail shot', 'signature detail shot', 'anchor detail shot', 'close up detail'),
+    '细部 detail shot', 'a detail shot', 1.0,
     '从已完工的签名锚点细部起手，实际的物理动作（机构行程、灯光亮起、使用者动作）在这一镜内发生')
 _R_PULLBACK = Rung(
-    'pullback', ('pull back shot',), '拉开 pull-back shot', 'a pull-back shot', 1.2,
+    'pullback', ('pull back shot', 'pullback shot', 'pulling back shot', 'pulling back'),
+    '拉开 pull-back shot', 'a pull-back shot', 1.2,
     '镜头拉开，把签名锚点放回整个空间里，动作继续完成')
 _R_FINAL_WIDE = Rung(
-    'final_wide', ('final wide shot',), '终局远景 final wide shot', 'a final wide shot', 1.3,
+    'final_wide', ('final wide shot', 'final wide', 'closing wide shot', 'finishing wide shot', 'concluding wide shot', 'final wide reveal'),
+    '终局远景 final wide shot', 'a final wide shot', 1.3,
     '稳定在略微收紧的终局远景上，画面等同结果 IMAGE，无工人无工具无材料，这一镜本身就是收尾欣赏')
 
 # 施工梯：主镜 + 一到两个特写插入 + 切回主镜。三镜是下限（主镜/插入/切回，任何长度
@@ -187,7 +216,16 @@ def _article(phrase):
 
 def _rescaled(rung, phrase, label_prefix):
     """把一级镜头换成另一个景别的同一级镜头。key 一律不动。"""
-    return rung._replace(variants=(phrase,), label=f'{label_prefix} {phrase}',
+    variants = [phrase]
+    if rung.key == 'return':
+        for pfx in ('returning ', 'return to ', 'returns to ', 'cutting back to ', 'cut back to '):
+            variants.append(phrase.replace('returning ', pfx))
+    elif rung.key == 'main':
+        variants.append(phrase.replace(' working shot', ' work shot'))
+        variants.append(phrase.replace(' working shot', ' shot'))
+    elif rung.key in ('close', 'xclose'):
+        variants.extend(['close up', 'macro insert', 'detail insert', 'extreme close up', 'insert'])
+    return rung._replace(variants=tuple(dict.fromkeys(variants)), label=f'{label_prefix} {phrase}',
                          phrase=f'{_article(phrase)} {phrase}')
 
 
@@ -1213,8 +1251,9 @@ Rewrite rules (additive — do not lose content):
         system = self.multishot_rework_system(ladder, duration)
         user = f"Beat {i} video prompt draft to restructure:\n\n{video_prompt}"
 
+        timeout_sec = int(config.get('composeRequestTimeoutSeconds', 45))
         try:
-            resp = pp._chat(config, system, user, temperature=0.7, timeout=90)
+            resp = pp._chat(config, system, user, temperature=0.7, timeout=timeout_sec)
         except pp.GenerationCancelled:
             raise
         except Exception as e:

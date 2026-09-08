@@ -6,6 +6,7 @@ AdsPower 连接、Playwright 页面管理、下载、粘贴等通用功能。
 """
 
 import os
+import re
 import sys
 import time
 import random
@@ -36,6 +37,71 @@ from .logger import log
 
 class BrowserSessionClosedError(RuntimeError):
     """The Playwright page/CDP browser was closed while an operation was waiting."""
+
+
+# ── Flow 站点地址（唯一事实来源） ────────────────────────────────────────────
+# 2026-09-05：Google 把 Flow 从 labs.google/fx/tools/flow 搬到 flow.google.com。
+# 当时"是不是 Flow 页面"这个判断在四五个文件里各写了一遍 `"labs.google" in url`，
+# 改版当天全部集体转否，连带把"已经打开的项目画布"判成陌生页面导航走。
+# 常量放在这一层：helpers/services 都 import 得到 utils.browser，反过来不成立，
+# 定义在这里既没有循环 import，也保证上下游用的是同一份。
+FLOW_HOST_HINTS = ("labs.google", "flow.google.com")
+# 老地址仍会 301 到新域名，但每次导航白饶一跳；实测新建项目落在
+# https://flow.google.com/project/<uuid>。
+FLOW_HOME_URL = "https://flow.google.com/"
+
+
+def is_flow_url(url) -> bool:
+    """URL 是否指向 Flow 站点（新旧域名都认）。"""
+    return any(hint in (url or "") for hint in FLOW_HOST_HINTS)
+
+
+# 项目页地址的两种形状：旧版 .../fx/tools/flow/project/<id>，新版 flow.google.com
+# 上实测两种都出现过（/project/<uuid> 与直接挂在根下的 /<uuid>）。判据放在这一层，
+# 是因为"这算不算一张画布"被三条链各自判过一遍：
+#   · 新建项目的成功确认（helpers._click_new_project_button）
+#   · 本批次项目页的记录（video._ChunkRunner._prepare_page）
+#   · 画布复用与就地采纳（image._open_image_flow_canvas）
+# 各判各的必然分叉：只认 /project/ 的一侧会把新版项目页当成"没有画布"，于是
+# 项目 URL 记不下来 / 复用判不成立，同一组任务每个分批都重开一张画布。
+_FLOW_PROJECT_ID_RE = re.compile(
+    r"/(?:project/)?([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})",
+    re.I,
+)
+
+
+def flow_project_id(url) -> str:
+    """URL 里的项目 id（小写）；不是项目页就返回 ""。
+
+    ⚠️ 只在 Flow 站点的地址上取。别处的 UUID（媒体 redirect、blob: 地址）长得
+    一模一样，拿它当项目 id 会把两张不同的画布判成同一张。
+    """
+    text = str(url or "").strip()
+    # blob:https://flow.google.com/<uuid> 长得和新版项目页一模一样，但那是页面内存
+    # 对象的地址，不是画布。只认真正能导航过去的 http(s) 地址。
+    if not text.lower().startswith(("http://", "https://")):
+        return ""
+    if not is_flow_url(text):
+        return ""
+    match = _FLOW_PROJECT_ID_RE.search(text)
+    if match:
+        return match.group(1).strip().lower()
+    # 没有 id 的旧版项目路由（.../project/<非 uuid>）仍按项目页处理，取其末段。
+    marker = "/project/"
+    if marker in text:
+        tail = text.split(marker, 1)[1].split("/")[0].split("?")[0].split("#")[0]
+        return tail.strip().lower()
+    return ""
+
+
+def is_flow_project_url(url) -> bool:
+    """URL 是不是**一张具体画布**，而不是工作台首页/项目列表。
+
+    工作台首页同样是 Flow 站点地址，`is_flow_url` 对它也返回 True——把首页当成
+    "本批次的项目页"记下来，下一个分批 goto 回去落到的是首页，Flow 在那里给的是
+    另一张画布，参考图得重传、已提交的卡片也认不回来。
+    """
+    return bool(flow_project_id(url))
 
 
 def random_sleep(min_s=1.0, max_s=3.0):
@@ -604,8 +670,18 @@ def find_or_create_page(context, url_pattern, fallback_url=None, *, user_id=None
     user_id 对积分探针、诊断等非任务绑定调用必须显式传入，防止拿默认账号凭据
     登录另一个 AdsPower profile。
     """
-    if not fallback_url and ("labs.google" in url_pattern or "/fx" in url_pattern):
-        fallback_url = "https://labs.google/fx/tools/flow"
+    # url_pattern 允许传一串候选（Flow 2026-09-05 从 labs.google 搬到了
+    # flow.google.com，两个域名都得认；只认一个的话，人在新域名的项目画布上，
+    # 这里会判成"不是 Flow 页"，转头把页面导回首页，画布连同刚传的参考图一起丢）。
+    patterns = ((url_pattern,) if isinstance(url_pattern, str)
+                else tuple(p for p in (url_pattern or ()) if p))
+    def _url_matches(u):
+        u = str(u or "")
+        return any(p in u for p in patterns)
+
+    if not fallback_url and any(
+            (any(h in p for h in FLOW_HOST_HINTS) or "/fx" in p) for p in patterns):
+        fallback_url = FLOW_HOME_URL
 
     pages = [p for p in getattr(context, "pages", []) if _is_manageable_user_page(p)]
     target_page = None
@@ -614,7 +690,7 @@ def find_or_create_page(context, url_pattern, fallback_url=None, *, user_id=None
     for pg in reversed(pages):
         try:
             url = str(getattr(pg, "url", ""))
-            if url_pattern in url or "labs.google" in url or "/fx/tools/flow" in url:
+            if _url_matches(url) or "labs.google" in url or "flow.google.com" in url                     or "/fx/tools/flow" in url:
                 target_page = pg
                 break
         except Exception:
@@ -641,7 +717,7 @@ def find_or_create_page(context, url_pattern, fallback_url=None, *, user_id=None
     if fallback_url:
         try:
             curr_url = str(getattr(target_page, "url", ""))
-            if url_pattern not in curr_url:
+            if not _url_matches(curr_url):
                 try:
                     target_page.goto(fallback_url, timeout=PAGE_LOAD_TIMEOUT, wait_until="domcontentloaded")
                 except Exception as goto_err:
@@ -653,7 +729,7 @@ def find_or_create_page(context, url_pattern, fallback_url=None, *, user_id=None
                         #   导致后续所有 locator/evaluate 操作静默挂死）
                         target_page = _recover_valid_page(context, target_page)
                         curr_url = str(getattr(target_page, "url", ""))
-                        if url_pattern in curr_url or "labs.google" in curr_url or "accounts.google" in curr_url:
+                        if _url_matches(curr_url) or "labs.google" in curr_url                                 or "flow.google.com" in curr_url or "accounts.google" in curr_url:
                             log(f"ℹ️ 标签页跳转 fallback_url 触发重定向/Frame解绑，恢复后页面已就绪: {curr_url}", "浏览器管理")
                         else:
                             # 恢复后的页面 URL 仍不对，重新导航一次
@@ -1076,7 +1152,7 @@ def _recover_from_flow_project_crash(page) -> bool:
             continue
     # 兜底：如果按钮无法点击或不存在，直接 goto 回 /fx/tools/flow
     try:
-        page.goto("https://labs.google/fx/tools/flow", timeout=30000, wait_until="domcontentloaded")
+        page.goto(FLOW_HOME_URL, timeout=30000, wait_until="domcontentloaded")
         time.sleep(1.0)
         return True
     except Exception as e:
@@ -1177,17 +1253,31 @@ def ensure_flow_workspace(page, timeout_seconds: float = 30.0, user_id=None) -> 
 def download_video_via_browser(page, video_url, output_dir, prefix="video"):
     """🎬 通过浏览器 fetch + base64 下载视频 (替代 2 处重复代码)"""
     log(f"🎬 同步下载视频到本地...", prefix)
-    b64_data = page.evaluate("""async (url) => {
-        const response = await fetch(url);
-        const blob = await response.blob();
-        return new Promise((resolve, reject) => {
-            const reader = new FileReader();
-            reader.onloadend = () => resolve(reader.result.split(',')[1]);
-            reader.onerror = reject;
-            reader.readAsDataURL(blob);
-        });
-    }""", video_url)
-    video_bytes = base64.b64decode(b64_data)
+    try:
+        b64_data = page.evaluate("""async (url) => {
+            const response = await fetch(url, {signal: AbortSignal.timeout(30000)});
+            if (!response.ok) throw new Error('Video HTTP ' + response.status);
+            const blob = await response.blob();
+            return new Promise((resolve, reject) => {
+                const reader = new FileReader();
+                reader.onloadend = () => resolve(reader.result.split(',')[1]);
+                reader.onerror = reject;
+                reader.readAsDataURL(blob);
+            });
+        }""", video_url)
+        video_bytes = base64.b64decode(b64_data)
+    except Exception:
+        # Angular /asb/ redirects to googlevideo; page fetch can be blocked by
+        # CORS while the authenticated browser request context can read it.
+        response = page.context.request.get(video_url, timeout=30000)
+        try:
+            if response.status != 200:
+                raise RuntimeError(f"视频下载 HTTP {response.status}，拒绝保存不完整响应")
+            video_bytes = response.body()
+        finally:
+            response.dispose()
+    if len(video_bytes) < 1024 or b'ftyp' not in video_bytes[:64]:
+        raise RuntimeError("下载内容不是有效 MP4，拒绝将缩略图/错误页面上报为视频")
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
     filename = f"{prefix}_{int(time.time())}.mp4"

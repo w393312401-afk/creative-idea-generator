@@ -1,4 +1,5 @@
 from integrations.google_fx.services import google_fx_image as image_service
+from integrations.google_fx.utils import browser
 
 
 class _Page:
@@ -135,5 +136,6 @@ def test_stale_bound_project_falls_back_to_project_home(monkeypatch):
     # 遇到进不去的绑定画布不重试，直接换新画布。
     assert page.goto_calls == [
         (stale_url, 60000),
-        ("https://labs.google/fx/tools/flow", 60000),
+        # 换画布是我们自己发起的导航 → 去新站首页，不再走旧地址的 301。
+        (browser.FLOW_HOME_URL, 60000),
     ]

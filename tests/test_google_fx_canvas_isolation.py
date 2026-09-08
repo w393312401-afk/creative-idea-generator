@@ -14,6 +14,7 @@ import inspect
 import pytest
 
 from integrations.google_fx.services import google_fx_image as image_service
+from integrations.google_fx.utils import browser
 
 
 PREV_TASK_PROJECT = (
@@ -22,7 +23,11 @@ PREV_TASK_PROJECT = (
 FRESH_PROJECT = (
     "https://labs.google/fx/tools/flow/project/11111111-2222-4333-8444-555555555555"
 )
+# 页面**当前**停在哪个域名都要认（旧地址仍会 301 到新域名，浏览器里也确实
+# 还能停在旧地址上），但我们自己发起的导航一律去新站首页 —— 这是 2026-09-05
+# 换域名后的唯一落点，写死旧地址等于每次白饶一跳 301。
 WORKSPACE = "https://labs.google/fx/tools/flow"
+WORKSPACE_HOME = browser.FLOW_HOME_URL
 
 
 class _StubPage:
@@ -69,7 +74,7 @@ def test_new_task_never_adopts_the_previous_task_canvas(monkeypatch):
         page, None, require_fresh_canvas=True
     ) == FRESH_PROJECT
     # 必须先回项目列表，不能在旧项目里就地开工
-    assert page.goto_calls == [WORKSPACE]
+    assert page.goto_calls == [WORKSPACE_HOME]
 
 
 def test_fresh_canvas_refuses_to_land_back_on_the_previous_project(monkeypatch):
@@ -108,7 +113,7 @@ def test_project_route_is_not_a_restored_workspace(monkeypatch):
     image_service._open_image_flow_canvas(page, None, require_fresh_canvas=False)
 
     # 早退分支若仍然命中就一次导航都不会发生，旧项目会被直接绑给调用方。
-    assert page.goto_calls == [WORKSPACE]
+    assert page.goto_calls == [WORKSPACE_HOME]
 
 
 def test_bound_project_is_still_reused_without_navigation(monkeypatch):
@@ -143,7 +148,7 @@ def test_dead_bound_project_falls_back_to_a_fresh_canvas(monkeypatch):
 
     assert image_service._open_image_flow_canvas(page, dead_project) == FRESH_PROJECT
     # 遇到进不去的绑定画布不重试，直接换新画布。
-    assert page.goto_calls == [dead_project, WORKSPACE]
+    assert page.goto_calls == [dead_project, WORKSPACE_HOME]
 
 
 def test_flow_project_id_extraction():
@@ -222,7 +227,7 @@ def test_bound_canvas_crashed_page_directly_creates_new_canvas(monkeypatch):
 
     result = image_service._open_image_flow_canvas(page, PREV_TASK_PROJECT)
     assert result == FRESH_PROJECT
-    assert page.goto_calls == [PREV_TASK_PROJECT, WORKSPACE]
+    assert page.goto_calls == [PREV_TASK_PROJECT, WORKSPACE_HOME]
 
 
 def test_bounced_back_to_workspace_list_is_not_a_successful_entry(monkeypatch):
@@ -243,5 +248,5 @@ def test_bounced_back_to_workspace_list_is_not_a_successful_entry(monkeypatch):
     result = image_service._open_image_flow_canvas(page, PREV_TASK_PROJECT)
 
     # 失败后直接新建，新建必须走"回项目列表"的正规路径
-    assert page.goto_calls == [PREV_TASK_PROJECT, WORKSPACE]
+    assert page.goto_calls == [PREV_TASK_PROJECT, WORKSPACE_HOME]
     assert result == FRESH_PROJECT

@@ -41,11 +41,17 @@ class _Page:
 
 def test_credit_parser_accepts_balance_lines_only():
     assert credit._extract_credit_number('1050 Google Flow credits') == 1050
+    assert credit._extract_credit_number('995 Google Flow credits') == 995
+    assert credit._extract_credit_number('1,050 个 Google Flow 点数') == 1050
     assert credit._extract_credit_number('1,050 credits remaining') == 1050
     assert credit._extract_credit_number('0 Google Flow credits') == 0
+    assert credit._extract_credit_number('0 个 Google Flow 点数') == 0
     assert credit._extract_credit_number('0 credits') == 0
+    assert credit._extract_credit_number('0 个点数') == 0
     assert credit._extract_credit_number('剩余 88 积分') == 88
     assert credit._extract_credit_number('860 Google Flow 点数') == 860
+    assert credit._extract_credit_number('Credits display: 995') == 995
+    assert credit._extract_credit_number('点数显示: 1,050') == 1050
     assert credit._extract_credit_number('Pro plan: 1,000 monthly Google Flow credits') is None
     assert credit._extract_credit_number('Daily Bonus: Enjoy 50 extra credits') is None
 
@@ -323,11 +329,15 @@ def test_is_credit_exhausted_message_comprehensive():
     assert credit.is_credit_exhausted_message("0积分") is True
     assert credit.is_credit_exhausted_message("0 点数") is True
     assert credit.is_credit_exhausted_message("0点数") is True
+    assert credit.is_credit_exhausted_message("0 个 Google Flow 点数") is True
+    assert credit.is_credit_exhausted_message("0 个点数") is True
     assert credit.is_credit_exhausted_message("点数余额为 0") is True
     assert credit.is_credit_exhausted_message("积分余额为 0") is True
     assert credit.is_credit_exhausted_message("无可用积分") is True
 
     # 正常正数积分（严防以 0 结尾的正数被子串 "0 credits" / "0积分" 误伤）
+    assert credit.is_credit_exhausted_message("1,050 个 Google Flow 点数") is False
+    assert credit.is_credit_exhausted_message("995 Google Flow credits") is False
     assert credit.is_credit_exhausted_message("100 credits") is False
     assert credit.is_credit_exhausted_message("100 Google Flow credits") is False
     assert credit.is_credit_exhausted_message("1000 credits") is False
@@ -450,3 +460,38 @@ def test_is_manageable_user_page_and_find_or_create_page_exclusion():
     assert omnibox_p2.closed is False
     # 多余的普通用户页被正常清理
     assert extra_user_page.closed is True
+
+
+def test_redesigned_angular_panel_chinese_ui():
+    """验证改版后的 Angular 移动端面板（中文 UI: 1,050 个 Google Flow 点数）。"""
+    page = _Page({
+        ".credits-count": _Locator(["1,050 个 Google Flow 点数"]),
+        "a.credits-link": _Locator(["1,050 个 Google Flow 点数"]),
+        "a[href*='flow_ai_credits_page']": _Locator(["1,050 个 Google Flow 点数"]),
+        "div[role='dialog']": _Locator(["ly F\nw393312401@gmail.com\n1,050 个 Google Flow 点数\n升级"]),
+        ".panel.panel-mobile": _Locator(["ly F\nw393312401@gmail.com\n1,050 个 Google Flow 点数\n升级"]),
+    })
+    assert credit._scan_menu_for_credit(page, timeout_seconds=1, poll_interval=0) == 1050
+
+
+def test_redesigned_angular_panel_english_ui():
+    """验证改版后的 Angular 移动端面板（英文 UI: 995 Google Flow credits）。"""
+    page = _Page({
+        ".credits-count": _Locator(["995 Google Flow credits"]),
+        "a.credits-link": _Locator(["995 Google Flow credits"]),
+        "a[href*='flow_ai_credits_page']": _Locator(["995 Google Flow credits"]),
+        "div[role='dialog']": _Locator(["Johnson Michael\nwushi0208.5@gmail.com\n995 Google Flow credits\nUpgrade"]),
+        ".panel.panel-mobile": _Locator(["Johnson Michael\nwushi0208.5@gmail.com\n995 Google Flow credits\nUpgrade"]),
+    })
+    assert credit._scan_menu_for_credit(page, timeout_seconds=1, poll_interval=0) == 995
+
+
+def test_redesigned_angular_panel_surface_fallback():
+    """验证当语义元素选择器由于外部变动未命中时，兜底从 account_menu_surface 提取。"""
+    page = _Page({
+        "div[role='dialog']": _Locator([
+            "Google\nclose\nly F\nw393312401@gmail.com\nSwitch account\n1,050 个 Google Flow 点数\n升级\n创建虚拟形象"
+        ]),
+    })
+    assert credit._scan_menu_for_credit(page, timeout_seconds=1, poll_interval=0) == 1050
+

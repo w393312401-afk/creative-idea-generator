@@ -239,6 +239,7 @@ sandbox.EventSource = function () { this.addEventListener = () => {}; this.close
 
 const runAdvance = async (action) => {
     calls.length = 0;
+    call('replicaBusy = false; replicaTaskId = null;');
     call(`replicaState = { job_id: 'j1', beats: { beats: [{ id: 'B01' }] } };`);
     await call(`replicaAdvance('${action}', {}, undefined)`);
     return calls;
@@ -259,8 +260,12 @@ const runAdvance = async (action) => {
     assert.ok(!urls.includes('/api/replica/beats'), 'recluster 不该先落盘——它本来就要丢掉这份阶梯');
 
     // 落盘失败必须就地中止。宁可让用户看见「保存失败」，也不能让一次静默的旧版本改写跑出去。
-    sandbox.fetch = async () => ({ ok: false, status: 500, statusText: 'boom', json: async () => ({}) });
+    sandbox.fetch = async (url) => {
+        calls.push(url);
+        return { ok: false, status: 500, statusText: 'boom', json: async () => ({}) };
+    };
     calls.length = 0;
+    call('replicaBusy = false;');
     call(`replicaState = { job_id: 'j1', beats: { beats: [{ id: 'B01' }] } };`);
     await call(`replicaAdvance('autofix', {}, undefined)`);
     assert.ok(!calls.includes('/api/replica/advance'), '落盘失败时不能继续推进');
@@ -282,6 +287,57 @@ const runAdvance = async (action) => {
     sandbox.confirm = () => { asked += 1; return true; };
     await call(`replicaLoadJob('j1')`);
     assert.equal(asked, 0, '刷新当前任务不该弹确认');
+
+    // 后发的切换请求先返回时，迟到的旧请求不能覆盖当前任务。
+    const pendingLoads = {};
+    sandbox.fetch = (url) => new Promise(resolve => { pendingLoads[url] = resolve; });
+    call('replicaDirty = false;');
+    const older = call("replicaLoadJob('older')");
+    const newer = call("replicaLoadJob('newer')");
+    const reply = (job_id) => ({ ok: true, json: async () => ({ job_state: { job_id } }) });
+    pendingLoads['/api/replica/status?job_id=newer'](reply('newer'));
+    await newer;
+    pendingLoads['/api/replica/status?job_id=older'](reply('older'));
+    await older;
+    assert.equal(call('replicaState.job_id'), 'newer');
+
+    // 保存尚未返回时再次点推进，只允许一个保存请求进入。
+    let finishSave;
+    calls.length = 0;
+    sandbox.fetch = (url) => {
+        calls.push(url);
+        if (url === '/api/replica/beats') return new Promise(resolve => { finishSave = resolve; });
+        return Promise.resolve({ ok: true, json: async () => ({ task_id: 't2' }) });
+    };
+    call("replicaBusy = false; replicaState = { job_id: 'j1', beats: { beats: [{id: 'B01'}] } };");
+    const firstAdvance = call("replicaAdvance('approve')");
+    await call("replicaAdvance('approve')");
+    assert.equal(calls.length, 1);
+    finishSave(reply('j1'));
+    await firstAdvance;
+    assert.equal(calls.filter(url => url === '/api/replica/advance').length, 1);
+
+    // 锁定母本可直接合成/派生，无需调用必然被后端拒绝的节拍写入。
+    calls.length = 0;
+    sandbox.fetch = async (url) => {
+        calls.push(url);
+        return { ok: true, json: async () => ({ task_id: 'locked-task' }) };
+    };
+    call("replicaBusy = false; replicaDirty = false; replicaState = { job_id: 'gold', is_locked_baseline: true, beats: { beats: [{id: 'B01'}] } };");
+    await call("replicaAdvance('approve')");
+    assert.deepEqual(calls, ['/api/replica/advance']);
+
+    // 四轴派生也必须先保存用户刚修改的母本。
+    calls.length = 0;
+    root.children.push(Object.assign(element('replica-axis-env'), { value: 'forest' }));
+    sandbox.fetch = async (url) => {
+        calls.push(url);
+        return { ok: true, json: async () => ({ task_id: 'variant-task',
+            job_state: { job_id: 'j1', beats: { beats: [{ id: 'B01' }] } } }) };
+    };
+    call("replicaBusy = false; replicaDirty = true; replicaState = { job_id: 'j1', beats: { beats: [{id: 'B01'}] } };");
+    await call('replicaMutateOrthogonal()');
+    assert.deepEqual(calls, ['/api/replica/beats', '/api/replica/mutate_orthogonal']);
 
     console.log('test_replica_progress.js: all assertions passed');
 })().catch(e => { console.error(e); process.exit(1); });

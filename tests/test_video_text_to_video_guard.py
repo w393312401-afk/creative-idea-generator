@@ -505,6 +505,22 @@ def test_prompt_reference_scan_falls_back_to_document_when_bar_is_unreachable():
     assert "if (!bar) return []" not in scripts[0]
 
 
+def test_prompt_reference_row_tolerance_preserves_left_to_right_order():
+    """同一行内的 chip 由于浮点渲染 top 可能有微弱偏差（如 0.5px），必须使用行高容差按 left 从左到右排序，不能直接按 a.top !== b.top 颠倒左右顺序。"""
+    scripts = []
+
+    class _P:
+        def evaluate(self, script):
+            scripts.append(script)
+            return {"uuids": [UUID_A, UUID_B], "scope": "bar"}
+
+    H.read_prompt_reference_state(_P(), limit=2)
+    assert len(scripts) == 1
+    script = scripts[0]
+    assert "Math.abs(a.top - b.top)" in script
+    assert "dy > 12" in script
+
+
 def test_long_prompt_reference_scan_does_not_block_submit_guard():
     class _P:
         def evaluate(self, _script):
@@ -619,3 +635,81 @@ def test_untainted_tile_is_still_adopted_on_retry_round(monkeypatch):
     adopted, still = runner._adopt_completed_tiles(object(), [(0, req)])
     assert len(adopted) == 1 and adopted[0]["tile_id"] == "fe_id_ok"
     assert still == []
+
+
+# ── 9. 老卡片重新拉取不许冒充本次上传（2026-09-06 第二批整体错位一帧）──────
+
+STALE_UUIDS = [
+    "59fe7974-3d92-4ff6-aec2-1faa6e567cea",
+    "b55260ab-4a1c-4ec0-bc9a-cd2f23e6f873",
+    "b60c00e1-cdf9-47d9-b43b-5a5395ae281a",
+    "74a83a0d-830c-4212-a485-2c4773c0fcd7",
+    "44e07c8a-5458-4298-95f5-29023762cf08",
+]
+# 现场日志里这 5 条的 Expires（签名链接的铸造时刻），全都早于上一张真上传的 9237
+STALE_EXPIRES = [1788699220, 1788699195, 1788699175, 1788699155, 1788699135]
+LAST_GOOD_EXPIRES = 1788699237
+
+
+def _flow_url(uuid, expires):
+    return f"https://flow-content.google/image/{uuid}?Expires={expires}&KeyName=la"
+
+
+@pytest.fixture
+def _fresh_watermark(monkeypatch):
+    monkeypatch.setattr(V, "_LAST_CONFIRMED_UPLOAD_EXPIRES", float(LAST_GOOD_EXPIRES))
+
+
+def test_lazy_reload_of_older_canvas_cards_is_not_taken_as_the_upload(
+        _patch_upload_deps, _fresh_watermark):
+    """现场复盘（server.log 14:54:01，videos_b99fa816）：新建项目失败，画布留着上一批
+    的成片卡片。上传 img_021 时这些老卡片的缩略图集中懒加载，一口气吐出 5 条
+    flow-content 响应——它们的 Expires 全都比刚传完的 img_020（9237）还早，是老卡片
+    的出生时间，不可能是刚传上去的这一张。
+
+    旧实现取列表第一条就走，把 59fe7974 当成了 img_021；img_021 的真卡片随后才渲染
+    出来，被下一张图的 DOM 扫描当成"恰好一张新卡"吃掉，整批映射从此错位一帧
+    （VID 022~024 实际用的是 img_021→022 / 022→023 / 023→024）。
+    """
+    page = _FakeUploadPage(
+        panel_states=[[UUID_A], [UUID_A] + STALE_UUIDS],
+        captured=[_flow_url(u, e) for u, e in zip(STALE_UUIDS, STALE_EXPIRES)],
+    )
+    got = V._upload_image_to_canvas(page, _patch_upload_deps, timeout=2,
+                                    extra_known_uuids={UUID_A})
+    assert got is None, "比水位线还旧的签名链接不是本次上传，宁可判上传失败也不能认领"
+
+
+def test_genuinely_new_upload_is_still_accepted_amid_stale_reloads(
+        _patch_upload_deps, _fresh_watermark):
+    """同样的老卡片噪声里混着一条真上传（Expires 更新）：必须挑出它，不能一起误杀。"""
+    page = _FakeUploadPage(
+        panel_states=[[UUID_A], [UUID_A] + STALE_UUIDS + [UUID_B]],
+        captured=[_flow_url(u, e) for u, e in zip(STALE_UUIDS, STALE_EXPIRES)]
+                 + [_flow_url(UUID_B, LAST_GOOD_EXPIRES + 9)],
+    )
+    got = V._upload_image_to_canvas(page, _patch_upload_deps, timeout=5,
+                                    extra_known_uuids={UUID_A})
+    assert got == UUID_B
+
+
+def test_confirmed_upload_raises_the_expires_watermark(_patch_upload_deps, monkeypatch):
+    """水位线只增不减：认下一张图后抬高，下一次上传才拦得住比它旧的老卡片。"""
+    monkeypatch.setattr(V, "_LAST_CONFIRMED_UPLOAD_EXPIRES", 0.0)
+    page = _FakeUploadPage(panel_states=[[UUID_A], [UUID_A, UUID_B]],
+                           captured=[_flow_url(UUID_B, LAST_GOOD_EXPIRES)])
+    assert V._upload_image_to_canvas(page, _patch_upload_deps, timeout=5,
+                                     extra_known_uuids={UUID_A}) == UUID_B
+    assert V._LAST_CONFIRMED_UPLOAD_EXPIRES == float(LAST_GOOD_EXPIRES)
+
+
+def test_two_equally_fresh_network_uuids_are_never_guessed(_patch_upload_deps, monkeypatch):
+    """网络里同时冒出两个都比水位线新的 UUID：无从分辨，绝不掷骰子。"""
+    monkeypatch.setattr(V, "_LAST_CONFIRMED_UPLOAD_EXPIRES", 0.0)
+    page = _FakeUploadPage(
+        panel_states=[[UUID_A], [UUID_A, UUID_B, UUID_C]],
+        captured=[_flow_url(UUID_B, LAST_GOOD_EXPIRES),
+                  _flow_url(UUID_C, LAST_GOOD_EXPIRES + 1)],
+    )
+    assert V._upload_image_to_canvas(page, _patch_upload_deps, timeout=2,
+                                     extra_known_uuids={UUID_A}) is None

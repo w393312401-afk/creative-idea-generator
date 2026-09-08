@@ -827,10 +827,10 @@ def run_standalone_login(user_id: str, port=None,
     from playwright.sync_api import sync_playwright
 
     from .browser import (find_or_create_page, get_ads_ws_url,
-                          wait_for_login_redirect)
+                          wait_for_login_redirect, FLOW_HOME_URL)
     from .browser_gate import browser_slot
 
-    flow_url = "https://labs.google/fx/tools/flow"
+    flow_url = FLOW_HOME_URL
     entered_slot = False
     try:
         with browser_slot('auto_login', priority=40, task_id=f'auto_login_{user_id}'):

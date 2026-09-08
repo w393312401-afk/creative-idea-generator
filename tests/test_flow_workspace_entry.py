@@ -190,7 +190,10 @@ def test_flow_project_crashed_recovers_via_goto_fallback():
 
     page = _CrashedPageNoBtn()
     assert ensure_flow_workspace(page, timeout_seconds=2) is True
-    assert page.navigated_to == "https://labs.google/fx/tools/flow"
+    # 断言对着常量而不是字面量：Flow 2026-09-05 搬到 flow.google.com，
+    # 当时到处写死的地址就是这么集体失效的，用例不该再复制一份。
+    from integrations.google_fx.utils.browser import FLOW_HOME_URL
+    assert page.navigated_to == FLOW_HOME_URL
     assert page.ready is True
 
 
@@ -441,3 +444,109 @@ def test_real_crash_page_is_still_detected():
     assert _flow_project_crashed(
         _crash_probe_page(editor_visible=False, body_text="Something went wrong.")
     ) is True
+
+
+# ── 新建项目失败 = 落回旧画布，历史卡片必须照样拍快照 ────────────────────
+# 2026-09-06 复盘：整份 server.log 里"新建项目成功"出现 0 次，tasks/results 里连续
+# 15 个任务的 google_fx_project_url 是同一个 id——新建项目其实一直在失败，每个任务
+# 都堆在上一次那张画布上。而 _snapshot_preexisting_tiles 当时只在"绑定画布"时才拍
+# 快照，理由是"自建的新项目画布本来就是空的"——这个前提在新建失败时根本不成立，
+# 于是历史卡片既没被排除在认领之外，也没人知道画布是脏的。
+
+def _dirty_runner():
+    from integrations.google_fx.services import google_fx_video as V
+    return V._ChunkRunner(total_reqs=1, chunk_start=0, chunk=[], all_slices={},
+                          on_progress=None, cancel_check=None)
+
+
+def test_failed_new_project_marks_canvas_dirty_and_snapshots_history(monkeypatch):
+    from integrations.google_fx.services import google_fx_video as V
+
+    runner = _dirty_runner()
+    runner.canvas_is_bound = False
+    runner.canvas_is_dirty = True  # _prepare_page 在新建项目失败时置位
+    monkeypatch.setattr(V, "_scan_canvas_tiles", lambda page: [
+        {"tileId": "old_1", "originalTileId": "old_1"},
+        {"tileId": "old_2", "originalTileId": "old_2"},
+    ])
+
+    runner._snapshot_preexisting_tiles(object())
+
+    assert runner.preexisting_tile_ids == {"old_1", "old_2"}, \
+        "沿用旧画布时历史卡片必须排除在认领之外，否则重试轮会认领别的任务的成片"
+
+
+def test_clean_self_made_canvas_still_skips_the_snapshot(monkeypatch):
+    from integrations.google_fx.services import google_fx_video as V
+
+    runner = _dirty_runner()
+    runner.canvas_is_bound = False
+    runner.canvas_is_dirty = False
+    monkeypatch.setattr(V, "_scan_canvas_tiles",
+                        lambda page: pytest.fail("干净画布不该白扫一遍"))
+
+    runner._snapshot_preexisting_tiles(object())
+    assert runner.preexisting_tile_ids == set()
+
+
+# ── 新建项目的确认窗口不能卡在 navigation 落地前一瞬间 ────────────────────
+# 2026-09-06 只读探针实测：从 flow.google.com 首页点 button.new-project-button 到
+# URL 变成 /project/<新 id>，耗时**略超过 15 秒**。原来 confirm_timeout=15.0 每次
+# 都在落地前一瞬间到期 → 这个函数从来没返回过 True（server.log 里"新建项目成功"
+# 出现 0 次），而项目其实每次都建出来了。调用方于是打出"画布可能残留历史卡片"的
+# 假警报，帧链靠 `or _find_fx_prompt_input(...)` 兜底才没出事。
+
+class _LateNavPage:
+    """点击后第 N 次读 url 才变成新项目页——模拟落地慢于确认窗口。"""
+
+    def __init__(self, flip_after_reads):
+        self._reads = 0
+        self._flip = flip_after_reads
+        self._clicked = False
+
+    @property
+    def url(self):
+        self._reads += 1
+        if self._clicked and self._reads >= self._flip:
+            return "https://flow.google.com/project/91049bf9-e2c6-4ef7-ade0-e2eb379083bf"
+        return "https://flow.google.com/"
+
+    def locator(self, selector):
+        return self
+
+    @property
+    def first(self):
+        return self
+
+    def is_visible(self, timeout=None):
+        return True
+
+    def click(self, **kwargs):
+        self._clicked = True
+
+    class _Kb:
+        @staticmethod
+        def press(_k):
+            return None
+
+    keyboard = _Kb()
+
+
+def test_new_project_confirm_window_is_not_shorter_than_measured_navigation():
+    """契约：确认窗口必须明显宽于实测的 ~15s，否则每次成功都被判成失败。"""
+    import inspect
+    from integrations.google_fx.services import google_fx_helpers as H
+
+    sig = inspect.signature(H._click_new_project_button)
+    assert sig.parameters["confirm_timeout"].default >= 30.0
+
+
+def test_navigation_landing_just_after_the_deadline_still_counts_as_success(monkeypatch):
+    from integrations.google_fx.services import google_fx_helpers as H
+
+    page = _LateNavPage(flip_after_reads=4)
+    monkeypatch.setattr(H, "random_sleep", lambda *a, **k: None)
+    monkeypatch.setattr(H.time, "sleep", lambda *_a: None)
+
+    # confirm_timeout=0：主循环一轮就到期，只剩收尾那一次宽限复查
+    assert H._click_new_project_button(page, confirm_timeout=0.0) is True

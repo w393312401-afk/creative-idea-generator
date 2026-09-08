@@ -231,32 +231,50 @@ try:
 except ImportError:
     fcntl = None
 
+_JOB_THREAD_LOCKS = {}
+_JOB_THREAD_LOCKS_GUARD = threading.Lock()
+
+def _get_job_thread_lock(job_id):
+    with _JOB_THREAD_LOCKS_GUARD:
+        if job_id not in _JOB_THREAD_LOCKS:
+            _JOB_THREAD_LOCKS[job_id] = threading.RLock()
+        return _JOB_THREAD_LOCKS[job_id]
+
 
 @contextmanager
 def state_lock(job_id, exclusive=True):
-    """跨进程/线程文件排他锁，防止后台 Worker 与前端 HTTP 请求并发写冲突。"""
+    """跨进程/线程排他锁，防止后台 Worker 与前端 HTTP 请求并发写冲突。"""
+    valid_id = validate_job_id(job_id)
+    thread_lock = _get_job_thread_lock(valid_id)
+    thread_lock.acquire()
+    f = None
     try:
-        valid_id = validate_job_id(job_id)
         directory = os.path.join(jobs_root(), valid_id)
         os.makedirs(directory, exist_ok=True)
         lock_path = os.path.join(directory, '.state.lock')
         flags = (fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH) if fcntl else 0
-        with open(lock_path, 'a') as f:
+        try:
+            f = open(lock_path, 'a')
             if fcntl:
                 try:
                     fcntl.flock(f.fileno(), flags)
                 except (OSError, AttributeError):
                     pass
-            try:
-                yield
-            finally:
-                if fcntl:
-                    try:
-                        fcntl.flock(f.fileno(), fcntl.LOCK_UN)
-                    except (OSError, AttributeError):
-                        pass
-    except Exception:
+        except Exception:
+            f = None
         yield
+    finally:
+        if f is not None:
+            if fcntl:
+                try:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+                except (OSError, AttributeError):
+                    pass
+            try:
+                f.close()
+            except Exception:
+                pass
+        thread_lock.release()
 
 
 def _write_summary(state):
@@ -633,10 +651,18 @@ def find_job_by_video_hash(video_hash):
     if not video_hash:
         return None
     for row in list_replica_jobs():
-        if row.get('video_sha256') == video_hash and row.get('stage') != 'cancelled':
+        if row.get('video_sha256') == video_hash:
+            if row.get('stage') in ('cancelled', 'archived') or row.get('archived'):
+                continue
+            if row.get('variant_of') or row.get('parent_baseline_id'):
+                continue
             state = _load_state(row['job_id'])
-            if state:
-                return state
+            if state and not state.get('archived') and state.get('stage') not in ('cancelled', 'archived'):
+                if state.get('variant_of') or state.get('parent_baseline_id'):
+                    continue
+                vpath = state.get('video_path')
+                if vpath and os.path.isfile(vpath):
+                    return state
     return None
 
 
@@ -2390,7 +2416,7 @@ def load_compose_state(job_id):
     return data if data.get('packet') and data.get('beat_ladder') else None
 
 
-def save_prompt(job_id, prompt_block):
+def save_prompt(job_id, prompt_block, force=False):
     """人工修改/修复提示词包并重新执行禁用元素门禁复核。
     
     若无违规项，自动转入 completed 阶段并落入创意库；
@@ -2408,7 +2434,7 @@ def save_prompt(job_id, prompt_block):
 
     # 门禁口径只有 run_audit 一处：这里再抄一份 banned_element_hits + _publish_to_library，
     # 两道闸迟早会走岔（run_audit 的注释里记着上一次走岔的代价）。
-    state = run_audit(state)
+    state = run_audit(state, force=force)
 
     if state.get('stage') == 'completed':
         # 同步更新 compose_state.json 中的槽位。compiled_images / compiled_videos 的契约是
@@ -2427,10 +2453,22 @@ def save_prompt(job_id, prompt_block):
     return _save_state(state)
 
 
+def force_deliver_prompt(job_id):
+    """人工强制放行并交付提示词包入库（即使用户确认忽略差量警告或门禁拦截）。"""
+    state = _load_state(job_id)
+    if not state:
+        raise ValueError(f'找不到复刻任务 {job_id}')
+    prompt_block = str(state.get('prompt_block') or '').strip()
+    if not prompt_block:
+        raise ValueError('任务尚未生成提示词包')
+    return save_prompt(job_id, prompt_block, force=True)
+
+
 def _slot_bodies(slots):
     """_parse_prompt_slots 的 {int: {'body','meta'}} → compose_state 用的 {int: str}。"""
     if isinstance(slots, list):
-        return {item.get('index', i + 1): (item.get('body') if isinstance(item, dict) else str(item))
+        return {(item.get('index', i + 1) if isinstance(item, dict) else i + 1):
+                (item.get('body') if isinstance(item, dict) else str(item))
                 for i, item in enumerate(slots)}
     return {k: (v.get('body') if isinstance(v, dict) else str(v)) for k, v in (slots or {}).items()}
 
@@ -2701,7 +2739,7 @@ def _outputs_url(state, abs_path):
     return f'/outputs/{_JOBS_DIRNAME}/{state.get("variant_of") or state["job_id"]}/{name}'
 
 
-def run_audit(state, on_progress=None):
+def run_audit(state, on_progress=None, force=False):
     """P0 门禁：banned_elements 命中即拦下交付。
 
     2026-08-10 之前这里扫完命中就 `_publish_to_library` + `stage='completed'`，只在文案里
@@ -2722,7 +2760,7 @@ def run_audit(state, on_progress=None):
     hits = reverse.banned_element_hits(state.get('prompt_block'), banned)
     state['banned_hits'] = hits
 
-    if hits:
+    if hits and not force:
         state['stage'] = 'audit_failed'
         _save_state(state)
         if on_progress:
@@ -2750,8 +2788,9 @@ def run_audit(state, on_progress=None):
     try:
         slots = prompt_slots_list(state.get('prompt_block') or '')
         video_bodies = {v['index']: v['body'] for v in (slots.get('videos') or [])}
+        image_bodies = {v['index']: v['body'] for v in (slots.get('images') or [])}
         beat_list = (state.get('beats') or {}).get('beats') or []
-        ghosts = validate_video_objects(beat_list, video_bodies)
+        ghosts = validate_video_objects(beat_list, video_bodies, image_prompts=image_bodies)
     except Exception:
         # 差量检查失手不该拦住一条本来合格的交付：它是新增的一道守卫，不是主干。
         ghosts = []
@@ -2759,7 +2798,7 @@ def run_audit(state, on_progress=None):
     state['video_delta_issues'] = ghosts
     blocking_ghosts = [g for g in ghosts if g.get('severity') == 'blocking']
 
-    if blocking_ghosts:
+    if blocking_ghosts and not force:
         state['stage'] = 'audit_failed'
         _save_state(state)
         if on_progress:
@@ -2770,7 +2809,7 @@ def run_audit(state, on_progress=None):
                             f'{format_violations(blocking_ghosts, limit=8)}\n'
                             f'把这些动作删掉，或者在节拍阶梯里补上对应的建造拍再重跑合成。'),
                 'title': state.get('title'),
-                'banned_hits': [],
+                'banned_hits': hits,
                 'video_delta_issues': blocking_ghosts,
             })
         return state
@@ -2785,7 +2824,8 @@ def run_audit(state, on_progress=None):
             'stage': 'completed',
             'message': '提示词包已生成，并已写入创意库。',
             'title': state.get('title'),
-            'banned_hits': [],
+            'banned_hits': hits,
+            'video_delta_issues': ghosts,
         })
     return state
 
@@ -3024,16 +3064,9 @@ def get_replica_status(job_id):
     # （2026-08-12 的变体阶梯就是这样：24 项「缺少 evidence_frames」全是过期结论）。
     _revalidate(state, persist=False)
 
-    # 自动自愈：若任务停在 audit_failed，但当前提示词在最新门禁规则下已无禁用词违规，自动恢复到 completed 并落库
+    # 自动自愈：若任务停在 audit_failed，调用 run_audit 统一复核（禁用元素与视频差量）；全通才落库
     if state.get('stage') == 'audit_failed' and state.get('prompt_block'):
-        from prompt_pipeline import reverse
-        banned = (state.get('beats') or {}).get('banned_elements') or []
-        hits = reverse.banned_element_hits(state.get('prompt_block'), banned)
-        state['banned_hits'] = hits
-        if not hits:
-            state['stage'] = 'completed'
-            _publish_to_library(state)
-            _save_state(state)
+        state = run_audit(state)
 
     state['frame_urls'] = frame_urls(state)
     # 有没有上一版可回退。前端据此决定要不要摆「撤销」——没有可回退版本时摆一个
@@ -3085,7 +3118,9 @@ def delete_replica_job(job_id, force=False):
         # 检查是否有变体任务依赖此任务
         dependents = []
         for item in list_replica_jobs():
-            if item.get('variant_of') == job_id:
+            if item.get('job_id') == job_id:
+                continue
+            if item.get('variant_of') == job_id or item.get('parent_baseline_id') == job_id:
                 dependents.append(item.get('job_id'))
         if dependents:
             raise ValueError(
@@ -3167,6 +3202,18 @@ def archive_replica_job(job_id):
     state = _load_state(job_id)
     if not state:
         raise ValueError(f'找不到复刻任务 {job_id}')
+
+    # 检查是否有变体任务依赖此任务
+    dependents = []
+    for item in list_replica_jobs():
+        if item.get('job_id') == job_id:
+            continue
+        if item.get('variant_of') == job_id or item.get('parent_baseline_id') == job_id:
+            dependents.append(item.get('job_id'))
+    if dependents:
+        raise ValueError(
+            f'无法归档该任务：已有 {len(dependents)} 个二创变体（如 {dependents[0]}）'
+            f'依赖于其视频素材。')
 
     directory = job_dir(job_id)
     # 1. 确保缩略图存在

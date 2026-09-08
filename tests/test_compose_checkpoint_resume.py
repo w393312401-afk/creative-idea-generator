@@ -563,6 +563,33 @@ class TestComposeRemainingBeatsResume(unittest.TestCase):
         # 整单成功交付后存档应该被清空
         self.assertIsNone(pp.load_compose_checkpoint(self.fingerprint))
 
+    def test_transport_failure_exposes_cause_and_retains_completed_beats(self):
+        state = self._make_state(total_beats=3)
+
+        def failing_chat(config, system, user, **kwargs):
+            if self._beat_numbers_from_batch_user(user):
+                return '===BEAT 1 VIDEO===\nVideo one\n===BEAT 1 IMAGE===\nImage two'
+            raise RuntimeError('Local LLM proxy timed out after 120 seconds')
+
+        config = {'composeRequestTimeoutSeconds': 120}
+        with patch.object(pp, '_chat', side_effect=failing_chat) as chat:
+            with self.assertRaisesRegex(pp.ComposeFailure, 'Cause: Local LLM proxy timed out'):
+                pp.compose_remaining_beats(config, state)
+        singles = [call for call in chat.call_args_list
+                   if 'Generate prompts for Beat ' in call.args[2]]
+        self.assertEqual(len(singles), 2)
+        self.assertTrue(all(call.kwargs['timeout'] == 120 for call in singles))
+        checkpoint = pp.load_compose_checkpoint(self.fingerprint)
+        self.assertEqual(checkpoint['pass_beats_done'], [1])
+        self.assertEqual(checkpoint['slot_states']['2'], 'failed')
+        self.assertNotIn(3, state['compiled_images'])
+
+        calls = []
+        with patch.object(pp, '_chat', side_effect=self._fake_chat_factory(calls)):
+            pp.compose_remaining_beats(config, state)
+        self.assertEqual(sorted(set(calls)), [2, 3])
+        self.assertIsNone(pp.load_compose_checkpoint(self.fingerprint))
+
     @staticmethod
     def _validation_crashes_on(beat_num, flag):
         """validate_beat_prompts side_effect: raises a code-level error for `beat_num`

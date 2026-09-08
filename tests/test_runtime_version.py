@@ -13,6 +13,16 @@ import server_common
 from server_common import code_staleness_report, runtime_version_report
 
 
+def test_google_fx_edits_are_detected(tmp_path, monkeypatch):
+    source = tmp_path / 'integrations/google_fx/services/google_fx_helpers.py'
+    source.parent.mkdir(parents=True)
+    source.write_text('# updated detector', encoding='utf-8')
+    monkeypatch.setattr(server_common, '_PROJECT_ROOT', str(tmp_path))
+    monkeypatch.setattr(server_common, 'SERVICE_START_TIME', time.time() - 10)
+    assert code_staleness_report()['stale_files'] == [
+        'integrations/google_fx/services/google_fx_helpers.py']
+
+
 @pytest.fixture
 def _fake_source_tree(tmp_path, monkeypatch):
     """把核心源文件的搜索范围钉死在一个临时目录，不touch真实仓库文件。"""

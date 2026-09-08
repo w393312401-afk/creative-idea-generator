@@ -61,41 +61,41 @@ _P = r'(?:e?s)?'
 
 _OBJECT_VOCAB: List[Tuple[str, str, str]] = [
     # (canonical_id, pattern, role)
-    ('sub_base',      rf'\b(?:sub-?base{_P}|sub-?floor\s+(?:bed|layer){_P}|aggregate\s+(?:bed|layer|sub-?base){_P}|hardcore|ballast\s+bed{_P}|crushed\s+\w+\s+(?:bed|layer){_P})\b', 'subfloor'),
+    ('sub_base',      rf'\b(?:sub-?base{_P}|sub-?floor\s+(?:bed|layer){_P}|aggregate\s+(?:bed|layer|sub-?base){_P}|hardcore|ballast\s+bed{_P}|crushed\s+\w+\s+(?:bed|layer){_P}|垫层|碎石层|找平层|基底)\b', 'subfloor'),
     # `screed` 在建造散文里多半是**动词**（"distribute, screed, and tamp the gravel"），
     # 收裸词会让每一条摊铺拍都凭空长出一层找平层。只收它作名词的写法。
     ('screed',        rf'\b(?:screed\s+layer{_P}|screed\s+bed{_P}|levell?ing\s+layer{_P}|floor\s+screed{_P})\b', 'subfloor'),
-    ('structural_frame', rf'\b(?:portal\s+(?:arch|frame){_P}|structural\s+frame{_P}|post-?and-?beam|stud\s+wall{_P}|wall\s+framing|framing\s+cage{_P}|roof\s+truss{_P}|rafter{_P}|wall\s+upright{_P})\b', 'structure'),
+    ('structural_frame', rf'\b(?:portal\s+(?:arch|frame){_P}|structural\s+frame{_P}|post-?and-?beam|stud\s+wall{_P}|wall\s+framing|framing\s+cage{_P}|roof\s+truss{_P}|rafter{_P}|wall\s+upright{_P}|pier\s+and\s+lintel{_P}|pier{_P}|lintel{_P}|monolithic\s+wall{_P}|tensioned\s+\w+\s+frame{_P}|骨架|框架|立柱|门拱|主梁)\b', 'structure'),
     ('ceiling_rib',   rf'\b(?:ceiling\s+(?:rib|arch|batten){_P}|curved\s+rib{_P}|barrel\s+arch{_P})\b', 'structure'),
-    ('exterior_cladding', rf'\b(?:exterior\s+cladding|exterior\s+panel{_P}|siding|shell\s+plate{_P}|cladding\s+plate{_P}|riveted\s+\w+\s+(?:panel|plate){_P})\b', 'enclosure'),
-    ('opening',       rf'\b(?:door\s+opening{_P}|portal\s+opening{_P}|aperture{_P}|wall\s+cut-?out{_P}|window\s+cut-?out{_P}|rebate{_P})\b', 'opening'),
-    ('window',        rf'\b(?:window{_P}|glazing\s+unit{_P}|glazed\s+(?:panel|unit){_P}|casement{_P})\b', 'window'),
-    ('door_leaf',     rf'\b(?:door\s+lea(?:f|ves)|swinging\s+door{_P}|cargo\s+door{_P}|entry\s+door{_P}|double\s+door{_P}|door\s+panel{_P})\b', 'door'),
+    ('exterior_cladding', rf'\b(?:exterior\s+cladding|exterior\s+panel{_P}|siding|shell\s+plate{_P}|cladding\s+plate{_P}|riveted\s+\w+\s+(?:panel|plate){_P}|外墙板|外挂板|外覆层|外壁)\b', 'enclosure'),
+    ('opening',       rf'\b(?:door\s+opening{_P}|portal\s+opening{_P}|aperture{_P}|wall\s+cut-?out{_P}|window\s+cut-?out{_P}|rebate{_P}|门洞|窗洞|洞口)\b', 'opening'),
+    ('window',        rf'\b(?:window{_P}|glazing\s+unit{_P}|glazed\s+(?:panel|unit){_P}|casement{_P}|窗户|玻璃窗)\b', 'window'),
+    ('door_leaf',     rf'\b(?:door\s+lea(?:f|ves)|swinging\s+door{_P}|cargo\s+door{_P}|entry\s+door{_P}|double\s+door{_P}|door\s+panel{_P}|门扇|双开门|板门|木门)\b', 'door'),
     ('door_hardware', rf'\b(?:strap\s+hinge{_P}|cam-?latch{_P}|locking\s+bar{_P}|espagnolette{_P}|door\s+handle{_P}|weatherseal{_P}|compression\s+seal{_P})\b', 'door'),
     ('sill_plate',    rf'\b(?:sill\s+plate{_P}|threshold\s+plate{_P}|door\s+sill{_P})\b', 'door'),
-    ('vapour_barrier', rf'\b(?:vapou?r\s+barrier{_P}|damp-?proof\s+membrane{_P}|breather\s+membrane{_P}|poly\s+sheeting|barrier\s+membrane{_P})\b', 'membrane'),
+    ('vapour_barrier', rf'\b(?:vapou?r\s+barrier{_P}|damp-?proof\s+membrane{_P}|breather\s+membrane{_P}|poly\s+sheeting|barrier\s+membrane{_P}|防潮层|隔汽膜|防水卷材)\b', 'membrane'),
     ('seam_tape',     rf'\b(?:seam\s+tape|foil\s+tape|sealing\s+tape)\b', 'membrane'),
-    ('conduit',       rf'\b(?:conduit{_P}|wiring\s+run{_P}|cable\s+run{_P}|junction\s+box{_P}|electrical\s+rough-?in)\b', 'service'),
+    ('conduit',       rf'\b(?:conduit{_P}|wiring\s+run{_P}|cable\s+run{_P}|junction\s+box{_P}|electrical\s+rough-?in|线管|穿线管|电线套管)\b', 'service'),
     ('power_source',  rf'\b(?:solar\s+panel{_P}|battery\s+bank{_P}|generator{_P}|shore\s+power|mains\s+hook-?up|charge\s+controller{_P})\b', 'service'),
-    ('plumbing',      rf'\b(?:water\s+tank{_P}|freshwater\s+tank{_P}|shut-?off\s+valve{_P}|supply\s+line{_P}|waste\s+pipe{_P}|greywater)\b', 'service'),
+    ('plumbing',      rf'\b(?:water\s+tank{_P}|freshwater\s+tank{_P}|shut-?off\s+valve{_P}|supply\s+line{_P}|waste\s+pipe{_P}|greywater|给排水|水管|水箱)\b', 'service'),
     # 裸 `basin` 不收：母本的「rock basin」是地貌，收了会让每一条排水拍都凭空长出一个水槽。
-    ('sink',          rf'\b(?:sink{_P}|wash\s*basin{_P})\b', 'cabinetry'),
-    ('flue_collar',   rf'\b(?:flue\s+(?:collar|sleeve|penetration){_P}|chimney\s+(?:collar|penetration){_P}|roof\s+penetration{_P})\b', 'heating'),
-    ('flue_pipe',     rf'\b(?:flue\s+pipe{_P}|chimney\s+pipe{_P}|twin-?wall\s+flue{_P}|stove\s+pipe{_P})\b', 'heating'),
-    ('stove',         rf'\b(?:wood-?burning\s+stove{_P}|cast-?iron\s+stove{_P}|stove{_P}|hearth{_P}|firebox{_P}|masonry\s+heater{_P})\b', 'heating'),
-    ('floor_batten',  rf'\b(?:floor\s+(?:batten|sleeper){_P}|sleeper\s+(?:grid|bay){_P}|noggin{_P}|counter-?batten{_P}|joist\s+grid{_P})\b', 'batten'),
-    ('insulation',    rf'\b(?:rockwool|mineral\s+wool|insulation\s+batt{_P}|wool\s+batt{_P}|aerogel\s+(?:layer|blanket){_P}|wood-?fibre\s+board{_P})\b', 'insulation'),
-    ('sheathing',     rf'\b(?:plywood\s+(?:sheathing|backing|panel){_P}|birch\s+plywood|osb\s+board{_P}|backing\s+panel{_P}|structural\s+backing)\b', 'sheathing'),
-    ('finish_floor',  rf'\b(?:floorboard{_P}|finish(?:ed)?\s+floor{_P}|tongue-?and-?groove\s+floor{_P}|hardwood\s+floor{_P}|floor\s+plank{_P})\b', 'flooring'),
-    ('interior_lining', rf'\b(?:slat\s+(?:lining|cladding)|interior\s+lining|wall\s+lining|panel(?:ling|ing)|wainscot{_P}|fluted\s+\w+\s+slat{_P})\b', 'cladding'),
-    ('protective_coating', rf'\b(?:passivator{_P}|clear\s+coat{_P}|protective\s+coating{_P}|sealer\s+coat{_P}|hardwax\s+oil|limewash|varnish{_P})\b', 'coating'),
-    ('paving',        rf'\b(?:flagstone{_P}|paving\s+slab{_P}|paver{_P}|patio\s+landing{_P}|entry\s+landing{_P}|walkway\s+slab{_P})\b', 'paving'),
+    ('sink',          rf'\b(?:sink{_P}|wash\s*basin{_P}|水槽|洗手盆)\b', 'cabinetry'),
+    ('flue_collar',   rf'\b(?:flue\s+(?:collar|sleeve|penetration){_P}|chimney\s+(?:collar|penetration){_P}|roof\s+penetration{_P}|穿顶领圈|烟囱套管)\b', 'heating'),
+    ('flue_pipe',     rf'\b(?:flue\s+pipe{_P}|chimney\s+pipe{_P}|twin-?wall\s+flue{_P}|stove\s+pipe{_P}|烟道|烟囱管|烟管)\b', 'heating'),
+    ('stove',         rf'\b(?:wood-?burning\s+stove{_P}|cast-?iron\s+stove{_P}|stove{_P}|hearth{_P}|firebox{_P}|masonry\s+heater{_P}|炉子|壁炉|火炉)\b', 'heating'),
+    ('floor_batten',  rf'\b(?:floor\s+(?:batten|sleeper){_P}|sleeper\s+(?:grid|bay|framing){_P}|noggin{_P}|counter-?batten{_P}|joist\s+grid{_P}|softwood\s+batten{_P}|timber\s+sleeper{_P}|地面龙骨|木楞|地龙骨)\b', 'batten'),
+    ('insulation',    rf'\b(?:rockwool|mineral\s+wool|insulation\s+batt{_P}|wool\s+batt{_P}|fiberglass\s+(?:batt|insulation){_P}|batt\s+insulation|aerogel\s+(?:layer|blanket){_P}|wood-?fibre\s+board{_P}|保温棉|岩棉)\b', 'insulation'),
+    ('sheathing',     rf'\b(?:plywood\s+(?:sheathing|backing|panel){_P}|birch\s+plywood|osb\s+board{_P}|backing\s+panel{_P}|structural\s+backing|基层板|衬板)\b', 'sheathing'),
+    ('finish_floor',  rf'\b(?:floorboard{_P}|finish(?:ed)?\s+floor{_P}|tongue-?and-?groove\s+floor{_P}|hardwood\s+floor{_P}|floor\s+plank{_P}|地板|木地板|成品地面)\b', 'flooring'),
+    ('interior_lining', rf'\b(?:slat\s+(?:lining|cladding)|interior\s+lining|wall\s+lining|panel(?:ling|ing)|wainscot{_P}|fluted\s+\w+\s+slat{_P}|饰面板|内衬板)\b', 'cladding'),
+    ('protective_coating', rf'\b(?:passivator{_P}|clear\s+coat{_P}|protective\s+coating{_P}|sealer\s+coat{_P}|hardwax\s+oil|limewash|varnish{_P}|保护涂层|防腐清漆)\b', 'coating'),
+    ('paving',        rf'\b(?:flagstone{_P}|paving\s+slab{_P}|paver{_P}|patio\s+landing{_P}|entry\s+landing{_P}|walkway\s+slab{_P}|铺路石板|室外地坪|前廊石板)\b', 'paving'),
     ('scrape_grate',  rf'\b(?:scrape\s+grate{_P}|entry\s+grate{_P}|perforated\s+\w+\s+grate{_P}|boot\s+grate{_P})\b', 'paving'),
-    ('cabinetry',     rf'\b(?:base\s+cabinet{_P}|cabinet\s+carcass{_P}|kitchenette{_P}|cabinetry|worktop{_P}|countertop{_P}|joinery\s+unit{_P})\b', 'cabinetry'),
+    ('cabinetry',     rf'\b(?:base\s+cabinet{_P}|cabinet\s+carcass{_P}|kitchenette{_P}|cabinetry|worktop{_P}|countertop{_P}|joinery\s+unit{_P}|橱柜|台面|操作台)\b', 'cabinetry'),
     ('kitchen_island', rf'\b(?:kitchen\s+island{_P}|island\s+unit{_P})\b', 'cabinetry'),
-    ('workbench',     rf'\b(?:workbench{_P}|fold-?down\s+bench{_P}|butcher-?block\s+bench{_P})\b', 'cabinetry'),
-    ('bed_platform',  rf'\b(?:platform\s+bed{_P}|bed\s+frame{_P}|sleeping\s+platform{_P}|berth{_P})\b', 'furnishing'),
-    ('lighting',      rf'\b(?:led\s+(?:strip|cove){_P}|cove\s+lighting|under-?cabinet\s+light{_P}|light\s+fitting{_P}|luminaire{_P})\b', 'service'),
+    ('workbench',     rf'\b(?:workbench{_P}|fold-?down\s+bench{_P}|butcher-?block\s+bench{_P}|工作台|手作台)\b', 'cabinetry'),
+    ('bed_platform',  rf'\b(?:platform\s+bed{_P}|bed\s+frame{_P}|sleeping\s+platform{_P}|berth{_P}|地台床|睡榻)\b', 'furnishing'),
+    ('lighting',      rf'\b(?:led\s+(?:strip|cove){_P}|cove\s+lighting|under-?cabinet\s+light{_P}|light\s+fitting{_P}|luminaire{_P}|灯具|照明|吊灯)\b', 'service'),
 ]
 
 _OBJECT_PATTERNS: List[Tuple[str, re.Pattern, str]] = [
@@ -113,6 +113,14 @@ ROLE_OBJECTS: Dict[str, Tuple[str, ...]] = {}
 for _oid, _pat, _role in _OBJECT_VOCAB:
     ROLE_OBJECTS[_role] = ROLE_OBJECTS.get(_role, ()) + (_oid,)
 
+
+def get_object_pattern(object_id: str) -> Optional[re.Pattern]:
+    """根据 canonical object_id 查找对应的受控正则模式。"""
+    for oid, pat, _role in _OBJECT_PATTERNS:
+        if oid == object_id:
+            return pat
+    return None
+
 # 工具 / 耗材 / 活物 / 天候 —— 反复出现是正常的，不进账。
 _NON_PRODUCT = re.compile(
     r'\b(?:rake|mallet|hammer|driver|drill|wrench|grinder|saw|chisel|trowel|brush|'
@@ -123,10 +131,16 @@ _NON_PRODUCT = re.compile(
 
 def extract_objects(*texts: Any) -> Set[str]:
     """一段（或几段）散文里出现的建造产物 canonical id 集合。"""
+    found: Set[str] = set()
+    for t in texts:
+        if isinstance(t, (list, tuple, set)):
+            for item in t:
+                s = str(item).strip()
+                if s in OBJECT_ROLE:
+                    found.add(s)
     blob = ' '.join(_flatten_text(t) for t in texts)
     if not blob.strip():
-        return set()
-    found: Set[str] = set()
+        return found
     for oid, pattern, _role in _OBJECT_PATTERNS:
         if pattern.search(blob):
             found.add(oid)
@@ -150,10 +164,11 @@ def _flatten_text(value: Any) -> str:
 # 账本的判据全靠把一拍的文字分成三面。混在一起读的话，「本拍新建的」和「本拍继承的」
 # 就分不开，凭空出现这条根本无从判起。
 def _produced_text(beat: Dict[str, Any]) -> str:
-    """本拍**产出**的东西：终态、可见成果、留存痕迹。"""
+    """本拍**产出**的东西：终态、可见成果、留存痕迹、声明物件。"""
     return ' '.join(_flatten_text(beat.get(k)) for k in (
         'state_after', 'after_state', 'visible_result', 'visible_details',
         'persistent_traces', 'milestone_name', 'completion_extent',
+        'produced_objects',
     ))
 
 
@@ -162,6 +177,7 @@ def _inherited_text(beat: Dict[str, Any]) -> str:
     return ' '.join(_flatten_text(beat.get(k)) for k in (
         'state_before', 'before_state', 'inherited_state', 'locked_anchors',
         'preserve_state', 'anchors',
+        'inherited_objects',
     ))
 
 
@@ -270,6 +286,8 @@ _REGRESSION_VERBS = re.compile(
     r'\b(?:re-?level|re-?levels|levell?ing|re-?grade|re-?spread|re-?rake|rakes?|'
     r'sweeps?\s+out|clears?\s+out|strips?\s+(?:back|off)|dismantles?|removes?|'
     r'tears?\s+(?:out|down)|excavates?|re-?laying|re-?lays?)\b', re.I)
+
+REGRESSION_VERBS = _REGRESSION_VERBS
 
 
 def validate_object_ledger(beats: List[Dict[str, Any]],
@@ -556,7 +574,27 @@ def beats_declare_objects(beats: List[Dict[str, Any]]) -> bool:
     return declared * 2 >= len(beats)
 
 
-def allowed_video_objects(beats: List[Dict[str, Any]], video_index: int) -> Set[str]:
+def _resolve_target_index(beats: List[Dict[str, Any]], video_index: int) -> int:
+    """确定 video_index 对应的目标节拍索引。
+    
+    当 beats 包含前置锚点帧（beats[0] 无 operation/action，len(beats) > video_count）时，
+    video 1 对应 beats[1]。
+    当 beats 纯由施工拍组成（beats[0] 即第一道工序，len(beats) == video_count）时，
+    video 1 对应 beats[0]。
+    """
+    if not beats:
+        return 0
+    b0 = beats[0]
+    has_action = bool(b0.get('operation') or b0.get('visible_action') or b0.get('action'))
+    if not has_action or b0.get('role') in ('anchor', 'scene', 'teaser', 'setup'):
+        return min(max(1, int(video_index)), len(beats) - 1)
+    else:
+        return min(max(0, int(video_index) - 1), len(beats) - 1)
+
+
+def allowed_video_objects(beats: List[Dict[str, Any]], video_index: int,
+                          *,
+                          image_prompts: Optional[Dict[int, str]] = None) -> Set[str]:
     """第 ``video_index`` 段视频（IMAGE i → IMAGE i+1）里允许出现的建造产物。
 
     = 目标帧新增的（差量） ∪ 此刻**已经建成**的（工人可以站在上面、靠着它干活）。
@@ -565,14 +603,44 @@ def allowed_video_objects(beats: List[Dict[str, Any]], video_index: int) -> Set[
     beats = [b for b in (beats or []) if isinstance(b, dict)]
     if not beats:
         return set()
-    i = max(1, int(video_index))
-    target = beats[i] if i < len(beats) else beats[-1]
+    target_idx = _resolve_target_index(beats, video_index)
+    target = beats[target_idx]
     delta = extract_objects(_produced_text(target), _action_text(target))
     delta |= _declared_objects(target, 'produced_objects', 'inherited_objects')
+    for field in ('macro_environment', 'material_specs', 'subject_placement', 'light_state', 'package_operations'):
+        if target.get(field):
+            delta |= extract_objects(target[field])
+
+    # 若传入了实际图片提示词，目标终帧图片中描写的产物即为该段视频交付的真实目标
+    if image_prompts:
+        target_img_text = image_prompts.get(video_index + 1) or ''
+        if target_img_text:
+            delta |= extract_objects(target_img_text)
+
     built: Set[str] = set()
-    for beat in beats[:i]:
+    for beat in beats[:target_idx]:
         built |= extract_objects(_produced_text(beat))
         built |= _declared_objects(beat, 'produced_objects')
+        for field in ('macro_environment', 'material_specs', 'subject_placement', 'light_state', 'package_operations'):
+            if beat.get(field):
+                built |= extract_objects(beat[field])
+
+    # 若传入了实际图片提示词，起始帧及前序各帧已呈现的结构即为已建成结构
+    if image_prompts:
+        for k in range(1, int(video_index) + 1):
+            prev_img = image_prompts.get(k) or ''
+            if prev_img:
+                built |= extract_objects(prev_img)
+
+    # 初始场地与既有载体特征（在任何施工前就已存在的自然/建筑地貌）
+    if beats:
+        first_beat = beats[0]
+        built |= extract_objects(
+            first_beat.get('state_before'), first_beat.get('before_state'),
+            first_beat.get('inherited_state'), first_beat.get('locked_anchors')
+        )
+        built |= _declared_objects(first_beat, 'inherited_objects')
+
     return delta | built
 
 
@@ -584,13 +652,22 @@ def _target_roles(beats: List[Dict[str, Any]], video_index: int) -> Set[str]:
     role=flooring 的地板，照样抓得住。
     """
     beats = [b for b in (beats or []) if isinstance(b, dict)]
-    i = max(1, int(video_index))
-    return {infer_role(b) for b in beats[:i + 1]}
+    target_idx = _resolve_target_index(beats, video_index)
+    return {infer_role(b) for b in beats[:target_idx + 1]}
+
+
+_DIEGETIC_OR_NEGATIVE = re.compile(
+    r'(?i)\b(?:diegetic\s+(?:sound\s+effects?|audio)|sound\s+effects?|no\s+(?:captions?|subtitles?|floating\s+labels?|ui\s+text)).*$'
+)
+_ILLUMINATION_CLAUSE = re.compile(
+    r'(?i)\b(?:illuminated\s+by|ambient\s+(?:interior\s+)?light(?:ing)?|illumination\s+from|glow\s+from|under\s+(?:\w+\s+){0,3}light(?:ing)?)[^,.;]+'
+)
 
 
 def validate_video_objects(beats: List[Dict[str, Any]],
                            video_prompts: Dict[int, str],
                            *,
+                           image_prompts: Optional[Dict[int, str]] = None,
                            strict: Optional[bool] = None) -> List[Dict[str, Any]]:
     """逐段视频做差量集合检查。
 
@@ -603,10 +680,16 @@ def validate_video_objects(beats: List[Dict[str, Any]],
     exact = beats_declare_objects(beats) if strict is None else bool(strict)
     violations: List[Dict[str, Any]] = []
     for index in sorted(video_prompts or {}):
-        text = str(video_prompts.get(index) or '')
-        if not text.strip():
+        raw_text = str(video_prompts.get(index) or '')
+        if not raw_text.strip():
             continue
-        allowed = allowed_video_objects(beats, index)
+        # 剥离拟音声效、负向约束和环境照明描述，避免环境光或 ASMR 拟音词被误判为新建构件
+        text = _DIEGETIC_OR_NEGATIVE.sub('', raw_text)
+        text = _ILLUMINATION_CLAUSE.sub('', text)
+        allowed = allowed_video_objects(beats, index, image_prompts=image_prompts)
+        target_idx = _resolve_target_index(beats, index)
+        target = beats[target_idx] if target_idx < len(beats) else beats[-1]
+        active_role = infer_role(target)
         # 角色层兜底在**两种模式下都算**。改动前它只在推断模式下生效，于是申报模式
         # 一遇到叫法不同（视频写 "clear coat"，这一拍的申报里是 protective_coating
         # 之外的写法）就直接判死——那正是推断模式测出两成误报的同一件事，只是换了个
@@ -615,7 +698,8 @@ def validate_video_objects(beats: List[Dict[str, Any]],
         for oid in sorted(extract_objects(text)):
             if oid in allowed:
                 continue
-            role_ok = OBJECT_ROLE.get(oid) in roles
+            oid_role = OBJECT_ROLE.get(oid)
+            role_ok = bool(oid_role and oid_role in roles)
             if role_ok and not exact:
                 continue
             severity = 'blocking' if (exact and not role_ok) else 'warning'

@@ -25,6 +25,14 @@ import time
 import urllib.request
 import urllib.error
 
+# Reconfigure stdout/stderr to UTF-8 on Windows to prevent UnicodeEncodeError
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
 # ── defaults ─────────────────────────────────────────────────────────────────
 DEFAULT_SERVER = "http://127.0.0.1:8085"
 LIBRARY_API    = "/api/library"

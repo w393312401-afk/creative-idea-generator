@@ -43,6 +43,27 @@ except (TypeError, ValueError):
     _stale_seconds = 21600
 STALE_AFTER_SECONDS = _stale_seconds if _stale_seconds > 0 else None
 
+
+def _env_seconds(name: str, default: int) -> int:
+    try:
+        val = int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+    return max(0, val)
+
+
+# 探测失败/被挡之后的最短重试间隔（0 = 不退避，退回旧行为）。
+#
+# 2026-09-05 修的正是"积分探测一直在刷新"：探测失败时只写 last_probe_at，
+# 不写 last_checked_at，而 _credit_is_stale() 只看 last_checked_at——于是一个
+# 探不动的账号永远是"过期"状态，pick_account()/account_is_usable()/静默巡检
+# 每来一次就真开一次 AdsPower 浏览器重探，失败、再重探，无限循环。浏览器被
+# 这些注定失败的探针占满，正常任务全排在后面。
+PROBE_RETRY_AFTER_SECONDS = _env_seconds("GOOGLE_FX_CREDIT_PROBE_RETRY_SECONDS", 600)
+# 排队没抢到浏览器（blocked）不是账号的问题，退避短一些，让它早点补探到真值。
+PROBE_BLOCKED_RETRY_AFTER_SECONDS = _env_seconds(
+    "GOOGLE_FX_CREDIT_PROBE_BLOCKED_RETRY_SECONDS", 120)
+
 # 选号排序时"未探测"账号的位置：排在已探测且有额度的账号之后、明确耗尽的之前。
 # 它们会在 pick_account 里被强制真实探测一次，所以不需要乐观值来抢先。
 _UNPROBED_SORT_KEY = -1
@@ -150,6 +171,28 @@ def _credit_is_stale(info: dict) -> bool:
     if STALE_AFTER_SECONDS is not None and last_checked is not None:
         return (_now() - last_checked).total_seconds() >= STALE_AFTER_SECONDS or tasks_since_check
     return is_unprobed or tasks_since_check
+
+
+def _probe_backoff_remaining(info: dict) -> float:
+    """上一轮探测失败/被挡后，还要等多少秒才允许再真开浏览器探一次。
+
+    0 = 现在就可以探。这是"积分探测一直刷新"的闸门：失败的探测不写
+    last_checked_at，_credit_is_stale() 因此一直为真，没有这道闸，每条选号
+    路径都会对同一个探不动的账号无限重探。
+    """
+    status = info.get("last_probe_status")
+    if status == "blocked":
+        window = PROBE_BLOCKED_RETRY_AFTER_SECONDS
+    elif status == "failed":
+        window = PROBE_RETRY_AFTER_SECONDS
+    else:
+        return 0.0
+    if window <= 0:
+        return 0.0
+    attempted = _parse_iso(info.get("last_probe_at"))
+    if attempted is None:
+        return 0.0
+    return max(0.0, window - (_now() - attempted).total_seconds())
 
 
 def _sync_zero_credit_disabled(info: dict, credit) -> None:
@@ -892,8 +935,14 @@ class AccountPool:
 
     # ── 积分刷新 ──────────────────────────────────
 
-    def refresh_credit(self, user_id: str, force: bool = False) -> Optional[dict]:
-        """真实探测一次该账号的 Flow 积分并写回状态。探测失败保留旧值不覆盖。"""
+    def refresh_credit(self, user_id: str, force: bool = False,
+                       ignore_backoff: bool = False) -> Optional[dict]:
+        """真实探测一次该账号的 Flow 积分并写回状态。探测失败保留旧值不覆盖。
+
+        force=True 跳过"缓存还新鲜就别探"的 TTL 判断（选号路径都这么传），但
+        **不**跳过失败退避——退避才是"积分探测一直刷新"的闸门。只有用户在控制台
+        亲手点「立即探测」才传 ignore_backoff=True：人点了就必须真探一次。
+        """
         with _LOCK:
             state = _read_state()
             if user_id not in state:
@@ -905,6 +954,18 @@ class AccountPool:
             if STALE_AFTER_SECONDS is None or (_now() - last_checked).total_seconds() < STALE_AFTER_SECONDS:
                 entry = dict(info)
                 entry["user_id"] = user_id
+                return entry
+
+        # 上一轮探测失败/被挡：先退避，别再拉一次浏览器。返回的还是当前缓存条目
+        # （带着 last_probe_status='failed'/'blocked'），调用方的判断口径不变——
+        # 该跳过的账号照样跳过，只是不再每次都真开浏览器重探一遍。
+        if not ignore_backoff:
+            wait_seconds = _probe_backoff_remaining(info)
+            if wait_seconds > 0:
+                entry = dict(info)
+                entry["user_id"] = user_id
+                # 只挂在返回值上，不写盘：这是本次调用的解释，不是账号状态。
+                entry["probe_backoff_seconds"] = int(wait_seconds)
                 return entry
 
         from ..services.google_fx_credit import (
@@ -1128,7 +1189,12 @@ class AccountPool:
                     if refreshed is not None:
                         info = refreshed
                     if not refreshed or refreshed.get("last_probe_status") != "ok":
-                        log(f"⏭️ 账号 {user_id} 初始积分探测未成功，跳过", "账号池")
+                        backoff = (refreshed or {}).get("probe_backoff_seconds")
+                        if backoff:
+                            log(f"⏭️ 账号 {user_id} 上次积分探测未成功，{backoff}s 内不再重探，跳过",
+                                "账号池")
+                        else:
+                            log(f"⏭️ 账号 {user_id} 初始积分探测未成功，跳过", "账号池")
                         continue
 
                 credit = info.get("credit")
@@ -1169,7 +1235,10 @@ class AccountPool:
         if _credit_is_stale(info):
             refreshed = self.refresh_credit(user_id, force=True)
             if not refreshed or refreshed.get("last_probe_status") != "ok":
-                log(f"⏭️ 账号 {user_id} 复核积分未探测成功，判为不可用（不假设有额度）", "账号池")
+                backoff = (refreshed or {}).get("probe_backoff_seconds")
+                suffix = f"，{backoff}s 内不再重探" if backoff else ""
+                log(f"⏭️ 账号 {user_id} 复核积分未探测成功{suffix}，判为不可用（不假设有额度）",
+                    "账号池")
                 return False
             info = refreshed
         credit = info.get("credit")

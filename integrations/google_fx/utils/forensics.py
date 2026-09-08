@@ -79,11 +79,61 @@ def _write(path, content, binary=False):
         return False
 
 
-def capture(page, tag, why="", bucket=None, extra=None):
+# 骨架里最多记多少个元素。8000 个节点足够覆盖 Flow 整个工作台，压出来也就几百 KB。
+_SKELETON_MAX_NODES = int(os.environ.get("GOOGLE_FX_DEBUG_SKELETON_NODES", "8000"))
+
+# ⚠️ 2026-09-05 教训：原来这里只存 `page.content()[:80000]`。Flow 把整套 CSS
+# 内联在 <head><style> 里，80000 字符**全被 CSS 吃光**，抓下来的 page.html 里
+# 一个 body 标签都没有。结果是 Flow 改版当天现场存了、却完全看不出新 DOM 长什么样，
+# 只能连真浏览器去看。下面两件事解决它：
+#   1) page.html 去掉 style/script/link/svg 再存 —— 同样的预算能装下真正的结构；
+#   2) 另存一份 dom_skeleton.txt：每个元素一行「深度|标签|class|data-*/aria-*」，
+#      不含文本和样式，几百 KB 就能完整还原"这一版 UI 的元素长什么样"，
+#      离线就能写出新选择器。
+_STRIP_HTML_JS = """() => {
+    const doc = document.documentElement.cloneNode(true);
+    doc.querySelectorAll('style, script, noscript, link, svg, template, iframe')
+       .forEach((el) => el.remove());
+    // 内联 style 属性同样是纯噪声（Angular 会往上面写几百字符的动画状态）
+    doc.querySelectorAll('[style]').forEach((el) => el.removeAttribute('style'));
+    return doc.outerHTML;
+}"""
+
+_SKELETON_JS = """(maxNodes) => {
+    const rows = [];
+    const KEEP = /^(id|class|role|type|href|src|alt|title|placeholder|contenteditable)$/;
+    const walk = (el, depth) => {
+        if (rows.length >= maxNodes) return;
+        const attrs = [];
+        for (const a of Array.from(el.attributes || [])) {
+            const n = a.name;
+            if (KEEP.test(n) || n.startsWith('data-') || n.startsWith('aria-')
+                || n.startsWith('mat') || n.startsWith('_ng')) {
+                let v = a.value || '';
+                if (v.length > 120) v = v.slice(0, 120) + '…';
+                attrs.push(n + '=' + JSON.stringify(v));
+            }
+        }
+        rows.push('  '.repeat(Math.min(depth, 30)) + el.tagName.toLowerCase()
+                  + (attrs.length ? ' ' + attrs.join(' ') : ''));
+        for (const child of Array.from(el.children)) walk(child, depth + 1);
+    };
+    walk(document.body || document.documentElement, 0);
+    if (rows.length >= maxNodes) rows.push('... (truncated at ' + maxNodes + ' nodes)');
+    return rows.join('\\n');
+}"""
+
+
+def capture(page, tag, why="", bucket=None, extra=None, collectors=None):
     """把当前页面状态落盘。返回取证目录路径（失败或未开启返回 None）。
 
     page 可以是 None（连浏览器之前就失败的场景）：那就只落文字信息。
     bucket 默认取当前日志任务标签，也就是 SPARK 的 task_id。
+
+    collectors: {文件名: callable(page) -> str}。调用方可以塞进额外的取证项，
+    比如画布卡片结构 dump（见 google_fx_diagnostics.dump_canvas_tiles）。
+    每个 collector 独立 try/except，任何一个挂了都不影响其余证据落盘——
+    取证是失败路径上的收尾动作，本身绝不能变成新的故障源。
     """
     if not is_enabled():
         return None
@@ -123,9 +173,29 @@ def capture(page, tag, why="", bucket=None, extra=None):
                 except Exception as e:
                     meta["screenshot_error"] = f"{type(e).__name__}: {e}"
                 try:
-                    _write(slot / "page.html", page.content()[:_TEXT_LIMIT * 4])
+                    # 先剥掉 style/script 再截断，否则预算全被内联 CSS 吃掉
+                    # （见 _STRIP_HTML_JS 上方注释）。JS 没跑成（抛异常、或返回
+                    # 了非字符串）就退回原始 content()——有总比没有强，绝不能因为
+                    # 想存得更好反而把现场丢了。
+                    html = None
+                    try:
+                        html = page.evaluate(_STRIP_HTML_JS)
+                    except Exception as e:
+                        meta["html_strip_error"] = f"{type(e).__name__}: {e}"
+                    if not isinstance(html, str):
+                        html = page.content()
+                    _write(slot / "page.html", html[:_TEXT_LIMIT * 4])
                 except Exception as e:
                     meta["html_error"] = f"{type(e).__name__}: {e}"
+                try:
+                    # 元素骨架：选择器失效时唯一真正能离线用的证据
+                    skeleton = page.evaluate(_SKELETON_JS, _SKELETON_MAX_NODES)
+                    if isinstance(skeleton, str) and skeleton.strip():
+                        _write(slot / "dom_skeleton.txt", skeleton)
+                    else:
+                        meta["skeleton_error"] = "evaluate 未返回文本"
+                except Exception as e:
+                    meta["skeleton_error"] = f"{type(e).__name__}: {e}"
                 try:
                     _write(slot / "page.txt", page.inner_text("body")[:_TEXT_LIMIT])
                 except Exception as e:
@@ -143,6 +213,15 @@ def capture(page, tag, why="", bucket=None, extra=None):
                            json.dumps(probe_selectors(page), ensure_ascii=False, indent=2, default=str))
                 except Exception as e:
                     meta["selectors_error"] = f"{type(e).__name__}: {e}"
+                for filename, collector in (collectors or {}).items():
+                    try:
+                        payload = collector(page)
+                        if not isinstance(payload, str):
+                            payload = json.dumps(payload, ensure_ascii=False,
+                                                 indent=2, default=str)
+                        _write(slot / _safe_name(filename, "extra.txt"), payload)
+                    except Exception as e:
+                        meta[f"collector_error:{filename}"] = f"{type(e).__name__}: {e}"
 
         _write(slot / "meta.json", json.dumps(meta, ensure_ascii=False, indent=2, default=str))
         _prune()

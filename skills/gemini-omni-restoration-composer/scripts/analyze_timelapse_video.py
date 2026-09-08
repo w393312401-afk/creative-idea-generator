@@ -34,6 +34,8 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
+import bisect
 from pathlib import Path
 from typing import Any
 
@@ -52,6 +54,34 @@ if sys.platform.startswith("win"):
         )
     except Exception:
         pass
+    # Force UTF-8 on Windows stdout/stderr to avoid UnicodeEncodeError when printing emojis/multilingual paths
+    for _stream in (sys.stdout, sys.stderr):
+        if hasattr(_stream, "reconfigure"):
+            try:
+                _stream.reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+
+
+def _safe_print(msg: Any = "") -> None:
+    text = str(msg)
+    try:
+        print(text)
+    except Exception:
+        try:
+            if hasattr(sys.stdout, "buffer") and sys.stdout.buffer is not None:
+                sys.stdout.buffer.write(text.encode("utf-8", errors="replace") + b"\n")
+                sys.stdout.buffer.flush()
+            else:
+                encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+                sys.stdout.write(text.encode(encoding, errors="replace").decode(encoding, errors="replace") + "\n")
+                sys.stdout.flush()
+        except Exception:
+            try:
+                sys.stdout.write(text.encode("ascii", errors="replace").decode("ascii") + "\n")
+                sys.stdout.flush()
+            except Exception:
+                pass
 
 
 def _window_suppression_kwargs() -> dict[str, Any]:
@@ -695,6 +725,47 @@ def extract_frame(video_path: Path, output_path: Path, timestamp: float, duratio
     run(command)
 
 
+def extract_frames_batch(video_path, requests, duration, fps):
+    """Decode once, selecting the first frame at/after each requested timestamp.
+
+    Timestamp selection (rather than frame-number arithmetic) also supports VFR.
+    Multiple requests may resolve to one frame; each retains its original filename.
+    """
+    if not requests:
+        return
+    targets = sorted(set(round(safe_frame_timestamp(t, duration, fps), 3)
+                         for _, t in requests))
+    with tempfile.TemporaryDirectory(prefix='timelapse_extract_') as tmp:
+        root = Path(tmp)
+        terms = [
+            f'gte(t,{t - 1e-6:.6f})*(isnan(prev_selected_t)+lt(prev_selected_t,{t - 1e-6:.6f}))'
+            for t in targets]
+        # A flat sum exceeds libavutil's expression-parser depth for long clips.
+        while len(terms) > 1:
+            terms = [f'({terms[i]}+{terms[i+1]})' if i + 1 < len(terms) else terms[i]
+                     for i in range(0, len(terms), 2)]
+        expression = terms[0]
+        script = root / 'select.txt'
+        script.write_text(f"select='{expression}',showinfo", encoding='utf-8')
+        result = run(['ffmpeg', '-hide_banner', '-loglevel', 'info', '-y',
+                      '-i', str(video_path), '-an', '-filter_script:v', str(script),
+                      '-fps_mode', 'vfr', '-threads', '2', str(root / '%06d.png')],
+                     capture_output=True)
+        pts = [float(x) for x in re.findall(r'\bpts_time:([\d.eE+\-]+)', result.stderr)]
+        frames = sorted(root.glob('*.png'))
+        if len(pts) != len(frames) or not pts:
+            raise RuntimeError('Batch extraction frame/timestamp count mismatch')
+        for output, timestamp in requests:
+            target = round(safe_frame_timestamp(timestamp, duration, fps), 3)
+            index = bisect.bisect_left(pts, target - 1e-5)
+            if index == len(frames):
+                # Preserve the existing EOF fallback for unusual container durations.
+                extract_frame(video_path, output, timestamp, duration, fps)
+            else:
+                output.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(frames[index], output)
+
+
 def build_contact_sheet(frame_paths: list[Path], output_path: Path, columns: int = 3) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     if not frame_paths:
@@ -921,9 +992,12 @@ def analyze_video(
         state_points,
         audio_transients=audio_transients,
     )
+    extract_frames_batch(video_path,
+                         [(review_dir / f'review_{i:03d}.png', t)
+                          for i, t in enumerate(timestamps, 1)],
+                         duration, metadata['fps'])
     for index, timestamp in enumerate(timestamps, start=1):
         frame_path = review_dir / f"review_{index:03d}.png"
-        extract_frame(video_path, frame_path, timestamp, duration, metadata["fps"])
         review_entries.append(
             {
                 "index": index,
@@ -1078,17 +1152,17 @@ def main() -> None:
         base_fps=args.base_fps,
         dense_fps=args.dense_fps,
     )
-    print(overview_path)
+    _safe_print(overview_path)
 
     summary = json.loads(overview_path.read_text(encoding="utf-8"))
     collage = summary.get("keyframe_collage")
     plan = summary.get("analysis_plan", {})
     if collage:
-        print(f"collage: {collage}")
+        _safe_print(f"collage: {collage}")
     else:
-        print("collage: FAILED — keyframe collage was not generated; do not proceed to beat mapping")
-    print(f"change_events: {summary.get('change_event_count', 0)}")
-    print(
+        _safe_print("collage: FAILED — keyframe collage was not generated; do not proceed to beat mapping")
+    _safe_print(f"change_events: {summary.get('change_event_count', 0)}")
+    _safe_print(
         "analysis_plan: "
         f"{plan.get('mode')} — send {plan.get('required_count', 0)} of "
         f"{plan.get('total_frames', 0)} frames to semantic review"
