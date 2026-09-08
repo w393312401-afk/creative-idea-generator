@@ -28,15 +28,16 @@ headland」在下面这些机位下都被声称占画幅高度的三分之一：
 
 物距通常没有记录。锁定机位的约定本身就意味着站位基本不动，所以 d₁ ≈ d₀，一阶项就是
 焦段比 **r₁ = r₀ · f₁ / f₀** —— 而焦段恰恰是上面那张表里唯一明确写着、且明确被忽略了
-的量。物距已知时按完整公式算。
+的量。（真量出过物距时，按上面那条完整公式加回来；目前 packet 里没有这个量，估出来的
+物距对锚点这种远景物体只会更错，见 `reproject_scale`。）
 
-俯仰角对占比也有影响（俯拍会压缩地面物体的投影高度），作为二阶修正给出，默认关闭：
-它需要知道物体是立面还是地面，而 packet 里没有这个信息，硬猜的收益低于误差。
+俯仰角对占比也有影响（俯拍会压缩地面物体的投影高度），但这里**不算**它：要用上俯角
+得先知道物体是立面还是地面，而 packet 里没有这个信息，硬猜的收益低于误差。既然算不了，
+也就不解析它——留一个没人消费的 pitch_deg 只会让人以为二阶修正已经在算了。
 """
 
 from __future__ import annotations
 
-import math
 import re
 from typing import Any, Dict, Optional
 
@@ -50,18 +51,13 @@ _LENS_CONTEXT_RE = re.compile(r'\b(?:lens|focal|equivalent|prime|zoom)\b', re.I)
 _LENS_PREFIX_RE = re.compile(r'\b(?:ultra-?wide|wide|normal|standard|tele(?:photo)?)\s*$', re.I)
 _LENS_CONTEXT_WINDOW = 30
 _HEIGHT_RE = re.compile(r'(?:camera\s+height|height\s+of|at)\s*(\d(?:\.\d+)?)\s*m\b', re.I)
-_PITCH_NUM_RE = re.compile(r'(?:looking\s+down|tilted\s+down|pitch(?:ed)?\s+down)\s*(\d{1,2})\s*(?:°|degrees?)', re.I)
-# 复合词必须排在它的前缀**之前**：'thirty' 排在 'thirty-five' 前面的话，正则交替会先
-# 匹配到 'thirty'，'looking down thirty-five degrees' 被读成 30°。
-_PITCH_WORD_RE = re.compile(
-    r'looking\s+down\s+(twenty-five|thirty-five|forty-five|fifteen|twenty|thirty|forty|fifty|ten)\s*(?:degrees?)?',
-    re.I)
-_WORD_DEG = {'ten': 10, 'fifteen': 15, 'twenty': 20, 'twenty-five': 25, 'thirty': 30,
-             'thirty-five': 35, 'forty': 40, 'forty-five': 45, 'fifty': 50}
+# 这里曾经还解析俯仰角。删掉了：它一行都没被消费过——占比重算需要知道物体是立面
+# 还是地面才能用上俯角，而 packet 里没有这个信息（见模块 docstring 末段）。解析一个
+# 没有消费者的量，只会让人以为二阶修正已经在算了。真要加，连同判据一起加。
 
 
 def parse_camera(text: Any) -> Dict[str, Optional[float]]:
-    """从一句机位散文里读出焦段 / 机位高 / 俯角。
+    """从一句机位散文里读出焦段与机位高。
 
     读不出的项返回 None —— 缺项让调用方决定怎么办，不在这里编一个默认值：编出来的
     焦段会让重算比不重算更错。
@@ -90,16 +86,7 @@ def parse_camera(text: Any) -> Dict[str, Optional[float]]:
         except ValueError:
             height = None
 
-    pitch = None
-    match = _PITCH_NUM_RE.search(blob)
-    if match:
-        pitch = float(match.group(1))
-    else:
-        match = _PITCH_WORD_RE.search(blob)
-        if match:
-            pitch = float(_WORD_DEG.get(match.group(1).lower(), 0) or 0) or None
-
-    return {'focal_mm': focal, 'height_m': height, 'pitch_deg': pitch}
+    return {'focal_mm': focal, 'height_m': height}
 
 
 def frame_height_at(distance_m: float, focal_mm: float,
@@ -121,14 +108,20 @@ def screen_height_ratio(subject_h_m: float, distance_m: float, focal_mm: float,
 
 def reproject_scale(scale_percent: Any,
                     ref_camera: Dict[str, Optional[float]],
-                    cur_camera: Dict[str, Optional[float]],
-                    *,
-                    ref_distance_m: Optional[float] = None,
-                    cur_distance_m: Optional[float] = None) -> Optional[int]:
-    """把参考机位下测得的占比，重投影到当前机位。
+                    cur_camera: Dict[str, Optional[float]]) -> Optional[int]:
+    """把参考机位下测得的占比，重投影到当前机位。只按焦段比算。
 
     两个机位的焦段任一读不出时返回 ``None`` —— 调用方据此保留原值。宁可不改，
     也不拿一个猜出来的焦段去改一个本来就对的数字。
+
+    **为什么这里不像 cast 那侧一样按机位高度估物距**：锚点是地貌与建筑体
+    （海蚀洞头岬、崖壁），它离镜头多远由它自己站在哪儿决定，镜头蹲下一米不会让它
+    近一米——`working_distance` 那个「机位高 × 1.6」的估计是给**工人**用的，工人确实
+    站在镜头前那一小块地方。把它套到锚点上，会把一次 20mm→35mm 的换镜算成占比翻近
+    三倍。锁定机位的约定本身就意味着站位基本不动，所以这里取一阶项 d₁≈d₀。
+
+    （形参里曾经留着 ref_distance_m / cur_distance_m 两个口子，唯一的调用点从来没传过
+    值，删了；真有量出来的物距时，按 docstring 顶上那条完整公式加回来即可。）
     """
     base = _percent(scale_percent)
     if base is None:
@@ -138,11 +131,7 @@ def reproject_scale(scale_percent: Any,
     if not ref_f or not cur_f:
         return None
 
-    ratio = float(cur_f) / float(ref_f)
-    if ref_distance_m and cur_distance_m and cur_distance_m > 0:
-        ratio *= float(ref_distance_m) / float(cur_distance_m)
-
-    projected = base * ratio
+    projected = base * (float(cur_f) / float(ref_f))
     # 夹在 2~100：超过画幅的锚点在提示词里没有意义，2 以下渲染不出任何措辞。
     return int(round(max(2.0, min(100.0, projected))))
 

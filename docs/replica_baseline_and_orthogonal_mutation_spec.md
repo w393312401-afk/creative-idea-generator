@@ -129,6 +129,13 @@ Pass A 与 Pass B 必须无损记录以下 13 字段，严禁在下游丢弃：
 ### 3.3 槽位正交注入算法 (Slot-Filling Injection)
 
 后端算法严格执行以下流水线：
+
+> **本节的伪代码已过时（保留作为设计沿革）。** 第 2 步「正交槽位替换」那三行在散文层
+> 跑正则，已于 2026-09-03 被角色本体层取代、并在 2026-09-07 连同函数一起删除：散文层
+> 没有「这是同一个构件」的概念，做不到全链一致，也拦不住词典外的母本名词。当前实现见
+> `docs/replica_flexible_mutation_plan.md` 与 `prompt_pipeline/ontology.py`——变异发生在
+> role → MaterialPack 这一层，兜底路径从角色从零写，不改写母本任何一句话。
+
 ```python
 def generate_orthogonal_variant(baseline_job: dict, mutation_axes: dict) -> dict:
     """

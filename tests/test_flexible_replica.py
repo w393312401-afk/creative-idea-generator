@@ -13,13 +13,13 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from prompt_pipeline.ontology import (
-    build_pack, infer_role, render_beat_title, detect_material_category, MaterialPack,
+    UNKNOWN_ROLE, build_pack, infer_role, render_beat_title, detect_material_category,
+    detect_asmr_bucket, MaterialPack,
 )
 from prompt_pipeline.object_ledger import (
     build_object_ledger, validate_object_ledger, validate_video_objects,
-    allowed_video_objects, extract_objects, beats_declare_objects,
+    allowed_video_objects, extract_objects, beats_declare_objects, annotate_beats,
 )
-from prompt_pipeline.topology import build_topology, validate_isomorphism
 from prompt_pipeline.anchor_geometry import (
     parse_camera, reproject_scale, cast_screen_percent, cast_scale_hint,
 )
@@ -97,9 +97,53 @@ class TestObjectLedgerGate(unittest.TestCase):
         ]
         self.assertEqual(validate_object_ledger(clean), [])
 
-    def test_every_violation_is_blocking(self):
+    def test_the_three_retrospective_defects_are_blocking(self):
+        """证据自相矛盾的两类判死：凭空继承、完工回归。"""
         for v in self.violations:
-            self.assertEqual(v['severity'], 'blocking')
+            if v['rule'] in ('phantom', 'regression'):
+                self.assertEqual(v['severity'], 'blocking', v['message'])
+
+    def test_role_order_conventions_only_warn(self):
+        """角色依赖表写的是常规工序顺序，不是物理定律——它不该拦交付。
+
+        先立架后做排水垫层的井屋、先挂舱门后开窗洞的舱体都真实存在。仓库里唯一那份
+        已交付母本（17 拍）就被这张表判死过三条，没有一条是复盘里的硬伤。
+        """
+        beats = [
+            {'index': 1, 'state_after': 'structural frame erected'},
+            {'index': 2, 'state_after': 'compacted aggregate sub-base laid'},
+        ]
+        inversions = [v for v in validate_object_ledger(beats) if v['rule'] == 'inversion']
+        self.assertTrue(inversions)
+        for v in inversions:
+            self.assertEqual(v['severity'], 'warning', v['message'])
+
+    def test_a_defect_the_mother_already_had_does_not_block_the_variant(self):
+        """闸判的是变异弄坏了什么，不是这条梯子标不标准。
+
+        母本自己就有的缺口会被 1:1 的骨架原样继承下来；拿它拦变体，拦的是母本的旧账。
+        实测：仓库里那份 17 拍的已交付母本，不给基线时变体被判死三条，全部是继承来的。
+        """
+        alone = validate_object_ledger(self.beats)
+        self.assertTrue([v for v in alone if v['severity'] == 'blocking'])
+
+        against_itself = validate_object_ledger(self.beats, baseline_beats=self.beats)
+        self.assertEqual([v for v in against_itself if v['severity'] == 'blocking'], [])
+        self.assertTrue(all(v.get('inherited') for v in against_itself
+                            if v['rule'] in ('phantom', 'regression')))
+
+    def test_a_defect_the_variant_introduced_still_blocks(self):
+        """母本干净、变体新造出来的缺口，照拦。"""
+        clean = [
+            {'index': 1, 'state_after': 'site cleared of debris', 'operation': 'strip out'},
+            {'index': 2, 'state_after': 'compacted aggregate sub-base laid', 'operation': 'lay sub-base'},
+        ]
+        dirty = clean + [{'index': 3, 'state_before': 'twin windows already glazed',
+                          'state_after': 'interior swept', 'operation': 'threshold'}]
+        hits = validate_object_ledger(dirty, baseline_beats=clean)
+        self.assertTrue([v for v in hits
+                         if v['rule'] == 'phantom' and v['object'] == 'window'
+                         and v['severity'] == 'blocking'])
 
 
 class TestVideoDeltaGate(unittest.TestCase):
@@ -189,43 +233,103 @@ class TestOntologyRendering(unittest.TestCase):
         self.assertIn('极地厚积雪冻土', out['visible_action'])
 
 
-class TestTopologyIsomorphism(unittest.TestCase):
-    """Step 6：冻因果拓扑，不冻拍数。"""
+class TestRoleInference(unittest.TestCase):
+    """role 是母本与变体之间唯一被继承的东西，它判错，变体就建错东西。"""
 
-    def test_reordering_the_causal_chain_is_blocking(self):
-        source = [
-            {'index': 1, 'operation': 'erect structural frame'},
-            {'index': 2, 'operation': 'sheathe exterior panel'},
-        ]
-        variant = [
-            {'index': 1, 'operation': 'sheathe exterior panel'},
-            {'index': 2, 'operation': 'erect structural frame'},
-        ]
-        issues = validate_isomorphism(source, variant)
-        self.assertTrue(any(i['rule'] == 'topology' and i['severity'] == 'blocking'
-                            for i in issues))
+    def test_operation_outranks_the_rest_of_the_headline(self):
+        """一拍申报的活，压过画面里还有什么。
 
-    def test_beat_count_is_elastic_when_the_caller_allows_it(self):
-        source = [{'index': i, 'operation': op} for i, op in enumerate(
-            ['strip out', 'lay sub-base', 'erect frame'], start=1)]
-        variant = [{'index': i, 'operation': op} for i, op in enumerate(
-            ['strip out', 'lay sub-base', 'erect frame', 'coat protective sealer'], start=1)]
-        self.assertTrue(any(i['rule'] == 'beat_count' for i in validate_isomorphism(source, variant)))
-        self.assertFalse(any(i['rule'] == 'beat_count' for i in
-                             validate_isomorphism(source, variant, beat_tolerance=1)))
+        改动前几个标题字段被拼成一段话一次过读，于是 `operation='hero reveal'` 的收尾拍
+        因为 visual_subject 里提了一句窗被判成装窗，`furnish upper chamber` 因为画面里
+        有炉子被判成取暖。实测母本 17 拍里这样错了 7 拍。
+        """
+        self.assertEqual(infer_role(
+            {'operation': 'hero reveal', 'visual_subject': 'the window wall glows'}), 'hero')
+        self.assertEqual(infer_role(
+            {'operation': 'furnish upper chamber', 'visual_subject': 'stove and flue behind'}),
+            'furnishing')
+        self.assertEqual(infer_role(
+            {'operation': 'plank floor', 'visual_subject': 'vapour barrier still visible'}),
+            'flooring')
 
-    def test_a_role_absent_from_the_variant_is_not_an_inversion(self):
-        """不同材质工序数天然不同，缺席不算倒置。"""
-        source = [{'index': 1, 'operation': 'pack insulation'},
-                  {'index': 2, 'operation': 'lay finish floor'}]
-        variant = [{'index': 1, 'operation': 'lay finish floor'}]
-        self.assertFalse(any(i['rule'] == 'topology'
-                             for i in validate_isomorphism(source, variant, beat_tolerance=1)))
+    def test_roof_is_a_role_of_its_own(self):
+        """`shingle conical roof` 从前被判成防潮层——词表里根本没有屋面这个角色。"""
+        self.assertEqual(infer_role({'operation': 'shingle conical roof'}), 'roof')
+        pack = build_pack({'material': '耐候钢'})
+        self.assertIn('roof', render_beat_title('roof', pack))
 
-    def test_chain_dedupes_consecutive_roles(self):
-        beats = [{'operation': 'erect frame'}, {'operation': 'brace the portal frame'},
-                 {'operation': 'lay finish floor'}]
-        self.assertEqual(build_topology(beats)['chain'], ['structure', 'flooring'])
+    def test_unreadable_beats_say_so_instead_of_defaulting_to_structure(self):
+        """默认成骨架的代价：一条涂层拍被兜底渲染成钢门架，静默建错东西。"""
+        self.assertEqual(infer_role({'operation': 'zzz qqq', 'stage': 'zzz'}), UNKNOWN_ROLE)
+        notes = annotate_beats([{'index': 1, 'operation': 'zzz qqq'}])
+        self.assertTrue([n for n in notes if n['rule'] == 'unknown_role'])
+
+
+class TestBeatAnnotation(unittest.TestCase):
+    """role 与物件申报在 Pass B 落盘时就地登记。"""
+
+    def test_annotation_fills_missing_fields_only(self):
+        beats = [{'index': 1, 'operation': 'erect frame',
+                  'state_after': 'structural frame erected'},
+                 {'index': 2, 'role': 'coating', 'operation': 'coat facade',
+                  'produced_objects': ['protective_coating']}]
+        annotate_beats(beats)
+        self.assertEqual(beats[0]['role'], 'structure')
+        self.assertIn('structural_frame', beats[0]['produced_objects'])
+        # 已有的值一律不动：模型填的、人手改的，都比这里推出来的可信。
+        self.assertEqual(beats[1]['role'], 'coating')
+        self.assertEqual(beats[1]['produced_objects'], ['protective_coating'])
+
+    def test_inferred_declarations_do_not_upgrade_the_ledger_to_blocking(self):
+        """补出来的申报是正则从散文里捞的，不能拿去拦交付。
+
+        实测推断模式误报率约两成（全部来自同一构件在图与视频里叫法不同）。只数
+        「字段在不在」的话，登记一跑，母本线就"升级"成申报式，那两成误报直接变成
+        拦单理由。
+        """
+        beats = [{'index': 1, 'state_after': 'structural frame erected'}]
+        annotate_beats(beats)
+        self.assertIn('produced_objects', beats[0])
+        self.assertEqual(beats[0]['objects_source'], 'inferred')
+        self.assertFalse(beats_declare_objects(beats))
+
+        beats[0]['objects_source'] = 'declared'
+        self.assertTrue(beats_declare_objects(beats))
+
+    def test_a_declared_role_name_counts_as_its_objects(self):
+        """申报写 role 名、账本比对 canonical id，两个命名空间必须打通。"""
+        beats = [{'index': 1, 'produced_objects': ['structure'], 'objects_source': 'declared'},
+                 {'index': 2, 'produced_objects': [], 'objects_source': 'declared'}]
+        self.assertIn('structural_frame', allowed_video_objects(beats, 1))
+
+    def test_a_same_role_naming_mismatch_warns_instead_of_blocking(self):
+        """申报模式下同角色的另一种叫法只记 warning，不判死。
+
+        改动前角色层兜底只在推断模式下生效，于是申报模式一遇到叫法不同就直接拦交付
+        ——那正是推断模式量出两成误报的同一件事，只是换了个地方发生。视频说
+        "cast-iron stove"、这一拍申报的是 flue_pipe，两者同属取暖工序。
+        """
+        beats = [{'index': 1, 'role': 'demolition', 'produced_objects': ['demolition'],
+                  'objects_source': 'declared'},
+                 {'index': 2, 'role': 'heating', 'produced_objects': ['flue_pipe'],
+                  'objects_source': 'declared'}]
+        hits = validate_video_objects(
+            beats, {1: 'the worker seats the cast-iron stove on its pad'})
+        self.assertTrue(hits)
+        self.assertEqual(hits[0]['object'], 'stove')
+        self.assertEqual(hits[0]['severity'], 'warning')
+
+    def test_an_out_of_role_phantom_still_blocks(self):
+        """角色也对不上的，照拦——VIDEO 1 在一条破拆拍上铺木地板就是这么抓住的。"""
+        beats = [{'index': 1, 'role': 'demolition', 'produced_objects': ['demolition'],
+                  'objects_source': 'declared'},
+                 {'index': 2, 'role': 'demolition', 'produced_objects': ['demolition'],
+                  'objects_source': 'declared'}]
+        hits = validate_video_objects(
+            beats, {1: 'the worker lays floorboards across the bed'})
+        self.assertTrue(hits)
+        self.assertEqual(hits[0]['object'], 'finish_floor')
+        self.assertEqual(hits[0]['severity'], 'blocking')
 
 
 class TestAnchorGeometry(unittest.TestCase):
@@ -247,11 +351,6 @@ class TestAnchorGeometry(unittest.TestCase):
         """猜出来的焦段比不改更糟——读不出就不动。"""
         self.assertIsNone(reproject_scale(33, parse_camera(self.REF), parse_camera('a static shot')))
 
-    def test_compound_pitch_words_are_not_truncated(self):
-        """'thirty-five' 曾被 'thirty' 先吃掉。"""
-        self.assertEqual(parse_camera('looking down thirty-five degrees')['pitch_deg'], 35.0)
-        self.assertEqual(parse_camera('looking down twenty-five degrees')['pitch_deg'], 25.0)
-
     def test_aggregate_depth_is_not_read_as_a_focal_length(self):
         self.assertIsNone(parse_camera('a 70mm deep layer of basalt aggregate')['focal_mm'])
 
@@ -271,21 +370,36 @@ class TestVariantGateIntegration(unittest.TestCase):
     def _baseline(self, beats):
         return {'pipeline_id': 'job_test', 'video_duration_sec': 30.0, 'beats': beats}
 
-    def test_strict_variant_raises_on_an_unclosed_ledger(self):
-        beats = [
-            {'id': 'B01', 'index': 1, 'stage': 'structural',
-             'state_after': 'window glazed into the wall', 'operation': 'glaze window'},
-        ]
+    # 母本自己没有、变体新装上去的窗：母本那一拍只说「单元就位」，账上什么都没有；
+    # 变体照角色渲染出一扇实打实的窗，而全片没有洞口也没有骨架。
+    NEW_GAP_BEATS = [
+        {'id': 'B01', 'index': 1, 'role': 'window', 'stage': 'fixtures',
+         'operation': 'fit unit', 'state_after': 'unit fitted flush'},
+    ]
+
+    def test_strict_variant_raises_on_a_gap_the_variant_introduced(self):
         with self.assertRaises(ValueError) as ctx:
-            generate_orthogonal_variant(self._baseline(beats), preset='polar')
+            generate_orthogonal_variant(self._baseline(self.NEW_GAP_BEATS), preset='polar')
         self.assertIn('物件账', str(ctx.exception))
 
-    def test_non_strict_reports_instead_of_raising(self):
+    def test_a_gap_inherited_from_the_mother_does_not_raise(self):
+        """母本自己就有的缺口，变体原样继承——记 warning，不拦单。
+
+        母本这一拍明写着窗已装好而全片没有洞口，变体 1:1 继承它。拦下来的是母本的
+        旧账（多半是反推漏了一拍），而不是变异弄坏的东西。
+        """
         beats = [
             {'id': 'B01', 'index': 1, 'stage': 'structural',
              'state_after': 'window glazed into the wall', 'operation': 'glaze window'},
         ]
-        doc = generate_orthogonal_variant(self._baseline(beats), preset='polar', strict=False)
+        doc = generate_orthogonal_variant(self._baseline(beats), preset='polar')
+        inherited = [v for v in doc['ledger_violations'] if v.get('inherited')]
+        self.assertTrue(inherited)
+        self.assertTrue(all(v['severity'] == 'warning' for v in doc['ledger_violations']))
+
+    def test_non_strict_reports_instead_of_raising(self):
+        doc = generate_orthogonal_variant(
+            self._baseline(self.NEW_GAP_BEATS), preset='polar', strict=False)
         self.assertTrue(doc['ledger_violations'])
         self.assertTrue(doc['validation'])
 

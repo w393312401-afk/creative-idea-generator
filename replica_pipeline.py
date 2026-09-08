@@ -1066,6 +1066,22 @@ def _beats_prev_path(job_id):
     return os.path.join(job_dir(job_id), _BEATS_PREV_FILENAME)
 
 
+def _source_beats_for(beats):
+    """变体文档 → 它母本的节拍列表；母本自己或读不到时返回 None。
+
+    读不到不是错误：母本可能已经被删了，或者这本来就是母本自己。返回 None 时账本按
+    绝对判据走，跟改动前一样。
+    """
+    parent = (beats or {}).get('variant_of')
+    if not parent or parent == (beats or {}).get('pipeline_id'):
+        return None
+    try:
+        with open(_beats_path(parent), 'r', encoding='utf-8') as f:
+            return (json.load(f) or {}).get('beats') or None
+    except (OSError, ValueError):
+        return None
+
+
 def _write_beats(state, beats):
     """写节拍阶梯，并把被覆盖的那一版留一份。
 
@@ -1084,21 +1100,32 @@ def _write_beats(state, beats):
         except OSError:
             # 备份失败不该拦住正事：没有上一版可回退，比写不进新版本轻。
             pass
-    # 物件账诊断挂在每一次落盘上，母本与变体一视同仁。
+    # 落盘前给每一拍补上 role 与物件申报，再挂一份物件账诊断。母本与变体一视同仁。
     #
-    # 母本是原片的记录，账不平通常意味着**反推漏了一拍**（原片里有的施工步骤没被
-    # 聚出来），而不是原片有问题——那同样值得在卡点上告诉用户，因为下游所有变体
-    # 都会继承这个缺口。变体那边已经在 mutate 里硬拦过一次，这里只是留档。
+    # role 写进文档而不是每次现推，是因为它是母本与变体之间唯一被继承的东西：现推意味着
+    # 同一拍在不同调用点可能推出不同的角色。写下来之后它只推一次，人能在卡点上看见、
+    # 也能直接改；变体那侧读到的是显式值。补出来的物件申报会标 objects_source='inferred'，
+    # 视频差量检查认这个标记，不会拿推断出来的账去拦交付。
+    #
+    # 账不平在母本这边通常意味着**反推漏了一拍**（原片里做过的事没被聚出来），而不是
+    # 原片有问题——那同样值得在卡点上告诉用户，因为下游所有变体都会继承这个缺口。
+    # 变体那边已经在 mutate 里判过一次（且是对着母本的基线判的），这里只是留档。
     try:
         from prompt_pipeline.object_ledger import (
-            validate_object_ledger, diagnose_object_ledger, format_violations,
+            annotate_beats, validate_object_ledger, diagnose_object_ledger, format_violations,
         )
         beat_list = beats.get('beats') or []
-        ledger_issues = validate_object_ledger(beat_list) + diagnose_object_ledger(beat_list)
+        role_notes = annotate_beats(beat_list)
+        # 变体的留档也对着母本判，跟 mutate 那道闸同一个口径。不这么做的话，卡点上会
+        # 显示一串 mutate 已经降级过的 blocking——同一份阶梯，两个地方给两种说法。
+        ledger_issues = (validate_object_ledger(beat_list, baseline_beats=_source_beats_for(beats))
+                         + diagnose_object_ledger(beat_list) + role_notes)
     except Exception:
         ledger_issues = []
-    if ledger_issues:
-        beats.setdefault('ledger_diagnostics', ledger_issues)
+    # 直接赋值，不是 setdefault：诊断是**这一版**阶梯的读数。用 setdefault 的话，
+    # 第一次落盘那一版的诊断会永久冻在文件里——用户照着清单把问题改掉、再存一次，
+    # 看到的还是那份旧清单。
+    beats['ledger_diagnostics'] = ledger_issues
 
     with open(path, 'w', encoding='utf-8') as f:
         json.dump(beats, f, ensure_ascii=False, indent=2)

@@ -16,8 +16,6 @@ from prompt_pipeline.mutate import (
     ORTHOGONAL_AXES,
     generate_orthogonal_variant,
     map_asmr_audio,
-    apply_slot_replacement,
-    apply_trace_mapping,
 )
 import replica_pipeline
 

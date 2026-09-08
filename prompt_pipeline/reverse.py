@@ -3304,6 +3304,19 @@ def normalize_beat_keys(beats_doc):
         # 一处也搬不到——那时清空，等于这条 warn 只在用户看不见的那一瞬间存在过。
         beats_doc['key_normalizations'] = (beats_doc.get('key_normalizations') or []) + moved
     normalize_beat_craft_fields(beats_doc)
+
+    # 角色与物件申报就地登记。放在归一里，是因为这里是母本线唯一一处「每一份阶梯、
+    # 每一次读写都会经过」的地方：Pass B 出稿、autofix 回炉、状态载入都走它。
+    #
+    # role 从前是每个调用点各推一次（mutate 推一次、账本推一次、拓扑再推一次），推
+    # 出来的东西谁也没写下来。它却是母本与变体之间唯一被继承的东西——变体这一拍要
+    # 建什么，全看它。写进文档之后：只推一次、人能在卡点上看见它、也能直接改。
+    try:
+        from .object_ledger import annotate_beats
+        annotate_beats(beats_doc.get('beats') or [])
+    except Exception:
+        # 登记失败不该拦住归一：下游 annotate 还会在落盘时再跑一次。
+        pass
     return moved
 
 

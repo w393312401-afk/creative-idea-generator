@@ -8,7 +8,7 @@ schema（`state_before` / `state_after` / `visible_action`），而且根本没�
 `package_operations` —— 直接接上去的话每一拍都会挨一条 "declares 0 operations"，
 一百条假报错淹掉真问题。所以这里另起一道**只判物件账**的闸。
 
-## 它判什么（三条，全部 blocking）
+## 它判什么（三条规则，两档 severity）
 
 2026-09-03 那批海蚀洞变体（20 图 + 19 视频）里，下面三类问题一路走到了成片，
 `chain_guard` 一条都没拦住 —— 它只比对相邻两帧像素，看不见跨十几拍的账目缺口：
@@ -25,6 +25,11 @@ schema（`state_before` / `state_after` / `visible_action`），而且根本没�
 
 三条都在 spec 层判 —— 这时候一张图都还没抽，改的代价是零。
 
+判死还是记诊断，看的是**这条问题是不是变异造出来的**：`validate_object_ledger` 收下
+母本的阶梯（`baseline_beats=`）之后，母本自身就有的缺口一律降级为 warning，只有变体
+新引入的才拦单。另外，规则 3 前半那张角色依赖表写的是常规工序顺序而不是物理定律，
+它恒为 warning——细节见 `ROLE_DEPENDENCIES` 与 `validate_object_ledger` 的注释。
+
 ## 判据的克制
 
 物件识别走**受控词表**，不做通用名词短语抽取：后者在建造散文里的假阳性率高到没法
@@ -38,7 +43,7 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
-from .ontology import ROLE_RANK, infer_role
+from .ontology import CONSTRUCTION_ROLES, UNKNOWN_ROLE, infer_role
 
 # ── 建造产物词表 ─────────────────────────────────────────────────────────────
 #
@@ -98,6 +103,15 @@ _OBJECT_PATTERNS: List[Tuple[str, re.Pattern, str]] = [
 ]
 
 OBJECT_ROLE: Dict[str, str] = {oid: role for oid, _pat, role in _OBJECT_VOCAB}
+
+# role → 该角色下的全部 canonical id。申报值归一要用它。
+#
+# 为什么需要：申报字段里写的可能是 role 名（'structure'），而账本比对的是 canonical id
+# （'structural_frame'），两个命名空间几乎不相交。不打通的话，「申报式账本可以精确
+# 拦单」这句话是假的——申报的东西一个也对不上，比对退化成纯散文推断，却按 blocking 判。
+ROLE_OBJECTS: Dict[str, Tuple[str, ...]] = {}
+for _oid, _pat, _role in _OBJECT_VOCAB:
+    ROLE_OBJECTS[_role] = ROLE_OBJECTS.get(_role, ()) + (_oid,)
 
 # 工具 / 耗材 / 活物 / 天候 —— 反复出现是正常的，不进账。
 _NON_PRODUCT = re.compile(
@@ -206,11 +220,18 @@ def build_object_ledger(beats: Iterable[Dict[str, Any]]) -> Dict[str, Dict[str, 
 # ── 角色依赖图 ───────────────────────────────────────────────────────────────
 #
 # role → 它必须排在**之后**的那些 role。只有当两个 role 在同一条梯子里都出现过时
-# 才判 —— 缺席不算倒置（不同材质工序数天然不同，见 topology.py 的拍数弹性）。
+# 才判 —— 缺席不算倒置（不同材质的工序数天然不同）。
+#
+# **这张表判出来的是 warning，不是 blocking。** 它写的是一套常规工序顺序，而不是
+# 物理定律：先立架后做排水垫层的井屋、先挂舱门后开窗洞的舱体，都真实存在且成立。
+# 拿它拦交付的代价实测过——仓库里唯一那份已交付母本
+# （`outputs/replica_jobs/replica_1ef74020a25b`，17 拍）照它判死三条，没有一条是
+# 复盘里那三类硬伤。判死的是「这条梯子不标准」，不是「变异弄坏了什么」。
 ROLE_DEPENDENCIES: Dict[str, Tuple[str, ...]] = {
     'subfloor':   ('demolition',),
     'structure':  ('subfloor',),
     'enclosure':  ('structure',),
+    'roof':       ('structure',),
     'opening':    ('enclosure',),
     'window':     ('opening',),
     'door':       ('opening',),
@@ -236,10 +257,14 @@ ROLE_DEPENDENCIES: Dict[str, Tuple[str, ...]] = {
 HARD_OBJECT_DEPENDENCIES: Dict[str, Tuple[str, ...]] = {
     'window':      ('opening', 'structural_frame'),
     'door_leaf':   ('opening', 'structural_frame'),
-    'flue_pipe':   ('flue_collar',),
     'lighting':    ('conduit', 'power_source'),
     'sink':        ('plumbing',),
 }
+# 这里曾经还有一条 `flue_pipe: (flue_collar,)`。删掉了：一段烟囱管当然穿过某个领圈，
+# 但领圈**被单独描写过**不是物理必然，它多半只是没被反推捞出来。实测里它拦下的是
+# 「材质包给了 twin-wall flue、却没有哪句话提到 collar」这种纯词表缺口。复盘里真正
+# 的那条烟囱缺陷（第 9 拍已存在、第 12 拍才 roughed in）是**顺序**问题，由规则 1
+# 的凭空出现抓，从来不依赖这条。
 
 _REGRESSION_VERBS = re.compile(
     r'\b(?:re-?level|re-?levels|levell?ing|re-?grade|re-?spread|re-?rake|rakes?|'
@@ -247,11 +272,29 @@ _REGRESSION_VERBS = re.compile(
     r'tears?\s+(?:out|down)|excavates?|re-?laying|re-?lays?)\b', re.I)
 
 
-def validate_object_ledger(beats: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """三条硬闸。返回 [{'rule','severity','beat','object','message'}, ...]。
+def validate_object_ledger(beats: List[Dict[str, Any]],
+                          *,
+                          baseline_beats: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
+    """物件账三条规则。返回 [{'rule','severity','beat','object','message'}, ...]。
 
-    `severity` 恒为 'blocking'（这三条就是硬闸的定义）；软信号走
-    :func:`diagnose_object_ledger`，不拦单。
+    ``baseline_beats``：母本的节拍阶梯。给了它，闸判的就从「这条梯子合不合规」变成
+    **「变异弄坏了什么」**——母本自己就有的那些缺口降级为 warning 并标 ``inherited``，
+    只有变体新引入的才判死。
+
+    这个区别不是宽严之争，是判据对不对的问题。母本是原片的反推记录，它的账不平通常
+    意味着反推漏了一拍（原片里做过的事没被聚出来），那是母本线要修的东西；变体 1:1
+    继承母本的骨架，必然把同一个缺口原样带下来。拿它拦变体，拦下的是母本的旧账，而
+    真正该拦的「变异新造出来的窗户」反而淹在里面。实测：仓库里唯一那份已交付母本
+    （17 拍）生成变体时被判死 3 条，全部是母本自带、且全部不是复盘里那三类硬伤。
+
+    severity 分两档：
+
+      · ``blocking`` —— 证据自相矛盾：凭空继承（规则 1）、完工回归（规则 2）、
+        物件级硬依赖缺位（规则 3 后半）。
+      · ``warning``  —— 顺序惯例：角色依赖倒置（规则 3 前半，见 ROLE_DEPENDENCIES
+        的注释），以及一切从母本继承下来的问题。
+
+    软信号走 :func:`diagnose_object_ledger`，不拦单。
     """
     beats = [b for b in (beats or []) if isinstance(b, dict)]
     if not beats:
@@ -321,10 +364,11 @@ def validate_object_ledger(beats: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             if there is None:
                 continue  # 缺席不算倒置，见 ROLE_DEPENDENCIES 的注释
             if there > here:
+                # 顺序惯例，不是物理定律 —— warning，见 ROLE_DEPENDENCIES 的注释。
                 violations.append({
-                    'rule': 'inversion', 'severity': 'blocking', 'beat': here, 'object': role,
-                    'message': (f'角色「{role}」在第 {here} 拍就出现，但它依赖的'
-                                f'「{need}」要到第 {there} 拍才出现。'),
+                    'rule': 'inversion', 'severity': 'warning', 'beat': here, 'object': role,
+                    'message': (f'角色「{role}」在第 {here} 拍就出现，但常规工序里它排在'
+                                f'「{need}」之后，而后者要到第 {there} 拍才出现。'),
                 })
 
     for oid, alternatives in HARD_OBJECT_DEPENDENCIES.items():
@@ -349,7 +393,31 @@ def validate_object_ledger(beats: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 'message': f'第 {here} 拍装了「{oid}」，但它必需的「{names}」从未被建造。',
             })
 
-    return _dedupe(violations)
+    return _dedupe(_demote_inherited(violations, baseline_beats))
+
+
+def _demote_inherited(violations: List[Dict[str, Any]],
+                      baseline_beats: Optional[List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
+    """母本自己就有的问题降级为 warning。
+
+    按 (rule, object) 配对而不是 (rule, beat, object)：变体的拍号会漂（同一个构件可能
+    落在相邻的另一拍上），拿拍号配对等于配不上，降级就永远不会发生。
+    """
+    if not baseline_beats:
+        return violations
+    inherited = {(v.get('rule'), v.get('object'))
+                 for v in validate_object_ledger(baseline_beats)}
+    if not inherited:
+        return violations
+    out = []
+    for item in violations:
+        if (item.get('rule'), item.get('object')) in inherited:
+            item = dict(item)
+            item['severity'] = 'warning'
+            item['inherited'] = True
+            item['message'] = item.get('message', '') + '（母本自身就有这条缺口，变体只是原样继承，不拦单。）'
+        out.append(item)
+    return out
 
 
 def diagnose_object_ledger(beats: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -373,6 +441,50 @@ def diagnose_object_ledger(beats: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 'message': (f'「{oid}」在第 {intro} 拍建成后再没被任何一拍提及，'
                             f'确认它是被后续工序覆盖了，而不是这一拍白建。'),
             })
+    return notes
+
+
+def annotate_beats(beats: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """给每一拍补上 `role` / `produced_objects` / `inherited_objects`，返回诊断。
+
+    在 Pass B 落盘前跑（`reverse.normalize_beat_keys`），母本与变体一视同仁。补的是
+    **缺失**的字段，已经有值的一律不动——模型填的、人在节拍阶梯上手改的，都比这里
+    推出来的可信。
+
+    为什么要写进文档而不是每次现推：`role` 是母本与变体之间唯一被继承的东西，靠正则
+    现推意味着同一拍在不同调用点可能推出不同的角色，而它决定了变体这一拍要建什么。
+    写下来之后它只推一次，人能在阶梯上看见它、也能直接改它，变体那侧读的是显式值。
+
+    补出来的物件申报会标 ``objects_source='inferred'``：它是正则从散文里捞的，不是
+    作者填的。`beats_declare_objects` 认这个标记——推断出来的账不能拿去拦交付。
+    """
+    notes: List[Dict[str, Any]] = []
+    for position, beat in enumerate(beats or [], start=1):
+        if not isinstance(beat, dict):
+            continue
+        idx = _beat_index(beat, position)
+
+        role = str(beat.get('role') or '').strip().lower()
+        if role not in CONSTRUCTION_ROLES:
+            role = infer_role(beat)
+            beat['role'] = role
+        if role == UNKNOWN_ROLE:
+            notes.append({
+                'rule': 'unknown_role', 'severity': 'warning', 'beat': idx, 'object': '',
+                'message': (f'第 {idx} 拍读不出施工角色（operation / stage / 散文里都没有'
+                            f'可辨认的工序词）。变体会照着角色从零写这一拍，角色空着就只能'
+                            f'写成一段通用施工——在节拍阶梯里给它补一个 role 更省事。'),
+            })
+
+        stamped = False
+        if 'produced_objects' not in beat:
+            beat['produced_objects'] = sorted(extract_objects(_produced_text(beat)))
+            stamped = True
+        if 'inherited_objects' not in beat:
+            beat['inherited_objects'] = sorted(extract_objects(_inherited_text(beat)))
+            stamped = True
+        if stamped and not beat.get('objects_source'):
+            beat['objects_source'] = 'inferred'
     return notes
 
 
@@ -409,27 +521,38 @@ def _declared_objects(beat: Dict[str, Any], *keys: str) -> Set[str]:
             token = str(item or '').strip().lower()
             if not token:
                 continue
-            canon = extract_objects(token)
-            out |= canon or {token}
+            out.add(token)
+            out |= extract_objects(token)
+            # role 名要展开成它名下的全部 canonical id：申报「structure」说的是这一拍
+            # 交付了骨架类构件，而账本比对用的是 'structural_frame' / 'ceiling_rib'。
+            # 不展开的话两个命名空间永不相交，申报等于白填。
+            out |= set(ROLE_OBJECTS.get(token) or ())
     return out
 
 
 def beats_declare_objects(beats: List[Dict[str, Any]]) -> bool:
-    """这条阶梯的物件账是**声明式**的，还是要靠散文推断的。
+    """这条阶梯的物件账是**声明式**的，还是账本自己从散文里推出来的。
 
-    这个区别决定了视频差量检查能不能当硬闸：申报字段是精确的，推断出来的不是。
-    实测（2026-09-03，仓库里 6 份已交付提示词包共 86 段视频）推断模式的误报率约
-    两成，全部来自同一个构件在图与视频里叫法不同（视频说 "subfloor joist grid"，
-    图说 "engineered floor deck"）。拿那样的判据去拦交付，拦掉的多半是好片子。
+    这个区别决定了视频差量检查能不能当硬闸：作者（模型或人）填的申报是精确的，
+    正则从散文里捞出来的不是。实测（2026-09-03，仓库里 6 份已交付提示词包共 86 段
+    视频）推断模式的误报率约两成，全部来自同一个构件在图与视频里叫法不同（视频说
+    "subfloor joist grid"，图说 "engineered floor deck"）。拿那样的判据去拦交付，
+    拦掉的多半是好片子。
+
+    判据是**申报的来源**，不是字段在不在。改动前这里只数键在不在，而 `annotate_beats`
+    如今给每一份阶梯都补了这两个字段——只数键的话，母本线会因为被补过字段就"升级"成
+    申报式，用推断出来的东西去拦单，等于把那两成误报直接变成拦单理由。
+    `objects_source == 'inferred'` 的那些拍不算申报。
+
+    `produced_objects: []` 是一次合法申报（这一拍没有新建成任何东西，比如过门拍），
+    和字段整个缺席是两回事，所以判键在不在、不判值真不真。
     """
     beats = [b for b in (beats or []) if isinstance(b, dict)]
     if not beats:
         return False
-    # 判**键在不在**，不判值真不真：`produced_objects: []` 是一次合法申报（这一拍
-    # 没有新建成任何东西，比如过门拍），和字段整个缺席是两回事。按真值判的话，
-    # 一条申报齐整、只是有几拍不产出的梯子会整条掉回推断模式。
     declared = sum(1 for b in beats
-                   if 'produced_objects' in b or 'inherited_objects' in b)
+                   if ('produced_objects' in b or 'inherited_objects' in b)
+                   and str(b.get('objects_source') or '') != 'inferred')
     return declared * 2 >= len(beats)
 
 
@@ -478,23 +601,30 @@ def validate_video_objects(beats: List[Dict[str, Any]],
     """
     beats = [b for b in (beats or []) if isinstance(b, dict)]
     exact = beats_declare_objects(beats) if strict is None else bool(strict)
-    severity = 'blocking' if exact else 'warning'
     violations: List[Dict[str, Any]] = []
     for index in sorted(video_prompts or {}):
         text = str(video_prompts.get(index) or '')
         if not text.strip():
             continue
         allowed = allowed_video_objects(beats, index)
-        roles = set() if exact else _target_roles(beats, index)
+        # 角色层兜底在**两种模式下都算**。改动前它只在推断模式下生效，于是申报模式
+        # 一遇到叫法不同（视频写 "clear coat"，这一拍的申报里是 protective_coating
+        # 之外的写法）就直接判死——那正是推断模式测出两成误报的同一件事，只是换了个
+        # 地方发生。现在它降一档而不是放行：角色对得上仍然记 warning，对不上才拦单。
+        roles = _target_roles(beats, index)
         for oid in sorted(extract_objects(text)):
             if oid in allowed:
                 continue
-            if not exact and OBJECT_ROLE.get(oid) in roles:
+            role_ok = OBJECT_ROLE.get(oid) in roles
+            if role_ok and not exact:
                 continue
+            severity = 'blocking' if (exact and not role_ok) else 'warning'
+            note = ('，不过它的角色与这一段已经进行到的工序对得上，可能只是叫法不同。'
+                    if role_ok else '。')
             violations.append({
                 'rule': 'phantom_motion', 'severity': severity, 'beat': index, 'object': oid,
                 'message': (f'第 {index} 段视频里出现了「{oid}」，它既不在这一段的首尾帧'
-                            f'差量里，也不是此前已经建成的东西。'),
+                            f'差量里，也不是此前已经建成的东西{note}'),
             })
     return _dedupe(violations)
 

@@ -23,13 +23,14 @@ import sys
 from typing import Any, Dict, List, Optional
 
 from . import ontology
-from .ontology import build_pack, infer_role, render_beat_title, MaterialPack
+from .ontology import (
+    UNKNOWN_ROLE, build_pack, detect_asmr_bucket, infer_role, render_beat_title, MaterialPack,
+)
 from .object_ledger import (
     validate_object_ledger,
     diagnose_object_ledger,
     format_violations,
 )
-from .topology import build_topology, validate_isomorphism
 
 # 四大正交轴定义与元数据
 ORTHOGONAL_AXES = {
@@ -190,18 +191,6 @@ _ASMR_CUES_MAP = {
 }
 
 
-def _detect_material_category(material_text: str) -> str:
-    """根据材质文本推断材质大类 (metal / stone / ice / default)。"""
-    mat = (material_text or '').lower()
-    if any(k in mat for k in ['钛合金', 'titanium', '碳钢', 'carbon steel', '碳纤维', 'carbon fiber', '金属', '合金', '钢构', 'rgb']):
-        return 'metal'
-    if any(k in mat for k in ['火山石', '玄武岩', 'basalt', '微水泥', 'cement', '石材', 'stone', 'rock']):
-        return 'stone'
-    if any(k in mat for k in ['冰', '极地', 'arctic', 'ice', 'permafrost', '雪', 'snow']):
-        return 'ice'
-    return 'default'
-
-
 STAGE_OP_ALIAS = {
     'clearing': 'demolition',
     'demolition': 'demolition',
@@ -239,102 +228,23 @@ def map_asmr_audio(operation_type: str, material: str = '', action: str = '') ->
     if not stage_key:
         stage_key = 'demolition'
 
-    mat_cat = _detect_material_category(material or action)
+    mat_cat = detect_asmr_bucket(material or action)
     stage_cues = _ASMR_CUES_MAP.get(stage_key, _ASMR_CUES_MAP['demolition'])
     cues = stage_cues.get(mat_cat) or stage_cues.get('default') or ['物理施工细节敲击声']
     return list(cues)
 
 
-def apply_slot_replacement(text: str, mutation_axes: Dict[str, Any]) -> str:
-    """【已退役 / DEPRECATED】母本专用词典的正则替换。
-
-    留着只为兼容仍在 import 它的调用方（`prompt_pipeline.__init__` 的再导出、
-    老测试）。**新代码一律走 `render_beat_from_role`**，理由见 `ontology` 模块的
-    docstring：在已渲染的散文上跑正则，天然做不到「同一构件全链同一材料」，也拦不住
-    词典外的母本名词。
-
-    行为已经改了两处：
-      1. 命中母本载体名词（railcar / container / scrapyard …）的文本直接返回空串，
-         由调用方退回按角色渲染，而不是交付一句带着别人载体的句子；
-      2. 剩下的仍走旧词典，但那张词典**不再扩充** —— 它是遗留物，不是接口。
-    """
-    if not text or not isinstance(text, str):
-        return ''
-
-    scrubbed = scrub_carrier_leak(text)
-    if not scrubbed:
-        return ''
-    text = scrubbed
-
-    env = mutation_axes.get('environment') or ''
-    mat = mutation_axes.get('material') or ''
-    func = mutation_axes.get('function') or ''
-    hero = mutation_axes.get('hero_reveal') or ''
-
-    mapping = {}
-    if env:
-        # 地貌环境词汇
-        mapping[r'荒野河流泥岸|浑绿江水|河岸泥地|泥泞河滩|江水|河流泥岸|grassy riverbank|muddy riverbank|green river water|riverbank shoreline|river water|river shoreline|reddish-brown earth|brown loam|loose loam|compacted dirt|forest canopy|woodland clearing|tropical forest|natural soil ground|soil ground'] = env
-        mapping[r'室外泥地|岸边坡地|水下岸边|河岸|江边|\bshoreline\b|\briverbank\b|\bclearing\b'] = f'{env}边缘'
-    if mat:
-        # 结构建筑材料与旧建筑
-        mapping[r'蓝色钢构|废弃集装箱|沉水集装箱|集装箱钢板|集装箱波纹板|钢构舱体|shipping container|rusted container|\bcontainer\b'] = mat
-        mapping[r'破旧木棚|旧木棚|木结构小屋|石木别墅|木屋|shack|wooden shack|dilapidated shack|cottage|masonry cottage|two-story cottage|concrete block cottage|villa'] = f'{mat}主体结构'
-        mapping[r'混凝土砌块|空心砖|红砖|灰浆|砌块|砂浆|concrete masonry units|concrete masonry|concrete block|CMU|grey blockwork|mortar joints|mortar'] = f'{mat}砌体材料'
-        mapping[r'松木过梁|实木屋架|人字木屋架|木檩条|timber lintel|timber trusses|rafter trusses|pine timber|pine rafter|roof purlins|timber balcony'] = f'{mat}高强度结构梁架'
-        mapping[r'陶瓦|仿古瓦|屋顶瓦片|terracotta-style roof tiles|roof tiles|terracotta tiles'] = f'{mat}耐候顶层覆板'
-        mapping[r'米黄抹灰|外墙灰浆|抹灰面层|beige stucco plaster|stucco plaster|beige stucco'] = f'{mat}防护面层'
-        mapping[r'暖橡木板|实木地板|橡木地板|木质板材|wood paneling|wood panels|paneled interior|oak wood-grain flooring|light-oak wood'] = f'{mat}配套饰面板'
-        mapping[r'条形暖光灯槽|家用日光灯|普通灯带|复古壁灯|carriage lantern|strip lights|warm lighting'] = f'{mat}专用隐形线型暖光灯槽'
-    if func:
-        # 空间功用与家具
-        mapping[r'全景江景卧房|水下江景卧房|水下卧室|江景卧房|卧房|卧室|度假别墅|两层别墅|\bunderwater room\b|\bbedroom\b|\bliving room\b|\bcottage interior\b'] = func
-        mapping[r'白棉麻床品|双人床|大床|实木餐桌|餐桌椅|L型橱柜|卫浴设施|\bbedding\b|\bbed\b|dining table|kitchen suite|cabinetry'] = f'{func}核心定制配置'
-    if hero:
-        # 终极生物与揭示
-        mapping[r'野生淡水大鲟鱼|2米巨型野生淡水大鲟鱼|大鲟鱼|鲟鱼|淡水大鱼|wild sturgeon|large sturgeon|giant sturgeon|\bsturgeon\b'] = hero
-        mapping[r'大鱼游弋|鱼群掠过|fish swimming'] = f'{hero}游弋'
-        mapping[r'花园造景|石板小径|石板路|flagstone walkway|garden beds|flower shrubs'] = f'{hero}周边地貌'
-
-    if not mapping:
-        return text
-
-    combined_pattern = re.compile('|'.join(f'({pat})' for pat in mapping.keys()), flags=re.IGNORECASE)
-    replacements_list = list(mapping.values())
-
-    def _sub_callback(match):
-        for idx, val in enumerate(replacements_list):
-            if match.group(idx + 1) is not None:
-                return val
-        return match.group(0)
-
-    return combined_pattern.sub(_sub_callback, text)
-
-
-def apply_trace_mapping(traces: Any, mutation_axes: Dict[str, Any]) -> List[str]:
-    """将遗留痕迹 (persistent_traces) 根据新材质工艺进行正交映射。"""
-    if not traces:
-        return []
-    if isinstance(traces, str):
-        traces = [traces]
-    
-    out_traces = []
-    mat = mutation_axes.get('material') or ''
-    mat_cat = _detect_material_category(mat)
-
-    for tr in traces:
-        tr_str = str(tr).strip()
-        if not tr_str:
-            continue
-        mapped = apply_slot_replacement(tr_str, mutation_axes)
-        # 根据材质体系微调痕迹特征
-        if mat_cat == 'metal' and ('水泥' in mapped or '砖' in mapped):
-            mapped = mapped.replace('水泥', '碳纤维结构胶').replace('砖', '合金型材')
-        elif mat_cat == 'stone' and ('钢板' in mapped or '铁锈' in mapped):
-            mapped = mapped.replace('钢板', '玄武岩石板').replace('铁锈', '天然火山石孔隙压痕')
-        out_traces.append(mapped)
-        
-    return out_traces if out_traces else [f'{mat or "主体"}结构安装锁紧留存压痕', f'{mat or "表面"}接缝密封防水胶打胶留存细线']
+# ── 已退役并删除：apply_slot_replacement / apply_trace_mapping ────────────────
+#
+# 那是一张母本专用的正则词典（集装箱 / 河岸 / 鲟鱼 / 木棚），在**已经渲染好的散文上**
+# 做替换。散文层没有「这是同一个构件」的概念，所以它既做不到全链一致，也拦不住词典外
+# 的名词——railcar / scrapyard / camper / blast doors 都是从它手里漏出去的。
+#
+# 2026-09-03 的灵活复刻改造把变异挪到了角色本体层（见 ontology 模块）之后，它就只剩
+# 一句「保留以兼容仍在 import 它的调用方」。全仓查过：生产代码零调用，唯一的 import
+# 是 `prompt_pipeline.__init__` 的再导出和它自己的老测试。留着一张不再扩充、也不再有人
+# 走的词典，只会让下一个人以为散文层替换仍是一条可选路径。新代码一律走
+# `render_beat_from_role`。
 
 
 # ── 按角色渲染（替代在母本散文上跑正则）────────────────────────────────────
@@ -348,6 +258,7 @@ _ROLE_ACTION_ZH = {
     'subfloor': '分层摊铺骨料并夯压至标高，用刮尺找平',
     'structure': '吊装并校正主体构件，逐点锁紧紧固件',
     'enclosure': '逐块就位围护板，沿缝固定并做密封',
+    'roof': '铺设屋面覆层，自檐口向脊线搭接压实',
     'opening': '按放线切割洞口，修整洞边并加固',
     'window': '安装窗框、打胶固定，校正开启扇',
     'door': '挂装门扇，调整合页与锁具至平齐',
@@ -372,6 +283,7 @@ _ROLE_RESULT_ZH = {
     'subfloor': '垫层满铺压实、通面找平',
     'structure': '主体骨架全部就位并锁紧',
     'enclosure': '围护面完整封闭、接缝密实',
+    'roof': '屋面满铺完成、搭接压实不渗',
     'opening': '洞口成型、洞边加固完成',
     'window': '窗体安装到位、开启顺畅',
     'door': '门扇挂装完成、启闭平齐',
@@ -429,7 +341,10 @@ def render_beat_from_role(beat: Dict[str, Any], role: str, pack: MaterialPack,
             f'{material}固定点留存的{pack.fastening[0]}压痕' if pack.fastening else f'{material}固定点压痕',
             f'{material}接缝处留存的施工痕迹',
         ],
-        'produced_objects': [role],
+        # 申报的是 role —— 账本会把它展开成这个角色名下的 canonical id
+        # （object_ledger.ROLE_OBJECTS）。读不出角色时不申报：宁可这一拍在账上没有
+        # 产出，也不要申报一个连自己都不知道是什么的东西。
+        'produced_objects': [] if role == UNKNOWN_ROLE else [role],
         'inherited_objects': [],
     }
 
@@ -486,10 +401,13 @@ _LLM_MUTATE_BEATS_SYSTEM = """你是一位顶尖的纪录片级视觉短视频�
 ]"""
 
 
-# 母本载体名词的通用清洗。四轴替换只认自己词典里的词，词典外的母本名词会原样留在
-# 变体里 —— railcar / carriage / scrapyard / camper / blast doors 全是这么来的。
-# 这里不做替换，只做**拦截**：这些词一旦出现在变体产物里，说明模型在凭空复原它想象
-# 中的母本载体，该条字段作废退回规则渲染。
+# 母本载体名词的拦截表。这些词一旦出现在变体产物里，说明模型在凭空复原它想象中的
+# 母本载体，该条字段作废、退回按角色渲染。
+#
+# **它是事故补丁，不是机制。** 表里这几个词是 2026-09-03 那批海蚀洞变体实际漏出来的
+# （railcar / carriage / scrapyard / camper / blast doors），它挡不住下一个母本的载体
+# 名词——真正的机制是上游那条「母本散文一个字都不进变异上下文」，见 _llm_mutate_beats。
+# 这里只是第三道保险，不要指望往这张表里加词能解决泄漏。
 _CARRIER_LEAK = re.compile(
     r'\b(?:railcar|rail\s*car|carriage|boxcar|caboose|locomotive|shipping\s+container|'
     r'container\s+(?:box|unit)|scrapyard|junkyard|camper|caravan|motorhome|rv\b|'
@@ -604,7 +522,6 @@ def generate_orthogonal_variant(
     on_progress: Optional[Any] = None,
     *,
     strict: bool = True,
-    beat_tolerance: int = 0,
 ) -> Dict[str, Any]:
     """通过词槽正交映射与大模型智能重构生成二创变体，严格确保物理骨架零坍塌、零漂移。
 
@@ -615,11 +532,11 @@ def generate_orthogonal_variant(
         brief: 用户补充指示
         config: LLM 配置 (可选)
         on_progress: 进度回调函数 (可选)
-        strict: 物件账/拓扑硬闸命中时是否抛错。默认 True —— 这道闸在 spec 层，
-            拦下来的代价是零，而放过去的代价是一整条已经抽完卡的链。传 False 只
-            记诊断不拦单（给「先看看变体长什么样」的探查路径用）。
-        beat_tolerance: 允许的拍数偏差，交给 topology.validate_isomorphism。默认 0
-            即维持既有的 1:1 拍数冻结；放宽是调用方的显式决定。
+        strict: 物件账硬闸命中时是否抛错。默认 True —— 这道闸在 spec 层，拦下来的
+            代价是零，而放过去的代价是一整条已经抽完卡的链。传 False 只记诊断不
+            拦单（给「先看看变体长什么样」的探查路径用）。
+            注意闸判的是**变异新引入**的问题：母本自己就有的缺口一律降级为 warning
+            （见 object_ledger.validate_object_ledger 的 baseline_beats）。
 
     返回:
         variant_beats_doc: 派生的变体節拍阶梯数据字典
@@ -728,6 +645,10 @@ def generate_orthogonal_variant(
         v_beat['inherited_objects'] = [
             str(x) for x in ((llm_beat or {}).get('inherited_objects') or fallback['inherited_objects']) if str(x).strip()
         ]
+        # 申报的来源：模型填的或按角色兜底渲染的，都是**作者**的申报，不是账本从散文
+        # 里捞出来的。视频差量检查靠这个标记决定能不能精确拦单
+        # （object_ledger.beats_declare_objects）。
+        v_beat['objects_source'] = 'declared'
 
         # 1.5 动态刷新 ASMR 音效特征
         v_beat['sfx'] = map_asmr_audio(
@@ -768,14 +689,16 @@ def generate_orthogonal_variant(
     # frame_state 的账本校验（那道闸只挂在母本线的 __init__.py:12062）。于是「窗户
     # 从没被建造却当了 12 张图的锚点」这类跨十几拍的账目缺口，一路走到了成片——
     # chain_guard 只比对相邻两帧像素，看不见它。
-    ledger_violations = validate_object_ledger(variant_beats)
+    #
+    # 判据收下母本一起看：母本自身就有的账目缺口（反推漏掉的一拍、原片里本来就没
+    # 拍到的前置工序）会被 1:1 的骨架继承下来，拿它拦变体，拦的是母本的旧账。实测
+    # 仓库里那份 17 拍的已交付母本，不给基线时变体被判死 3 条，全部是继承来的。
+    ledger_violations = validate_object_ledger(variant_beats, baseline_beats=source_beats)
     ledger_notes = diagnose_object_ledger(variant_beats)
-    topology_issues = validate_isomorphism(
-        source_beats, variant_beats, beat_tolerance=int(beat_tolerance or 0))
 
-    blocking = ([v for v in ledger_violations if v.get('severity') == 'blocking']
-                + [v for v in topology_issues if v.get('severity') == 'blocking'])
-    warnings = (ledger_notes + [v for v in topology_issues if v.get('severity') != 'blocking'])
+    blocking = [v for v in ledger_violations if v.get('severity') == 'blocking']
+    warnings = (ledger_notes + [v for v in ledger_violations
+                                if v.get('severity') != 'blocking'])
 
     variant_doc = {
         'pipeline_id': pipeline_id,
@@ -794,7 +717,6 @@ def generate_orthogonal_variant(
         'beats': variant_beats,
         'validation': list(blocking) + list(warnings),
         'ledger_violations': ledger_violations,
-        'topology_issues': topology_issues,
     }
 
     if blocking and strict:

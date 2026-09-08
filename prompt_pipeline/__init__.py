@@ -62,8 +62,6 @@ from .mutate import (
     ORTHOGONAL_AXES,
     MUTATION_PRESETS,
     map_asmr_audio,
-    apply_slot_replacement,
-    apply_trace_mapping,
 )
 from .decision_framework import (
     evaluate_variant_compatibility,
