@@ -32,7 +32,7 @@
             match: /MANUAL_REQUIRED|login_required|需要人工处理/,
             title: 'Google FX 需要你手动登录',
             hint: '生图浏览器已经打开 Google FX，但停在登录页。切到那个浏览器窗口登录完，任务会自己继续。',
-            action: { label: '操作说明', href: 'docs/google_fx_console_manual.md' },
+            action: { label: '操作说明', href: 'docs/guides/google_fx_console_manual.md' },
         },
         {
             id: 'accounts-exhausted',

@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Tests for Replica Baseline and Orthogonal Mutation Engine.
-Specification: docs/replica_baseline_and_orthogonal_mutation_spec.md (v2.0-STABLE)
+Specification: docs/reference/replica_baseline_and_orthogonal_mutation_spec.md (v2.0-STABLE)
 """
 
 import json

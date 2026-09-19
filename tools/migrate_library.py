@@ -13,7 +13,7 @@
 正文全塞在条目里），改一个字段要上传并重写全库。而"整表覆盖"这个动作引发过两次
 数据事故，逼出了三道防线（空库拒写 / 缩量闸门 409 / .bak 轮换），用户日常撞到的
 就是那句"保存失败，请刷新页面后重试"。拆开之后写一条只碰一个文件，那些洞在结构上
-就不存在了。详见 docs/project_workbench_refactor_plan.md。
+就不存在了。详见 docs/plans/project_workbench_refactor_plan.md。
 
 迁移**不删除** library.json，而是把它备份成 library.json.pre-split —— 出任何问题
 时那是唯一一份完整的老数据。

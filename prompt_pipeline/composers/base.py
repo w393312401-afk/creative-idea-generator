@@ -287,6 +287,7 @@ Instructions:
   2. Ergonomic Prop Scale: In compact structures (diameter <= 3.5m), FORBID oversized residential furniture (e.g. two-tier bunk beds, large sectional sofas) that causes AI to hallucinate cavernous halls. Use compact ergonomic furniture (low-profile single platform daybed with under-bed storage, recessed berth, compact 80cm workbench).
   3. Camera Normalization: Default to 24mm wide-angle lens feel at 1.3m chest height, horizon/vanishing axis at 45%-50% frame height.
   4. Video Worker Scale Figure: VIDEO {i} must declare the worker's metric scale, computed for THIS beat's lens and camera height — never copied from another beat (e.g. '{_cast_scale_example}'). A longer lens or a closer camera means a LARGER share of frame height; restating one beat's percentage on a differently-framed beat is a contradiction the renderer cannot resolve.
+{pp.WORK_FIRST_VIDEO_RULES}
 - LIVING CAST & DYNAMIC WORKER CHOREOGRAPHY (P0):
   1. Zero Frozen Figures: Never describe workers, figurines, characters, or animals as static, holding still, unmoving, or holding their previous posture (FORBIDDEN: 'remain standing', 'stay put', 'static in place', 'unchanged', 'standing still', 'holding position', 'where they were', 'same posture').
   2. Action-Reaction Causal Chain: Every beat's VIDEO must describe active, continuous physical kinetic labor and bodily posture transitions from the starting image's pose to the resulting image's settled pose (e.g. Inception Reflex -> Active Tool/Hand Movement -> Settled Landing Posture).
@@ -812,7 +813,7 @@ Instructions:
                     _traces = ', '.join(beat.get('persistent_traces') or ['contact marks', 'material dust'])
                     vid_prompt = (
                         f"Use the provided first frame and last frame as exact composition anchors. Use IMAGE {i} as the actual first-frame image and IMAGE {i+1} as the actual last-frame image; every visible action must interpolate between those two frame images without inventing a third layout. "
-                        f"This is a continuous construction time-lapse, not real-time footage, creating the {beat.get('milestone_name')} milestone through the cohesive {_package} package. In the opening frame the visible state is {beat.get('before_state')}; the frame is empty of people, and immediately after that opening instant the same lone worker enters from off-frame straight to the active work face, makes the first effective tool contact without pausing, and repeatedly performs the work cycle along a visible movement path. The primary progression shows {beat.get('primary_progress')}; simultaneously the secondary progression shows {beat.get('secondary_progress')}. By the final moment {beat.get('after_state')} across {beat.get('completion_extent')}, while {_traces} remain; the worker continues the visible operation until the closing moment, then steps fully out of frame so the final frame is empty of people again."
+                        f"This is a continuous construction time-lapse, not real-time footage, creating the {beat.get('milestone_name')} milestone through the cohesive {_package} package. In the opening frame the visible state is {beat.get('before_state')}; the frame is empty of people, and immediately after that opening instant the same lone worker enters from off-frame at the adjacent work face with one short reach or step, makes the first effective tool contact without pausing, and repeatedly performs the work cycle along a visible movement path. The primary progression shows {beat.get('primary_progress')}; simultaneously the secondary progression shows {beat.get('secondary_progress')}. By the final moment {beat.get('after_state')} across {beat.get('completion_extent')}, while {_traces} remain; the worker withdraws fully out of frame with the last working motion so the final frame is empty of people again, with no separate departure or empty hold. Installed materials and any stock retained by the last-frame anchor stay in place."
                     )
                 else:
                     vid_prompt = (
@@ -1155,7 +1156,7 @@ Instructions:
         # 唯一来源锚点是帧序列最后一张整体完工图。锦上添花，不设硬门禁——失败/跳过
         # 都不影响整单合成结果，只是没有这一条额外视频。
         # 2026-07-31 起 _HERO_SHOWCASE_ENABLED 默认为 False（收尾不再放两条完工镜头，
-        # 见 docs/pacing_rhythm_balance_plan.md §7），整段连同进度提示一起跳过。
+        # 见 docs/plans/pacing_rhythm_balance_plan.md §7），整段连同进度提示一起跳过。
         hero_video_text = ''
         if pp._HERO_SHOWCASE_ENABLED:
             if on_progress:

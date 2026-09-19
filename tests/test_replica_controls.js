@@ -38,6 +38,13 @@ for (const file of ['progress_model.js', 'replica_pipeline.js']) {
 }
 const call = (expr) => vm.runInContext(expr, sandbox);
 
+// Both retry buttons must pass their button, and each is bound only once.
+const replicaSource = fs.readFileSync(path.join(__dirname, '..', 'js', 'replica_pipeline.js'), 'utf8');
+for (const selector of ['#replica-retry-compose-btn', '#replica-bar-recompose-btn']) {
+    assert.equal(replicaSource.split(`on('${selector}',`).length - 1, 1);
+    assert.ok(replicaSource.includes(`on('${selector}', (e) => replicaCompose(e.currentTarget));`));
+}
+
 // ── 1. 送审档位的翻译 ─────────────────────────────────────────────────────────
 // 单选框的 value 'full' 是两档时代留下来的，后端叫它 'plan'。翻译错了不会报错，
 // 只会静默换档——而档位决定的是这一单送多少帧、花多少钱。
@@ -281,4 +288,3 @@ assert.ok(sceneHtml.includes('人种'), '人物栏必须点名人种/肤色—�
 assert.ok(sceneHtml.includes('褪色红长袖T恤'), '已有的人物读数要回填进输入框');
 
 console.log('test_replica_controls.js: all assertions passed');
-

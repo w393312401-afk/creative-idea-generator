@@ -320,7 +320,7 @@ def fetch_trend_snippet(config, cache_key, system_instruction, query,
 
     aux_model = _aux_model(config)
     m_lower = aux_model.lower()
-    if not ('gemini' in m_lower or 'gpt-5' in m_lower or 'codex' in m_lower):
+    if not ('gemini' in m_lower or 'gpt-5' in m_lower or 'gpt-6' in m_lower or 'codex' in m_lower):
         return entry.get('text', '')
 
     try:
@@ -932,7 +932,7 @@ def _chat(config, system, user, temperature=0.85, max_tokens=65536, timeout=240,
             },
         }]
         payload['tool_choice'] = 'auto'
-    elif enable_search and ('gpt-5' in m_lower or 'codex' in m_lower):
+    elif enable_search and ('gpt-5' in m_lower or 'gpt-6' in m_lower or 'codex' in m_lower):
         # gpt-5.x 走的 codex 网关(见 resolve_gateway)：原生托管工具,类型必须是
         # "web_search"——"web_search_preview"(Responses API 的旧名字)在这个网关上
         # 会 400 Unsupported tool type。
@@ -1034,10 +1034,21 @@ def _chat(config, system, user, temperature=0.85, max_tokens=65536, timeout=240,
             raise
         except (urllib.error.URLError, socket.timeout, ConnectionError, OSError) as e:
             reason = getattr(e, 'reason', e)
+            # A refused TCP connection has not submitted the generation request.
+            # Allow a restarting local gateway to recover; do not replay ambiguous
+            # timeouts/disconnects here, which may already have billed upstream work.
+            import errno
+            if (isinstance(reason, ConnectionRefusedError)
+                    or getattr(reason, 'errno', None) in (errno.ECONNREFUSED, 10061)) and attempt < 2:
+                delay = 5 * (attempt + 1)
+                if sys.stdout:
+                    print(f"[DEBUG] LLM 代理连接被拒绝，等待 {delay}s 后重试（{attempt + 1}/3）")
+                _interruptible_sleep(delay)
+                continue
             raise RuntimeError(
                 f"无法连接本地 LLM 代理（{base_url}）：{reason}。"
-                "请确认 Antigravity Tools 代理服务正在运行、端口正确（默认 8046），"
-                "并检查 API 配置中心的 Base URL / API Key。"
+                f"请确认该地址对应的代理服务正在运行，并检查模型 {model} 的网关配置"
+                "（GPT/Codex 使用 codexBaseUrl / codexApiKey；其他模型使用 Base URL / API Key）。"
             )
     try:
         return body['choices'][0]['message'].get('content') or ''
@@ -2826,7 +2837,7 @@ def _stage_scope_ladder_violations(beat_ladder):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 拍重（beat delta weight）与节奏曲线 —— docs/pacing_rhythm_balance_plan.md 第 1、2 层
+# 拍重（beat delta weight）与节奏曲线 —— docs/plans/pacing_rhythm_balance_plan.md 第 1、2 层
 #
 # 要解决的问题：既有的每拍门禁全是「单拍内、成员资格式」的判断，
 # (3 工序, 3 格位, 跨2族) 和 (1 工序, 1 格位, 1族) 都完全合法，实际视觉增量却差 3.6 倍，
@@ -2889,7 +2900,7 @@ def beat_delta_weight(beat):
     **全部由 ladder 已声明的字段派生，绝不要求模型额外申报一个 weight 字段。**
     两条理由：
       1) 模型评估自己的「变化量」必然乐观——它刚写完这一拍，主观上就是「一件事」；
-      2) 多一个并列字段就多一处漂移。这正是 docs/beat_count_skeleton_plan.md §1.3
+      2) 多一个并列字段就多一处漂移。这正是 docs/plans/beat_count_skeleton_plan.md §1.3
          记录的 recommended_beats / beat_outline 双字段教训，不要在同一个文件里
          犯第二次。同理也不要把这个公式写进 prompt 喂给模型——它会开始反向工程分数，
          写出迎合公式但内容空洞的拍。
@@ -3174,7 +3185,7 @@ def rhythm_ladder_violations(beat_ladder, skeleton_id=None):
       - milestone_ladder_violations：这一拍**自己**合不合法（字段齐不齐、有没有跨相位
         打包、格位是不是太散）
       - _stage_scope_ladder_violations：run 内的 large 配额（注：目前只有测试在用它，
-        生产路径并未调用，见 docs/pacing_rhythm_balance_plan.md §1.2）
+        生产路径并未调用，见 docs/plans/pacing_rhythm_balance_plan.md §1.2）
       - 本函数：**拍与拍之间**的关系。这是此前完全空白的一维。
 
     三条规则按误判风险从低到高排：R1 硬天花板、R2 相邻比值、R3 曲线形状。
@@ -3805,7 +3816,15 @@ _WORKER_AGENT_RE_SRC = (r'(?:the\s+)?(?:same\s+)?(?:one\s+)?(?:lone\s+)?'
 # 入画/出画的判据。副词插在动词和介词之间是这条链上最常见的写法（"steps fully out of
 # frame"、"walks straight in"），所以两条都留一个副词位——漏掉它的后果实测是 fix 认不出
 # 自己刚写进去的那句话，每跑一遍再追加一遍（test_it_is_idempotent 抓到的正是这个）。
+WORK_FIRST_VIDEO_RULES = """WORK-FIRST, NON-FORMULAIC CONSTRUCTION (VIDEO only; not threshold/reward):
+- Keep person-free anchor instants, not an arrival/departure scene. Immediately after the opening instant, a worker may reach or lean in from just off-frame directly into first effective tool contact, or take one short step where access requires it. At the last effective action, withdraw the visible hands/body fully out of frame in the same motion. No separate walking, unloading, packing-up, farewell, or empty hold shots. Choose a physically reachable work face; never stretch limbs across the room or erase a visible body.
+- Spend the clip on ONE milestone and its causal evidence, not extra unrelated tasks. Adapt emphasis to the operation: separation and debris capture for demolition, alignment and fastening for installation, advancing coverage edges for coating, final fitting and unobstructed result for finishing. Vary the opening action and closing gesture across adjacent beats; do not impose identical second-by-second choreography.
+- Material continuity is not compulsory delivery and removal in every clip. Use an inherited stack/container already in the starting anchor, or a brief edge-of-frame handoff directly into use. Show consumption, assembly or captured waste as part of the work. Retain installed materials and any staged stock/tools required by the next anchor; remove only declared waste or temporary items absent from that anchor, with a credible destination and volume. Never clear the whole site merely because the clip ends.
+- Follow the selected shot contract: do not add cuts to a single-shot profile. In multi-shot clips, inserts prove this operation's contact, material behavior or fastening, never generic tool beauty shots; preserve completion level across cutaways and show remaining work on return. Cuts must not conjure unperformed construction. Existing shot-count and anchor locks still apply; this rule does not prescribe a fixed timing table.
+"""
+
 _WORKER_ENTRY_RE_SRC = (r'\b(?:enters?\b|'
+                        r'(?:reaches?|leans?)\s+(?:\w+\s+){0,2}?in\s+from\s+(?:just\s+)?off[- ]frame\b|'
                         r'(?:walks?|steps?|comes?|moves?)\s+(?:\w+\s+){0,2}?(?:in|into|on)\b)')
 _WORKER_EXIT_RE_SRC = (r'\b(?:exits?|withdraws?|clears?\s+the\s+frame|'
                        r'(?:walks?|steps?|moves?|backs?)\s+(?:\w+\s+){0,2}?out\b|'
@@ -3855,18 +3874,18 @@ def fix_out_and_in(prompt, is_threshold_or_reveal=False, beat=None, packet=None)
     if is_multi:
         scale_clause = _worker_scale_clause_from_packet(packet, plural=True)
         clause = (f" The opening frame is empty of people; immediately after that opening instant "
-                  f"the workers{scale_clause} enter from off-frame straight to the active work "
-                  "faces and make the first effective tool contact without pausing, continue the "
-                  "same visible operation, then step fully out of frame in the closing moment so "
+                  f"the workers{scale_clause} enter from off-frame at the adjacent work "
+                  "faces with one short reach or step and make the first effective tool contact without pausing, continue the "
+                  "same visible operation, then withdraw fully out of frame with the last working motion so "
                   "the final frame is empty of people again.")
     else:
         costume = _worker_costume_from_packet(packet)
         scale_clause = _worker_scale_clause_from_packet(packet)
         action = _beat_action_phrase(beat)
         clause = (f" The opening frame is empty of people; immediately after that opening instant "
-                  f"one lone worker{costume}{scale_clause} enters from off-frame straight to the "
-                  f"active work face and makes the first effective tool contact without pausing; the "
-                  f"worker {action}, then steps fully out of frame in the closing moment "
+                  f"one lone worker{costume}{scale_clause} enters from off-frame at the "
+                  f"adjacent work face with one short reach or step and makes the first effective tool contact without pausing; the "
+                  f"worker {action}, then withdraws fully out of frame with the last working motion "
                   "so the final frame is empty of people again.")
 
     prompt += clause
@@ -7489,7 +7508,7 @@ def check_out_and_in(prompt, is_threshold_or_reveal=False):
                           "opening instant — the first-frame anchor is a person-free still")
         if not has_exit:
             errors.append("VIDEO with a worker must have them step fully out of frame before the "
-                          "final moment — the last-frame anchor is a person-free still")
+                          "final moment (a hands/body withdrawal is sufficient) — the last-frame anchor is a person-free still")
         # 进出画是这一条的**边界**，不是内容：中间那段仍然必须是不停歇的有效施工。
         if not any(p in low for p in ('first effective tool contact', 'first tool contact',
                                       'without pausing', 'immediately', 'begins the first',
@@ -7966,7 +7985,8 @@ def check_cast_in_frame(video_prompt, image_prompt, beat):
         errors.append(
             f"VIDEO prompt never mentions this beat's cast, but the reference film shows "
             f"them in frame ({cast}). They are the only living thing in the shot: name them, "
-            f"walk them in from off-frame, and walk them back out before the final moment."
+            f"bring them into view directly from the adjacent frame edge, and withdraw the visible "
+            f"hands/body before the final moment; do not stage a walk-in/walk-out sequence."
         )
     return errors
 
@@ -9015,9 +9035,10 @@ def rework_structural_video_beat(config, i, video_prompt, structural_errs, packe
             "- The added sentences must describe the beat's single visible operation sweeping "
             "progressively across its full extent for the whole clip, performed by the same "
             "single lone worker in progressive -ing verbs. Both anchor frames are person-free, "
-            "so the worker enters from off-frame right after the opening instant, makes the "
-            "first effective tool contact without pausing, and steps fully out of frame before "
-            "the final moment."
+            "so the worker enters from the adjacent frame edge with a short reach or step right "
+            "after the opening instant, makes the first effective tool contact without pausing, "
+            "and withdraws all visible hands/body out of frame with the last working motion. "
+            "Do not add arrival/departure scenes or remove stock retained by the closing anchor."
             + (f" Reuse this worker choreography verbatim where relevant: {chore}\n" if chore else "\n")
         )
     system = (
@@ -12624,12 +12645,10 @@ HARD_CUT_VIDEO_PLACEHOLDER = (
 # 旧单识别用的正文前缀（占位声明的开头，历史上从未变过）。按正文识别而不是按 [CUT]
 # 标签识别，是这次改动的关键：标签在新单里仍然要保留（帧渲染据它把室内首帧当 t2i
 # 新链头、族锚计算与审查豁免也都认它），只有"正文是占位声明"才代表这一槽不该生成视频。
-HARD_CUT_PLACEHOLDER_PREFIX = 'DECLARED HARD CUT'
-
-
-def is_legacy_hard_cut_placeholder(body):
-    """这段 VIDEO 正文是不是 2026-07-30 之前留下的硬切占位声明（该槽不生成视频）。"""
-    return str(body or '').strip().upper().startswith(HARD_CUT_PLACEHOLDER_PREFIX)
+from legacy_media_contract import (
+    HARD_CUT_PLACEHOLDER_PREFIX,
+    is_legacy_hard_cut_placeholder,
+)
 
 
 # ── 逐帧逐字锁的登记表 ────────────────────────────────────────────────────────
@@ -13610,15 +13629,13 @@ def _milestone_beat_directive(beat, img_before="this beat's starting IMAGE",
         'word "first".',
         'Repeated cycles across the whole clip — "repeatedly" / "cycle by cycle" / "one by one" / '
         '"course by course" / "row by row". One action is not a cycle.',
-        'Name the material source as a stack / crate / bundle / bucket / rack / tray / barrow / bag / '
-        'pile standing at a stated spot, and trace the movement path from it to the work face.',
+        'Name the material source (stack/crate/bucket/pile), its spot and movement path into use; '
+        'inherited stock needs no delivery scene. Keep stock retained by the next anchor.',
         'Both progress markers above developing continuously and independently.',
-        'Both anchor frames are person-free: the worker enters from off-frame right after the '
-        'opening instant, straight to the work face, and makes the first effective tool contact '
-        'without pausing.',
-        f'Continue visible work up to the closing moment while landing on the completed state matching {img_after}; '
-        'then the worker steps fully out of frame so the final frame is empty of people again. The entry and the '
-        'exit are each one quick move, never a stroll onto the set and never an idle tail.',
+        'Person-free anchors: the worker enters from off-frame immediately after the opening instant '
+        'with a short reach/step into first effective tool contact without pausing.',
+        f'Work through the closing moment to match {img_after}; the worker withdraws fully out of frame '
+        'with the last working motion. No separate departure or empty hold. Installed materials stay.',
     ]
 
     image_block = '\n'.join(f'{n}. {rule}' for n, rule in enumerate(image_rules, 1))
@@ -13683,6 +13700,7 @@ Write the beats IN ORDER. Each beat's resulting IMAGE must continue directly and
 - EXTERIOR WORK VISIBILITY: If a beat involves work on the EXTERIOR surface of the structure (e.g., exterior insulation, exterior membrane), and the camera is positioned INSIDE looking out, the VIDEO must show the worker operating at the boundary edges visible from inside (e.g., working at seam lines visible in Grid B1/B3 from the interior). Do not describe exterior work that would be invisible from the current camera position.
 - ZONE-APPROPRIATE PROTECTIVE LAYERS: only describe waterproofing membrane, tar/bitumen coating, or vapor barrier material on a surface with real moisture/weather exposure (below-grade wall/floor, roof, exterior envelope, bathroom/kitchen/pool). Never describe these on an ordinary dry interior wall, floor, or ceiling — use plain primer/paint finish there instead.
 - CONSTRUCTION ORDER CONSTRAINTS: Floor finish (hardwood, tile) MUST be installed BEFORE heavy anchored objects (fireplace, stove) are placed on it. If a beat installs a fireplace or heavy object, its IMAGE must show it sitting on the FINISHED floor, not on bare metal/subfloor. If the floor is not yet finished, the fireplace cannot be installed in that beat.
+{WORK_FIRST_VIDEO_RULES}
 - LIVING CAST & DYNAMIC WORKER CHOREOGRAPHY (P0):
   1. Zero Frozen Figures: Never describe workers, figurines, characters, or animals as static, holding still, unmoving, or holding their previous posture (FORBIDDEN: 'remain standing', 'stay put', 'static in place', 'unchanged', 'standing still', 'holding position', 'where they were', 'same posture').
   2. Action-Reaction Causal Chain: Every beat's VIDEO must describe active, continuous physical kinetic labor and bodily posture transitions from the starting image's pose to the resulting image's settled pose (e.g. Inception Reflex -> Active Tool/Hand Movement -> Settled Landing Posture).
@@ -13743,7 +13761,8 @@ def _beat_block_text(i, contract):
         f"ACTION-REACTION CAUSAL CHAIN (immediate reflex to the trigger -> movement and gaze tracking the "
         f"active work -> settled posture at the finished result), then STEP FULLY OUT OF FRAME before the "
         f"final moment so the closing frame matches the empty last-frame anchor. State both the entry and "
-        f"the exit explicitly.\n"
+        f"the exit explicitly, as a brief adjacent-edge reach/step and a withdrawal integrated into the "
+        f"last action, not separate arrival/departure scenes. Do not hold the settled posture.\n"
         f"- NEVER write that they remain, stay put, hold their position or are unchanged: a cast that holds "
         f"one pose is delivered as dolls that never move. {cast_role_rule}, and their identity, costume and "
         f"scale never change while they are in frame.\n"
@@ -13816,7 +13835,7 @@ def _observed_block_for_beat(observed_digests, i):
 
 
 # 英雄展示视频（[HERO]）的总开关。2026-07-31 关闭，理由见
-# docs/pacing_rhythm_balance_plan.md §7：序列末尾原本连着两条在完工场景上运镜的片段
+# docs/plans/pacing_rhythm_balance_plan.md §7：序列末尾原本连着两条在完工场景上运镜的片段
 # —— reward 拍的视频（IMAGE N -> IMAGE N+1，带兑现动作，且是唯一落到最终揭示图上的
 # 片段，不可删）和这一条 HERO（单帧锚点，明令「零内容运动，只有镜头在动」）。
 # 观感上就是同一个英雄展示镜头放了两遍，其中偏静止的是 HERO。
@@ -14017,7 +14036,7 @@ Hard vetoes to check against these two images:
 - Clean Frame Boundary: image anchors are PERSON-FREE stills — zero workers, zero residents, zero bystanders, zero hands, and no active machinery. A person visible in an image anchor is a violation, and so is the same person repeated in the same pose across consecutive anchors.
 - Person-free anchors + worker entry/exit: image anchors contain nobody, so each construction clip has the worker entering from off-frame right after the opening instant, making the first effective tool contact without pausing, and stepping fully out of frame before the final moment.
 - PERSPECTIVE ISOLATION: Do not flip camera facing directions (e.g. turning 180 degrees from looking out to looking in) in the same spatial axis without a clean separate phase or TBCP transition.
-- WORKER BOUNDARY CHOREOGRAPHY IS REQUIRED, AND IS ONE BEAT LONG: the worker enters from off-frame and leaves before the final frame, but the entry and the exit must each be a single quick move straight to/from the work face — flag a clip that spends real time on walking, arriving, setting down bags, or lingering after the work is done. Everything between the two is uninterrupted visible work. Never flag the entry or the exit itself as a defect; the anchor frames are person-free by contract. The separate reward beat may be worker-free throughout.
+- WORKER BOUNDARIES, NOT ARRIVAL/DEPARTURE SCENES: retain person-free anchor instants; accept an immediate adjacent-edge reach/lean into tool contact and a visible hands/body withdrawal integrated into the last working action. Do not demand a full-body walk-in/walk-out. Flag separate walking, unloading, packing-up or empty holds; do not demand every material leave at the end. Installed work and stock retained by the next anchor must stay. Across adjacent construction beats, vary operation-specific action/evidence, not a repeated arrival-work-departure script. The separate reward beat may be worker-free throughout.
 - RIGID CONTAINER ENCAPSULATION: All loose materials, debris, fasteners, and liquids must be stored and tracked inside rigid, quantifiable containers (e.g. buckets, parts trays, boxes), and their volumes must be described as continuously increasing or decreasing.
 - INTERIOR ANCHOR QUALIFICATION (only applies if this beat is the threshold crossing beat, tagged [BRIDGE ...] or [CUT]): the interior landmarks this crossing lands on must plausibly ALREADY EXIST at crossing time — original structure, natural rock/wood formations, pre-existing wreckage, or items installed in an earlier on-camera beat. NEVER future construction products (an uncarved staircase, unplaced furniture, uninstalled fixtures).
 - SEALED ENTRY BEFORE ANY CROSSING (applies to EVERY crossing beat — [BRIDGE], [BRIDGE TURN] and [CUT] alike): the premise of every crossing in this system is that NOTHING of the interior is visible before it. A shut door, closed hatch, sealed shell, or pitch-black opening in the exterior IMAGE is the REQUIRED state — never report it as a missing interior peek, an unopened/unfinished entry, a blocked crossing, or a reason the next frame cannot be interior. There is no peek and no anchor scale-up to look for between these two images: the entry is opened and passed through INSIDE this beat's own clip. Conversely, an exterior IMAGE that already shows the entry standing open with the interior visible through it IS a violation of this rule. Judge the slot as a crossing clip (a pure camera move, sterile of workers, with no construction happening during the move) and never against the construction-clip rules (single milestone package, dual progress, worker entry/exit and agent flow, kinetic climax motion). The interior IMAGE is deliberately re-established rather than matched frame-to-frame against the exterior one, so do not report its different composition, framing, or camera position as a defect. What still applies across this crossing: construction order, envelope-seal continuity, and state monotonicity — it resets the camera only, so anything an earlier exterior beat sealed or repaired must read as still sealed and repaired on its inner face in the interior first frame. Those three apply PER SPACE: the space a crossing lands in may be raw and untouched or may already carry work from an earlier visit — judge it only against what THIS beat declares and against work previously shown IN THIS SAME space. A space that is bare is never a regression of the space the camera just left, and equally, a space that already looks worked on is not a violation when this film has been in it before. Never demand that an interior read as a ruin because it is the first time you are seeing it.
@@ -14236,7 +14255,7 @@ def outline_frame_review_block(items):
     富卡片（mat/zone/trace）在这里**指名点姓**地问：泛问"这拍的工序做完了吗"会被
     VLM 用一句笼统的"looks finished"糊过去，问"the oiled pine planks 在 floor 区里
     看得见吗、pine plank seams 还在吗"才有判定力。这是富字段唯一一处不改任何闸门
-    逻辑就白拿的收益（见 docs/beat_outline_enrichment_plan.md §5.7）。"""
+    逻辑就白拿的收益（见 docs/plans/beat_outline_enrichment_plan.md §5.7）。"""
     lines = []
     for item in (items or []):
         if not isinstance(item, dict):
@@ -16347,7 +16366,7 @@ def _build_partial_prompt_block(compiled_images, compiled_videos, beat_ladder,
             item["summary"] = summary
         formatted_images[idx] = item
 
-    # 节奏时间分配（docs/pacing_rhythm_balance_plan.md 第 3 层）：每段的 setpts 系数
+    # 节奏时间分配（docs/plans/pacing_rhythm_balance_plan.md 第 3 层）：每段的 setpts 系数
     # 由拍重算出，写成 "PACE <k>" 挂进 meta。
     rhythm = skeleton_rhythm(pacing_skeleton_id) if _RHYTHM_CLIP_TIMING else None
 
@@ -16723,7 +16742,7 @@ PACING_SKELETONS = {
     'dual_payoff': {
         'label_zh': '内外双重完工',
         # 带子更窄、比值更严：这个骨架本来就要在有限拍数里塞两幕，最容易发生的失效
-        # 模式恰恰是把一幕压成一两拍（见 docs/beat_count_skeleton_plan.md §8.5，
+        # 模式恰恰是把一幕压成一两拍（见 docs/plans/beat_count_skeleton_plan.md §8.5，
         # 那条失败路径还会自我强化）。two_arcs 查的就是两幕的平均拍重别差太多。
         'rhythm': {
             'weight_band': (0.9, 2.4),
@@ -18977,7 +18996,7 @@ _OUTLINE_MAX_ENTRY_FAMILIES = 3
 def outline_weight_violations(idea):
     """激发侧条目重量门禁：拦三族重条目和明确跨因果阶段的两族条目。
 
-    治的是 docs/pacing_rhythm_balance_plan.md §1.4——既有的
+    治的是 docs/plans/pacing_rhythm_balance_plan.md §1.4——既有的
     outline_skeleton_violations 只管条数、顺序、末拍和措辞，**不管每条的重量**，
     所以方差在卡片阶段就已经埋好了，合成侧再怎么补都是下游治标。
 
@@ -19035,7 +19054,7 @@ def compute_beats_floor(idea):
     else:
         structural = 4 if _outline_crossing_indices(outline) else 2
     # 密度下界改为「按族跨度加权后的条数」而不是裸条数（2026-07-31，
-    # docs/pacing_rhythm_balance_plan.md §4.5）。旧算法眼里
+    # docs/plans/pacing_rhythm_balance_plan.md §4.5）。旧算法眼里
     #   「封板批腻子并刷完整个室内」 == 「装一盏吊灯」 == 1 条，
     # 于是一份条数少、每条却很重的清单算出的 floor 偏低，ladder 合法地把每个工序
     # 压成一拍——正是「节拍量太少、变化量大」那一侧的源头。一条塞两族按 1.5 条计。

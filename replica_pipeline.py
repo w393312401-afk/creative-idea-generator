@@ -1,6 +1,6 @@
 """爆款延时视频「1:1 复刻 + 二创」流水线。
 
-方案见 docs/replica_and_variant_pipeline_plan.md。形态对标 stepped_pipeline.py：
+方案见 docs/plans/replica_and_variant_pipeline_plan.md。形态对标 stepped_pipeline.py：
 一个落盘的状态机，跑到人工卡点就停，由 /api/replica/advance 推进。
 
   ingest         收视频、探测、去重、建 job 目录

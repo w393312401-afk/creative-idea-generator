@@ -567,7 +567,7 @@ def _quality_to_images_api(quality):
 
 
 def _image_size_to_api_size(aspect_ratio, model=None):
-    if model == 'gpt-image-2':
+    if model in ('gpt-image-2', 'gpt-image-2.5'):
         return gpt_image_pixel_size(aspect_ratio)
     return aspect_ratio or '9:16'
 
@@ -617,7 +617,7 @@ def _image_generation_model(config):
     model = config.get('imageModel') or 'gemini-3.1-flash-image'
     if 'nano-banana-2' in model:
         model = model.replace('nano-banana-2', 'gemini-3.1-flash-image')
-    if model == 'gpt-image-2':
+    if model in ('gpt-image-2', 'gpt-image-2.5'):
         return model
     if re.search(r'-\d+-\d+(?:-\d+k)?$', model.lower()):
         return model
@@ -635,7 +635,7 @@ def _image_generation_model(config):
 
 
 def _image_generation_model_for_request(model, size, quality):
-    if model == 'gpt-image-2':
+    if model in ('gpt-image-2', 'gpt-image-2.5'):
         return model
     if re.search(r'-\d+-\d+(?:-\d+k)?$', model.lower()):
         return model
@@ -656,7 +656,7 @@ def _image_edit_model(config):
     model = config.get('imageModel') or 'gemini-3.1-flash-image'
     if 'nano-banana-2' in model:
         model = model.replace('nano-banana-2', 'gemini-3.1-flash-image')
-    if model == 'gpt-image-2':
+    if model in ('gpt-image-2', 'gpt-image-2.5'):
         return model
     if re.search(r'-\d+-\d+(?:-\d+k)?$', model.lower()):
         return model

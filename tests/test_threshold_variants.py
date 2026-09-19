@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""TBCP v4（docs/threshold_protocol_revision.md §12）单拍收编过门协议的单元测试：
+"""TBCP v4（docs/reference/threshold_protocol_revision.md §12）单拍收编过门协议的单元测试：
 
 - 两态镜头族（exterior/interior）：coaxial 与 pan 变体统一收编成单一 bridge_stage=1 拍，
   不再有 sill/vestibule 中间态
@@ -222,7 +222,7 @@ class TestStageScopeQuota(unittest.TestCase):
     whole ladder" count to a per-operation-run rule — every run of consecutive beats
     sharing the same 'operation' must end its LAST beat with stage_scope='large' (that
     operation's own full-completion milestone), and no other beat in the run may be
-    'large'. See docs/threshold_protocol_revision.md's alignment note and
+    'large'. See docs/reference/threshold_protocol_revision.md's alignment note and
     _stage_scope_ladder_violations' docstring for why the old global-1 quota starved
     every operation but one of ever reaching a real completion beat."""
 

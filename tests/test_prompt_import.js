@@ -234,7 +234,7 @@ const bodyOf = (text, type, index) => (Array.from(ctx.parsePromptBlock(text))
 
 // ── 真实样例：仓库里手写的 Veo 分段提示词集（17 图 + 16 视频）──────────
 {
-    const sample = path.join(__dirname, '..', 'veo_cliff_house_prompt_set.md');
+    const sample = path.join(__dirname, '..', 'examples/prompts/veo/veo_cliff_house_prompt_set.md');
     if (fs.existsSync(sample)) {
         const r = norm(fs.readFileSync(sample, 'utf8'));
         assert.strictEqual(r.ok, true, r.error);

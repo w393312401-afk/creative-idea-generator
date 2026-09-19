@@ -260,4 +260,4 @@ Close-up of the contractor's hands in yellow leather gloves gripping a matte-bla
 
 | id | 显示名 | 角色 | 默认模式 | 首次使用 |
 |---|---|---|---|---|
-| `jake-miller` | Jake Miller | 38 岁美国白人男性硬朗型装修工 | A | `veo_petrified_saguaro_prompt_set.md` |
+| `jake-miller` | Jake Miller | 38 岁美国白人男性硬朗型装修工 | A | `examples/prompts/veo/veo_petrified_saguaro_prompt_set.md` |

@@ -209,6 +209,8 @@ The final reveal anchor contains only objects installed or carried in during pri
 
 ## Material And Debris Logistics
 
+Follow `omni-work-first-rhythm.md`: source and destination are causal requirements, not compulsory delivery/removal scenes. Use inherited stock or a brief direct handoff; keep installed materials and retained stock, and show waste captured during the operation.
+
 - Bulk materials must be staged as a visible stockpile in a prior anchor or visibly carried/delivered into the scene inside the VIDEO before use.
 - Removed material either visibly exits the scene boundary or persists as a stockpile in later anchors until it visibly exits.
 - Stockpile volume should roughly match what was removed or what will be installed.
@@ -249,8 +251,7 @@ Hard consequence: an anchor showing freshly poured, unset concrete must still sh
 formwork supporting it. Concrete that is wet and unsupported has no legal way to hold its
 shape.
 
-Hand-carried ladders and step platforms are ordinary transient tools — they enter, are
-used, and exit within one video. The exception applies only to erected plant.
+Hand-carried ladders and step platforms may remain as static equipment when the next anchor needs them. Remove them visibly only when that anchor excludes them; do not repeat their delivery and removal every clip. Erected plant still requires named erection and strike beats.
 
 ### Worker Identity Lock
 
@@ -305,17 +306,19 @@ These traces are not dirt by default. They are visual proof of physical causalit
 
 ## Worker And Tool Handling
 
-Workers and machines appear only inside VIDEO prompts. To ensure physics simulation matches reality and avoids weightless actions, describe physical resistance, mass, and inertia.
+Apply `omni-work-first-rhythm.md` for work-integrated boundaries and material retention.
+
+Workers and active machines appear only inside VIDEO prompts; resting tools and parked plant may persist in IMAGE anchors. To ensure physics simulation matches reality and avoids weightless actions, describe physical resistance, mass, and inertia.
 
 Each worker sequence needs:
-- entry path
-- visible tool
-- single dominant task
-- exit path
-- empty final wide shot
+- a brief, reachable adjacent-edge entry directly into first tool contact after the person-free opening instant
+- visible tool contact and material source
+- single dominant task with operation-specific evidence
+- withdrawal of all visible hands/body integrated into the last working action
+- person-free final anchor instant, not a separate empty final shot
 
 Access and crew plausibility:
-- Work above comfortable arm reach requires a visible ladder, scaffold, or standing surface. Treat it like any other temporary tool: it enters, it is used, it exits before the returning wide shot unless it logically stays for the next beat.
+- Work above comfortable arm reach requires a visible ladder, scaffold, or standing surface. Use access equipment inherited from the starting anchor or visibly positioned when needed; retain it when the next anchor retains it. Do not remove a ladder while it still supports the worker.
 - Loads beyond one person's plausible capacity (full ceiling panels, beams, large appliances) require a second worker or a machine; describe the shared or mechanical lift.
 
 Physical weight and resistance guidelines:

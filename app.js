@@ -714,7 +714,7 @@ async function loadLibrary() {
      · 不会碰到别的记录，"整库清零 / 未声明缩量"在结构上不可能发生；
      · 删掉库里最后一条也不会被 409（老路径会撞上"空列表覆盖非空库"防护）；
      · 调用方不必再声明"这次缩量是我有意为之"。
-   见 docs/project_workbench_refactor_plan.md
+   见 docs/plans/project_workbench_refactor_plan.md
    ========================================================================== */
 
 // 单条写入服务端。返回 true/false 表示服务端是否接受。
@@ -5125,7 +5125,7 @@ function handleGlobalHotkeys(e) {
 //   ① 只读状态、只写 class 与状态文字；
 //   ② 绝不去写 disabled —— 那个属性归各自的生成流程所有（generateFrames /
 //      hydrateFramesPanel / mergeVideos 都在写它），两边都写必然打架。
-// 见 docs/spark_result_minimal_layout_plan.md
+// 见 docs/plans/spark_result_minimal_layout_plan.md
 // =====================================================================
 
 const PIPELINE_STEPS = ['cover', 'frames', 'videos', 'merge'];

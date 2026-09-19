@@ -1,21 +1,50 @@
 # 创意点子工坊 (Creative Idea Generator)
 
-这是一个集成了**三个视图（前端集成视图） + 一个图像子服务**的创意点子生成与管理系统。
+这是一个以视频复刻与提示词导入为入口、集成图像和视频生成的本地创作系统。
+应用统一使用 8085 端口，控制台提供 Google FX 运维与 API 文档。
+
+瘦身实施进度、离线检查命令和已知验收边界见 [执行记录](docs/reports/slimming-execution.md)。
 
 ---
 
-## 📂 项目结构与三视图
+## 📂 项目结构与入口
 
-本项目采用扁平化的前端资源结构，配合后端服务进行相对路径的分发。
+项目按代码、文档、示例和本地运行数据分区；前后端入口与启动脚本保留在根目录。
+
+```text
+creative-idea-generator/
+├── README.md                 # 项目说明与启动指南
+├── run.* / stop.bat          # 启动与停止入口
+├── server*.py / *_pipeline.py / *_generator.py
+│                            # 后端入口与现有业务模块
+├── index.html / app.js       # 创意工坊入口
+├── console.html / console.js # 控制台入口
+├── js/ · css/               # 前端模块与样式
+├── prompt_pipeline/         # 提示词管线
+├── integrations/            # 外部服务集成
+├── web_runtime/             # 静态文件传输与压缩
+├── skills/                  # 内置技能与契约
+├── tests/ · tools/          # 回归测试与维护工具
+├── docs/                    # 使用指南、技术参考、方案、排查记录
+├── examples/                # Veo / Omni 提示词示例与参考图片
+├── library/ · tasks/ · outputs/ # 本地创意库、任务与生成素材
+├── runtime/ · logs/         # 运行状态与日志
+└── scratch/                 # 临时草稿与整理留档（不提交）
+```
+
+查找资料：[文档导航](docs/README.md) · [提示词与素材示例](examples/README.md) · [瘦身与维护](docs/guides/project_maintenance.md)。
+运行配置、历史 JSON 数据及缓存仍使用现有路径；不要手动移动，以免影响读写和断点恢复。
+新说明文档按用途放入 `docs/` 子目录，提示词成品放入 `examples/prompts/`，一次性草稿放入 `scratch/`。
 
 ### 1. 两大集成视图
 
 | 视图入口 | 核心文件 | 说明 |
 | :--- | :--- | :--- |
-| **创意工坊** (`/`) | [index.html](file:///c:/Users/video/Desktop/creative-idea-generator/index.html)<br>[app.js](file:///c:/Users/video/Desktop/creative-idea-generator/app.js)<br>[js/image_studio.js](file:///c:/Users/video/Desktop/creative-idea-generator/js/image_studio.js)<br>[style.css](file:///c:/Users/video/Desktop/creative-idea-generator/style.css)<br>[image_studio.css](file:///c:/Users/video/Desktop/creative-idea-generator/image_studio.css)<br>[tokens.css](file:///c:/Users/video/Desktop/creative-idea-generator/tokens.css) | 主应用界面，含「激发维度／激发结果／图像工坊」三个顶部标签页，用于点子的生成、展示、交互，以及独立的文生图/图生图创作。 |
-| **控制台** (`/console.html`) | [console.html](file:///c:/Users/video/Desktop/creative-idea-generator/console.html)<br>[console.js](file:///c:/Users/video/Desktop/creative-idea-generator/console.js)<br>[console.css](file:///c:/Users/video/Desktop/creative-idea-generator/console.css)<br>[tokens.css](file:///c:/Users/video/Desktop/creative-idea-generator/tokens.css) | 与后端深度协同的第二视图，用于系统状态监控与管理。 |
+| **创意工坊** (`/`) | `index.html`、`app.js`、`js/`、`css/app/` | 视频复刻、提示词导入、创作结果、项目工作台和画廊；图像工坊通过顶部入口访问。 |
+| **控制台** (`/console.html`) | `console.html`、`console.js`、`js/google_fx_console.js`、`css/console/` | Google FX 运维与 API 文档；模型展示和请求沙盒已退役。 |
 
-> ⚠️ **开发注意事项**：根目录下的 `index.html`, `app.js`, `style.css`, `tokens.css` 以及 `console.*` 属于核心前端资产，**请勿移动到子文件夹**，否则后端 `SimpleHTTPRequestHandler` 的静态路由与页面引用将会失效。
+> 入口 HTML 与主脚本位于根目录，共享脚本位于 `js/`，样式位于 `css/`。
+> 移动资源时必须同步页面引用和静态路由白名单，并通过资源与浏览器回归检查。
 
 ---
 
@@ -61,7 +90,7 @@ Google FX 的视频生成还需要本机装好 AdsPower，见下方说明；不�
 
 根目录下提供了统一的批处理脚本来运行与管理服务：
 
-*   **启动与管理服务**：双击运行 [run.bat](file:///c:/Users/video/Desktop/creative-idea-generator/run.bat)
+*   **启动与管理服务**：双击运行 [run.bat](run.bat)
     *   **服务未启动时**：自动创建 `outputs/` 目录，在后台以 `8085` 端口启动 Python 服务，并自动拉起浏览器访问。
     *   **服务已运行时**：自动弹出交互菜单，提供以下选项：
         1.  **停止服务**（安全终止后台的 `server.py` 进程）
@@ -69,7 +98,7 @@ Google FX 的视频生成还需要本机装好 AdsPower，见下方说明；不�
         3.  **打开网页**（重新拉起浏览器页面）
         4.  **退出**
 
-*   **停止服务**：双击运行 [stop.bat](file:///c:/Users/video/Desktop/creative-idea-generator/stop.bat)（一次清掉 8085 与所有残留 8086 监听进程）。
+*   **停止服务**：双击运行 [stop.bat](stop.bat)（一次清掉 8085 与所有残留 8086 监听进程）。
 
 *   **macOS**：双击 [run.command](run.command)（不要双击 `run.sh`——Finder 对 `.sh` 后缀默认关联文本编辑器而不是终端，双击只会打开编辑器；`run.command` 是转调 `run.sh` 的薄封装，同一套启动/停止/重启交互菜单）。也可以在终端里直接 `./run.sh` 运行。
 
@@ -83,7 +112,7 @@ Google FX 的视频生成还需要本机装好 AdsPower，见下方说明；不�
 
 *   **Python 依赖**：`run.bat` / `run.sh` 首次运行会自动建 `.venv` 并安装；手动装是 `pip install -r requirements.txt`（包含 Pillow、Playwright、Pydantic 等）。
 *   **配置文件**：`server_config.json`（实际运行配置，已加入 `.gitignore` 避免密钥泄露）
-*   **配置模板**：[server_config.example.json](file:///c:/Users/video/Desktop/creative-idea-generator/server_config.example.json)
+*   **配置模板**：[server_config.example.json](server_config.example.json)
     *   包含 API 密钥、访问密码以及各类服务端参数配置。首次运行时由 `tools/bootstrap_config.py` 自动生成一份（占位说明会被清成空值），你只需要补 `apiKey`。
     *   `skillProfile` / `skillProfiles`：做哪个模型的提示词就读哪个技能包（两个包已随仓库内置，通常不用配；见下方「技能包与 profile」）。`skillDir` 是 base 包路径的历史别名。
     *   `adsPowerPort`：AdsPower 本地 API 端口（默认 `50325`）。Google FX 运行时已内置在 `integrations/google_fx/`，换机不再需要配置外部源码路径。
@@ -91,7 +120,7 @@ Google FX 的视频生成还需要本机装好 AdsPower，见下方说明；不�
 
 ### 技能包与 profile（做哪个模型的提示词，就读哪个包）
 
-两个技能包已随代码放进仓库的 [skills/](skills/)，不配任何东西也能跑：
+两个技能包已随代码放进仓库的 [skills/](skills)，不配任何东西也能跑：
 
 | profile | 技能包 | 面向的视频模型 | 契约文件 |
 | --- | --- | --- | --- |
@@ -127,7 +156,7 @@ Google FX 的视频生成还需要本机装好 AdsPower，见下方说明；不�
 
 ### 合成实现按 profile 分派（composer）
 
-提示词合成是两段式：`compose_anchor_and_packet`（Phase 1：brief / 工序梯 / Drift Lock 包 / IMAGE 1）+ `compose_remaining_beats`（Phase 2：逐拍撰写与装配），中间插一道首帧验收门。**只有 Phase 2 按 profile 分派**，实现在 [prompt_pipeline/composers/](prompt_pipeline/composers/)：`get_composer(profile)` 给出实现，未知 profile 一律回落 base。
+提示词合成是两段式：`compose_anchor_and_packet`（Phase 1：brief / 工序梯 / Drift Lock 包 / IMAGE 1）+ `compose_remaining_beats`（Phase 2：逐拍撰写与装配），中间插一道首帧验收门。**只有 Phase 2 按 profile 分派**，实现在 [prompt_pipeline/composers/](prompt_pipeline/composers)：`get_composer(profile)` 给出实现，未知 profile 一律回落 base。
 
 | | base | omni |
 | --- | --- | --- |
@@ -180,8 +209,8 @@ Google FX 的图片、视频、积分探测、浏览器控制与号池运行时�
 
 ## 📄 项目文档
 
-所有辅助及说明文档均已收纳至 [docs/](file:///c:/Users/video/Desktop/creative-idea-generator/docs/) 文件夹中：
+所有辅助及说明文档均已收纳至 [docs/](docs) 文件夹中：
 
-1.  [部署指南 (external_deploy_guide.md)](file:///c:/Users/video/Desktop/creative-idea-generator/docs/external_deploy_guide.md) — 介绍如何将服务部署到外部服务器。
-2.  [外网访问指南 (public_access_guide.md)](file:///c:/Users/video/Desktop/creative-idea-generator/docs/public_access_guide.md) — 介绍如何配置内网穿透或外网访问。
-3.  [图像生成指南 (image_generation_guide.md)](file:///c:/Users/video/Desktop/creative-idea-generator/docs/image_generation_guide.md) — 图像服务站及 AI 绘图相关的参数与使用说明。
+1.  [部署指南 (external_deploy_guide.md)](docs/guides/external_deploy_guide.md) — 介绍如何将服务部署到外部服务器。
+2.  [外网访问指南 (public_access_guide.md)](docs/guides/public_access_guide.md) — 介绍如何配置内网穿透或外网访问。
+3.  [图像生成指南 (image_generation_guide.md)](docs/guides/image_generation_guide.md) — 图像服务站及 AI 绘图相关的参数与使用说明。

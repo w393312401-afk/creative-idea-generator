@@ -1,7 +1,7 @@
 /* =====================================================================
    槽位卡片渲染器 + 网格事件委托
    ---------------------------------------------------------------------
-   方案与取舍见 docs/spark_result_slots_plan.md。
+   方案与取舍见 docs/plans/spark_result_slots_plan.md。
 
    本文件是**全仓唯一**写槽位卡片 innerHTML 的地方。在此之前同一张卡片有
    十几处各写各的模板（media_renderer.js 6 处、api_client.js 4 处 +
@@ -276,16 +276,20 @@ function openSlotLightbox(type, seq) {
         openLightbox(mediaList, idx >= 0 ? idx : 0);
         return;
     }
-    const valid = (run.frames || []).filter(f => f.url || f.file);
+    const imageSlots = resolvePromptSlots(idea).filter(s => s.type === 'image')
+        .sort((a, b) => a.index - b.index);
+    const valid = frameRenderItems(run.frames || [], imageSlots)
+        .filter(item => item.frame && (item.frame.url || item.frame.file));
     if (!valid.length) return;
 
     const refFrames = (idea && (idea.ref_frames || (idea.frameRun && idea.frameRun.ref_frames))) || {};
     const refRoles = (idea && (idea.ref_frame_roles || (idea.frameRun && idea.frameRun.ref_frame_roles))) || {};
     const mediaList = [];
-    let targetIdx = 0;
+    let targetIdx = -1;
 
-    valid.forEach((f, i) => {
-        const seqNum = Number(f.sequence);
+    valid.forEach((item, i) => {
+        const f = item.frame;
+        const seqNum = item.sequence;
         const isCurrent = (seqNum === Number(seq));
         if (isCurrent) {
             targetIdx = mediaList.length;
@@ -305,7 +309,8 @@ function openSlotLightbox(type, seq) {
         }
     });
 
-    openLightbox(mediaList, targetIdx);
+    // 生成中/删除后的槽位不应悄悄打开第一张无关图片。
+    if (targetIdx >= 0) openLightbox(mediaList, targetIdx);
 }
 
 /**

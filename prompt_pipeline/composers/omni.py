@@ -1228,13 +1228,14 @@ single continuous take、one continuous take、single take、unbroken take 或�
 {multishot_ref}
 
 Rewrite rules (additive — do not lose content):
+{pp.WORK_FIRST_VIDEO_RULES}
 - Keep the opening anchor sentence ("Use the provided image as the exact starting composition and environment anchor. ...") VERBATIM as the first sentence.
 - Express the multi-shot sequence using pure natural language cinematic transitions (e.g. 'The sequence opens with...', 'Cutting in closer to...', 'An extreme close-up reveals...', 'Cutting back to...'). Do NOT output numeric timestamps, seconds marks, or robotic cut mark tables.
 - Keep every concrete detail already in the draft: the same single worker and costume, the same tool, the same operation, the same persistent traces, the same audio description, the same lighting progression. Redistribute them across the shots instead of inventing new ones.
 - Restructure the body into exactly {len(ladder)} shots IN THIS ORDER, naming each one in prose exactly as written here: {scales}. Join them with clean cuts or match cuts.
 - This is NOT a shot-scale rotation. Do not write "establishing long shot", "full shot", "medium shot", or "wide outro shot" anywhere — those names belong to the retired grammar and count as a contract violation.
 - The first and the last shot are the SAME camera setup, framing, and focal length, differing only in how far the work has progressed; say so explicitly in the last shot ("the same camera setup as the opening wide working shot"). The insert(s) cut into that setup and cut back at the same completion level.
-- Both anchor frames are person-free stills, so the opening wide working shot starts empty and the worker ENTERS FROM OFF-FRAME immediately after the opening instant, straight to the active work face, making the first effective tool contact without pausing; that shot carries this beat's whole visible advance up to roughly three quarters; the insert(s) carry tool contact, material physics, and the persistent traces without advancing the state; the returning wide shot compresses the remaining repetitions the same way and reaches the beat's resulting state, and the worker STEPS FULLY OUT OF FRAME before its last moment so the closing frame is empty of people again. The entry and the exit are each one quick move — never a stroll onto the set and never a lingering tail.
+- Both anchor frames are person-free stills: immediately after the opening instant the worker reaches or steps in from the adjacent frame edge into first effective tool contact without pausing. The main shot carries the visible advance; the insert(s) prove this operation's contact, material physics and persistent traces without advancing completion; the returning wide shot compresses the remaining repetitions the same way and reaches the resulting state. The last working motion includes withdrawing all visible hands/body out of frame, matching the person-free closing anchor. No separate arrival, departure or empty hold; let the operation determine the opening and closing gesture.
 - Preserve the visible stage-milestone skeleton VERBATIM in meaning: the declared visible start state, the declared resulting state, both declared progress lines (primary and secondary material/stock), the first effective tool contact at the opening moment, the material source/container and the movement path, and repeated work cycles. Use the words "repeated"/"repeatedly"/"cycle by cycle"/"course by course" literally — "repetitions" alone does not read as repeated cycles.
 - All numbers and counts must be written in English words. Never include arabic digits.
 - NEVER write oner, one-shot, one-take, single continuous take, one continuous take, single take, or unbroken take — there is no exemption.
@@ -1287,11 +1288,7 @@ Rewrite rules (additive — do not lose content):
 
 def ensure_ladder_out_and_in(video_prompt, ladder, packet=None, beat=None,
                              is_threshold_or_reveal=False):
-    """Compatibility-named Omni fixer for direct work from the first instant.
-
-    The worker is already at the active work face from the opening instant. Any old entrance/exit
-    language is removed and the clip uses every shot for the operation through the outro.
-    """
+    """Keep person-free anchor instants with work-integrated edge entry/withdrawal."""
     text = video_prompt or ''
     if is_threshold_or_reveal or not ladder or ladder in (_TRAVERSAL_LADDER, _REWARD_LADDER):
         return text
@@ -1319,11 +1316,10 @@ def ensure_ladder_out_and_in(video_prompt, ladder, packet=None, beat=None,
     if text and not text.rstrip().endswith(('.', '!', '?')):
         text = text.rstrip() + '.'
     clause = (
-        f" The opening frame is empty of people; immediately after that opening instant the same "
-        f"lone worker{costume} enters from off-frame straight to the active work face and makes the "
-        "first effective tool contact without pausing; every following shot continues that visible "
-        "operation, and the worker steps fully out of frame in the last shot so the closing frame "
-        "is empty of people again."
+        f" The opening frame is empty of people; immediately afterwards the lone worker{costume} "
+        "enters from off-frame with one short reach or step into first effective tool contact at "
+        "the adjacent work face; subsequent shots continue the operation. The worker withdraws fully "
+        "out of frame with the last working motion, leaving a person-free closing frame."
     )
     return (text.rstrip() + clause).strip()
 
@@ -1335,11 +1331,12 @@ def fallback_ladder_clause(ladder):
     for rung in ladder:
         fragment = _FALLBACK_SHOT_FRAGMENT[rung.key]
         if rung.key == 'main':
-            fragment = (f'{rung.phrase} matching the first frame, with the worker already making '
-                        f'effective tool contact and carrying the whole visible advance of this beat')
+            fragment = (f'{rung.phrase} matching the person-free first frame, with the worker entering '
+                        f'from the adjacent frame edge immediately afterwards into first effective tool contact '
+                        f'and carrying the visible advance of this beat')
         elif rung.key == 'return':
             fragment = (f'{rung.phrase} from the same camera setup, matching the last frame '
-                        f'while visible work continues')
+                        f'as the last working motion ends with the worker withdrawing fully out of frame')
         fragments.append(fragment)
     joined = ', '.join(fragments[:-1]) + f", and {fragments[-1]}"
     count = _COUNT_WORDS.get(len(ladder), str(len(ladder)))

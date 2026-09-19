@@ -1,6 +1,6 @@
 // --- replica_pipeline.js ---
 // 爆款复刻 / 二创面板。后端见 replica_pipeline.py，方案见
-// docs/replica_and_variant_pipeline_plan.md。
+// docs/plans/replica_and_variant_pipeline_plan.md。
 //
 // 页面只有三个真状态：没任务、跑着、停在人工卡点。所有长耗时阶段走 SSE 推进度，
 // 停下来之后页面是静止的——所以这里没有轮询。
@@ -3112,7 +3112,7 @@ function replicaBindEvents() {
             replicaSaveBeats(true, e.currentTarget);
         });
     });
-    on('#replica-bar-recompose-btn', (e) => replicaCompose(e.currentTarget));
+    on('#replica-retry-compose-btn', (e) => replicaCompose(e.currentTarget));
     on('#replica-bar-cancel-btn', replicaCancelRun);
 
     root.querySelectorAll('.replica-job-open').forEach(btn => {
@@ -3764,7 +3764,7 @@ function replicaBindBottomBarEvents() {
     on('#replica-bar-save-btn', (e) => replicaSaveBeats(true, e.currentTarget));
     on('#replica-bar-compose-btn', (e) => replicaCompose(e.currentTarget));
     on('#replica-bar-project-btn', (e) => replicaSaveToProject(e.currentTarget));
-    on('#replica-bar-recompose-btn', replicaCompose);
+    on('#replica-bar-recompose-btn', (e) => replicaCompose(e.currentTarget));
     on('#replica-bar-cancel-btn', replicaCancelRun);
     // 硬伤计数本身就是「带我去看」的入口：它是这条栏上唯一说得出问题在哪的东西。
     on('#replica-bar-errors-btn', () => replicaFocusSection('replica-sec-beats'));

@@ -1763,7 +1763,15 @@ def _select_pool_account(config, pool):
     except TypeError:
         chosen = pool.pick_account(min_credit=min_credit)
     if chosen is None:
-        raise RuntimeError('号池所有账号积分不足或被禁用，请在「号池管理」里检查/刷新后重试')
+        explain = getattr(pool, 'selection_unavailable_message', None)
+        if callable(explain):
+            try:
+                message = explain(min_credit=min_credit)
+            except Exception:
+                message = None
+            if isinstance(message, str) and message:
+                raise RuntimeError(message)
+        raise RuntimeError('号池暂时没有可用账号，请在「号池管理」里检查积分、禁用、冷却和探测状态后重试')
     config['googleFxUserId'] = chosen['user_id']
     return chosen['user_id']
 
@@ -2166,7 +2174,7 @@ def resolve_gateway(model_name, config):
     base_url = (config.get('baseUrl') or 'http://127.0.0.1:8046/v1').rstrip('/')
     api_key = config.get('apiKey') or ''
     m_lower = (model_name or '').lower()
-    if 'gpt-5' in m_lower or 'codex' in m_lower or 'gpt-image-2' in m_lower:
+    if 'gpt-5' in m_lower or 'gpt-6' in m_lower or 'codex' in m_lower or 'gpt-image-2' in m_lower:
         base_url = (config.get('codexBaseUrl')
                     or SERVER_CONFIG.get('codexBaseUrl')
                     or _CODEX_BASE_URL_DEFAULT).rstrip('/')

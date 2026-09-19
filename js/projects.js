@@ -19,7 +19,7 @@
    依赖宿主应用：escapeHtml / showToast / customConfirm / switchMainTab /
    openSparkProject / viewTask / loadCompletedTask / rerunCompletedTask /
    retryTask / cancelTask / deleteTask / deleteFromLibrary。
-   见 docs/project_workbench_refactor_plan.md
+   见 docs/plans/project_workbench_refactor_plan.md
    ========================================================================== */
 
 let projectsRows = null;           // 当前页的项目行（服务端已筛选/排序）
@@ -1214,6 +1214,13 @@ async function startProjectRemix(p) {
 function initProjects() {
     const container = document.getElementById('projects-list');
     if (!container) return;   // console.html 等页面没有工作台面板
+
+    // Empty launches begin at the workbench; keep restored results and active
+    // generation on their existing resume path. Respect hidden-tab preferences.
+    if (!currentIdea && !localStorage.getItem('spark_current_idea_id') &&
+        !localStorage.getItem('spark_active_task_id')) {
+        switchMainTab('projects');
+    }
 
     document.getElementById('projects-filters')?.addEventListener('click', (e) => {
         const chip = e.target.closest('.projects-filter-chip');

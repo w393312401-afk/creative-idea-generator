@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""拍数与施工推进骨架（docs/beat_count_skeleton_plan.md）的单元测试：
+"""拍数与施工推进骨架（docs/plans/beat_count_skeleton_plan.md）的单元测试：
 
 - P0-B 通用骨架门禁 outline_skeleton_violations：所有 pacing_skeleton 共用的确定性验收，
   重点是**不误判**——每一条规则误伤一次的代价是 150s 的重试白烧 + 掉进静态兜底列表
@@ -285,7 +285,7 @@ class TestComputeBeatsFloor(unittest.TestCase):
         """13 条清单（12 施工拍 + reward）→ ceil(13.0 * 0.7) = 10。
 
         2026-07-31：密度下界改由**按族跨度加权后的条数**派生，不再是裸条数
-        （docs/pacing_rhythm_balance_plan.md §4.5）。这份清单里
+        （docs/plans/pacing_rhythm_balance_plan.md §4.5）。这份清单里
         「铺设龙骨与羊毛保温」「封装内衬木饰面墙」各跨两个材料层族，各记 1.5 条，
         12 条因此加权成 13.0，下界从 9 抬到 10 —— 加权是有区分度的，不是全表 +1：
         只跨一族的条目仍然记 1 条。

@@ -1,6 +1,6 @@
 """四轴正交受控发散调制引擎 (Orthogonal Mutation & Variant Generator)
 
-规范见 docs/replica_baseline_and_orthogonal_mutation_spec.md。
+规范见 docs/reference/replica_baseline_and_orthogonal_mutation_spec.md。
 在 1:1 黄金母本 (Gold Baseline) 骨架硬冻结的前提下，沿四大正交轴进行参数化词槽置换：
   1. 轴 1：地貌与水体环境 (Environment & Biome)
   2. 轴 2：材质与工艺体系 (Material & Craft)

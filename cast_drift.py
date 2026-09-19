@@ -1,6 +1,6 @@
 """剪影级人物漂移探针 —— 对着成片判「这一段还是不是同一个人」。
 
-这是人物一致性三层里的第三层（见 docs/character_consistency_plan.md）：
+这是人物一致性三层里的第三层（见 docs/plans/character_consistency_plan.md）：
 
   L1 词表层  每段逐字重述同一组锚点词  → cast_lock（提示词写对了没有）
   L2 像素层  参考图 / seed 钉住脸       → 未实现

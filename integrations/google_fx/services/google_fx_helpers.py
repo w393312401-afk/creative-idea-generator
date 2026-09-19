@@ -2054,16 +2054,56 @@ def _wait_for_new_tile_id(page, before_tile_ids, timeout=20, expect_slice=None):
     return None
 
 
+def _read_editor_prompt(input_el):
+    """Read text only, excluding non-editable reference chips/placeholders."""
+    return input_el.evaluate(r"""(ed) => {
+        if (ed.matches('textarea, input')) return ed.value;
+        const copy = ed.cloneNode(true);
+        copy.querySelectorAll('[contenteditable="false"], button, script, style')
+            .forEach(el => el.remove());
+        copy.querySelectorAll('br').forEach(el => el.replaceWith('\n'));
+        copy.querySelectorAll('p, div').forEach(el => {
+            el.prepend('\n'); el.append('\n');
+        });
+        return copy.textContent || '';
+    }""")
+
+
+def _editor_prompt_matches(input_el, prompt):
+    # Layout whitespace may differ; NEVER remove spaces inside words or accept
+    # a prefix. That would conceal the historical mid-word insertion bug.
+    normalize = lambda value: re.sub(r'\s+', ' ', str(value or '')).strip()
+    return bool(normalize(prompt)) and normalize(_read_editor_prompt(input_el)) == normalize(prompt)
+
+
+def _verify_video_prompt_before_send(input_el, prompt):
+    try:
+        if _editor_prompt_matches(input_el, prompt):
+            return
+    except Exception as exc:
+        raise RuntimeError('PROMPT_TEXT_MISMATCH:无法读取发送前的完整提示词，拒绝提交') from exc
+    raise RuntimeError('PROMPT_TEXT_MISMATCH:编辑框全文与任务提示词不一致，拒绝提交以避免错误生成')
+
+
 # ── _fill_prompt_text ──
 def _fill_prompt_text(page, input_el, prompt, has_refs=False):
     """向提示词输入框写入文本（复用 _generate_video_google_fx 中的多策略逻辑）。返回 True 表示成功。"""
     filled = False
 
     if has_refs:
+        # Never concatenate a retry onto partial or stale text; preserve chips
+        # and fail closed so no corrupt request is sent.
+        if _read_editor_prompt(input_el).strip():
+            return _editor_prompt_matches(input_el, prompt)
         for attempt_label, fn in [
             ("insert_text", lambda: (
-                input_el.click(), random_sleep(0.2, 0.3),
-                page.keyboard.press("End"), random_sleep(0.1, 0.2),
+                input_el.evaluate("""(ed) => {
+                    ed.focus();
+                    const r = document.createRange();
+                    r.selectNodeContents(ed); r.collapse(false);
+                    const s = window.getSelection();
+                    s.removeAllRanges(); s.addRange(r);
+                }"""),
                 page.keyboard.insert_text(prompt), random_sleep(0.3, 0.5),
             )),
             ("execCommand", lambda: (
@@ -2081,12 +2121,15 @@ def _fill_prompt_text(page, input_el, prompt, has_refs=False):
                 break
             try:
                 fn()
-                editor_text = input_el.inner_text().strip()
-                if prompt[:15].lower() in editor_text.lower():
+                if _editor_prompt_matches(input_el, prompt):
                     filled = True
                     log(f"✅ {attempt_label} 追加提示词成功: {len(prompt)} 字符", "GoogleFX")
+                elif _read_editor_prompt(input_el).strip():
+                    return False
             except Exception as e:
                 log(f"⚠️ {attempt_label} 追加提示词失败: {e}", "GoogleFX")
+                if _read_editor_prompt(input_el).strip():
+                    return False
     else:
         try:
             input_el.click()
@@ -2136,7 +2179,7 @@ def _fill_prompt_text(page, input_el, prompt, has_refs=False):
             except Exception as e:
                 log(f"⚠️ 剪贴板粘贴失败: {e}", "GoogleFX")
 
-    return filled
+    return filled and _editor_prompt_matches(input_el, prompt)
 
 
 def _read_prompt_refs_settled(page, limit, attempts=3, settle=0.6):
@@ -2310,20 +2353,8 @@ def _submit_video_to_canvas(page, req, before_tile_ids, expect_slice=None):
         raise RuntimeError("视频提示词输入失败")
     random_sleep(0.5, 1.0)
 
-    try:
-        input_el.click()
-        random_sleep(0.1, 0.2)
-        page.keyboard.press("End")
-        if prompt_has_refs:
-            page.keyboard.type(" ")
-            random_sleep(0.15, 0.25)
-        else:
-            page.keyboard.type(" ")
-            random_sleep(0.1, 0.15)
-            page.keyboard.press("Backspace")
-            random_sleep(0.2, 0.3)
-    except Exception as e:
-        log(f"⚠️ React state 同步失败: {type(e).__name__}", "GoogleFX")
+    # Do not click/End/type a space to "sync" the editor. On macOS that
+    # inserted a space in the middle of words after the successful fill.
 
     # 🚧 提交前最后一道锚点复核（见 _video_refs_still_attached）。放在节奏闸门之前：
     # 复核不过就没必要再等那几秒的提交间隔了。
@@ -2338,6 +2369,7 @@ def _submit_video_to_canvas(page, req, before_tile_ids, expect_slice=None):
     # 提交之间**隔了多久，所以闸门必须贴在提交动作前面，两条链共用同一个时间戳。
     fx_pacing_wait(*fx_pacing_bounds())
 
+    _verify_video_prompt_before_send(input_el, req.prompt)
     click_time = time.time()
     click_fx_send_button(page, input_el)
     note_fx_submit()   # 与图片链共用提交节奏闸门的参照点
@@ -4193,7 +4225,7 @@ def _dismiss_unexpected_overlays(page, log_tag="GoogleFX"):
     return dismissed
 
 
-def _get_panel_uuid_order(page):
+def _get_panel_uuid_order(page, filename=None):
     """同 _get_panel_uuids，但按 DOM 文档顺序返回**列表**（去重，保留首次出现的位置）。
 
     上传归属判定需要回答"这一批新冒出来的卡片里，哪一张是刚刚传上去的那一张"。
@@ -4204,11 +4236,19 @@ def _get_panel_uuid_order(page):
     ordered = []
     seen = set()
     try:
-        srcs = page.evaluate("""() => {
+        srcs = page.evaluate("""(filename) => {
             const selectors = 'img[src*="getMediaUrlRedirect"], img[src*="flow-content.google"], img[src*="/image/"], img[data-media-id]';
             return Array.from(document.querySelectorAll(selectors))
+                .filter(img => !img.closest('flow-video-tile'))
+                .filter(img => {
+                    if (!filename) return true;
+                    const tile = img.closest('flow-grid-tile-container');
+                    // New Flow uploads expose the source filename on the
+                    // image card. Reject unrelated delayed image loads too.
+                    return tile ? tile.getAttribute('aria-label') === filename : true;
+                })
                 .map(img => img.getAttribute('data-media-id') || img.getAttribute('src') || '');
-        }""")
+        }""", filename)
     except Exception as e:
         log(f"  ⚠️ _get_panel_uuid_order 失败: {e}", "GoogleFX")
         return ordered

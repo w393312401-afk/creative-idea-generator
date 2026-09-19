@@ -920,15 +920,12 @@ def load_stale_slots(manifest_data):
     return stale
 
 
-# 旧单硬切占位声明的正文前缀（与 prompt_pipeline.HARD_CUT_PLACEHOLDER_PREFIX 同一常量，
-# 这里复制一份字面量是为了让 plan_video_slots 保持零依赖可单测；该字符串已冻结，新单不再
-# 产生这种正文，见 prompt_pipeline.HARD_CUT_VIDEO_PLACEHOLDER 的说明）。
-_LEGACY_HARD_CUT_PLACEHOLDER_PREFIX = 'DECLARED HARD CUT'
-
-
-def _is_legacy_hard_cut_placeholder(body):
-    """该 VIDEO 正文是不是 2026-07-30 之前落盘的硬切占位声明（那种槽位不生成视频）。"""
-    return str(body or '').strip().upper().startswith(_LEGACY_HARD_CUT_PLACEHOLDER_PREFIX)
+# 旧存档兼容识别来自无依赖叶子模块；保留旧私有导入名供槽位规划与外部测试使用。
+# 不导入 prompt_pipeline，避免仅规划视频槽位时加载整套合成引擎。
+from legacy_media_contract import (
+    HARD_CUT_PLACEHOLDER_PREFIX as _LEGACY_HARD_CUT_PLACEHOLDER_PREFIX,
+    is_legacy_hard_cut_placeholder as _is_legacy_hard_cut_placeholder,
+)
 
 
 def _is_declared_editorial_cut(body, meta=''):
@@ -1442,6 +1439,11 @@ class _BatchBridge:
                     ))
                     return 'rejected'  # 与锚点拒收同路径：批量脚本据此进入失败重试轮
             info = _video_info(plan, self.video_model, status='success')
+            # Keep the upstream output identity with the local slot; DOM stamps
+            # are transient and cannot serve as a durable provenance record.
+            for key in ('flow_media_id', 'flow_project_url'):
+                if (details or {}).get(key):
+                    info[key] = details[key]
             # 校验结果留痕：skipped:* 表示该片段其实没经过锚点核验（环境异常被放行）
             info['anchor_check'] = reason
             if not ok:
@@ -2432,7 +2434,7 @@ def prepend_cover_intro(project_dir, manifest_data, video_files, tmp_dir, speed,
     return [built] + list(video_files), info
 
 
-# ── 节奏时间分配（docs/pacing_rhythm_balance_plan.md 第 3 层） ─────────────────
+# ── 节奏时间分配（docs/plans/pacing_rhythm_balance_plan.md 第 3 层） ─────────────────
 # 每段固定 8 秒的 i2v 输出装的信息量差着几倍，观感上就是同一条片子里既有跟不上的
 # 段落也有拖沓的段落。合成侧把每拍的拍重换算成一个 setpts 系数，写进提示词块的
 # meta（"PACE 1.21"），一路经 plan -> manifest 流到这里，在合并时兑现成屏幕时间。

@@ -24,6 +24,7 @@ packet_cache.json
 process_brief_cache.json
 compose_checkpoints.json
 search_snippet_cache.json
+artifacts/
 *.json.tmp
 # 写前备份轮换(如 library.json.bak / packet_cache.json.bak-YYYYMMDD)
 *.bak

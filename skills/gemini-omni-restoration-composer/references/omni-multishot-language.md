@@ -47,7 +47,7 @@ compress work — but neither is exempt from the One-Take Ban.
 **We do NOT use rigid numeric timestamp tables or robotic cut mark sentences (e.g. `Cut this ten-second clip on these marks...` is forbidden).** Video diffusion models (Veo, Kling, Sora) respond best to **fluent cinematic narrative transitions** that naturally guide camera shifts, macro close-ups, and worker actions in pure English prose:
 
 ```text
-The sequence opens with a wide working shot of the restoration area in its initial state, where the worker is already positioned and begins [primary action] with [tool]. The camera then cuts in closer to a tight close-up insert on the tool contact point, showing [material physics: mortar extrusion, wood shavings curling, adhesive spreading]. Next, an extreme close-up insert reveals [two persistent craft traces and micro-textures]. Finally, the camera cuts back to a returning wide shot from the exact same camera setup as the opening shot, where the worker continues the visible operation smoothly through to the finished state.
+The sequence opens with a wide working shot of the restoration area in its initial state, then immediately after the person-free anchor instant the worker reaches in from the adjacent frame edge into [primary action] with [tool]. The camera then cuts in closer to a tight close-up insert on the tool contact point, showing [material physics: mortar extrusion, wood shavings curling, adhesive spreading]. Next, an extreme close-up insert reveals [two persistent craft traces and micro-textures]. Finally, the camera cuts back to a returning wide shot from the exact same camera setup as the opening shot, where the last working motion reaches the finished state and withdraws all visible hands/body to match the person-free ending anchor.
 ```
 
 Rules:
@@ -84,25 +84,18 @@ by contract, and the returning shot is precisely where a stated same-way compres
 A clip cannot be continuously progressing and obey its own shot-level progress locks at the
 same time.
 
-## Worker Action From Zero Seconds
+## Work-Integrated Worker Boundaries
 
-The pack's IMAGE anchors remain worker-free render references, but the VIDEO does not spend
-time reconciling that boundary. At the first video instant the worker is already at the work
-face and makes effective tool contact. No shot is allocated to arrival or departure:
+Follow `omni-work-first-rhythm.md`. Keep person-free boundary instants, not arrival/departure scenes.
 
 | Shot | Worker state |
 |---|---|
-| wide working shot | The worker is already positioned at the work zone and makes the first effective tool contact at zero seconds, then works through repeated cycles at full-body scale with tool, material source, and physical weight all visible. |
-| close-up insert | The worker's hands / tool contact only. |
-| extreme close-up insert | Traces only; the worker may be entirely out of frame. |
-| returning wide shot | The worker continues the visible operation through the end of the shot. No exit or empty tail is staged; the scene reaches the state represented by IMAGE N+1. |
+| wide working shot | Immediately after the opening anchor instant, a short adjacent-edge reach/lean or step starts first effective tool contact; repeated work cycles carry progress. Show plausible access, source and weight; full-body visibility is not mandatory. |
+| close-up insert | Operation-specific hand/tool contact and material physics, not a generic beauty shot. |
+| extreme close-up insert | Existing characteristic traces; no new completion. |
+| returning wide shot | Resume at the same progress level, complete remaining work and withdraw all visible hands/body in the last working motion, landing on the person-free final instant without an empty hold. |
 
-Do not name or stage worker entry and exit paths. The worker is already at the active work
-face at the first frame and remains engaged through the last frame. Material and debris paths
-must still be physically plausible and may cross frame boundaries when the operation requires it.
-
-Machines follow the same lifecycle. Erected plant does not — see the Persistent Site Plant
-Exception in `omni-restoration-continuity.md`.
+Retain stock and resting equipment required by the next anchor. Do not make a working machine blink away; its location and final operating/parked state must agree with the anchors. Erected plant follows its persistent lifecycle.
 
 ## Shot Reference
 
@@ -123,8 +116,8 @@ forbidden here.
 Include:
 - full environment, restoration carrier, and weather or ambient motion
 - first-frame anchor match, with no state jump at the opening instant
-- an empty opening frame, then the worker entering from off-frame and making effective tool contact without pausing, and stepping fully out of frame before the closing moment
-- full-body scale, tool visible, material source visible, real physical weight
+- a person-free opening instant, then an adjacent-edge reach or short step directly into first effective tool contact
+- readable tool contact, a located material source and real physical weight; show only as much of the worker as the reachable operation needs
 - one dominant physical action, repeated in visible cycles
 - a ladder, scaffold, or standing surface if the task is above arm reach
 - physical resistance and rising dust or debris
@@ -135,7 +128,7 @@ Include:
 
 Natural prose pattern:
 
-`The clip opens on a wide working shot captured like casual smartphone footage, slightly off-center with mild wide-angle edge distortion and phone auto-exposure settling, matching IMAGE N to show the full [location] and the [carrier] in its [current state] under [lighting], with [worker] already at [work zone] making the first effective contact with [tool] at zero seconds and then repeatedly [verb] [object/surface] as the changed area grows steadily and fine dust settles nearby.`
+`The clip opens on a wide working shot captured like casual smartphone footage, slightly off-center with mild wide-angle edge distortion and phone auto-exposure settling, matching IMAGE N to show the full [location] and the [carrier] in its [current state] under [lighting], then immediately after that person-free opening instant [worker] reaches in from the adjacent frame edge at [reachable work zone] into first effective contact with [tool] and then repeatedly [verb] [object/surface] as the changed area grows steadily and fine dust settles nearby.`
 
 ### Close-Up Insert — every clip
 
@@ -196,17 +189,17 @@ overshoot, no missing elements. Finished-state wording is allowed only here.
 
 Include:
 - an explicit statement that this is the same camera setup as the opening wide working shot
-- the worker continuing the visible operation through the shot end
+- remaining work completed visibly, with all visible hands/body withdrawing in the last working motion
 - temporary tools, ladders, and scaffolds remaining only when supported by the resulting
   state or the next beat
 - a final layout matching IMAGE N+1
 - permanent traces, including all changes inherited from earlier beats
-- no staged exit and no worker-free tail
+- no separate departure scene or empty hold; only the final anchor instant is person-free
 - phone-recorded exposure and tone matching the next anchor
 
 Natural prose pattern:
 
-`A final clean cut at the [entry mark in words] returns to the same camera setup as the opening wide working shot, matching the phone-recorded exposure and tone of IMAGE N+1, where — after the remaining [repetitions] are completed the same way — [worker] continues the same visible operation through the last instant as the realistically weathered scene reaches IMAGE N+1 and [persistent traces] remain visible.`
+`A final clean cut at the [entry mark in words] returns to the same camera setup as the opening wide working shot, matching the phone-recorded exposure and tone of IMAGE N+1, where — after the remaining [repetitions] are completed the same way — [worker] finishes [last concrete action] and withdraws the visible hands/body in that same motion, matching the person-free IMAGE N+1 with [persistent traces] and [retained stock/equipment] still in place.`
 
 ## Progress Across Cuts
 
@@ -246,6 +239,8 @@ The shot structure is a fixed skeleton — and a smaller one than it used to be 
 template-loop prose the default failure mode of this skill: every beat opening the same way,
 using the same clause order, and reaching for the same verbs. With only two shot names in
 play, the burden falls entirely on the work description.
+
+Vary operation-specific opening actions, evidence and closing gestures using `omni-work-first-rhythm.md`; never make arrival-work-departure a repeated plot. Keep the existing shot structure, but do not turn its timing into fixed logistics phases.
 
 Before finalising each VIDEO, compare it against the immediately preceding VIDEO:
 

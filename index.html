@@ -93,11 +93,11 @@
     <link rel="stylesheet" href="css/app/panels-tabs.css?v=1.8.1">
     <!-- 激发结果页的极简布局（管线条 / 折叠标题 / section 弹层 / 宽屏分栏）。
          必须排在 panels-tabs.css 之后：它要覆盖那里的桌面端 .content-header 与
-         移动端 .action-row 规则。见 docs/spark_result_minimal_layout_plan.md -->
+         移动端 .action-row 规则。见 docs/plans/spark_result_minimal_layout_plan.md -->
     <link rel="stylesheet" href="css/app/result-minimal.css?v=1.0.0">
     <!-- API 配置中心的极简两栏布局（左分区导航 + 右单区表单，号池并入同一窗口）。
          必须排在 base.css 之后：要覆盖那里的 .form-group 竖排规则与 .modal-content 宽度。
-         见 docs/spark_settings_center_layout_plan.md -->
+         见 docs/plans/spark_settings_center_layout_plan.md -->
     <link rel="stylesheet" href="css/app/settings-center.css?v=1.0.0">
     <link rel="stylesheet" href="css/image_studio.css?v=1.2.0">
     <link rel="stylesheet" href="css/gallery.css?v=1.4.0">
@@ -183,7 +183,7 @@
         <div class="mobile-nav-tabs">
             <button id="main-tab-results" class="mobile-nav-btn active" onclick="switchMainTab('results')">
                 <span class="btn-icon">☄️</span>
-                <span class="btn-text">激发结果</span>
+                <span class="btn-text">创作结果</span>
             </button>
             <button id="main-tab-projects" class="mobile-nav-btn" onclick="switchMainTab('projects')">
                 <span class="btn-icon">📁</span>
@@ -203,7 +203,7 @@
         <main class="app-main">
             <!-- Left Workspace: Brainstorming Panel
                  极简布局（激发轨 / 取材抽屉 / 灵感卡网格 / 单行页脚）：
-                 方案与取舍见 docs/spark_dimension_minimal_layout_plan.md。
+                 方案与取舍见 docs/plans/spark_dimension_minimal_layout_plan.md。
                  所有控件 id 与既有监听保持不变，只换外壳与位置。 -->
             <!-- Main Workspace: Spark Outputs -->
             <section class="panel-right glass-panel mobile-active">
@@ -219,7 +219,7 @@
                 <!-- Welcome/Placeholder View -->
                 <div class="output-placeholder active" id="output-placeholder-view">
                     <div class="placeholder-icon">☄️</div>
-                    <h3>等待引燃创意星火...</h3>
+                    <h3>从视频复刻或导入提示词开始创作</h3>
                     <p>新建一单有两条路：到 <b>🎬 爆款复刻</b> 传一条成品延时视频反推出提示词包，或在 <b>📁 项目</b> 工具栏用「📥 上传提示词集」导入手上已有的整份提示词集。两条路都会把选题送入 <b>gemini-veo-restoration-composer</b> skill，按其连续性契约合成完整的「图片 1–N+1 + 视频 1–N」提示词集，并附质量审核报告。</p>
                 </div>
 
@@ -337,7 +337,7 @@
                          芯片的状态文字与三态样式由 app.js 的 updatePipelineBar() 刷新。
                          中间那枚主按钮永远指向"当前该做的下一步"，右边 ⋯ 收纳
                          复制/收藏/导出三个随手工具。
-                         见 docs/spark_result_minimal_layout_plan.md
+                         见 docs/plans/spark_result_minimal_layout_plan.md
                          ========================================================== -->
                     <div class="pipeline-bar" id="pipeline-bar">
                         <div class="pipeline-steps">
@@ -516,7 +516,7 @@
                                     <button id="run-full-sequence-review-btn" class="action-btn text-btn mini-btn secondary" title="不复用任何既有结论，把每一拍与跨帧层整个重审一遍（慢、调用多；一般用增量的那个按钮就够）">🔁 全量重审</button>
                                     <!-- 删除整拍时服务端会落一份完整快照；删除后的一次性「撤销」
                                          在 toast 上（30 秒），过了窗口从这里恢复。见
-                                         docs/spark_result_slots_plan.md 与 /api/restore_slot -->
+                                         docs/plans/spark_result_slots_plan.md 与 /api/restore_slot -->
                                     <button id="deleted-slots-btn" class="action-btn text-btn mini-btn" title="查看本单删除过哪些拍，并把它们恢复回来（删除时已保存完整快照）">↩️ 已删除的拍</button>
                                 </div>
                                 <div class="section-pop" id="frames-info-pop" hidden>
@@ -838,6 +838,7 @@
                                         <select id="t2i-model" class="styled-select" translate="no">
                                             <option value="nano-banana-2" selected>🍌 Nano Banana 2</option>
                                             <option value="gpt-image-2">gpt-image-2 (GPT / codex 通道)</option>
+                                            <option value="gpt-image-2.5">gpt-image-2.5 (GPT / codex 通道)</option>
                                         </select>
                                     </div>
                                 </div>
@@ -923,6 +924,7 @@
                                         <select id="i2i-model" class="styled-select" translate="no">
                                             <option value="nano-banana-2" selected>🍌 Nano Banana 2</option>
                                             <option value="gpt-image-2">gpt-image-2 (参考图编辑/当前可用)</option>
+                                            <option value="gpt-image-2.5">gpt-image-2.5 (参考图编辑)</option>
                                         </select>
                                     </div>
                                 </div>
@@ -1096,7 +1098,7 @@
                  一行 = 一个创意项目（选题 → 激发任务 → 结果收藏 → 成片资产），四路
                  数据在服务端按 project_key 合流（GET /api/projects），左列表 + 右详情
                  双栏取代原先两个互斥的 380px 抽屉。见 js/projects.js 与
-                 docs/project_workbench_refactor_plan.md -->
+                 docs/plans/project_workbench_refactor_plan.md -->
             <section class="panel-projects glass-panel" id="panel-projects">
                 <div class="projects-shell">
                     <div class="panel-header">
@@ -1210,7 +1212,7 @@
 
             <!-- 爆款复刻：成品视频 → 抽帧 → 逐帧客观事实 → 节拍阶梯 → 提示词包；
                  已确认的节拍还可沿受控变异轴派生二创。
-                 方案见 docs/replica_and_variant_pipeline_plan.md。
+                 方案见 docs/plans/replica_and_variant_pipeline_plan.md。
                  整个页面由 js/replica_pipeline.js 渲染，这里只留挂载点。 -->
             <section class="panel-replica glass-panel" id="panel-replica">
                 <div class="replica-shell">
@@ -1227,19 +1229,19 @@
     <!-- 「我的点子库」与「激发任务列表」两个右侧抽屉已于 2026-07-31 删除：
          内容合并进「📁 项目」主标签页（#panel-projects，见 js/projects.js）。
          抽屉里原有的「导入 JSON / 全部导出」已搬到工作台工具栏。
-         见 docs/project_workbench_refactor_plan.md -->
+         见 docs/plans/project_workbench_refactor_plan.md -->
 
     <!-- Settings Modal — API 配置中心 · 极简两栏布局
          旧版是一条 10 项的长滚动表单，且「号池」还要再点开一个嵌套弹窗（modal 叠 modal）；
          改一个参数要先滚着找、改完还得记得按「保存配置」。现在：
-            · 左侧分区导航（后端 / 号池 / 激发参考 / 系统），右侧一次只显示一个分区；
+            · 左侧分区导航（后端 / 号池 / 联网参考 / 系统），右侧一次只显示一个分区；
             · 生图参数（宽高比/清晰度）已并入「生成后端」分区，减少一级跳转；
            · 号池整块并入本窗口的「生成号池」分区（原 #account-pool-manage-modal 已删除，
              js/account_pool.js 继续负责池子渲染）；默认环境和换号节拍只在 Google FX
              服务管理中心配置；
            · 所有控件改动即存（silent autoSaveConfig + 头部「已保存」提示），底部只留
              测试连接 / 恢复默认 / 完成。
-         见 docs/spark_settings_center_layout_plan.md -->
+         见 docs/plans/spark_settings_center_layout_plan.md -->
     <div class="modal" id="settings-modal">
         <div class="modal-content glass-panel settings-center">
             <div class="modal-header settings-center-header">
@@ -1264,7 +1266,7 @@
                         <span class="settings-nav-icon">🛡</span><span class="settings-nav-label">质量门禁</span>
                     </button>
                     <button type="button" class="settings-nav-item" data-section="ideation">
-                        <span class="settings-nav-icon">🌐</span><span class="settings-nav-label">激发参考</span>
+                        <span class="settings-nav-icon">🌐</span><span class="settings-nav-label">联网参考</span>
                     </button>
                     <button type="button" class="settings-nav-item" data-section="system">
                         <span class="settings-nav-icon">🧩</span><span class="settings-nav-label">系统</span>
@@ -1532,19 +1534,19 @@
                         </div>
                     </section>
 
-                    <!-- ④ 激发参考 -->
+                    <!-- ④ 联网参考 -->
                     <section class="settings-section" data-section="ideation">
-                        <h4 class="settings-section-title">激发参考</h4>
-                        <p class="settings-section-desc">随机创意激发前联网取材用的搜索词与固定参考网址。</p>
+                        <h4 class="settings-section-title">联网参考</h4>
+                        <p class="settings-section-desc">复刻变体与联网参考库使用的搜索词和固定参考网址。</p>
                         <div class="form-group settings-field stack">
                             <label for="settings-ideation-search-query">联网搜索词（可选）</label>
                             <input type="text" id="settings-ideation-search-query" placeholder="留空使用默认：最新 爆款 延时摄影 废墟改造成居所 视频 趋势…">
-                            <small class="settings-hint">随机创意激发前联网搜索用的查询词；改词立即生效，按搜索词分别缓存 6 小时</small>
+                            <small class="settings-hint">联网参考库搜索用的查询词；改词立即生效，按搜索词分别缓存 6 小时</small>
                         </div>
                         <div class="form-group settings-field stack">
                             <label for="settings-ideation-trend-urls">参考网址（可选）</label>
                             <textarea id="settings-ideation-trend-urls" rows="4" placeholder="每行一个网址（最多取前 5 个），例如：&#10;https://www.tiktok.com/tag/renovation&#10;留空则只用联网搜索趋势"></textarea>
-                            <small class="settings-hint">随机创意激发时抓取这些页面正文，压成要点作为灵感参考注入（6 小时缓存，与联网搜索趋势叠加）</small>
+                            <small class="settings-hint">检索参考案例时抓取这些页面正文，压成要点作为灵感参考注入（6 小时缓存，与联网搜索趋势叠加）</small>
                         </div>
                     </section>
 
@@ -1747,7 +1749,7 @@
     <!-- 本地服务工作日志：右侧全高 dock（展开态）
          两个模式：「概览」把日志行归成人话事件卡（见 js/log_semantics.js），只在
          真出事时才有内容；「明细」是原来那个逐行面板，能力一条没减，只是四行常驻
-         筛选控件收进了「筛选 ▾」浮层。见 docs/spark_log_panel_layout_plan.md -->
+         筛选控件收进了「筛选 ▾」浮层。见 docs/plans/spark_log_panel_layout_plan.md -->
     <div class="log-panel-drawer" id="log-panel-drawer">
         <div class="log-dock-resizer" id="log-dock-resizer" title="拖动调整日志面板宽度"></div>
 
@@ -1827,14 +1829,14 @@
     <script src="js/account_pool.js?v=1.2.1" defer></script>
     <script src="js/progress_model.js?v=1.2.3" defer></script>
     <!-- 槽位状态模型（纯函数）与卡片渲染器：必须排在 api_client / media_renderer /
-         app.js 之前——那三处的槽位渲染全部转调这里。见 docs/spark_result_slots_plan.md -->
+         app.js 之前——那三处的槽位渲染全部转调这里。见 docs/plans/spark_result_slots_plan.md -->
     <script src="js/slot_model.js?v=1.4.0" defer></script>
-    <script src="js/slot_card.js?v=1.5.0" defer></script>
+    <script src="js/slot_card.js?v=1.5.1" defer></script>
     <script src="js/slot_toolbar.js?v=1.1.0" defer></script>
     <!-- 审查结论面板 + 单帧违规详情弹层（消费 manifest 里既有的 review_issues） -->
     <script src="js/review_report.js?v=1.0.0" defer></script>
     <!-- 日志语义规则表（纯函数）：必须排在 api_client 之前——日志面板的概览模式
-         转调这里把日志行归成人话事件。见 docs/spark_log_panel_layout_plan.md -->
+         转调这里把日志行归成人话事件。见 docs/plans/spark_log_panel_layout_plan.md -->
     <script src="js/log_semantics.js?v=1.0.0" defer></script>
     <script src="js/api_client.js?v=1.9.1" defer></script>
     <script src="js/prompt_pipeline.js?v=1.2.6" defer></script>
@@ -1846,13 +1848,13 @@
     <script src="js/prompt_import.js?v=1.0.1" defer></script>
     <script src="js/prompt_editor.js?v=1.0.1" defer></script>
     <script src="js/lightbox.js?v=1.1.0" defer></script>
-    <script src="js/media_renderer.js?v=1.12.0" defer></script>
+    <script src="js/media_renderer.js?v=1.12.1" defer></script>
     <script src="app.js?v=1.7.0" defer></script>
     <script src="js/image_studio.js?v=1.0.4" defer></script>
     <script src="js/gallery.js?v=1.3.0" defer></script>
     <!-- 项目工作台：必须排在 app.js 之后（依赖它的 openSparkProject / viewTask /
          retryTask / deleteFromLibrary 等宿主函数） -->
-    <script src="js/projects.js?v=1.2.1" defer></script>
+    <script src="js/projects.js?v=1.2.2" defer></script>
     <!-- 顶部标签栏自定义（排序 / 隐藏）。纯 DOM 层改造，不依赖任何业务模块，
          只要求 .mobile-nav-tabs 已经在文档里 -->
     <script src="js/nav_customize.js?v=1.0.1" defer></script>

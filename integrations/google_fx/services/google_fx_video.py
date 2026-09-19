@@ -51,6 +51,7 @@ from .google_fx_helpers import (
     _get_panel_uuids,
     _get_panel_uuid_order,
     _fill_prompt_text,
+    _verify_video_prompt_before_send,
     _normalize_model_name,
     wait_out_manual_intervention,
     _ManualInterventionTimeoutError,
@@ -274,7 +275,12 @@ def _upload_image_to_canvas(page, local_path, timeout=45, extra_known_uuids=None
                 )
             live_net = [u for u in net_candidates if u not in stale_net]
 
-            if len(live_net) == 1:
+            # A CDN image response can be a video poster or an unrelated lazy
+            # load. Never establish upload ownership from network timing alone.
+            panel_uuids = set(_get_panel_uuid_order(page, filename=os.path.basename(abs_path)))
+            live_net = [u for u in live_net if u in panel_uuids]
+            fresh = [u for u in panel_uuids if u not in known_uuids and u not in stale_net]
+            if len(live_net) == 1 and fresh == live_net:
                 new_uuid = live_net[0]
                 log(f"  🎉 通过网络捕获到新上传图片 UUID={new_uuid[:16]}...", "GoogleFX")
                 break
@@ -287,7 +293,6 @@ def _upload_image_to_canvas(page, local_path, timeout=45, extra_known_uuids=None
                 )
 
             # 2. 兜底通过 DOM 扫描（文档顺序）找本次新增的卡片
-            fresh = [u for u in _get_panel_uuid_order(page) if u not in known_uuids]
             if len(fresh) == 1:
                 new_uuid = fresh[0]
                 log(f"  🎉 通过 DOM 扫描到上传图片: UUID={new_uuid[:16]}...", "GoogleFX")
@@ -307,11 +312,9 @@ def _upload_image_to_canvas(page, local_path, timeout=45, extra_known_uuids=None
             # 上传等待期间画布已有缩略图随时可能被重新拉取一次，那条响应和真正的
             # 上传响应长得一模一样——之前无条件采信它，就是"img_002 被安上 img_001
             # 的 UUID"这类首尾帧错乱的根因。
-            if dedup_candidate and not fresh \
-                    and time.time() - started >= _DEDUP_ATTRIBUTION_GRACE_SECONDS:
-                new_uuid = dedup_candidate
-                log(f"  🎉 通过网络捕获到去重上传图片 UUID={new_uuid[:16]}...", "GoogleFX")
-                break
+            # An existing image being fetched is not proof of content dedup.
+            # Without an upload receipt/content proof, fail closed instead of
+            # assigning another local frame's UUID to this file.
             time.sleep(1)
     finally:
         page.remove_listener("response", handle_response)
@@ -690,6 +693,7 @@ def _generate_video_google_fx(req: VideoRequest):
             click_time = time.time()
 
             # 🛠️ 5. 点击发送
+            _verify_video_prompt_before_send(input_el, req.prompt)
             click_fx_send_button(page, input_el)
 
             log(f"📡 正在等待视频生成 (最大 {get_runtime_max_wait_seconds() * 5}s)...", "GoogleFX-Video")
@@ -978,6 +982,7 @@ class _ChunkRunner:
         self._refs_map = {}
         self._submitted_tiles = {}  # (project_url, sub_idx) -> tile_id，跨重试保留
         self._identity_recovery_at = 0
+        self._identity_session = None
         self._unresolved_identity_subs = set()
         # 距上次"实读余额"过去了几次提交（见 _credit_checkpoint）
         self._submits_since_credit_check = 0
@@ -1127,13 +1132,17 @@ class _ChunkRunner:
                 self._tile_slices = {}
 
                 self._prepare_page(page)
-                adopted, remaining = self._adopt_completed_tiles(page, remaining)
-                attempted = list(remaining)   # 本轮真正下场提交的那些（认领的不算）
-                path_to_uuid = self._upload_references(page, remaining)
-                submitted = self._submit_tasks(page, remaining, adopted, path_to_uuid)
-                self._await_generation(page, submitted)
-                self._download_and_report(page, submitted)
+                from .flow_video_identity import ProjectVideoRecovery
+                with ProjectVideoRecovery(page) as recovery:
+                    self._identity_session = recovery
+                    adopted, remaining = self._adopt_completed_tiles(page, remaining)
+                    attempted = list(remaining)
+                    path_to_uuid = self._upload_references(page, remaining)
+                    submitted = self._submit_tasks(page, remaining, adopted, path_to_uuid)
+                    self._await_generation(page, submitted)
+                    self._download_and_report(page, submitted)
         finally:
+            self._identity_session = None
             if browser:
                 try: browser.close()
                 except: pass
@@ -2041,7 +2050,8 @@ class _ChunkRunner:
                     tile_id=t['tile_id'], prompt=t['req'].prompt,
                     refs=self._refs_map.get(t['tile_id'], []),
                     click_time=t.get('click_time', 0)) for t in lost], self._check_cancel,
-                    on_resolved=on_resolved)
+                    on_resolved=on_resolved,
+                    **({'session': self._identity_session} if self._identity_session else {}))
                 states.update(recovered)
             except Exception as exc:
                 self._check_cancel()
@@ -2091,6 +2101,7 @@ class _ChunkRunner:
             if state.get("status") == "done" and state.get("videoSrc"):
                 task["status"] = "success"
                 task["video_url"] = state["videoSrc"]
+                task["media_id"] = state.get("mediaId")
                 log(f"✅ 任务 {task['idx'] + 1} 已识别成片，立即下载并交付", "GoogleFX-Video")
                 self._download_and_report_task(page, task)
 
@@ -2112,6 +2123,13 @@ class _ChunkRunner:
                     os.makedirs(output_dir)
                 local_path = download_video_via_browser(page, task["video_url"], output_dir, f"veo3_{idx}")
                 item_result.update({"status": "success", "video_url": local_path})
+                media_id = task.get('media_id')
+                if not media_id:
+                    hit = re.search(r'/video/([0-9a-fA-F-]{36})(?:[?/#]|$)', task['video_url'])
+                    media_id = hit[1] if hit else None
+                if media_id:
+                    item_result['flow_media_id'] = media_id
+                    item_result['flow_project_url'] = self.project_url
                 self.completed.add(sub_idx)
             except Exception as download_err:
                 log(f"⚠️ 下载任务 {idx + 1} 视频失败: {download_err}", "GoogleFX-Video")

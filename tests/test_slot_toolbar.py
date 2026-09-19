@@ -1,6 +1,6 @@
 """槽位工具条（筛选 / 多选 / 尺寸档 / 跳到第一个问题）的行为契约。
 
-方案见 docs/spark_result_slots_plan.md §F。工具条只读卡片上的
+方案见 docs/plans/spark_result_slots_plan.md §F。工具条只读卡片上的
 data-kind / data-badges——那是 renderSlotCard 按 slot_model 的判定写下的，
 工具条再算一遍就会有第二套口径。这里同时守住这一点。
 """

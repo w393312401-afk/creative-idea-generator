@@ -11,7 +11,7 @@
    的完整性门禁；成功时追加在成片末尾，失败/缺失时静默跳过、不阻塞主体合并。
 
 2026-07-31：`_HERO_SHOWCASE_ENABLED` 默认改为 False（收尾不再连放两条完工镜头，
-见 docs/pacing_rhythm_balance_plan.md §7）。第 1 层的用例因此显式把开关打开再跑——
+见 docs/plans/pacing_rhythm_balance_plan.md §7）。第 1 层的用例因此显式把开关打开再跑——
 它们锁的是「开关打开时这条管线仍然完好」，这正是选择关开关而不是删代码的前提；
 关闭态本身由 TestHeroShowcaseDisabledByDefault 单独锁。第 2、3 层是纯下游逻辑，
 不读这个开关（存量项目的 manifest 里还有 HERO 槽位，且手动上传路径仍需可用），
@@ -173,7 +173,7 @@ class TestHeroShowcaseDisabledByDefault(_HeroComposeFixture, unittest.TestCase):
         # 读的是导入期快照，不是 setUp 里 patch 过的值——这条锁的是仓库里的默认值本身。
         self.assertFalse(
             _HERO_ENABLED_DEFAULT,
-            "英雄展示视频应默认关闭（docs/pacing_rhythm_balance_plan.md §7）")
+            "英雄展示视频应默认关闭（docs/plans/pacing_rhythm_balance_plan.md §7）")
 
     def test_no_hero_slot_and_no_llm_call_when_disabled(self):
         state = self._make_state(total_beats=3)

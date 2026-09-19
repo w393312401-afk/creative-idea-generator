@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Tests for Object Ledger Auto-Fix (AI & Deterministic In-Flight Repair).
-Specification: docs/replica_baseline_and_orthogonal_mutation_spec.md
+Specification: docs/reference/replica_baseline_and_orthogonal_mutation_spec.md
 """
 
 import os

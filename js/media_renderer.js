@@ -13,7 +13,7 @@ const _imgCacheVersions = new Map();
 // 路径用的不一样。按去掉前导斜杠与查询串的路径做键，两种写法共用同一个版本号——
 // 否则拿 file 渲染的地方永远看不到用 url 记的那次作废。
 function _mediaCacheKey(url) {
-    return String(url).split('?')[0].replace(/^\/+/, '');
+    return String(url).split(/[?#]/)[0].replace(/^\/+/, '');
 }
 
 // 服务端刚(重)写过某个文件时调用：递增该 URL 的缓存版本，让下一次渲染
@@ -33,7 +33,14 @@ function cacheBustedUrl(url) {
     }
     const version = _imgCacheVersions.get(_mediaCacheKey(url));
     if (!version) return url;
-    return url + (url.includes('?') ? '&' : '?') + 'v=' + version;
+    const hashIndex = url.indexOf('#');
+    const hash = hashIndex < 0 ? '' : url.slice(hashIndex);
+    const base = hashIndex < 0 ? url : url.slice(0, hashIndex);
+    const queryIndex = base.indexOf('?');
+    const pathname = queryIndex < 0 ? base : base.slice(0, queryIndex);
+    const params = new URLSearchParams(queryIndex < 0 ? '' : base.slice(queryIndex + 1));
+    params.set('v', String(version));
+    return pathname + '?' + params.toString() + hash;
 }
 
 function safeSetImageSrc(imgEl, url, bust = false) {
@@ -572,6 +579,20 @@ function isImageFileLike(file) {
     return /\.(png|jpe?g|webp|bmp|gif)$/i.test(file.name || '');
 }
 
+// 网格与灯箱共享槽位映射：sequence 优先，兼容旧清单的 slot 和无编号记录。
+function frameRenderItems(frames, imageSlots) {
+    return imageSlots.length
+        ? imageSlots.map(slot => ({
+            sequence: Number(slot.index),
+            frame: frames.find(f => Number(f.sequence) === Number(slot.index))
+                || frames.find(f => Number(f.slot) === Number(slot.index)),
+        }))
+        : frames.map((frame, index) => ({
+            sequence: Number(frame.sequence || frame.slot || (index + 1)),
+            frame,
+        }));
+}
+
 function renderFramesForIdea(idea) {
     // 容器由 slotRenderTarget 决定：合并视图（一拍一列）下两类卡片共用
     // #beats-grid，拆分视图下各回各的网格。见 js/slot_toolbar.js。
@@ -612,23 +633,7 @@ function renderFramesForIdea(idea) {
     meta.textContent = `已生成 ${generatedCount}/${totalFramesCount} 帧连续帧序列图${dirText}`;
 
     // Loop through the slots (or frames if slots is empty)
-    const itemsToRender = imageSlots.length > 0
-        ? imageSlots.map((slot) => {
-            // 用槽位号本身做 sequence（后端保证 1..N 连续），不再用"数组下标+1"——
-            // 一旦解析漏掉一个槽位，下标制会让后续所有帧整体错位配对（历史事故前提）。
-            const seq = slot.index;
-            const frame = frames.find(f => f.sequence === seq || f.slot === slot.index);
-            return {
-                sequence: seq,
-                slot: slot.index,
-                frame: frame
-            };
-          })
-        : frames.map((f, idx) => ({
-            sequence: f.sequence || (idx + 1),
-            slot: f.slot || (idx + 1),
-            frame: f
-          }));
+    const itemsToRender = frameRenderItems(frames, imageSlots);
 
     // 该创意的帧序列任务正在跑时，哪些槽位算"还没轮到"：单帧重试的任务记录带
     // targetSequences（如 [3]），此时其余槽位服务端压根没碰，画"等待中"会让人

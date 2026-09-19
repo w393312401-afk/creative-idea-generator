@@ -21,8 +21,8 @@ cannot fill all nine is not a beat yet — it is a wish.
 | `light_source_state` | only physically installed or carried sources visible at this point |
 | `beat_type` | `removal` / `excavation` / `surface_prep` / `coating` / `rough_in` / `enclosure` / `fixture_install` / `threshold` / `interior_finish` / `furnishing` / `temporary_works_strike` |
 | `single_physical_operation` | the one named terminal milestone this whole video produces |
-| `material_source` | where the changed material or object comes from before it enters frame |
-| `entry_path` | how it physically enters the working area |
+| `material_source` | the inherited in-frame stock/container or visible delivery/handoff supplying the change |
+| `entry_path` | the short path from that source into use; not a mandatory off-screen arrival |
 | `tool_contact` | the specific hand / tool / machine contact that causes the change |
 | `movement_path` | the visible transport or installation route through the frame |
 | `persistent_traces` | at least two physical traces inherited by IMAGE N+1 |
@@ -31,11 +31,13 @@ cannot fill all nine is not a beat yet — it is a wish.
 Mapping to the shot structure:
 
 - `entry_path` + `material_source` + `movement_path` → the main wide working shot, where the
-  worker, tool, and material source are all in frame at full-body scale
+  tool contact, source location and credible worker access are readable; full-body entry is not required
 - `tool_contact` → the close-up insert
 - `persistent_traces` → the extreme close-up insert (or the single close-up insert on 4s and
   6s clips) and carried into IMAGE N+1
 - `next_frame_inheritance` → the returning wide shot and the next anchor's inherited-trace list
+
+Use `omni-work-first-rhythm.md` to embed logistics in the operation and retain objects required by the next anchor; do not allocate separate delivery/clearance shots to fill these fields.
 
 If a field has no home in the clip's three or four shots, the beat is underspecified and the
 model will invent the missing physics.

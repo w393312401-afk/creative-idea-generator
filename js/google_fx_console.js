@@ -1095,7 +1095,7 @@
   }
 
   // ── 使用说明书 ────────────────────────────────────────────────────────────
-  // 内容来自 docs/google_fx_console_manual.md。这里只做够用的 Markdown 渲染：
+  // 内容来自 docs/guides/google_fx_console_manual.md。这里只做够用的 Markdown 渲染：
   // 标题 / 表格 / 列表 / 围栏代码块 / 引用 / 分隔线 / 行内 code、粗体、链接。
   // 全程先 escape 再放行这几种标记，所以文档内容不会变成注入面。
 

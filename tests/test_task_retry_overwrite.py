@@ -20,6 +20,9 @@ def _isolated_tasks(tmp_path, monkeypatch):
     """tasks/ 落盘目录指到临时目录，并隔离全局 ACTIVE_TASKS。"""
     monkeypatch.chdir(tmp_path)
     os.makedirs("tasks", exist_ok=True)
+    # Task storage resolves an absolute directory; chdir alone cannot override
+    # the shared conftest fixture's independent task directory.
+    monkeypatch.setattr(server_common, "TASKS_DIR", str(tmp_path / "tasks"))
     monkeypatch.setattr(server_common, "ACTIVE_TASKS", {})
 
 

@@ -93,9 +93,9 @@ def test_directive_requires_off_frame_entry_and_exit_around_person_free_anchors(
     assert 'person-free' in low
     assert 'enters from off-frame' in low
     assert 'first effective tool contact' in low
-    assert 'steps fully out of frame' in low
+    assert 'withdraws fully out of frame' in low
     # 进出画各只占一拍：不许把片长花在走路和收工闲站上。
-    assert 'one quick move' in low
+    assert 'with the last working motion' in low
 
 
 def test_directive_stays_terse():

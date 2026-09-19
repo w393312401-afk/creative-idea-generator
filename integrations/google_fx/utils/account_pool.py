@@ -15,6 +15,7 @@ runtime/generation_counter.json 同一目录、同样的"读 JSON → 改 → �
 """
 
 import json
+import math
 import os
 import threading
 import time
@@ -1208,6 +1209,64 @@ class AccountPool:
                     return entry
 
         return None
+
+    def selection_unavailable_message(self, min_credit: int = 1) -> str:
+        """解释最近选号失败的状态快照，不开浏览器、不改状态或绕过探测退避。
+
+        pick_account 返回 None 也可能是探测服务离线或浏览器忙，不能一律解释为
+        账号余额不足。只返回固定原因分类，避免把探测异常里的凭据等内容带给用户。
+        """
+        with _LOCK:
+            state = _read_state()
+        now = _now()
+        counts = {}
+        backoffs = []
+        adspower_unreachable = False
+
+        for info in state.values():
+            cooldown_until = _parse_iso(info.get("cooldown_until"))
+            if info.get("disabled"):
+                reason = ("积分低于最低要求" if info.get("disabled_reason") == _ZERO_CREDIT_DISABLED_REASON
+                          else "已禁用")
+            elif cooldown_until is not None and cooldown_until > now:
+                reason = "处于冷却期"
+                if info.get("cooldown_reason") == "login_required":
+                    reason = "登录失效，处于冷却期"
+            elif _credit_is_stale(info):
+                status = info.get("last_probe_status")
+                if status == "failed":
+                    reason = "积分探测失败，余额尚未确认"
+                    error = str(info.get("last_probe_error") or "").lower()
+                    if "adspower" in error and any(token in error for token in (
+                        "无法连接", "connection refused", "failed to establish a new connection",
+                    )):
+                        adspower_unreachable = True
+                elif status == "blocked":
+                    reason = "浏览器忙，积分探测尚未完成"
+                else:
+                    reason = "积分尚未确认"
+                remaining = _probe_backoff_remaining(info)
+                if remaining > 0:
+                    backoffs.append(remaining)
+            elif info.get("credit") is None:
+                reason = "积分尚未确认"
+            elif info["credit"] < min_credit:
+                reason = "积分低于最低要求"
+            else:
+                # 选号结束后状态可能刚被另一个任务更新，不据此伪造失败原因。
+                continue
+            counts[reason] = counts.get(reason, 0) + 1
+
+        message = "号池暂时没有可用账号"
+        if counts:
+            message += "：" + "；".join(f"{count} 个账号{reason}" for reason, count in counts.items())
+        message += "。"
+        if adspower_unreachable:
+            message += "最近一次积分探测因 AdsPower 本地 API 无法连接而失败；请确认客户端已启动、本地 API 服务已开启且端口配置正确。"
+        if backoffs:
+            message += f"{len(backoffs)} 个账号处于探测重试等待期，最早约 {math.ceil(min(backoffs))} 秒后可重新探测。"
+        message += "请在「号池管理」里检查；修复后可手动刷新积分再重试。"
+        return message
 
     def account_is_usable(self, user_id: str, min_credit: Optional[int] = None) -> bool:
         """复核单个账号此刻是否真的还能用，口径与 pick_account 完全一致。

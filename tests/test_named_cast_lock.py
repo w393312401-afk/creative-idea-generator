@@ -81,7 +81,7 @@ class TestBaselineStillPasses:
     def test_delivered_reference_set_still_passes(self, jake, registry):
         """已交付的 saguaro 提示词集是这条锁的活基线；抽取器或门禁改动把它判红即是回归。"""
         path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                            'veo_petrified_saguaro_prompt_set.md')
+                            'examples/prompts/veo/veo_petrified_saguaro_prompt_set.md')
         if not os.path.exists(path):
             pytest.skip('参考提示词集不在仓库里')
         with open(path, 'r', encoding='utf-8') as f:

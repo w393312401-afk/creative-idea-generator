@@ -45,7 +45,8 @@ Load only the reference files needed for the request.
 **Always load, every composition run:**
 
 - `references/omni-scene-skeleton.md`: Six-dimensional Omni scene skeleton, UGC phone-capture realism, Location DNA vs. Shot Ladder, anchor stability boundary, frame density.
-- `references/omni-multishot-language.md`: Mandatory main-working-shot plus close-up insert grammar, same-camera-setup rule, pacing declaration, direct worker action from zero seconds, phrasing variation.
+- `references/omni-multishot-language.md`: Mandatory main-working-shot plus close-up insert grammar, same-camera-setup rule, pacing declaration, immediate tool contact after the person-free opening instant, phrasing variation.
+- `references/omni-work-first-rhythm.md`: Always load for construction prompts. Work-integrated worker boundaries, material retention and operation-specific rhythm; apply to generation, examples and review.
 - `references/omni-restoration-continuity.md`: Continuity, single-operation beats, construction dependency order and hard vetoes, causal traces, occlusion handling, persistent site plant, worker identity lock.
 - `references/omni-beat-skeleton.md`: Internal planning layer — temporal physics skeleton, visible milestone package rule, spatial anchoring without coordinates, object persistence.
 - `references/omni-damage-vocabulary.md`: Before-state pathology for IMAGE 1; banned soft-focus words.
@@ -214,7 +215,7 @@ What the schema cannot enforce, and you must:
 5. Register a **Material Palette Lock** for the three to five materials that occupy meaningful frame area. Give each an immutable `substrate` phrase and a monotonic `state_track`; copy the substrate wording verbatim whenever that material is visible and advance its state only in the beat that works it. Then draft the internal progress ledger: for each anchor, the cumulative installed items, counts of major countable elements, completion extent, lighting phase, inherited traces, shell envelope, and current material states. Never include the ledger itself in the output.
 6. Create IMAGE anchors for the before state, each progressive state, and the final reward state. IMAGE anchors are clean frames at full-shot scale with no active workers or machinery. IMAGE 1 uses the three-part damage pattern from `references/omni-damage-vocabulary.md`. Every post-crossing interior IMAGE restates the envelope signature, roof form, aperture constraints, wall material, and at least one fixed structural carrier landmark; every IMAGE restates the visible materials' immutable substrate phrases.
 7. Create VIDEO prompts between adjacent IMAGE anchors. Every VIDEO starts by binding IMAGE N as first frame and IMAGE N+1 as last frame.
-8. Render each VIDEO as a main working shot plus this clip length's one or two close-up inserts, in natural prose, carrying the shot timeline sentence right after the anchor-binding sentence. At zero seconds the worker is already at the active work face and begins the first effective action immediately; keep work visible through the returning wide shot and never allocate a shot to entering or exiting.
+8. Render each VIDEO as a main working shot plus this clip length's one or two close-up inserts, in natural prose, carrying the shot timeline sentence right after the anchor-binding sentence. Immediately after the person-free opening instant, begin effective tool contact with a short adjacent-edge reach or step; integrate withdrawal into the final working action. Apply `references/omni-work-first-rhythm.md` without assigning separate arrival/departure shots.
 9. Apply the lighting phase, passive environment, and audio layers from `references/omni-lighting-environment-audio.md`.
 10. Apply the UGC de-AI capture layer to both IMAGE and VIDEO prompts before wording polish.
 11. (Optional, only when the user explicitly requests 对话微调提示词) Add two to three conversational edit prompts for Gemini Omni follow-up refinement.
@@ -333,7 +334,7 @@ Every object is `inherited in place`, `human-moved` (state the movement and dest
 
 ### Clean Frame Boundary
 
-IMAGE prompts are person-free stills: zero workers, zero residents, zero bystanders, zero hands, zero active machines — and no sentence saying nobody is present either, since a negative makes image models render people. Workers, tools, vehicles, and temporary machines appear only inside VIDEO prompts. Because both anchors are empty, each construction VIDEO opens on an empty frame, brings the worker in from off-frame immediately after the opening instant for the first effective tool contact without pausing, and takes the worker fully out of frame before the closing moment. The entry and the exit are each one quick move, never a stroll onto the set and never an idle tail. Parked plant is not an active machine and may remain.
+IMAGE prompts remain person-free static states, with no active machinery or tools in motion. Do not add people or statements about their absence to IMAGE prose. VIDEO begins at the person-free anchor instant, then a brief reach/lean or short step from the adjacent frame edge makes immediate tool contact; the last working action withdraws all visible hands/body fully out of frame. No separate arrival, unloading, packing-up, departure or empty hold shots. Static stock, resting tools, ladders and parked plant may remain when present in the next anchor; installed materials stay. See `references/omni-work-first-rhythm.md` for operation-specific rhythm, reachable access and material accounting.
 
 ### Worker Identity Lock
 
@@ -427,7 +428,7 @@ Rules:
 - The final reveal contains any object never installed or carried in during a prior beat.
 - Any VIDEO lacks adjacent first-frame / last-frame binding.
 - Any IMAGE includes active workers or machinery.
-- Any construction VIDEO with a worker does not place that worker at the active work face at zero seconds with immediate effective tool contact, or spends any shot on worker entrance, arrival, exit, or walk-out.
+- A construction VIDEO contradicts person-free anchor instants, omits a physically credible worker boundary crossing, or invents impossible reach/access. A brief edge reach and withdrawal integrated into work are valid; do not demand a full-body walk-in/walk-out.
 - A worker's silhouette description changes between shots or between videos.
 - Any referenced `<image>`, `<video>`, or `<audio>` is not explicitly used where needed.
 - Any prompt defaults to captions, subtitles, prompt text, labels, or rendered typography without user request.
@@ -444,6 +445,9 @@ Rules:
 - (Reverse-engineering mode) Any prompt mentions an element listed in `banned_elements`; any beat-derived claim lacks `evidence_frames`; any `change_events` entry is unbound to a beat; the keyframe collage failed to generate; or fewer frames were reviewed than `analysis_plan` requires.
 
 ### P1 - Strengthen Before Delivery
+
+- Separate arrival, unloading, packing-up, walk-out or empty-hold shots crowd out construction; adjacent beats repeat identical action choreography rather than operation-specific evidence.
+- Stock, installed materials or static access equipment are removed merely because a clip ends, despite being retained by its next anchor.
 
 - The inserts are the same framing and subject as each other instead of stepping from contact to trace.
 - The close-up insert lacks tool contact or material deformation.

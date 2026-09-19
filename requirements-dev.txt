@@ -1,0 +1,3 @@
+# Install runtime requirements first; Node is only needed for JS tests.
+-r requirements.txt
+pytest>=8,<10

@@ -38,6 +38,22 @@ def test_submission_snapshot_delivers_once_before_batch_wait(monkeypatch, tmp_pa
     assert runner.completed == {0}
 
 
+def test_delivery_carries_verified_media_identity(monkeypatch, tmp_path):
+    req = VideoRequest(prompt='exact', output_path=str(tmp_path))
+    notifications = []
+    runner = _ChunkRunner(1, 0, [req], {}, lambda *a: notifications.append(a), None)
+    runner.project_url = 'https://flow.google.com/project/original-project'
+    monkeypatch.setattr('integrations.google_fx.services.google_fx_video.download_video_via_browser',
+                        lambda *a: str(tmp_path / 'result.mp4'))
+    task = dict(sub_idx=0, idx=0, req=req, tile_id='lost-dom-stamp', status='generating')
+    runner._deliver_ready_tasks(FakePage(), [task], {
+        'lost-dom-stamp': dict(status='done', mediaId='verified-output',
+                               videoSrc='https://flow.google.com/asb/opaque-player')})
+    payload = notifications[0][2]
+    assert payload['flow_media_id'] == 'verified-output'
+    assert payload['flow_project_url'] == runner.project_url
+
+
 def test_retry_recognizes_submitted_tile_without_prompt_or_reference_images(monkeypatch):
     req = VideoRequest(prompt='long original prompt')
     runner = _ChunkRunner(1, 0, [req], {}, None, None)

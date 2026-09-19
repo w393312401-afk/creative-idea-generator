@@ -75,7 +75,7 @@ const DEFAULT_CONFIG = {
 
 // LLM 主模型清单（激发/合成/审核/质检判定共用；网关路由由服务端 resolve_gateway 处理）。
 // 按供应商分三组，渲染成激发页脚的分组芯片单选器（见 config.js syncIdeationLlmPicker）：
-// - gpt: 模型名含 "gpt-5" 会被 resolve_gateway 自动转发到 codex 网关；只保留当前代
+// - gpt: 模型名含 "gpt-5" 或 "gpt-6" 会被 resolve_gateway 自动转发到 codex 网关；只保留当前代
 //   gpt-5.5+（旧 gpt-4/gpt-3.5 系列、以及性能较弱的 gpt-5.4 系列都不放进来）。
 //   2026-07-13 已用真实请求逐个验证 gpt-5.5/5.6-sol/5.6-terra/5.6-luna 均原生
 //   支持联网搜索（{"type":"web_search"} 工具自动执行）。
@@ -85,6 +85,7 @@ const DEFAULT_CONFIG = {
 //   真实请求验证两者都能正常应答。
 const LLM_MODEL_GROUPS = {
     gpt: [
+        { value: 'gpt-6-astra', label: 'gpt-6-astra' },
         { value: 'gpt-5.5', label: 'gpt-5.5' },
         { value: 'gpt-5.6-sol', label: 'gpt-5.6-sol' },
         { value: 'gpt-5.6-terra', label: 'gpt-5.6-terra' },
@@ -110,6 +111,7 @@ const LLM_MODEL_GROUPS = {
 // 固定出 1K 档）；连这条通道也没额度才就地报错。
 const IMAGE_MODELS = [
     { value: 'nano-banana-2', label: '🍌 Nano Banana 2 (Gemini)' },
+    { value: 'gpt-image-2.5', label: 'gpt-image-2.5 (GPT / codex 通道)' },
     { value: 'gpt-image-2', label: 'gpt-image-2 (GPT / codex 通道)' }
 ];
 

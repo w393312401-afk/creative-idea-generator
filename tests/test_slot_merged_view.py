@@ -5,7 +5,7 @@
 
 关键不变量：**两种视图下卡片内容完全一致**——合并视图只换容器与列位，
 不改渲染器输出，所以卡片 id、操作按钮、拖拽、事件委托、勾选全都照旧成立。
-方案见 docs/spark_result_slots_plan.md §F。
+方案见 docs/plans/spark_result_slots_plan.md §F。
 """
 import os
 

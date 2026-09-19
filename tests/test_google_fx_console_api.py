@@ -13,6 +13,20 @@ from integrations.google_fx.utils import account_pool as account_pool_module
 from integrations.google_fx.utils import selector_stats
 
 
+def test_manual_endpoint_reads_reorganized_guide():
+    handler = object.__new__(server.SparkRequestHandler)
+    handler.path = '/api/google-fx/manual'
+    handler._gate = lambda: True
+    responses = []
+    handler._send_json = lambda payload, status=200: responses.append((status, payload))
+    handler.do_GET()
+    status, payload = responses[0]
+    assert status == 200
+    assert payload['status'] == 'ok'
+    assert payload['path'] == 'docs/guides/google_fx_console_manual.md'
+    assert 'Google FX' in payload['markdown']
+
+
 def test_fx_log_tail_reads_dedicated_logger_file_and_filters_task(tmp_path, monkeypatch):
     """实时日志接口必须读取 FX logger 真正写入的文件，而不是主服务日志。"""
     fx_log = tmp_path / 'fx.log'

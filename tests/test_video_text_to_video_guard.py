@@ -128,14 +128,13 @@ def test_upload_never_reuses_a_uuid_already_owned_by_another_frame(_patch_upload
     assert got is None
 
 
-def test_upload_accepts_dedup_uuid_only_after_grace_when_unowned(_patch_upload_deps, monkeypatch):
-    """同一张图重传（Flow 按内容去重返回已有 media id）仍要能用——
-    前提是这个 UUID 没被本轮别的文件占用，且等够了宽限期。"""
+def test_upload_does_not_infer_dedup_from_unowned_lazy_response(_patch_upload_deps, monkeypatch):
+    """Elapsed time and lack of another owner do not prove upload identity."""
     monkeypatch.setattr(V, "_DEDUP_ATTRIBUTION_GRACE_SECONDS", 0)
     page = _FakeUploadPage(panel_states=[[UUID_A]],
                            captured=[f"/fx/api/trpc/media.getMediaUrlRedirect?name={UUID_A}"])
-    got = V._upload_image_to_canvas(page, _patch_upload_deps, timeout=5, extra_known_uuids=None)
-    assert got == UUID_A
+    got = V._upload_image_to_canvas(page, _patch_upload_deps, timeout=1, extra_known_uuids=None)
+    assert got is None
 
 
 def test_upload_refuses_to_guess_when_multiple_new_cards_appear(_patch_upload_deps):
@@ -152,6 +151,19 @@ def test_upload_takes_the_single_new_card(_patch_upload_deps):
     got = V._upload_image_to_canvas(page, _patch_upload_deps, timeout=5,
                                     extra_known_uuids={UUID_A})
     assert got == UUID_B
+
+
+def test_video_poster_network_response_is_not_an_upload(_patch_upload_deps):
+    page = _FakeUploadPage(panel_states=[[UUID_A]],
+                           captured=[f'https://flow-content.google/image/{UUID_B}'])
+    assert V._upload_image_to_canvas(page, _patch_upload_deps, timeout=1) is None
+
+
+def test_real_upload_wins_over_video_poster_response(_patch_upload_deps):
+    page = _FakeUploadPage(panel_states=[[UUID_A], [UUID_A, UUID_C]],
+                           captured=[f'https://flow-content.google/image/{UUID_B}',
+                                     f'https://flow-content.google/image/{UUID_C}'])
+    assert V._upload_image_to_canvas(page, _patch_upload_deps, timeout=1) == UUID_C
 
 
 def test_panel_uuid_order_is_document_order_not_hash_order():

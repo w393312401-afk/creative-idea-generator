@@ -3,7 +3,7 @@
 
 覆盖 js/slot_model.js（状态）→ js/slot_card.js（渲染 + 委托）→
 media_renderer/api_client 各调用点这一整条链路，方案见
-docs/spark_result_slots_plan.md。纯逻辑部分另见 tests/test_slot_model.js。
+docs/plans/spark_result_slots_plan.md。纯逻辑部分另见 tests/test_slot_model.js。
 
 跑法（会自起一个静态服务，无需后端）：
     pytest tests/test_slot_grid_render.py

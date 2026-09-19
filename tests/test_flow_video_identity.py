@@ -35,6 +35,52 @@ def test_shared_prefix_and_duplicate_outputs_are_not_identity():
     assert _distinct_slices({1: row['prompt'], 2: row['prompt']}) == {1: '', 2: ''}
 
 
+def test_rich_text_hyphen_wrap_does_not_lose_completed_video():
+    row = dict(media_id='result', prompt='An extreme close- up reveals the trim.',
+               refs=['first', 'last'], created=200)
+    assert match_project_media([row], 'An extreme close-up reveals the trim.',
+                               ['first', 'last'], 190) == row
+    assert match_project_media([row], 'An extreme close-up reveals another trim.',
+                               ['first', 'last'], 190) is None
+    assert match_project_media([row], 'An extreme close-up reveals the trim.',
+                               ['last', 'first'], 190) is None
+    assert match_project_media([row, dict(row, media_id='duplicate')],
+                               'An extreme close-up reveals the trim.') is None
+
+
+def test_recovery_reuses_reader_with_bounded_refresh_and_cleanup(monkeypatch):
+    from integrations.google_fx.services.flow_video_identity import ProjectVideoRecovery
+    page = MagicMock()
+    page.url = 'https://flow.google.com/project/3ab3cd1e-c52e-453b-8c1c-e6e996e72b27'
+    clock = [100]
+    monkeypatch.setattr('integrations.google_fx.services.flow_video_identity.time.monotonic', lambda: clock[0])
+    with ProjectVideoRecovery(page) as recovery:
+        for t in [100, 130, 160, 190, 220, 280, 400]:
+            clock[0] = t
+            recovery.read(lambda: None)
+        page.context.new_page.assert_called_once()
+        assert recovery.reader.goto.call_count == 3
+    recovery.reader.close.assert_called_once()
+    page.remove_listener.assert_called_once()
+
+
+def test_verified_binding_survives_record_refresh_but_not_request_changes():
+    from integrations.google_fx.services.flow_video_identity import ProjectVideoRecovery
+    page = MagicMock()
+    page.url = 'https://flow.google.com/project/3ab3cd1e-c52e-453b-8c1c-e6e996e72b27'
+    session = ProjectVideoRecovery(page)
+    row = dict(media_id='stable-media', prompt='exact prompt', refs=['first', 'last'], created=100)
+    session.records[row['media_id']] = row
+    request = dict(tile_id='temporary-dom-stamp', prompt='exact prompt', refs=['first', 'last'], click_time=100)
+    assert session.match_request(request) == row
+    session.records.clear()
+    assert session.match_request(request) == row
+    assert session.match_request(request, excluded=['stable-media']) is None
+    assert session.match_request(dict(request, prompt='changed prompt')) is None
+    assert session.match_request(dict(request, refs=['last', 'first'])) is None
+    assert session.match_request(dict(request, click_time=200)) is None
+
+
 def test_lost_dom_recovered_and_delivered_in_same_poll(monkeypatch, tmp_path):
     req = VideoRequest(prompt='exact full prompt', output_path=str(tmp_path))
     events = []

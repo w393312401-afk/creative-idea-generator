@@ -306,7 +306,7 @@ class TestNegativeExampleIsCaught(unittest.TestCase):
         rewritten = fix_out_and_in(legacy, False, beat=None, packet=None)
         self.assertNotIn('already positioned at the active work face', rewritten)
         self.assertIn('enters from off-frame', rewritten)
-        self.assertIn('steps fully out of frame', rewritten)
+        self.assertIn('withdraws fully out of frame', rewritten)
         self.assertEqual(check_out_and_in(rewritten), [])
         self.assertEqual(fix_out_and_in(rewritten, False, beat=None, packet=None), rewritten)
         # 被动语态的拍描述不能拼进 'cycles of'（实测单曾产出破碎语法+双逗号）

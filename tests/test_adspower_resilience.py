@@ -13,8 +13,14 @@ def test_get_ads_ws_url_reuses_running_browser_on_conn_error(monkeypatch, tmp_pa
     port_file = cache_dir / "DevToolsActivePort"
     port_file.write_text("9222\n/devtools/browser/abc-123\n")
 
+    # The cache root must also be synthetic: mocking glob alone still depends
+    # on a real ~/.ADSPOWER_GLOBAL/cache directory existing on the developer's
+    # machine. Never inspect or manipulate a real browser in this unit test.
+    monkeypatch.setattr(browser.os.path, "expanduser", lambda path: str(tmp_path))
     monkeypatch.setattr(browser.glob, "glob", lambda pat: [str(port_file)])
     monkeypatch.setattr(browser, "_is_ws_port_open", lambda ws, *args, **kwargs: True)
+    monkeypatch.setattr(browser, "_macos_frontmost_app", lambda: "")
+    monkeypatch.setattr(browser, "suppress_browser_window", lambda *args, **kwargs: False)
 
     def mock_get(url, *args, **kwargs):
         raise requests.exceptions.ConnectionError("Connection refused")
@@ -29,6 +35,8 @@ def test_get_ads_ws_url_provides_clear_error_when_adspower_down(monkeypatch):
     """当 AdsPower 未启动且无法自愈拉起时，应抛出包含明确指引的异常。"""
     monkeypatch.setattr(browser, "_find_running_browser_ws", lambda uid: None)
     monkeypatch.setattr(browser, "_try_revive_adspower", lambda port: False)
+    monkeypatch.setattr(browser, "_macos_frontmost_app", lambda: "")
+    monkeypatch.setattr(browser, "suppress_browser_window", lambda *args, **kwargs: False)
 
     def mock_get(url, *args, **kwargs):
         raise requests.exceptions.ConnectionError("Connection refused")
