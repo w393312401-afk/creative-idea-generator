@@ -669,33 +669,16 @@ function renderFramesForIdea(idea) {
 
     // 异步补充原片基准抽帧与 5 列拼图（每次切换项目或页面加载时拉取一次权威基准，避免陈旧缓存锁定）
     let projectTitle = idea ? (idea.title || (typeof getIdeaSaveTitle === 'function' ? getIdeaSaveTitle(idea) : '') || idea.project_key || '') : '';
-    let jobId = idea ? (idea.replica_job_id || (idea.frameRun && idea.frameRun.replica_job_id) || (typeof idea.id === 'string' && idea.id.startsWith('replica_') ? idea.id : '')) : '';
-    if (!jobId && idea) {
-        const rawFrames = (idea.frameRun && idea.frameRun.frames) || idea.frames || [];
-        const candidateStrings = [
-            projectTitle,
-            idea.collage_url,
-            idea.source_collage,
-            ...(Array.isArray(rawFrames) ? rawFrames.map(f => f.url || f.file || '') : [])
-        ].filter(Boolean);
-        for (const str of candidateStrings) {
-            const m = str.match(/(?:replica_|run_replica_)([a-f0-9]{12})/i);
-            if (m) {
-                jobId = `replica_${m[1]}`;
-                break;
-            }
-        }
-    }
     if (!projectTitle && Array.isArray(itemsToRender) && itemsToRender.length) {
         const firstU = itemsToRender[0].frame ? (itemsToRender[0].frame.url || itemsToRender[0].frame.file || '') : '';
         const mDir = firstU.match(/\/outputs\/([^/]+)\//);
         if (mDir) projectTitle = mDir[1];
     }
-    const refFetchKey = `${projectTitle}::${jobId}`;
-    if (idea && (projectTitle || jobId) && !idea._fetchingRefs && idea._lastRefFetchKey !== refFetchKey) {
+    const refFetchKey = projectTitle;
+    if (idea && projectTitle && !idea._fetchingRefs && idea._lastRefFetchKey !== refFetchKey) {
         idea._fetchingRefs = true;
         idea._lastRefFetchKey = refFetchKey;
-        fetch(`/api/project/references?title=${encodeURIComponent(projectTitle)}&job_id=${encodeURIComponent(jobId)}`)
+        fetch(`/api/project/references?title=${encodeURIComponent(projectTitle)}`)
             .then(r => r.ok ? r.json() : null)
             .then(data => {
                 idea._fetchingRefs = false;
@@ -741,6 +724,14 @@ function renderFramesForIdea(idea) {
     }
 }
 
+/** Read the rate recorded on the finished file; the current form setting is unrelated. */
+function mergedVideoSpeed(merged) {
+    const value = merged && merged.speed;
+    if (value === null || value === undefined || value === '') return null;
+    const speed = Number(value);
+    return Number.isFinite(speed) && speed > 0 ? speed : null;
+}
+
 function renderVideosForIdea(idea) {
     const grid = slotRenderTarget('video');
     const meta = document.getElementById('videos-meta');
@@ -759,25 +750,33 @@ function renderVideosForIdea(idea) {
     const mergedReveal = document.getElementById('merged-video-reveal');
 
     if (mergedContainer) {
-        if (frameRun && frameRun.merged_video && frameRun.merged_video.status === 'success') {
+        const mergedReady = !!(frameRun && frameRun.merged_video
+            && frameRun.merged_video.status === 'success'
+            && (frameRun.merged_video.url || frameRun.merged_video.file));
+        if (typeof syncResultLeftColumnForMerged === 'function') syncResultLeftColumnForMerged(mergedReady);
+        if (typeof syncCodexVideoEditor === 'function') {
+            syncCodexVideoEditor(mergedReady ? frameRun.merged_video : null, idea);
+        }
+        if (mergedReady) {
             const mv = frameRun.merged_video;
-            const speed = [1, 1.5, 2].includes(Number(mv.speed)) ? Number(mv.speed) : 2;
-            const speedLabel = speed === 1 ? '无加速' : `${speed}倍速`;
-            const speedSlug = speed === 1.5 ? '1_5x' : `${speed}x`;
+            const speed = mergedVideoSpeed(mv);
+            const speedLabel = speed === null ? '倍速未记录' : speed === 1 ? '原速' : `${speed}倍速`;
+            const speedSlug = speed === null ? '' : `_${String(speed).replace('.', '_')}x`;
+            const videoUrl = mv.url || mv.file;
             mergedContainer.style.display = 'block';
-            if (mergedHeading) mergedHeading.textContent = `🎬 ${speedLabel}合并成品视频 (Merged Finished Video)`;
+            if (mergedHeading) mergedHeading.textContent = mv.partial ? '🎬 部分片段成片' : '🎬 成片';
             if (mergedDescription) {
-                mergedDescription.textContent = speed === 1
-                    ? '所有生成的视频片段已按顺序合并，并保留原始播放速度。'
-                    : `所有生成的视频片段已按顺序合并，并调整为${speed}倍速度播放。`;
+                const resultLabel = mv.partial ? '已完成的片段已合并，仍有片段待补齐。' : '视频片段已按顺序合并。';
+                mergedDescription.textContent = resultLabel + (speed === null ? ''
+                    : speed === 1 ? '保留原始播放速度。' : `成片为 ${speed} 倍速。`);
             }
             if (mergedPlayer) {
                 // 重新合成会原地覆盖同一个成片文件，同样要带版本号才看得到新的
-                mergedPlayer.src = cacheBustedUrl(mv.url);
+                mergedPlayer.src = cacheBustedUrl(videoUrl);
             }
             if (mergedDownload) {
-                mergedDownload.href = mv.url;
-                mergedDownload.download = `${idea.title || 'video'}_merged_${speedSlug}.mp4`;
+                mergedDownload.href = videoUrl;
+                mergedDownload.download = `${idea.title || 'video'}_merged${speedSlug}.mp4`;
             }
             if (mergedReveal) {
                 // 定位用的是磁盘相对路径（mv.file），不是播放地址：合并结果原地

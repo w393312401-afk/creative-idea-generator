@@ -12,10 +12,10 @@
     flex: 1;
     background: var(--bg-card);
     border: 1px solid var(--border-color);
-    border-radius: 8px;
+    border-radius: var(--radius-md);
     padding: 8px 12px;
     color: var(--text-secondary);
-    font-size: 12px;
+    font-size: var(--fs-sm);
     font-weight: 500;
     cursor: pointer;
     transition: var(--transition-fast);
@@ -39,10 +39,10 @@
 .config-summary-box {
     background: rgba(176, 123, 82, 0.02);
     border: 1px solid rgba(176, 123, 82, 0.12);
-    border-radius: 10px;
+    border-radius: var(--radius-md);
     padding: 10px 14px;
     margin-top: 10px;
-    font-size: 12.5px;
+    font-size: var(--fs-md);
     line-height: 1.5;
     display: flex;
     align-items: center;
@@ -71,7 +71,7 @@
     padding: 14px 20px !important;
 }
 .btn-shortcut-hint {
-    font-size: 10px;
+    font-size: var(--fs-2xs);
     color: rgba(255, 255, 255, 0.35);
     text-transform: uppercase;
     letter-spacing: 1px;
@@ -90,7 +90,7 @@
 /* 4. Timer in Loading screen */
 /* 激发进行中展示的本单选题名（灵感卡片选题名或基础主题） */
 .loading-topic-name {
-    font-size: 15px;
+    font-size: var(--fs-lg);
     color: var(--text-primary);
     font-weight: 700;
     margin-top: 8px;
@@ -101,7 +101,7 @@
     display: none;
 }
 .loading-timer {
-    font-size: 13px;
+    font-size: var(--fs-md);
     color: var(--text-secondary);
     margin-top: 6px;
     margin-bottom: 8px;
@@ -112,7 +112,7 @@
     font-family: monospace;
 }
 .loading-stage-info {
-    font-size: 13.5px;
+    font-size: var(--fs-base);
     color: var(--neon-purple);
     font-weight: 600;
     margin-bottom: 18px;
@@ -132,7 +132,7 @@
     gap: 12px;
     align-items: center;
     color: var(--text-secondary);
-    font-size: 12px;
+    font-size: var(--fs-sm);
     line-height: 1.4;
 }
 
@@ -176,7 +176,7 @@
     min-height: 16px;
     margin-top: 6px;
     color: var(--text-muted);
-    font-size: 11.5px;
+    font-size: var(--fs-sm);
     text-align: left;
 }
 
@@ -198,7 +198,7 @@
     padding: 30px;
     background: rgba(239, 68, 68, 0.03);
     border: 1px solid rgba(239, 68, 68, 0.15);
-    border-radius: 16px;
+    border-radius: var(--radius-xl);
     box-shadow: 0 0 20px rgba(239, 68, 68, 0.05);
 }
 .error-icon {
@@ -212,11 +212,11 @@
 }
 .error-container h3 {
     font-family: 'Outfit', sans-serif;
-    font-size: 16px;
+    font-size: var(--fs-lg);
     color: #f3f4f6;
 }
 .error-container p {
-    font-size: 12.5px;
+    font-size: var(--fs-md);
     color: var(--text-secondary);
     line-height: 1.6;
     margin-bottom: 6px;
@@ -242,7 +242,7 @@
     border-bottom: 2px solid transparent;
     color: var(--text-secondary);
     padding: 10px 16px;
-    font-size: 13px;
+    font-size: var(--fs-md);
     font-weight: 600;
     cursor: pointer;
     transition: var(--transition-fast);
@@ -300,11 +300,11 @@
     flex-wrap: wrap;
     background: rgba(var(--ink-rgb), 0.03);
     padding: 10px 14px;
-    border-radius: 8px;
+    border-radius: var(--radius-md);
     border: 1px solid var(--border-color);
 }
 .jump-title {
-    font-size: 12px;
+    font-size: var(--fs-sm);
     color: var(--text-muted);
     font-weight: 600;
 }
@@ -316,9 +316,9 @@
 .jump-pill {
     background: rgba(var(--ink-rgb), 0.04);
     border: 1px solid var(--border-color);
-    border-radius: 12px;
+    border-radius: var(--radius-lg);
     padding: 4px 10px;
-    font-size: 11px;
+    font-size: var(--fs-xs);
     color: var(--text-secondary);
     cursor: pointer;
     transition: var(--transition-fast);
@@ -337,7 +337,7 @@
 .prompt-slot-card {
     background: var(--bg-card);
     border: 1px solid var(--border-color);
-    border-radius: 12px;
+    border-radius: var(--radius-lg);
     padding: 16px;
     transition: var(--transition-fast);
     display: flex;
@@ -359,7 +359,7 @@
     display: flex;
     justify-content: space-between;
     align-items: center;
-    font-size: 12.5px;
+    font-size: var(--fs-md);
     font-weight: 700;
 }
 .prompt-slot-card.image-slot .slot-label {
@@ -373,24 +373,24 @@
     gap: 6px;
 }
 .prompt-slot-body {
-    font-size: 12px;
+    font-size: var(--fs-sm);
     color: var(--text-primary);
     line-height: 1.6;
     word-break: break-word;
     background: rgba(176, 123, 82, 0.06);
     padding: 10px 12px;
-    border-radius: 8px;
+    border-radius: var(--radius-md);
     border: 1px solid rgba(var(--ink-rgb), 0.04);
 }
 .raw-prompt-details {
     background: rgba(255, 255, 255, 0.01);
     border: 1px dashed var(--border-color);
-    border-radius: 12px;
+    border-radius: var(--radius-lg);
     padding: 10px 14px;
     margin-top: 10px;
 }
 .raw-prompt-details summary {
-    font-size: 12px;
+    font-size: var(--fs-sm);
     color: var(--text-secondary);
     cursor: pointer;
     font-weight: 500;
@@ -404,7 +404,7 @@
 /* 10. Details/Summary style for audit details */
 .audit-details {
     border: 1px solid var(--border-color);
-    border-radius: 12px;
+    border-radius: var(--radius-lg);
     background: rgba(var(--panel-rgb), 0.15);
     overflow: hidden;
 }
@@ -431,12 +431,12 @@
     gap: 8px;
 }
 .summary-summary-title h3 {
-    font-size: 14px;
+    font-size: var(--fs-base);
     font-weight: 600;
     margin: 0;
 }
 .fold-indicator {
-    font-size: 11px;
+    font-size: var(--fs-xs);
     color: var(--text-muted);
     text-transform: uppercase;
     letter-spacing: 0.5px;
@@ -454,10 +454,10 @@
     width: 100%;
     background: rgba(176, 123, 82, 0.06);
     border: 1px solid var(--border-color);
-    border-radius: 8px;
+    border-radius: var(--radius-md);
     padding: 8px 12px;
     color: var(--text-primary);
-    font-size: 12px;
+    font-size: var(--fs-sm);
     outline: none;
     transition: var(--transition-fast);
 }
@@ -473,10 +473,10 @@
     flex: 1;
     background: rgba(176, 123, 82, 0.06);
     border: 1px solid var(--border-color);
-    border-radius: 8px;
+    border-radius: var(--radius-md);
     padding: 6px 8px;
     color: var(--text-secondary);
-    font-size: 11px;
+    font-size: var(--fs-xs);
     outline: none;
     cursor: pointer;
     transition: var(--transition-fast);
@@ -506,32 +506,14 @@
 
 /* 13. Responsive Grid Layout and Prefers Reduced Motion */
 
-/* Responsive layout change: 1024px and below stack columns */
+/* 外壳在所有宽度下都是「固定视口高度 + 面板内部滚动」（面板互斥显示，见 base.css
+   的 .glass-panel / .mobile-active）。这里不要再在 ≤1024px 把 body/.app-container/
+   .glass-panel 改成 height:auto 的整页滚动：那是早年左右双栏堆叠时代的规则，会让
+   769–1024px（平板）独自变成整页滚动，和桌面、手机两端的行为都不一致。
+   平板只收紧一下外边距。 */
 @media (max-width: 1024px) {
-    body {
-        overflow-y: auto;
-        height: auto;
-    }
     .app-container {
-        height: auto;
-        min-height: 100vh;
         padding: 16px;
-    }
-    .app-main {
-        grid-template-columns: 1fr;
-        gap: 16px;
-        height: auto;
-    }
-    /* :not(.modal-content) — 弹窗（settings-modal 等）也复用 .glass-panel 做视觉样式，
-       但它的限高+内部滚动必须在所有宽度下都生效，不能被这条"窄屏下让左右主面板
-       撑到内容高度"的规则连带清空，否则窄屏/中等宽度下弹窗关闭按钮会被顶出视口。 */
-    .glass-panel:not(.modal-content) {
-        height: auto;
-        max-height: none;
-    }
-    .panel-body, .content-scroll-area {
-        overflow-y: visible;
-        max-height: none;
     }
 }
 
@@ -568,11 +550,11 @@
     background: none;
     border: none;
     color: var(--neon-cyan);
-    font-size: 11px;
+    font-size: var(--fs-xs);
     font-weight: 600;
     cursor: pointer;
     padding: 2px 6px;
-    border-radius: 4px;
+    border-radius: var(--radius-xs);
     transition: var(--transition-fast);
     display: flex;
     align-items: center;
@@ -602,7 +584,7 @@
     padding: 8px;
     background: rgba(var(--ink-rgb), 0.03);
     border: 1px dashed var(--border-color);
-    border-radius: 8px;
+    border-radius: var(--radius-md);
     margin-top: 6px;
 }
 
@@ -612,9 +594,9 @@
     border: 1px solid var(--border-color);
     color: var(--text-primary);
     padding: 6px 26px 6px 10px;
-    border-radius: 6px;
+    border-radius: var(--radius-sm);
     cursor: pointer;
-    font-size: 11.5px;
+    font-size: var(--fs-sm);
     font-weight: 500;
     transition: var(--transition-fast);
     display: flex;
@@ -639,7 +621,7 @@
     justify-content: center;
     border-radius: 50%;
     color: var(--text-muted);
-    font-size: 10px;
+    font-size: var(--fs-2xs);
     transition: var(--transition-fast);
     z-index: 2;
 }
@@ -686,7 +668,7 @@
     padding: 12px 16px;
     background: rgba(var(--ink-rgb), 0.03);
     border: 1px solid var(--border-color);
-    border-radius: 12px;
+    border-radius: var(--radius-lg);
     margin-bottom: 14px;
 }
 
@@ -697,7 +679,7 @@
 }
 
 .control-label {
-    font-size: 12px;
+    font-size: var(--fs-sm);
     color: var(--text-secondary);
     font-weight: 500;
 }
@@ -705,7 +687,7 @@
 .filter-btn-group {
     display: flex;
     background: rgba(176, 123, 82, 0.06);
-    border-radius: 6px;
+    border-radius: var(--radius-sm);
     padding: 2px;
     border: 1px solid var(--border-color);
 }
@@ -715,9 +697,9 @@
     border: none;
     color: var(--text-secondary);
     padding: 4px 10px;
-    font-size: 11.5px;
+    font-size: var(--fs-sm);
     font-weight: 500;
-    border-radius: 4px;
+    border-radius: var(--radius-xs);
     cursor: pointer;
     transition: var(--transition-fast);
 }
@@ -767,7 +749,7 @@
     cursor: default;
     pointer-events: none;
     gap: 12px;
-    border-radius: 10px;
+    border-radius: var(--radius-md);
 }
 
 .frame-placeholder-spinner {
@@ -777,7 +759,7 @@
 }
 
 .frame-card.placeholder-frame-card span {
-    font-size: 11px;
+    font-size: var(--fs-xs);
     color: var(--text-muted);
 }
 
@@ -799,7 +781,7 @@
     background: linear-gradient(90deg, rgba(176, 123, 82, 0.1) 0%, rgba(122, 139, 111, 0.1) 100%);
     border-bottom: 1px solid var(--border-color);
     padding: 12px 24px;
-    font-size: 13px;
+    font-size: var(--fs-md);
     z-index: 10;
     box-shadow: 0 4px 20px rgba(var(--ink-rgb), 0.08);
     flex-shrink: 0;
@@ -838,7 +820,7 @@
 }
 
 .active-generation-banner .banner-icon {
-    font-size: 14px;
+    font-size: var(--fs-base);
     animation: flash 1.5s infinite alternate;
 }
 
@@ -852,9 +834,9 @@
     border: 1px solid var(--neon-cyan);
     color: var(--neon-cyan);
     padding: 6px 12px;
-    border-radius: 8px;
+    border-radius: var(--radius-md);
     cursor: pointer;
-    font-size: 12px;
+    font-size: var(--fs-sm);
     font-weight: 600;
     transition: var(--transition-fast);
     box-shadow: 0 0 10px rgba(176, 123, 82, 0.2);
@@ -877,7 +859,7 @@
     background: linear-gradient(90deg, rgba(217, 83, 79, 0.18) 0%, rgba(217, 83, 79, 0.08) 100%);
     border-bottom: 1px solid rgba(217, 83, 79, 0.5);
     padding: 12px 24px;
-    font-size: 13px;
+    font-size: var(--fs-md);
     z-index: 200;
     box-shadow: 0 4px 20px rgba(217, 83, 79, 0.25);
     flex-shrink: 0;
@@ -898,7 +880,7 @@
 }
 
 .manual-intervention-banner .banner-icon {
-    font-size: 15px;
+    font-size: var(--fs-lg);
     animation: flash 1s infinite alternate;
     flex-shrink: 0;
 }
@@ -914,9 +896,9 @@
     border: 1px solid #d9534f;
     color: #d9534f;
     padding: 6px 12px;
-    border-radius: 8px;
+    border-radius: var(--radius-md);
     cursor: pointer;
-    font-size: 12px;
+    font-size: var(--fs-sm);
     font-weight: 600;
     transition: var(--transition-fast);
     flex-shrink: 0;

@@ -15,17 +15,26 @@ SPARK 在启动时装上 FX_CONTROL.slot 的实现，于是探针也进同一条
 """
 
 import contextlib
+import inspect
 
 _GATE = None
+_GATE_TAKES_USER_ID = False
 
 
 def install(gate):
     """宿主注入闸门实现；传 None 恢复 no-op。
 
-    gate(kind, cancel_check=None, priority=0, task_id=None) 必须返回一个上下文管理器。
+    gate(kind, cancel_check=None, priority=0, task_id=None, user_id=None) 必须返回一个上下文管理器。
+    user_id：这个旁路动作要操作的 AdsPower 环境（并发时据此避开被别的任务占用的环境）。
     """
-    global _GATE
+    global _GATE, _GATE_TAKES_USER_ID
     _GATE = gate
+    # user_id 是 P2 新增的参数；老签名的闸门（外部宿主、测试替身）不认它，不能因此崩。
+    try:
+        params = inspect.signature(gate).parameters.values() if gate is not None else ()
+        _GATE_TAKES_USER_ID = any(p.name == 'user_id' or p.kind is p.VAR_KEYWORD for p in params)
+    except (TypeError, ValueError):
+        _GATE_TAKES_USER_ID = False
 
 
 def is_installed():
@@ -33,10 +42,11 @@ def is_installed():
 
 
 @contextlib.contextmanager
-def browser_slot(kind, cancel_check=None, priority=0, task_id=None):
+def browser_slot(kind, cancel_check=None, priority=0, task_id=None, user_id=None):
     """进入浏览器临界区。未安装闸门时安静降级为直通。"""
     if _GATE is None:
         yield
         return
-    with _GATE(kind, cancel_check=cancel_check, priority=priority, task_id=task_id):
+    kwargs = {'user_id': user_id} if _GATE_TAKES_USER_ID else {}
+    with _GATE(kind, cancel_check=cancel_check, priority=priority, task_id=task_id, **kwargs):
         yield

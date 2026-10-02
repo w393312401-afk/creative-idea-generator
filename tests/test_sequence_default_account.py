@@ -44,6 +44,46 @@ def _account(user_id, **overrides):
 
 class TestSequenceDefaultAccountSelection(unittest.TestCase):
 
+    def test_open_usable_browser_wins_over_unlocked_default(self):
+        pool = _FakePool(accounts=[_account('opened'), _account('default')])
+        pool.pick_open_account = lambda **_kwargs: _account('opened')
+        config = {'googleFxSequenceUserId': 'default'}
+        self.assertEqual(_select_pool_account(config, pool), 'opened')
+        self.assertEqual(config['googleFxUserId'], 'opened')
+        self.assertEqual(pool.pick_calls, [])
+
+    def test_explicit_lock_keeps_default_over_another_open_browser(self):
+        pool = _FakePool(accounts=[_account('opened'), _account('default')])
+        pool.pick_open_account = lambda **_kwargs: self.fail('locked account must win')
+        config = {'googleFxSequenceUserId': 'default', 'googleFxSequenceUserLock': True}
+        self.assertEqual(_select_pool_account(config, pool), 'default')
+
+    def test_open_browser_check_failure_still_selects_from_pool(self):
+        pool = _FakePool(accounts=[_account('a')], chosen=_account('a'))
+        def broken(**_kwargs):
+            raise RuntimeError('AdsPower temporarily unavailable')
+        pool.pick_open_account = broken
+        self.assertEqual(_select_pool_account({}, pool), 'a')
+
+    def test_open_default_exhausted_during_probe_is_not_selected_again(self):
+        pool = _FakePool(accounts=[_account('default'), _account('replacement')],
+                         chosen=_account('replacement'))
+        def probe_open(**_kwargs):
+            pool._accounts = [_account('default', credit=0, disabled=True),
+                              _account('replacement')]
+            return None
+        pool.pick_open_account = probe_open
+        config = {'googleFxSequenceUserId': 'default'}
+        self.assertEqual(_select_pool_account(config, pool), 'replacement')
+
+    def test_selection_does_not_fetch_profile_names(self):
+        pool = _FakePool(chosen=_account('a'))
+        def list_cached(*, heal=True):
+            self.assertFalse(heal)
+            return [_account('a')]
+        pool.list_accounts = list_cached
+        self.assertEqual(_select_pool_account({}, pool), 'a')
+
     def test_default_environment_is_used_when_available(self):
         pool = _FakePool(accounts=[_account('a'), _account('b')], chosen={'user_id': 'a'})
         config = {'googleFxSequenceUserId': 'b'}

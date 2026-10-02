@@ -32,13 +32,18 @@ function slotCardClass(state) {
 function slotActionsHtml(state) {
     if (!state.actions || !state.actions.length) return '';
     const wrapCls = state.type === 'video' ? 'video-card-actions' : 'frame-card-actions';
-    const btns = state.actions.map(a =>
-        `<button type="button" class="action-btn text-btn mini-btn slot-action-btn ${a.cls}"`
+    const button = a =>
+        `<button type="button" class="action-btn text-btn mini-btn slot-action-btn ${a.cls}${a.primary ? ' slot-primary-action' : ''}"`
         + ` data-act="${a.act}" data-variant="${a.variant}"`
+        + (a.primary ? ' data-primary="1"' : '')
         + (state.type === 'video' ? ` data-slot="${state.seq}"` : ` data-seq="${state.seq}"`)
-        + (a.disabled ? ' disabled' : '') + `>${a.label}</button>`
-    ).join('');
-    return `<div class="slot-actions ${wrapCls}">${btns}</div>`;
+        + (a.disabled ? ' disabled' : '') + `>${a.label}</button>`;
+    const primary = state.actions.filter(a => a.primary);
+    const secondary = state.actions.filter(a => !a.primary);
+    const more = secondary.length ? `<details class="slot-more-actions">`
+        + `<summary class="slot-more-toggle" title="更多操作" aria-label="更多操作">更多 ···</summary>`
+        + `<div class="slot-more-menu">${secondary.map(button).join('')}</div></details>` : '';
+    return `<div class="slot-actions ${wrapCls}">${primary.map(button).join('')}${more}</div>`;
 }
 
 /**
@@ -193,6 +198,7 @@ function slotGridIsBusy(type) {
 // =====================================================================
 
 const SLOT_ACTION_HANDLERS = {
+    'preview-slot': (seq, type) => openSlotLightbox(type, seq),
     'retry-frame': seq => retrySingleFrame(seq),
     'fix-frame': async seq => {
         const frames = (typeof currentIdea !== 'undefined' && currentIdea
@@ -304,7 +310,7 @@ function openSlotLightbox(type, seq) {
             mediaList.push({
                 type: 'image',
                 url: refUrl,
-                caption: `<strong>🎯 第 ${seqNum} 拍爆款原片基准抽帧 (REF ${String(seqNum).padStart(3, '0')})</strong> ${refFrameRoleLabel(refRoles, seqNum)}`,
+                caption: `<strong>🎯 第 ${seqNum} 拍参考原片基准抽帧 (REF ${String(seqNum).padStart(3, '0')})</strong> ${refFrameRoleLabel(refRoles, seqNum)}`,
             });
         }
     });
@@ -321,6 +327,24 @@ function bindSlotGrid(gridId) {
     const grid = document.getElementById(gridId);
     if (!grid || grid.dataset.slotBound === '1') return;
     grid.dataset.slotBound = '1';
+
+    grid.addEventListener('toggle', (e) => {
+        const menu = e.target;
+        if (!menu.matches || !menu.matches('.slot-more-actions')) return;
+        const card = menu.closest('.slot-card');
+        if (card) card.classList.toggle('is-actions-open', menu.open);
+        if (menu.open) grid.querySelectorAll('.slot-more-actions[open]').forEach(other => {
+            if (other !== menu) other.open = false;
+        });
+    }, true);
+    grid.addEventListener('keydown', (e) => {
+        if (e.key !== 'Escape') return;
+        const menu = e.target.closest('.slot-more-actions[open]');
+        if (!menu) return;
+        menu.open = false;
+        menu.querySelector('summary').focus();
+        e.stopPropagation();
+    });
 
     grid.addEventListener('click', (e) => {
         const card = e.target.closest('.slot-card');
@@ -362,11 +386,16 @@ function bindSlotGrid(gridId) {
 
         const btn = e.target.closest('.slot-action-btn');
         if (btn) {
-            // disabled 的按钮浏览器不会派发 click，走到这里就一定是可点的
+            if (btn.disabled) return;
+            e.stopPropagation();
+            const menu = btn.closest('.slot-more-actions');
+            if (menu) menu.open = false;
             const handler = SLOT_ACTION_HANDLERS[btn.dataset.act];
             if (handler) handler(seq, card.dataset.type);
             return;
         }
+        // Native details handles mouse and keyboard disclosure; it must not open the preview.
+        if (e.target.closest('.slot-more-actions')) return;
         if (card.dataset.kind !== 'ready') return;
         openSlotLightbox(card.dataset.type, seq);
     });

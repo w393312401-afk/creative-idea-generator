@@ -12,6 +12,14 @@
     config: null,
     configSchema: null,
     configVersions: [],
+    configBaseline: null,
+    configSaving: false,
+    configLoadSeq: 0,
+    configMessage: '',
+    configError: '',
+    configRemoteUpdate: false,
+    configRestartRequired: [],
+    section: 'monitor',
     lastTasks: [],
     lastQueue: {},
     proxies: [],
@@ -19,6 +27,17 @@
     selftestRunning: false,
     logTaskFilter: '',
     logKeyword: '',
+    logAutoTask: true,
+    logFollow: true,
+    logPaused: false,
+    logLevel: 'all',
+    logRenderedLines: [],
+    logRenderedRecords: [],
+    logPendingLines: null,
+    logPendingRecords: null,
+    logQueryKey: '',
+    logRequestSeq: 0,
+    logError: '',
     expandedTask: null,
     accountSortKey: 'serial_asc',
     selectedAccounts: new Set(),
@@ -33,27 +52,32 @@
     }[ch]));
   };
 
-  // 账号状态判定顺序有讲究：禁用 > 登录失效 > 冷却 > 未探测 > 额度耗尽 > 可用。
+  // 账号状态判定顺序有讲究：禁用 > 登录失效 > 图片限额 > 积分不足 > 冷却 > 未探测 > 可用。
   // "登录失效"必须排在"冷却"之前单独成一档——后端用 cooldown_reason 区分了
   // "登录失效（2 小时冷却，积分不动）"和"额度耗尽（24 小时冷却，积分清零）"，
   // 前端一律显示"冷却中"的话，用户不知道该去人工重新登录还是等额度恢复。
   // "未探测"也必须和"额度耗尽"分开：credit=null 表示从来没探测成功过，
   // 不是"没额度"，把它显示成 0 或"可用"都是在编造账号健康状态。
   function accountState(account, nowMs = Date.now()) {
-    if (account && account.disabled) {
-      if (account.disabled_reason === 'zero_credit' || (account.credit !== null && Number(account.credit) <= 0)) {
-        return { key: 'empty', label: '积分不足', tone: 'bad' };
-      }
-      return { key: 'disabled', label: '已禁用', tone: 'bad' };
-    }
     const cooling = account && account.cooldown_until
       && Number.isFinite(Date.parse(account.cooldown_until))
       && Date.parse(account.cooldown_until) > nowMs;
+    if (account && account.disabled) {
+      if (account.disabled_reason === 'zero_credit') {
+        return { key: 'empty', label: cooling ? '积分不足 · 周期停用' : '积分不足 · 待复核', tone: 'warn' };
+      }
+      return { key: 'disabled', label: '已禁用', tone: 'bad' };
+    }
     if (cooling && account.cooldown_reason === 'login_required') {
       return { key: 'login_required', label: '待人工登录', tone: 'bad' };
     }
     if (cooling && (account.cooldown_reason === 'image_quota_exceeded' || account.cooldown_reason === 'daily_limit_reached' || account.cooldown_reason === 'daily_limit' || account.cooldown_reason === 'image_limit_exceeded' || String(account.last_generation_error || '').includes('图片余额超限'))) {
       return { key: 'image_limit', label: '图片余额超限', tone: 'bad' };
+    }
+    if (account && (account.cooldown_reason === 'quota_exhausted'
+      || account.disabled_reason === 'zero_credit'
+      || (account.credit != null && Number(account.credit) < Number(account.min_credit ?? 15)))) {
+      return { key: 'empty', label: '积分不足', tone: 'bad' };
     }
     if (cooling) return { key: 'cooling', label: '冷却中', tone: 'warn' };
     if (account && account.last_probe_status === 'failed') {
@@ -63,7 +87,7 @@
       return { key: 'unprobed', label: '未探测', tone: 'warn' };
     }
     if (account && account.credit_stale) return { key: 'stale', label: '缓存过期', tone: 'warn' };
-    if (Number(account.credit) <= 0) return { key: 'empty', label: '额度不足', tone: 'bad' };
+    if (Number(account.credit) <= 0) return { key: 'empty', label: '积分不足', tone: 'bad' };
     return { key: 'ready', label: '可用', tone: 'good' };
   }
 
@@ -86,6 +110,51 @@
 
   function taskTypeLabel(type) {
     return ({ frames: '帧序列', videos: '视频序列', staged_render: '分步渲染', auto: '自治管线', stepped: '分步管线' })[type] || 'FX 任务';
+  }
+
+  function taskState(task = {}) {
+    if (task.status === 'running') {
+      if (task.manual_intervention) return { key: 'manual', label: '等待登录或验证', tone: 'bad' };
+      if (task.queue_state === 'waiting') return { key: 'queued', label: '排队中', tone: 'neutral' };
+      if (/retry|ip_rotating/.test(task.stage || '')) return { key: 'recovering', label: '自动恢复中', tone: 'warn' };
+      return { key: 'running', label: '生成中', tone: 'neutral' };
+    }
+    if (task.status === 'completed') {
+      const outcome = task.outcome || task.result?.completion_state;
+      if (outcome === 'partial_failed' || task.has_failures || task.result?.has_failures) {
+        return { key: 'partial_failed', label: '部分完成', tone: 'warn' };
+      }
+      if (outcome === 'completed_with_warnings' || task.has_quality_warnings || task.result?.has_quality_warnings) {
+        return { key: 'completed_with_warnings', label: '已完成 · 有提醒', tone: 'warn' };
+      }
+      return { key: 'completed', label: '已完成', tone: 'good' };
+    }
+    return ({
+      queued: { key: 'queued', label: '排队中', tone: 'neutral' },
+      pending: { key: 'pending', label: '等待开始', tone: 'neutral' },
+      paused: { key: 'paused', label: '等待确认', tone: 'neutral' },
+      cancelled: { key: 'cancelled', label: '已取消', tone: 'neutral' },
+      failed: { key: 'failed', label: '失败', tone: 'bad' },
+    })[task.status] || { key: 'unknown', label: '状态未知', tone: 'neutral' };
+  }
+
+  function stageLabel(stage) {
+    return ({ queue: '等待调度', queued: '等待调度', submitting: '提交请求',
+      generating: '生成中', polling: '等待生成结果', downloading: '下载素材',
+      frame_start: '准备生成帧', frame: '帧已生成', video_start: '准备生成视频',
+      video_done: '片段已完成', video_error: '片段未成功', video_warning: '生成提醒',
+      video_retry_autonomous: '自动重试', upstream_retry: '自动重试',
+      ip_rotating: '恢复网络', ip_rotated: '网络已恢复', ip_rotation_failed: '网络恢复未成功',
+      manual_intervention: '等待人工处理', manual_intervention_detected: '等待登录或验证',
+      manual_intervention_cleared: '验证已完成', manual_intervention_timeout: '等待处理超时',
+      merge: '合并视频', merging: '合并视频', result: '结果已返回', error: '任务已停止',
+      completed: '已完成', cancelled: '已取消' })[stage] || stage || '—';
+  }
+
+  function currentLogTask(tasks, queue = {}) {
+    const active = queue.active_list || (queue.active ? [queue.active] : []);
+    const activeTask = active.find(row => (tasks || []).some(task => task.id === row.task_id && task.status === 'running'));
+    return activeTask?.task_id || (tasks || []).find(task => task.status === 'running')?.id || '';
   }
 
   function formatTime(value) {
@@ -175,8 +244,10 @@
 
     const activeTask = queue.active;
     const busy = Boolean(execution.lock_busy || activeTask);
+    const activeRecord = activeTask && (data.tasks || []).find(task => task.id === activeTask.task_id);
+    const activeLabel = activeRecord?.theme || (activeTask ? taskTypeLabel(activeTask.kind) : '浏览器占用中');
     setCard('fx-execution', busy ? '正在执行' : '空闲',
-      busy ? `任务: ${activeTask ? (activeTask.task_id || activeTask.kind) : '浏览器占用中'}` : '无活跃任务（随时可接收新任务）',
+      busy ? activeLabel : '当前没有任务执行',
       busy ? 'warn' : 'good');
     const available = accounts.ready ?? 0;
     const accountSub = [`${accounts.cooling || 0} 冷却`, `${accounts.disabled || 0} 禁用`];
@@ -204,17 +275,12 @@
       const refModeMap = { 'VIDEO_FRAMES': '帧（首尾帧）', 'VIDEO_REFERENCES': '素材' };
       refModeEl.textContent = refModeMap[config.video_ref_mode] || config.video_ref_mode || '—';
     }
-    // 锁定默认环境时轮转环只剩一个号，节拍值一次都用不上。状态条以前照样把它
-    // 显示成正在生效的样子，用户只能靠翻手册才知道自己改的数字是死的。
+    // 旧换号节拍只为配置兼容保留，不再按请求数主动更换有额度的环境。
     const switchEl = $('fx-config-switch');
     if (switchEl) {
-      const switchInert = config.account_switch_effective === false;
-      switchEl.textContent = `每 ${config.account_switch_requests || 5} 次请求`
-        + (switchInert ? ' · 不生效' : '');
-      switchEl.className = switchInert ? 'fx-danger-value' : '';
-      switchEl.title = switchInert
-        ? '「锁定默认环境」开着，整条序列固定在同一个号上，这个节拍不会被用到；取消锁定后才按节拍轮转号池'
-        : '每这么多个请求换一个号池账号（IP 始终不变）';
+      switchEl.textContent = '复用至额度不足';
+      switchEl.className = 'fx-safe-value';
+      switchEl.title = '自动选号优先复用已打开且额度足够的浏览器；额度不足后周期停用 24 小时，关闭该浏览器并换号继续。手动指定或锁定默认环境优先。';
     }
     if ($('fx-config-account')) $('fx-config-account').textContent = config.selected_user_id || '自动选择';
     const sequenceEl = $('fx-config-sequence-account');
@@ -225,8 +291,8 @@
         ? `${(seqAccount && (seqAccount.name || seqAccount.user_id)) || seqId}${config.sequence_user_locked ? ' · 已锁定' : ''}`
         : '自动选择';
       sequenceEl.title = seqId
-        ? `序列生成默认浏览器环境：${seqId}${config.sequence_user_locked ? '（整条序列不换号）' : '（后续仍按换号节拍轮转）'}`
-        : '未指定：按号池自动选号';
+        ? `序列首选浏览器环境：${seqId}${config.sequence_user_locked ? '（优先使用指定环境，额度不足仍自动换号）' : '（无可复用浏览器时优先使用）'}`
+        : '未指定：优先复用已打开且额度足够的浏览器；没有可用窗口时按号池策略选号';
     }
     if ($('fx-sync-time')) $('fx-sync-time').textContent = `同步于 ${formatTime(data.checked_at)}`;
 
@@ -256,8 +322,10 @@
 
     const modeBadge = $('fx-service-mode');
     if (modeBadge) {
-      modeBadge.textContent = busy ? '任务执行中' : '运行中';
-      modeBadge.className = `fx-lock-badge fx-badge-${busy ? 'warn' : 'good'}`;
+      const unavailable = !runtime.available || !adspower.online;
+      modeBadge.textContent = !runtime.available ? '运行时不可用' : !adspower.online ? '等待浏览器服务'
+        : config.dry_run ? '演练模式 · 不提交' : busy ? '任务执行中' : '服务已就绪';
+      modeBadge.className = `fx-lock-badge fx-badge-${unavailable ? 'bad' : busy || config.dry_run ? 'warn' : 'good'}`;
     }
 
     const lockBadge = $('fx-lock-badge');
@@ -267,8 +335,20 @@
     }
 
     renderSlotDisplay(queue);
+    renderBoard(data.board);
     renderDiagnostics(data.diagnostics || [], data.selectors || {});
     renderTasks(data.tasks || []);
+  }
+
+  function renderBoard(board) {
+    const container = $('fx-board');
+    if (!container || !global.FxBoard) return;
+    // 只读面板：渲染失败不能拖垮整页状态刷新。
+    try {
+      global.FxBoard.render(container, board);
+    } catch (error) {
+      container.innerHTML = `<div class="fx-empty">作战板渲染失败：${esc(error.message)}</div>`;
+    }
   }
 
   function renderSlotDisplay(queue) {
@@ -304,7 +384,9 @@
           </div>
           <div class="fx-slot-actions">
             <button class="fx-button" data-slot-action="view_logs" data-task-id="${id}">📜 查看实时日志</button>
-            <button class="fx-button fx-button-danger" data-slot-action="force_release" data-task-id="${id}">🚨 强行释放此占用</button>
+            <details class="fx-action-menu"><summary class="fx-button">维护</summary><div class="fx-action-menu-body">
+              <button class="fx-button fx-button-danger" data-slot-action="force_release" data-task-id="${id}">强行释放此占用</button>
+            </div></details>
           </div>
         </div>
       `;
@@ -320,20 +402,6 @@
         </div>
       `;
     }
-  }
-
-  function renderOrphaned(rows) {
-    const box = $('fx-orphaned');
-    if (!box) return;
-    if (!rows.length) {
-      box.innerHTML = '';
-      box.hidden = true;
-      return;
-    }
-    box.hidden = false;
-    box.innerHTML = `<div class="fx-orphan-title">上次退出时仍在队列中的任务（${rows.length}）</div>`
-      + rows.map((row) => `<div class="fx-orphan-row">${esc(row.task_id)} · ${esc(row.kind || '')} · ${esc(row.was || '')}</div>`).join('')
-      + '<button class="fx-button" data-fx-action="clear-orphaned" type="button">知道了，清除记录</button>';
   }
 
   function renderDiagnostics(items, selectors) {
@@ -506,6 +574,9 @@
     body.innerHTML = state.proxies.map((proxy) => {
       const status = proxyState(proxy);
       const id = esc(proxy.proxy_id);
+      const priority = proxy.source === 'airport'
+        ? (String(proxy.fallback_tier) === '0' ? '机场 · 美国优先' : '机场 · 备用')
+        : '静态 · 优先';
       const auth = proxy.user
         ? `${esc(proxy.user)}${proxy.has_password ? ':***' : ''}@` : '';
       const note = proxy.note ? `<span class="fx-account-id">${esc(proxy.note)}</span>` : '';
@@ -518,6 +589,7 @@
         : '未下发';
       return `<tr>
         <td><span class="fx-account-name">${esc(proxy.label || proxy.endpoint)}</span>
+          <span class="fx-badge fx-badge-muted">${esc(priority)}</span>
           <span class="fx-proxy-endpoint">${esc(proxy.proxy_type)}://${auth}${esc(proxy.endpoint)}</span>${note}</td>
         <td>${exit}</td>
         <td><span class="fx-badge fx-badge-${status.tone}" title="${esc(proxy.last_check_error || '')}">${status.label}</span></td>
@@ -656,7 +728,7 @@
     if (!rows.length) return '<div class="fx-empty">暂无阶段记录</div>';
     return '<div class="fx-timeline">' + rows.map((row) => `
       <div class="fx-timeline-row${row.slow ? ' slow' : ''}">
-        <span class="fx-timeline-stage">${esc(row.stage)}${row.count > 1 ? ` ×${row.count}` : ''}</span>
+        <span class="fx-timeline-stage">${esc(stageLabel(row.stage))}${row.count > 1 ? ` ×${row.count}` : ''}</span>
         <span class="fx-timeline-duration">${esc(formatDuration(row.duration_seconds))}</span>
         <span class="fx-timeline-message">${esc(row.message || '')}</span>
       </div>`).join('') + '</div>';
@@ -664,6 +736,7 @@
 
   function renderTasks(tasks) {
     state.lastTasks = tasks;
+    syncCurrentLogTask();
     const body = $('fx-task-table-body');
     if (!body) return;
     if (!tasks.length) {
@@ -671,7 +744,7 @@
       return;
     }
     body.innerHTML = tasks.map((task) => {
-      const statusTone = task.status === 'running' ? 'warn' : (task.status === 'completed' ? 'good' : 'bad');
+      const displayState = taskState(task);
       const id = esc(task.id);
       const waiting = task.queue_state === 'waiting';
       const priorityActions = waiting
@@ -687,7 +760,7 @@
         ? `执行中 ${formatDuration(task.elapsed_seconds)}${task.overdue ? ' ⚠超时' : ''}`
         : (waiting ? `第 ${task.queue_position} 位 · P${task.priority || 0}` : '—');
       const stuck = task.stuck_stage
-        ? `<div class="fx-task-flag warn">阶段 ${esc(task.stuck_stage.stage)} 已 ${esc(formatDuration(task.stuck_stage.duration_seconds))}</div>` : '';
+        ? `<div class="fx-task-flag warn">阶段 ${esc(stageLabel(task.stuck_stage.stage))} 已 ${esc(formatDuration(task.stuck_stage.duration_seconds))}</div>` : '';
       const manual = task.manual_intervention ? `
         <div class="fx-task-flag bad">
           🛑 等待人工处理（${esc(task.manual_intervention.code || '未知')}）
@@ -701,9 +774,9 @@
       return `<tr data-task-row="${id}">
         <td><span class="fx-account-name">${esc(task.theme || '未命名任务')}</span><span class="fx-task-id">${id}</span>${manual}${stuck}</td>
         <td>${esc(taskTypeLabel(task.type))}</td><td>${esc(queueLabel)}</td>
-        <td><button class="fx-link" data-task-action="timeline" data-task-id="${id}">${esc(task.stage || '—')} ${expanded ? '▾' : '▸'}</button></td>
+        <td><button class="fx-link" data-task-action="timeline" data-task-id="${id}">${esc(stageLabel(task.stage))} ${expanded ? '▾' : '▸'}</button></td>
         <td>${esc(task.account || '自动')}${pin}</td>
-        <td><span class="fx-badge fx-badge-${statusTone}" title="${esc(task.error || '')}">${esc(task.status || 'unknown')}</span></td>
+        <td><span class="fx-badge fx-badge-${displayState.tone}" title="${esc(task.error || '')}">${esc(displayState.label)}</span></td>
         <td>${action}</td>
       </tr>${detail}`;
     }).join('');
@@ -767,7 +840,7 @@
     if (current && !(state.accounts || []).some((a) => String(a.user_id) === current)) {
       rows.push(`<option value="${esc(current)}" selected>${esc(current)}（已不在号池）</option>`);
     }
-    return `<option value=""${current ? '' : ' selected'}>自动（按号池选号）</option>` + rows.join('');
+    return `<option value=""${current ? '' : ' selected'}>自动（优先复用可用浏览器）</option>` + rows.join('');
   }
 
   function syncAccountConfigFields() {
@@ -776,33 +849,45 @@
       if (document.activeElement === select) return;  // 用户正在选，别把它重建掉
       select.innerHTML = accountOptionsHtml(select.value);
     });
+    document.querySelectorAll('#fx-config-form [data-config-type="account_list"]').forEach((field) => {
+      if (field.contains(document.activeElement)) return;
+      const selected = Array.from(field.querySelectorAll('input[data-config-account-item]:checked'),
+        checkbox => checkbox.dataset.configAccountItem);
+      const list = field.querySelector('.fx-config-account-list');
+      if (list) list.innerHTML = configAccountListHtml(selected);
+    });
+  }
+
+  function configAccountListHtml(value) {
+    const selected = new Set((Array.isArray(value) ? value : String(value || '').split(','))
+      .map(String).map(value => value.trim()).filter(Boolean));
+    const accounts = [...(state.accounts || [])];
+    selected.forEach(uid => {
+      if (!accounts.some(account => String(account.user_id) === uid)) accounts.push({ user_id: uid, name: `${uid}（已不在号池）` });
+    });
+    return accounts.map(account => {
+      const uid = String(account.user_id);
+      const serial = account.serial_number ? `[#${esc(account.serial_number)}] ` : '';
+      return `<label class="fx-config-account-option"><input type="checkbox" data-config-account-item="${esc(uid)}"${selected.has(uid) ? ' checked' : ''}>
+        <span>${serial}${esc(account.name || uid)}</span></label>`;
+    }).join('') || '<span class="fx-config-empty">暂无号池账号</span>';
   }
 
   function configFieldHtml(key, spec, value) {
     const label = `${esc(spec.label || key)}${spec.hot ? '' : ' <span class="fx-restart-tag">需重启</span>'}`;
+    if (spec.inactive) {
+      return `<label class="fx-config-field"><span>${label}</span>
+        <input type="number" value="${esc(value ?? spec.default)}" disabled aria-label="${esc(spec.label || key)}">
+        <small>${esc(spec.hint || '仅兼容旧配置，不参与当前调度。')}</small></label>`;
+    }
     if (spec.type === 'account') {
       return `<label class="fx-config-field"><span>${label}</span>
         <select data-config-key="${esc(key)}" data-config-account="1">${accountOptionsHtml(value)}</select></label>`;
     }
     if (spec.type === 'account_list') {
-      const selectedList = Array.isArray(value)
-        ? value.map(String)
-        : (typeof value === 'string' && value ? value.split(',').map(s => s.trim()) : []);
-      const selectedSet = new Set(selectedList);
-      const rows = (state.accounts || []).map((account) => {
-        const uid = String(account.user_id);
-        const serial = account.serial_number ? `[#${esc(account.serial_number)}] ` : '';
-        const checked = selectedSet.has(uid) ? 'checked' : '';
-        return `<label style="display:inline-flex; align-items:center; gap:4px; margin-right:10px; font-size:12px; cursor:pointer;">
-          <input type="checkbox" data-config-account-item="${esc(uid)}" ${checked}>
-          <span>${serial}${esc(account.name || uid)}</span>
-        </label>`;
-      }).join('');
       return `<div class="fx-config-field" data-config-key="${esc(key)}" data-config-type="account_list">
         <span>${label}</span>
-        <div class="fx-config-account-list" style="display:flex; flex-wrap:wrap; gap:8px; margin-top:6px; padding:8px 10px; background:rgba(0,0,0,0.03); border-radius:6px; border:1px solid var(--border-color, rgba(0,0,0,0.1));">
-          ${rows || '<span style="color:var(--text-muted, #888); font-size:11px;">暂无号池账号</span>'}
-        </div>
+        <div class="fx-config-account-list">${configAccountListHtml(value)}</div>
       </div>`;
     }
     if (spec.type === 'bool') {
@@ -810,8 +895,16 @@
         <input type="checkbox" data-config-key="${esc(key)}" ${value ? 'checked' : ''}></label>`;
     }
     if (spec.type === 'enum') {
-      const options = (spec.options || []).map((option) =>
-        `<option value="${esc(option)}"${String(option) === String(value ?? '') ? ' selected' : ''}>${esc(option || '不指定')}</option>`
+      const current = value ?? spec.default ?? '';
+      const values = [...(spec.options || [])];
+      const labels = ({
+        videoRefMode: { VIDEO_FRAMES: '帧（首尾帧）', VIDEO_REFERENCES: '素材（主体与风格）', INGREDIENTS: '素材（主体与风格）' },
+        googleFxAccountStrategy: { credit_desc: '积分最多优先', expiration_asc: '重置日期最早优先', rotation: '均衡使用' },
+        adsPowerMacWindowMode: { hide: '隐藏浏览器窗口', focus: '仅归还焦点', off: '不干预窗口' },
+      })[key] || {};
+      if (!values.some(option => String(option) === String(current))) values.push(current);
+      const options = values.map((option) =>
+        `<option value="${esc(option)}"${String(option) === String(current) ? ' selected' : ''}>${esc(labels[option] || option || '不指定')}</option>`
       ).join('');
       return `<label class="fx-config-field"><span>${label}</span>
         <select data-config-key="${esc(key)}">${options}</select></label>`;
@@ -820,63 +913,166 @@
       <input type="number" data-config-key="${esc(key)}" min="${esc(spec.min ?? 0)}" max="${esc(spec.max ?? 999999999)}" value="${esc(value ?? spec.default)}"></label>`;
   }
 
-  function renderConfig(data) {
-    state.config = data.config || {};
-    state.configSchema = data.schema || {};
-    state.configVersions = data.versions || [];
-
-    const host = $('fx-config-form');
-    if (host) {
-      const groups = {};
-      Object.keys(state.configSchema).forEach((key) => {
-        const spec = state.configSchema[key];
-        const group = spec.group || '其它';
-        (groups[group] = groups[group] || []).push([key, spec]);
-      });
-      host.innerHTML = Object.keys(groups).map((group) => `
-        <fieldset class="fx-config-group">
-          <legend>${esc(group)}</legend>
-          ${groups[group].map(([key, spec]) => configFieldHtml(key, spec, state.config[key])).join('')}
-        </fieldset>`).join('');
-    }
-
-    const last = (data.audit || [])[0];
-    if ($('fx-config-note')) {
-      $('fx-config-note').textContent = last
-        ? `最近修改：${formatTime(last.at)} · ${last.action}`
-        : `配置已加载`;
-    }
+  function showSection(section, targetId) {
+    if (!['monitor', 'accounts', 'maintenance'].includes(section)) return;
+    const changed = state.section !== section;
+    state.section = section;
+    if (typeof document === 'undefined') return;
+    document.querySelectorAll('.fx-console-section').forEach((panel) => {
+      panel.hidden = panel.id !== `fx-section-${section}`;
+    });
+    document.querySelectorAll('.fx-section-tab').forEach((button) => {
+      const selected = button.dataset.fxSection === section;
+      button.classList.toggle('active', selected);
+      button.setAttribute('aria-selected', String(selected));
+      button.tabIndex = selected ? 0 : -1;
+    });
+    if (targetId) $(targetId)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    else if (changed) $(`fx-section-${section}`)?.scrollIntoView({ behavior: 'auto', block: 'start' });
   }
 
-  async function loadConfig() {
-    try {
-      renderConfig(await api('/api/google-fx/config'));
-    } catch (error) {
-      if ($('fx-config-note')) {
-        $('fx-config-note').textContent = `配置读取失败：${error.message}`;
-      }
-      showToast(`配置读取失败：${error.message}`, true);
+  function configValueEqual(left, right, spec = {}) {
+    if (spec.type === 'account_list') {
+      const normalize = (value) => (Array.isArray(value) ? value : String(value || '').split(','))
+        .map(String).map(value => value.trim()).filter(Boolean).sort();
+      return JSON.stringify(normalize(left)) === JSON.stringify(normalize(right));
     }
+    if (spec.type === 'integer') return Number(left) === Number(right);
+    if (spec.type === 'bool') return Boolean(left) === Boolean(right);
+    return String(left ?? '') === String(right ?? '');
+  }
+
+  function readConfigValues() {
+    const values = {};
+    if (typeof document === 'undefined') return values;
+    (document.querySelectorAll('#fx-config-form [data-config-key]') || []).forEach((el) => {
+      const key = el.dataset.configKey;
+      const spec = (state.configSchema || {})[key];
+      if (!spec || spec.inactive) return;
+      if (spec.type === 'bool') values[key] = el.checked;
+      else if (spec.type === 'integer') values[key] = el.value === '' ? null : Number(el.value);
+      else if (spec.type === 'account_list') {
+        values[key] = Array.from(el.querySelectorAll('input[data-config-account-item]:checked'),
+          checkbox => checkbox.dataset.configAccountItem);
+      } else values[key] = el.value;
+    });
+    return values;
+  }
+
+  function configDelta(values, baseline) {
+    const patch = {};
+    Object.entries(values).forEach(([key, value]) => {
+      const spec = (state.configSchema || {})[key];
+      if (spec && !spec.inactive && !configValueEqual(value, baseline?.[key] ?? spec.default, spec)) patch[key] = value;
+    });
+    return patch;
   }
 
   function collectConfigPatch() {
-    const patch = {};
-    (document.querySelectorAll('[data-config-key]') || []).forEach((el) => {
-      const key = el.dataset.configKey;
-      const spec = (state.configSchema || {})[key];
-      if (!spec) return;
-      if (spec.type === 'bool') patch[key] = el.checked;
-      else if (spec.type === 'integer') patch[key] = Number(el.value);
-      else if (spec.type === 'account_list') {
-        const checked = [];
-        el.querySelectorAll('input[data-config-account-item]:checked').forEach((cb) => {
-          checked.push(cb.dataset.configAccountItem);
-        });
-        patch[key] = checked;
-      }
-      else patch[key] = el.value;
-    });
-    return patch;
+    return state.configBaseline ? configDelta(readConfigValues(), state.configBaseline) : {};
+  }
+
+  function updateConfigFeedback() {
+    const count = Object.keys(collectConfigPatch()).length;
+    const saving = state.configSaving;
+    const restart = state.configRestartRequired.length > 0;
+    const label = saving ? '正在保存…' : state.configError ? '保存 / 读取失败'
+      : count ? `${count} 项尚未保存` : restart ? '已保存 · 待重启' : state.configBaseline ? '已与服务器同步' : '正在读取配置';
+    const status = $('fx-config-state');
+    if (status) {
+      status.textContent = label;
+      status.dataset.state = state.configError ? 'error' : saving ? 'saving' : count || restart ? 'pending' : 'saved';
+    }
+    const button = $('fx-config-save');
+    if (button) {
+      button.disabled = saving || !state.configBaseline || count === 0;
+      button.textContent = saving ? '保存中…' : count ? `保存 ${count} 项更改` : '保存配置';
+    }
+    const reload = $('fx-config-reload');
+    if (reload) reload.disabled = saving;
+    const indicator = $('fx-config-tab-indicator');
+    if (indicator) {
+      indicator.hidden = !count && !restart;
+      indicator.textContent = count ? '· 未保存' : '· 待重启';
+    }
+    const note = $('fx-config-note');
+    if (note) {
+      const restartNames = state.configRestartRequired.map(key => (state.configSchema?.[key] || {}).label || key);
+      note.textContent = [
+        state.configError,
+        saving ? '正在写入本次修改，之后继续编辑的内容会保留为未保存。' : state.configMessage,
+        count && !saving ? '当前修改仅保留在此页面，点击保存后才会写入。' : '',
+        state.configRemoteUpdate ? '服务器配置已更新；你的编辑已保留，保存只提交修改过的字段。' : '',
+        restart ? `本次会话已保存的以下设置需要重启服务后生效：${restartNames.join('、')}。当前未执行重启。` : '',
+      ].filter(Boolean).join(' ');
+    }
+  }
+
+  function renderConfig(data, options = {}) {
+    const pending = options.draft || collectConfigPatch();
+    const config = data.config || {};
+    const preserveEditing = !options.force && state.configBaseline && Object.keys(pending).length > 0;
+    state.config = config;
+    state.configSchema = data.schema || state.configSchema || {};
+    state.configVersions = data.versions || [];
+    state.configError = '';
+    if (preserveEditing) {
+      state.configRemoteUpdate = Object.entries(config).some(([key, value]) =>
+        !configValueEqual(value, state.configBaseline[key], state.configSchema[key]));
+      updateConfigFeedback();
+      return;
+    }
+    const host = $('fx-config-form');
+    const advancedOpen = $('fx-config-advanced')?.open;
+    state.configBaseline = { ...config };
+    state.configRemoteUpdate = false;
+    if (host) {
+      const groups = { common: {}, advanced: {} };
+      const values = { ...config, ...pending };
+      Object.entries(state.configSchema).forEach(([key, spec]) => {
+        const common = !spec.inactive && (spec.group === '模型' ||
+          ['adsPowerSilentMode', 'googleFxSequenceUserId', 'googleFxSequenceUserLock'].includes(key));
+        const bucket = groups[common ? 'common' : 'advanced'];
+        const group = spec.group || '其它';
+        (bucket[group] = bucket[group] || []).push([key, spec]);
+      });
+      const renderGroups = (bucket) => Object.entries(bucket).map(([group, fields]) => `
+        <fieldset class="fx-config-group"><legend>${esc(group)}</legend>
+          ${fields.map(([key, spec]) => configFieldHtml(key, spec, values[key] ?? spec.default)).join('')}
+        </fieldset>`).join('');
+      host.innerHTML = `<div class="fx-config-common"><h5>常用配置</h5><div class="fx-config-form">${renderGroups(groups.common)}</div></div>`
+        + `<details id="fx-config-advanced" class="fx-config-advanced"${advancedOpen ? ' open' : ''}><summary>高级参数 <span>连接、号池策略、超时、节奏、去重与调试</span></summary>
+          <div class="fx-config-form">${renderGroups(groups.advanced)}</div></details>`;
+    }
+    if (!options.force) state.configMessage = '已读取服务器配置；自动刷新不会覆盖未保存的修改。';
+    updateConfigFeedback();
+  }
+
+  function validConfigPayload(data) {
+    const config = data?.config;
+    const schema = data?.schema || state.configSchema;
+    if (!config || typeof config !== 'object' || Array.isArray(config) || !schema || typeof schema !== 'object') return false;
+    const keys = Object.keys(schema).filter(key => !schema[key].inactive);
+    return keys.length > 0 && keys.every(key => Object.hasOwn(config, key));
+  }
+
+  async function loadConfig(options = {}) {
+    if (state.configSaving) return;
+    const sequence = ++state.configLoadSeq;
+    const beforeReload = options.force ? readConfigValues() : null;
+    try {
+      const data = await api('/api/google-fx/config');
+      if (sequence !== state.configLoadSeq || state.configSaving) return;
+      if (!validConfigPayload(data)) throw new Error('服务器未返回有效配置');
+      const renderOptions = beforeReload
+        ? { ...options, draft: configDelta(readConfigValues(), beforeReload) } : options;
+      renderConfig(data, renderOptions);
+    } catch (error) {
+      if (sequence !== state.configLoadSeq) return;
+      state.configError = `配置读取失败：${error.message}。页面中的编辑已保留。`;
+      updateConfigFeedback();
+      showToast(`配置读取失败：${error.message}`, true);
+    }
   }
 
   // 把 FX 控制台保存的模型设置同步到主界面的 localStorage（spark_config），
@@ -907,28 +1103,42 @@
   }
 
   async function saveConfig() {
-    const result = await post('/api/google-fx/config', { patch: collectConfigPatch() });
-    renderConfig({
-      config: result.config, schema: state.configSchema,
-      versions: result.versions, audit: []
-    });
-    await refresh(true);
-    // 同步模型设置到主界面的 localStorage
-    syncFxModelToMainConfig(result.config);
-    // 被别的配置项压住的字段排在"需重启"前面报：重启能解决，互相打架不能。
-    if ((result.inert || []).length) {
-      showToast(`已保存，但当前配置下跑不起来 —— ${result.inert.join('；')}`, true);
+    if (state.configSaving) return;
+    const patch = collectConfigPatch();
+    if (!Object.keys(patch).length) {
+      state.configMessage = '配置没有变化。';
+      updateConfigFeedback();
       return;
     }
-    if ((result.restart_required || []).length) {
-      showToast(`已保存，但这些字段要重启服务才生效：${result.restart_required.join('、')}`, true);
-      return;
+    const submittedValues = readConfigValues();
+    for (const element of document.querySelectorAll('#fx-config-form [data-config-key]')) {
+      if (Object.hasOwn(patch, element.dataset.configKey) && typeof element.reportValidity === 'function' && !element.reportValidity()) return;
     }
-    if (!Object.keys(result.changed || {}).length) {
-      showToast('配置没有变化');
-      return;
+    state.configSaving = true;
+    state.configError = '';
+    ++state.configLoadSeq; // A GET started before this save cannot restore the old configuration.
+    updateConfigFeedback();
+    try {
+      const result = await post('/api/google-fx/config', { patch });
+      if (!validConfigPayload(result)) throw new Error('服务器未返回保存结果，请重试');
+      const laterEdits = configDelta(readConfigValues(), submittedValues);
+      state.configRestartRequired = [...new Set([...state.configRestartRequired, ...(result.restart_required || [])])];
+      state.configMessage = Object.keys(result.changed || {}).length
+        ? '本次修改已保存。可即时更新的设置已应用，当前任务不会重新开始。'
+        : '服务器中已是相同配置。';
+      if ((result.inert || []).length) state.configMessage += ` ${result.inert.join('；')}`;
+      renderConfig({ config: result.config, schema: state.configSchema, versions: result.versions },
+        { force: true, draft: laterEdits });
+      syncFxModelToMainConfig(result.config);
+      await refresh(true);
+      showToast(state.configRestartRequired.length ? '配置已保存，部分设置需重启后生效' : '配置已保存');
+    } catch (error) {
+      state.configError = `保存失败：${error.message}。修改已保留，请重试。`;
+      showToast(`保存失败：${error.message}`, true);
+    } finally {
+      state.configSaving = false;
+      updateConfigFeedback();
     }
-    showToast('FX 配置已保存并热生效');
   }
 
   // ── 调试：自检 / 选择器探针 / 现场 / 日志 ──────────────────────────────────
@@ -1060,19 +1270,197 @@
     }
   }
 
+  // The API returns a rolling tail. Freeze the displayed tail while reading older lines.
+  function countNewLogLines(previous, next) {
+    if (!previous.length) return next.length;
+    for (let overlap = Math.min(previous.length, next.length); overlap > 0; overlap--) {
+      if (previous.slice(-overlap).every((line, index) => line === next[index])) return next.length - overlap;
+    }
+    return next.length;
+  }
+
+  function updateLogReaderControls() {
+    const latest = $('fx-log-latest');
+    if (latest) {
+      latest.hidden = state.logFollow;
+      const added = state.logPendingLines ? countNewLogLines(state.logRenderedLines, state.logPendingLines) : 0;
+      latest.textContent = added ? `有新日志 · 回到最新` : '回到最新';
+    }
+    const context = $('fx-log-context');
+    if (context) {
+      const scope = state.logTaskFilter ? `${state.logAutoTask ? '当前任务' : '指定任务'}：${state.logTaskFilter}`
+        : state.logAutoTask ? '暂无运行任务，显示最近日志' : '全部 FX 日志';
+      const levelLabel = { all: '全部级别', warning: '警告和错误', error: '仅错误' }[state.logLevel];
+      const reading = state.logFollow ? '跟随最新' : '暂停跟随';
+      const count = state.logRenderedRecords.length
+        ? `${state.logRenderedRecords.length} 条记录` : `${state.logRenderedLines.length} 行`;
+      context.textContent = state.logError ? `${scope} · 日志同步失败，将自动重试`
+        : `${scope} · ${levelLabel} · ${count} · ${reading}`;
+      context.title = state.logError || scope;
+    }
+    $('fx-log-current')?.setAttribute('aria-pressed', String(state.logAutoTask));
+    $('fx-log-all')?.setAttribute('aria-pressed', String(!state.logAutoTask && !state.logTaskFilter));
+    const pause = $('fx-log-pause');
+    if (pause) {
+      pause.textContent = state.logFollow ? '暂停跟随' : '继续跟随';
+      pause.setAttribute('aria-pressed', String(!state.logFollow));
+    }
+    const copy = $('fx-log-copy');
+    if (copy) copy.disabled = !state.logRenderedLines.length;
+  }
+
+  function renderLogLines(lines, records = []) {
+    const host = $('fx-log-view');
+    if (!host) return;
+    state.logRenderedLines = lines;
+    state.logRenderedRecords = records;
+    state.logPendingLines = null;
+    state.logPendingRecords = null;
+    const text = lines.length ? lines.join('\n') : '（没有匹配的日志行）';
+    if (records.length) {
+      const markup = records.map(record => {
+        const level = ['error', 'warning', 'info', 'debug'].includes(record.level) ? record.level : 'info';
+        return `<span class="fx-log-record" data-level="${level}">${esc(record.lines.join('\n'))}</span>`;
+      }).join('\n');
+      if (host.innerHTML !== markup) host.innerHTML = markup;
+    } else if (host.textContent !== text) host.textContent = text;
+    if (state.logFollow) host.scrollTop = host.scrollHeight;
+    updateLogReaderControls();
+  }
+
+  function setLogFilter(taskId, automatic = false) {
+    state.logAutoTask = automatic;
+    state.logTaskFilter = String(taskId || '');
+    const input = $('fx-log-task');
+    if (input) input.value = state.logTaskFilter;
+    updateLogReaderControls();
+  }
+
+  function syncCurrentLogTask() {
+    if (!state.logAutoTask || !state.logFollow) return;
+    const input = $('fx-log-task');
+    if (input && String(input.value || '').trim() !== state.logTaskFilter.trim()) return;
+    const taskId = currentLogTask(state.lastTasks, state.lastQueue);
+    // Keep the just-finished task in view until another task starts.
+    if (taskId && taskId !== state.logTaskFilter) {
+      setLogFilter(taskId, true);
+      loadLogs();
+    }
+  }
+
+  function resumeLogFollowing() {
+    state.logPaused = false;
+    state.logFollow = true;
+    const taskId = state.logAutoTask && currentLogTask(state.lastTasks, state.lastQueue);
+    if (taskId && taskId !== state.logTaskFilter) {
+      setLogFilter(taskId, true);
+      loadLogs();
+    } else {
+      renderLogLines(state.logPendingLines || state.logRenderedLines, state.logPendingRecords || state.logRenderedRecords);
+    }
+  }
+
+  function setupLogReader() {
+    const host = $('fx-log-view');
+    const toolbar = $('fx-log-refresh')?.parentElement;
+    if (!host || !toolbar || $('fx-log-latest')) return;
+    const controls = [
+      ['fx-log-current', '跟随当前任务', () => {
+        state.logPaused = false;
+        state.logFollow = true;
+        setLogFilter(currentLogTask(state.lastTasks, state.lastQueue), true);
+        loadLogs();
+      }],
+      ['fx-log-all', '全部日志', () => { setLogFilter(''); loadLogs(); }],
+      ['fx-log-latest', '回到最新', resumeLogFollowing],
+      ['fx-log-pause', '暂停跟随', () => {
+        if (!state.logFollow) { resumeLogFollowing(); return; }
+        state.logPaused = true;
+        state.logFollow = false;
+        updateLogReaderControls();
+      }],
+      ['fx-log-copy', '复制当前结果', async () => {
+        if (!state.logRenderedLines.length) return;
+        try {
+          await global.navigator.clipboard.writeText(state.logRenderedLines.join('\n'));
+          showToast('已复制当前显示的日志');
+        } catch (_) { showToast('复制失败，请选中日志文字后复制', true); }
+      }],
+    ];
+    controls.forEach(([id, label, action]) => {
+      const button = document.createElement('button');
+      button.id = id;
+      button.type = 'button';
+      button.className = 'fx-button';
+      button.textContent = label;
+      button.addEventListener('click', action);
+      const destination = ['fx-log-current', 'fx-log-all'].includes(id) ? $('fx-log-scope-controls') || toolbar : toolbar;
+      destination.appendChild(button);
+    });
+    const level = document.createElement('select');
+    level.id = 'fx-log-level';
+    level.className = 'fx-select';
+    level.setAttribute('aria-label', '日志级别');
+    level.innerHTML = '<option value="all">全部级别</option><option value="warning">警告和错误</option><option value="error">仅错误</option>';
+    level.value = state.logLevel;
+    level.addEventListener('change', () => {
+      state.logLevel = ['all', 'warning', 'error'].includes(level.value) ? level.value : 'all';
+      loadLogs();
+    });
+    toolbar.insertBefore(level, $('fx-log-refresh'));
+    const context = document.createElement('p');
+    context.id = 'fx-log-context';
+    context.setAttribute('aria-live', 'polite');
+    host.parentElement.insertBefore(context, host);
+    host.addEventListener('scroll', () => {
+      state.logFollow = !state.logPaused && host.scrollHeight - host.clientHeight - host.scrollTop < 24;
+      if (state.logFollow && state.logPendingLines) renderLogLines(state.logPendingLines, state.logPendingRecords || []);
+      else updateLogReaderControls();
+    }, { passive: true });
+    updateLogReaderControls();
+  }
+
   async function loadLogs() {
     const host = $('fx-log-view');
     if (!host) return;
     const params = new URLSearchParams({ limit: '150' });
+    params.set('level', state.logLevel);
     if (state.logTaskFilter) params.set('task_id', state.logTaskFilter);
     if (state.logKeyword) params.set('q', state.logKeyword);
+    const queryKey = params.toString();
+    if (queryKey !== state.logQueryKey) {
+      state.logQueryKey = queryKey;
+      state.logFollow = true;
+      state.logPaused = false;
+      state.logPendingLines = null;
+      state.logPendingRecords = null;
+      state.logRenderedLines = [];
+      state.logRenderedRecords = [];
+      state.logError = '';
+      host.textContent = '正在读取…';
+      updateLogReaderControls();
+    }
+    const requestId = ++state.logRequestSeq;
     try {
-      const data = await api(`/api/google-fx/logs?${params.toString()}`);
-      const lines = data.lines || [];
-      host.textContent = lines.length ? lines.join('\n') : '（没有匹配的日志行）';
-      host.scrollTop = host.scrollHeight;
+      const data = await api(`/api/google-fx/logs?${queryKey}`);
+      if (requestId !== state.logRequestSeq || queryKey !== state.logQueryKey) return;
+      state.logError = '';
+      const displayLine = value => String(value).replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '');
+      const lines = Array.isArray(data.lines) ? data.lines.map(displayLine) : [];
+      const records = Array.isArray(data.records) ? data.records
+        .filter(record => record && Array.isArray(record.lines))
+        .map(record => ({ level: record.level, lines: record.lines.map(displayLine) })) : [];
+      if (state.logFollow) renderLogLines(lines, records);
+      else {
+        state.logPendingLines = lines;
+        state.logPendingRecords = records;
+        updateLogReaderControls();
+      }
     } catch (error) {
-      host.textContent = `日志读取失败：${error.message}`;
+      if (requestId !== state.logRequestSeq) return;
+      state.logError = error.message;
+      if (!state.logRenderedLines.length) host.textContent = `日志同步失败：${error.message}`;
+      updateLogReaderControls();
     }
   }
 
@@ -1313,10 +1701,9 @@
   }
 
   function filterAndFocusLogs(taskId) {
+    showSection('monitor');
     if (!taskId) return;
-    state.logTaskFilter = String(taskId);
-    const input = $('fx-log-task');
-    if (input) input.value = taskId;
+    setLogFilter(taskId);
     loadLogs();
     const logPanel = $('fx-log-panel') || document.querySelector('.fx-log-panel');
     if (logPanel) {
@@ -1381,6 +1768,22 @@
   }
 
   function bind() {
+    $('fx-console-root')?.addEventListener('click', (event) => {
+      const link = event.target.closest('[data-fx-section]');
+      if (!link) return;
+      event.preventDefault();
+      showSection(link.dataset.fxSection, link.dataset.fxTarget);
+    });
+    document.querySelector('.fx-section-nav')?.addEventListener('keydown', (event) => {
+      const tabs = Array.from(document.querySelectorAll('.fx-section-tab'));
+      const index = tabs.indexOf(event.target);
+      if (index < 0 || !['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+      event.preventDefault();
+      const next = event.key === 'Home' ? 0 : event.key === 'End' ? tabs.length - 1
+        : (index + (event.key === 'ArrowRight' ? 1 : -1) + tabs.length) % tabs.length;
+      showSection(tabs[next].dataset.fxSection);
+      tabs[next].focus();
+    });
     $('fx-refresh-status')?.addEventListener('click', () => refresh(false));
     $('fx-open-manual')?.addEventListener('click', openManual);
     $('fx-manual-close')?.addEventListener('click', closeManual);
@@ -1399,14 +1802,27 @@
       if (event.key === 'Escape' && !$('fx-manual-overlay')?.hidden) closeManual();
     });
 
-    // ⚠️ 保存按钮在 finally 里重置 disabled
-    $('fx-config-save')?.addEventListener('click', async (event) => {
-      const button = event.currentTarget;
-      button.disabled = true;
-      try { await saveConfig(); }
-      catch (error) { showToast(`保存失败：${error.message}`, true); }
-      finally { button.disabled = false; }
+    $('fx-config-save')?.addEventListener('click', saveConfig);
+    const configChanged = () => {
+      state.configError = '';
+      updateConfigFeedback();
+    };
+    $('fx-config-form')?.addEventListener('input', configChanged);
+    $('fx-config-form')?.addEventListener('change', configChanged);
+    $('fx-config-reload')?.addEventListener('click', () => {
+      const dirty = Object.keys(collectConfigPatch()).length > 0;
+      if (dirty && !global.confirm('放弃当前未保存的配置修改，并重新读取服务器配置？')) return;
+      loadConfig({ force: true, draft: {} });
     });
+    global.addEventListener?.('beforeunload', (event) => {
+      if (!Object.keys(collectConfigPatch()).length) return;
+      event.preventDefault();
+      event.returnValue = '';
+    });
+    $('fx-audit-details')?.addEventListener('toggle', (event) => {
+      if (event.currentTarget.open) loadAudit();
+    });
+    $('fx-audit-refresh')?.addEventListener('click', loadAudit);
 
     [0, 1, 2].forEach((level) => {
       $(`fx-selftest-l${level}`)?.addEventListener('click', () => {
@@ -1444,9 +1860,10 @@
       }
     });
     $('fx-reload-captures')?.addEventListener('click', loadCaptures);
+    setupLogReader();
     $('fx-log-refresh')?.addEventListener('click', () => triggerHighFreq(15000));
     $('fx-log-task')?.addEventListener('change', (event) => {
-      state.logTaskFilter = event.target.value.trim();
+      setLogFilter(event.target.value.trim());
       triggerHighFreq(15000);
     });
     $('fx-log-keyword')?.addEventListener('change', (event) => {
@@ -1773,6 +2190,23 @@
 
     $('fx-slot-refresh')?.addEventListener('click', () => refresh(false));
 
+    $('fx-board')?.addEventListener('click', async (event) => {
+      const button = event.target.closest('[data-board-action]');
+      if (!button) return;
+      if (button.dataset.boardAction === 'view_logs') {
+        if (button.dataset.taskId) filterAndFocusLogs(button.dataset.taskId);
+      } else if (button.dataset.boardAction === 'close_orphans') {
+        if (!global.confirm('关闭所有「无主」浏览器？\n只会关闭没有任务在用、且近 30 分钟没被用过的环境；账号登录状态不受影响。')) return;
+        button.disabled = true;
+        try {
+          const result = await post('/api/google-fx/orphans/close', {});
+          showToast(`已关闭 ${result.closed || 0} 个无主浏览器`);
+          await refresh(true);
+        } catch (error) { showToast(`关闭失败：${error.message}`, true); }
+        finally { button.disabled = false; }
+      }
+    });
+
     $('fx-slot-display')?.addEventListener('click', async (event) => {
       const button = event.target.closest('[data-slot-action]');
       if (!button) return;
@@ -1804,17 +2238,6 @@
         } catch (error) { showToast(`调整优先级失败：${error.message}`, true); }
         finally { button.disabled = false; }
       }
-    });
-
-    $('fx-console-root')?.addEventListener('click', async (event) => {
-      const button = event.target.closest('[data-fx-action="clear-orphaned"]');
-      if (!button) return;
-      button.disabled = true;
-      try {
-        await post('/api/google-fx/control', { action: 'clear_orphaned' });
-        await refresh(true);
-        triggerHighFreq(15000);
-      } catch (error) { showToast(`清除失败：${error.message}`, true); }
     });
 
     if (typeof document !== 'undefined') {
@@ -1892,8 +2315,8 @@
   }
 
   const apiObject = {
-    init, activate, deactivate, refresh, accountState, proxyState, taskTypeLabel,
-    creditLabel, formatDuration, runSelftest, runSelectorProbe,
+    init, activate, deactivate, refresh, showSection, accountState, proxyState, taskTypeLabel,
+    creditLabel, formatDuration, taskState, stageLabel, currentLogTask, countNewLogLines, runSelftest, runSelectorProbe,
     renderMarkdown, openManual, closeManual, loadProxies
   };
   global.GoogleFxConsole = apiObject;

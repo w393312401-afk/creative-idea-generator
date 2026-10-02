@@ -1,6 +1,6 @@
 ---
 name: gemini-omni-restoration-composer
-description: 专门为 Gemini Omni / Gemini Omni Flash 生成改造延时提示词。接受中文或英文主题、参考图片、参考视频、参考音频、现有改造 brief，也可在无主题时先用「选题发动机」批量产出源源不断、有创新和独特性的延时改造点子。输出 copy-ready 的 IMAGE anchors 和 Gemini Omni 多镜头 VIDEO prompts。强制多镜头组接：单段是一条贯穿全段的主工作镜，中间被一到两个特写插入切开，再切回同一机位收尾；禁止默认一镜到底，也禁止旧的五景别轮换。内部严格执行施工顺序依赖、供电链、封闭空间成因、体积守恒、累积状态与因果痕迹契约，对用户屏蔽底层复杂度。P2 去 AI 味从整体画面开始，默认偏 UGC 手机拍摄、真实可用光、轻微过曝、压缩噪点和不稳定构图。对话微调提示词仅在用户明确要求时输出。Trigger this skill when the user asks for Omni提示词, Gemini Omni prompts, Omni Flash video prompts, omni模型, 改造延时提示词, 多镜头改造视频, 反推延时视频提示词, reverse-engineering prompts from an existing restoration time-lapse video, multimodal restoration/renovation timelapse prompts for Gemini Omni, OR asks for topic ideas with 给我点子、帮我想选题、来点延时改造创意、brainstorm topics、选题发动机.
+description: 为 Gemini Omni / Omni Flash 制作修复、翻新、建造与空间改造延时提示词，输出可复制的 IMAGE 锚点与 VIDEO 提示词；接受主题、已有 brief 和实际多模态参考，也支持反推改造参考视频及生成改造选题。默认多镜头和真实手机拍摄风格，遵从用户明确的一镜到底或电影风格覆盖；对话微调仅按请求提供。适用于 Omni提示词、改造延时提示词、多镜头改造视频、反推延时视频提示词、延时改造创意／选题发动机；不用于普通故事片、音乐视频或无关选题。
 ---
 
 # Gemini Omni Restoration Composer
@@ -11,7 +11,7 @@ This skill creates copy-ready Gemini Omni / Gemini Omni Flash prompt packs for r
 
 It is a parallel Omni-specific companion to `gemini-veo-restoration-composer`. Do not modify or depend on that skill at runtime. Its production contracts have been absorbed into this skill's own references — adjacent IMAGE anchors, clean static frames, single-operation beats, visible causal traces, construction dependency order, and a Chinese audit report.
 
-The Omni-specific difference is mandatory: every VIDEO prompt uses a multi-shot edit pattern with **stated cut marks**. Do not default to one-take, oner, single continuous take, or one-shot language. The video grammar is **one sustained wide working shot, cut open by one or two close-up inserts, then cut back to the same camera setup to land** — three shots at 4s and 6s, four at 8s and 10s. It is not a shot-scale rotation; the retired names `establishing long shot`, `full shot`, `medium shot`, and `wide outro shot` are banned. The structure table, the same-camera-setup rule, and the timeline sentence that pins the cut marks to seconds all live in `references/omni-multishot-language.md`.
+The default construction grammar is **one wide working shot, one or two close-up inserts, then a return to the same camera setup** — three shots at 4s and 6s, four at 8s and 10s. Describe clean cuts in natural prose; do not add second-by-second timelines. Reward and physical-entry clips use their dedicated structures in `references/omni-multishot-language.md` and `references/omni-threshold-bridge.md`. An explicit user request for one take overrides this default directly. The retired scale rotation (`establishing long shot`, `full shot`, `medium shot`, `wide outro shot`) is not the construction grammar.
 
 The realism difference is also mandatory: de-AI polish starts from the whole image capture style. Unless the user requests polished cinema, default the pack toward UGC-like phone footage, real available light, slight framing instability, overexposed highlight patches, phone auto-exposure shifts, low-light noise, mild compression, and imperfect focus behavior.
 
@@ -19,9 +19,9 @@ The realism difference is also mandatory: de-AI polish starts from the whole ima
 
 These three pairs of rules pull against each other. They are resolved here once, and the resolution is binding everywhere else.
 
-1. **Cut coverage beats every single-take instinct, and the insert beats every scale-rotation instinct.** There is no exemption for the final reward beat, no exemption for a threshold crossing, and no exemption for a "simple" beat: every clip is cut. Equally, no beat earns extra shot scales — more clip length buys a second insert and a longer main shot, never another rung. Reveal pushes and forward moves happen as motion *inside* the main working shot.
-2. **Landmarks are locked; framing is loose.** The UGC layer buys handheld tilt, off-centre composition, focus hunting, and exposure pumping. It never buys a primary landmark leaving frame, changing its relationship to another landmark, or changing its frame share between anchors. Full rule in `references/omni-scene-skeleton.md`.
-3. **Counts are mandatory; digits are banned.** Write `three roof beams`, never `3 roof beams` and never `70%`. Numerals and percent symbols in a prompt are a leading cause of literal text rendering into the frame. Full rule in `references/omni-output-templates.md`.
+1. **Choose the structure for the beat's role.** Ordinary construction uses the clip-length table; reward uses its three-shot usage sequence; physical entry uses the declared topology stages. These are all edited by default. User-specified one-take coverage takes precedence without reconfirmation; mark the replaced cut/insert checks `用户覆盖／不适用`.
+2. **Landmarks are locked; framing is loose.** The UGC layer buys handheld tilt, off-centre composition, focus hunting, and exposure pumping. Within a locked construction family it never buys a primary landmark leaving the working/returning view or changing its frame share. Physical relationships stay fixed across all viewpoints; declared entry, reframe and reward coverage can change their screen projection. Full rule in `references/omni-scene-skeleton.md`.
+3. **Counts use English words; notation stays internal.** Write `three roof beams`, never `3 roof beams` or `70%`. IMAGE references and numbered Chinese slot labels remain allowed. A runtime-supplied IMAGE landmark packet may retain its registered `Grid B2` cell verbatim; do not invent Grid coordinates or numeric weights in chat output. Full rule in `references/omni-output-templates.md`.
 
 ## Use This Skill When
 
@@ -36,7 +36,8 @@ These three pairs of rules pull against each other. They are resolved here once,
 
 - The request is a generic non-restoration story film, product ad, music video, or normal text-to-video prompt.
 - The user wants the original restoration prompt format rather than Gemini Omni output.
-- The user explicitly requests a single-take / oner style. In that case, ask whether they want to override this skill's default multi-shot contract.
+
+An explicit single-take / oner request remains within this skill. Follow it directly, preserving physical continuity, scope and clean anchor boundaries; do not ask the user to confirm their own choice.
 
 ## Required Reference Loading
 
@@ -56,7 +57,7 @@ Load only the reference files needed for the request.
 **Load conditionally:**
 
 - `references/idea-engine.md` + `references/used-topic-ledger.md`: Tier 0 only — the user wants ideas, not prompts.
-- `references/omni-threshold-bridge.md`: whenever the story crosses from exterior to interior through a real opening.
+- `references/omni-threshold-bridge.md`: whenever the story crosses a real opening or changes an interior camera family through a no-work reframe.
 - `references/omni-worked-ladders.md`: when the beat ladder's shape is uncertain, or the carrier is a vessel/vehicle/cave/excavated shell.
 - `examples/minimal-omni-restoration.md`: when you need a concrete formatting example.
 
@@ -107,7 +108,7 @@ If the user provides a production beat ladder, existing restoration prompt set, 
 - Parse any structured brief fields (`VARIABLES`, `PRODUCTION BEAT LADDER`, `ROUTING`, `TIMELAPSE CONTROL`, `PASSIVE ENVIRONMENTAL LAYER`, `VOICEOVER LAYER`, `HANDOFF`) as **binding inputs**. Do not reinvent topic, reward, route, or construction order that the brief already fixed. Set the beat count from the supplied ladder.
 - If the user's beat order violates real construction dependencies (for example wiring after wall panels close, or finish coat before primer), surface the conflict and propose the corrected order before writing prompts.
 - Convert the video language to Gemini Omni multi-shot natural prose.
-- Split overloaded beats into separate videos; expand under-scoped beats to a full visible milestone.
+- Split overloaded beats into separate videos; complete each milestone at the user's declared scope without expanding a local request or dropping another required action.
 - Keep adjacent anchor binding and causal trace logic.
 
 ### Tier 4 - Reference Video Reverse-Engineering (反推模式)
@@ -128,7 +129,7 @@ The dopamine is contrast held in tension: raw huge untouched outside vs. refined
 
 ### Algorithm
 
-1. **Recombine** — draw one entry from each of the five orthogonal axes: `CARRIER`, `ENVIRONMENT`, `TRAUMA`, `DESTINY`, `SIGNATURE TWIST`. Rotate the carrier *family* (natural → man-made → vehicle → fantasy-grounded) so no two ideas in a batch share a shell family.
+1. **Recombine** — draw one entry from each of the five orthogonal axes: `CARRIER`, `ENVIRONMENT`, `TRAUMA`, `DESTINY`, `SIGNATURE TWIST`. Aim for carrier-family variety; the binding quota and user-pinned exceptions live in `references/idea-engine.md`. Do not turn this soft rotation into a ban on two distinct man-made carriers.
 2. **Filter**, in order — Orthogonal-Pairing Rule, mandatory single twist, dedup vs. `references/used-topic-ledger.md`, Cliché Blocklist, Buildability Gate, Realism Gate, **Two-Distance Coverage Gate**, Scroll-Stop Test. Drop any candidate that fails.
 3. **Score & rank** — rate each survivor on Novelty, Visual Contrast, Twist Strength, Buildability, Scroll-Stop; output the top N (default 8).
 4. **Honor constraints** — if the user pins an axis, lock it and recombine the other four.
@@ -182,7 +183,7 @@ Review discipline:
 
 Create `timelapse_beats.json` in the job directory before writing any prompt.
 
-**The field contract lives in `references/timelapse-beats.schema.json` — that file is the single source of truth.** Read it before writing the file; do not restate its fields here or anywhere else. The same schema is imported by the app's `replica_pipeline` so that manual reverse-engineering in chat and automated reverse-engineering in the app cannot drift apart.
+**The field contract lives in `references/timelapse-beats.schema.json` — that file is the single source of truth.** Read it before writing the file; do not restate its fields here or anywhere else. Use this schema when delivering a manual video analysis in chat.
 
 What the schema cannot enforce, and you must:
 
@@ -196,7 +197,7 @@ What the schema cannot enforce, and you must:
 
 ### Stage 2 Mapping To The Prompt Pack
 
-- Beats become the production beat ladder; split any beat containing more than one dominant physical operation, and expand any beat whose result is only a token patch.
+- Beats become the production beat ladder; split any beat containing more than one dominant physical operation while preserving observed coverage. Do not invent unobserved room-wide work to enlarge a genuinely local repair shown in the source.
 - IMAGE anchors come from clean frames (`workers_present: false`) at or near beat boundaries. The anchor description must match the evidence frame's actual state, including its `persistent_traces`.
 - Each VIDEO prompt covers exactly one beat, rendered as this clip length's mandatory shot structure; the inserts must use the beat's actual visible tool contact and traces.
 - `state_before` / `state_after` become the anchor delta; `persistent_traces` feed the cumulative state rules.
@@ -208,19 +209,19 @@ What the schema cannot enforce, and you must:
 
 ## Internal Composition Pipeline
 
-1. Parse the topic into carrier, environment, trauma state, destiny, reward action, and reference assets.
-2. Build a production beat ladder. Each ordinary beat contains exactly one dominant physical operation **and** produces one full visible milestone — never a token patch. Validate the ladder against the construction dependency order, the hard vetoes, and the delta budget before writing any prompts. Consult `references/omni-worked-ladders.md` if the shape is uncertain.
-3. Convert every beat into a **Temporal Physics Skeleton** (nine fields, `references/omni-beat-skeleton.md`). A beat that cannot fill all nine is underspecified — fix it now, not in prose.
+1. Parse the topic and keep a compact internal request checklist: required operations and their scope, protected surfaces/items, route, clip length, style/coverage overrides, reference assets, and requested IMAGE/VIDEO/edit deliverables. Preserve the exact edit count when supplied; otherwise an explicit edit request defaults to two. Missing references are requested, never described as observed.
+2. Build a production beat ladder. Each ordinary beat contains one dominant physical operation and completes its declared milestone. Map every requested action to its VIDEO and IMAGE delta: `carry in` needs an outside source and a shown boundary crossing, not an item pre-positioned inside. A whole-carrier renovation must deliver visible repair/fit-out at that scope, not silently shrink to one shallow patch plus prop staging. A local repair completes only its named local scope; do not add room-wide work. Split overloaded beats without dropping or weakening their actions. Validate dependencies and delta budget; consult `references/omni-worked-ladders.md` if needed.
+3. Convert every beat into the **Temporal Physics Skeleton** in `references/omni-beat-skeleton.md`. Fill its required fields before prompt writing; do not let polished prose hide an unspecified action or inheritance.
 4. Fix the **Location DNA** (copied verbatim everywhere) and the three primary landmarks, one per depth zone, in relative-position prose. Build the shell Geometry Lock before writing prompts: clear width in door widths, clear height in door heights, depth in countable bays, one roof form at the exterior's own pitch, an exhaustive aperture ledger, an explicit aperture denylist, and the same wall-material family inside and out. Choose one numeral-free envelope signature under twelve words.
 5. Register a **Material Palette Lock** for the three to five materials that occupy meaningful frame area. Give each an immutable `substrate` phrase and a monotonic `state_track`; copy the substrate wording verbatim whenever that material is visible and advance its state only in the beat that works it. Then draft the internal progress ledger: for each anchor, the cumulative installed items, counts of major countable elements, completion extent, lighting phase, inherited traces, shell envelope, and current material states. Never include the ledger itself in the output.
 6. Create IMAGE anchors for the before state, each progressive state, and the final reward state. IMAGE anchors are clean frames at full-shot scale with no active workers or machinery. IMAGE 1 uses the three-part damage pattern from `references/omni-damage-vocabulary.md`. Every post-crossing interior IMAGE restates the envelope signature, roof form, aperture constraints, wall material, and at least one fixed structural carrier landmark; every IMAGE restates the visible materials' immutable substrate phrases.
 7. Create VIDEO prompts between adjacent IMAGE anchors. Every VIDEO starts by binding IMAGE N as first frame and IMAGE N+1 as last frame.
-8. Render each VIDEO as a main working shot plus this clip length's one or two close-up inserts, in natural prose, carrying the shot timeline sentence right after the anchor-binding sentence. Immediately after the person-free opening instant, begin effective tool contact with a short adjacent-edge reach or step; integrate withdrawal into the final working action. Apply `references/omni-work-first-rhythm.md` without assigning separate arrival/departure shots.
+8. Render each VIDEO with its role's shot structure, explicit clean cuts and natural prose, or the user's explicit one-take coverage. Immediately after the person-free opening instant, begin effective contact; integrate withdrawal into the final action. Apply `references/omni-work-first-rhythm.md` without adding arrival/departure filler.
 9. Apply the lighting phase, passive environment, and audio layers from `references/omni-lighting-environment-audio.md`.
 10. Apply the UGC de-AI capture layer to both IMAGE and VIDEO prompts before wording polish.
-11. (Optional, only when the user explicitly requests 对话微调提示词) Add two to three conversational edit prompts for Gemini Omni follow-up refinement.
-12. Run silent P0/P1/P2 gates, including the phrasing-variation and notation checks.
-13. Deliver one fenced `text` block followed by a Chinese audit table.
+11. Only when requested, include the exact requested number of independently executable conversational edits; each names its target, permitted change and preserved result/anchors.
+12. Count every final slot with `scripts/lint_prompt_pack.py` (see output reference), then review action coverage, causal order and adjacent deltas. The lint checks counts and formatting, not semantic quality. Compress and recount overlong slots; do not infer `通过` from the presence of headings.
+13. Deliver one fenced `text` block followed by a concise Chinese evidence-based audit table. Compare final deliverables to step 1's checklist before sending; report unverified checks honestly.
 
 ---
 
@@ -228,7 +229,7 @@ What the schema cannot enforce, and you must:
 
 ### Multi-Shot Contract
 
-Every VIDEO prompt is one sustained working shot cut open by inserts, plus the timeline sentence that states where each cut falls:
+Ordinary construction uses these default structures, expressed through clean cuts in natural prose:
 
 | Clip length | Shots | Structure |
 |---|---|---|
@@ -237,17 +238,17 @@ Every VIDEO prompt is one sustained working shot cut open by inserts, plus the t
 | 8s | 4 | wide working shot, close-up insert, extreme close-up insert, returning wide shot |
 | 10s | 4 | wide working shot, close-up insert, extreme close-up insert, returning wide shot |
 
-The first and last shots are the **same camera setup**, differing only in how far the work has got, and the last shot says so verbatim. The main working shot carries this beat's entire visible advance; the inserts carry contact and traces and advance nothing. At 4s and 6s the single insert also carries the two persistent traces. Threshold bridge and reward videos keep their own three-station ladders. Full rules in `references/omni-multishot-language.md`.
+The opening and returning construction shots have the **same position, framing and focal length**, differing only in work state. State `the same camera setup as the opening wide working shot`; do not contradict it with a new overhead, lens or framing. Work progresses in the working shots; inserts inspect contact and traces already created on camera. At 4s and 6s the single insert carries both traces. Reward uses its dedicated three-shot sequence; entry follows the threshold reference, not this construction table. Explicit user coverage overrides apply directly.
 
 Use clean cuts or match cuts between shots. Do not use cross-dissolve, fade-in, magical transition, instant transformation, montage replacement, or scene teleport language.
 
 ### One-Take Ban
 
-Do not write `oner`, `one-shot`, `single continuous take`, `one continuous take`, `one-take`, or equivalent default wording. There is **no exemption** — including the final reward beat. Only use these if the user explicitly overrides the multi-shot contract.
+Do not default to `oner`, `one-shot` or `single continuous take`. When the user explicitly requests one take, use it and mark cut, insert and return-camera checks `用户覆盖／不适用`; never claim those shots exist.
 
 ### Pacing Declaration
 
-Every ordinary construction VIDEO states its time base once: `edited construction time-lapse assembled from multiple camera setups, not real-time footage`. Threshold bridge videos and the final reward video are exempt.
+Default construction VIDEO states `edited construction time-lapse assembled from multiple camera setups, not real-time footage` once. For a user-selected single take, describe the requested real-time or time-lapse pace without claiming multiple setups. Entry and reward are exempt from this construction declaration.
 
 ### Omni Six-Dimensional Skeleton
 
@@ -311,7 +312,7 @@ Timelapse must compress time, but only through legal channels. If the prompt off
 
 - Delta budget: one VIDEO may only carry a plausible amount of change. If an operation alters more than roughly one-third of the visible frame area, or could not believably progress that far within one short video, split the same operation into consecutive quantified beats. Split by extent — never by shrinking the milestone to a token patch.
 - Shot-level progress lock: the main working shot opens on exactly IMAGE N with zero new progress and then advances the beat's change from zero to roughly three quarters through repeated visible work cycles; each insert examines ongoing contact or existing traces without advancing the state; the returning wide shot lands exactly on IMAGE N+1.
-- Cuts carry no progress: every shot opens at the completion level the previous shot ended with.
+- Cuts carry no unperformed construction progress; declared elapsed curing follows the continuity reference and preserves coverage and objects.
 - First occurrence on camera: the first instance of every change type must appear in full with its causal chain. A cut may compress only repetitions of an action already shown once, and the prose must say so.
 - Monotonicity: construction state never regresses, across shots or across anchors.
 
@@ -328,7 +329,8 @@ Every object is `inherited in place`, `human-moved` (state the movement and dest
 
 - Bulk materials must be staged in a visible stockpile in a prior anchor or visibly carried/delivered into the scene inside the VIDEO before use.
 - Removed material must either visibly exit the scene boundary or persist as a stockpile until it does; stockpile volume must roughly match what was removed.
-- If a VIDEO ends with wet material, the next IMAGE anchor shows the cured or dried state.
+- A requested carry-in/out requires a camera family that sees its source/boundary, crossing and contact/destination; a locked camera with the entrance behind it cannot certify that route. Reframe beforehand or split the transfer stages, following the continuity reference.
+- A VIDEO's final instant and last-frame IMAGE must have the same moisture state. If the next operation needs a dry/cured surface, either declare a drying/curing time-lapse before this clip's dry endpoint or add a separate transition; never use a wet VIDEO tail with a supposedly exact dry anchor.
 - Work above comfortable arm reach requires a visible ladder, scaffold, or standing surface. Erected scaffolding follows the Persistent Site Plant Exception — it persists across anchors between a named erection beat and a named strike beat.
 - Loads beyond one person's plausible capacity require a second worker or a machine.
 
@@ -365,7 +367,7 @@ Exit codes: `0` rendered; `2` server unreachable, fall back to plain text delive
 
 The server runs **no** automatic judgement on the frame (2026-08-05: all generation-time consistency review was removed). Show the user the rendered anchor, say plainly that nothing checked it automatically, and let them decide before you compose the rest. The rendered prompt is then authoritative: deliver it verbatim and reconcile dependent prompts against what actually rendered rather than against the pre-visualised plan.
 
-When rendering, stop at the first IMAGE of **every new shot family**, not only IMAGE 1. A single-family run stops once at IMAGE 1. A threshold run stops again at the first settled interior IMAGE; a declared cut to a new family stops at that cut's resulting IMAGE. Pass its real slot number through `--sequence`. Before continuing, inspect roof form and pitch, aperture ledger/denylist, clear width and height in door units, fixed carrier landmark, material substrates, untouched trauma state, full door-frame clearance, and DLSP compliance (wide 3/4 oblique perspective, entrance ladder/jamb locked in immediate foreground <1m, broad unobstructed midground, explicit perimeter wall topologies, and absence of tunnel/cube distortion). On failure, delete the rejected frame and re-render the same slot with `--force_regenerate`; allow at most three attempts. A retry never creates a new beat or IMAGE number.
+When rendering, stop at the first IMAGE of **every new shot family**, not only IMAGE 1. A single-family run stops once at IMAGE 1. A threshold run stops again at the first settled interior IMAGE; a declared cut to a new family stops at that cut's resulting IMAGE. Pass its real slot number through `--sequence`. Before continuing, inspect roof form/pitch, aperture ledger/denylist, door-unit proportions, fixed carrier landmark, material substrates, inherited trauma/work state and DLSP. Confirm an oblique viewpoint, entrance hardware on its original physical boundary (at the near margin, behind the camera or visible from a declared reverse viewpoint), inherited floor tether, actual staging area and boundary topology without invented depth. On failure, delete the rejected frame and re-render the same slot with `--force_regenerate`; allow at most three attempts. A retry never creates a new beat or IMAGE number.
 
 `--prompt_file` is preferred over `--prompt`; prompt bodies contain characters that are painful to escape on a command line.
 
@@ -403,7 +405,7 @@ Rules:
 - Do not use XML.
 - Do not use Markdown bullets, headings, or tables inside the fenced block.
 - Do not expose internal acronyms, field names, or structured labels in prompt bodies.
-- No percent symbols, arabic digits for counts, coordinate notation, or colons introducing values inside descriptive sentences.
+- No percent symbols, arabic digits for counts, numeric weights, invented coordinates, or colons introducing values in descriptive sentences. The registered runtime IMAGE Grid-packet exception is defined in the output reference.
 - Do not default to visible text rendering.
 - Length targets: exterior and single-family IMAGE 140–180 words with a hard ceiling of 180; post-crossing interior IMAGE 170–220 words with a hard ceiling of 220; VIDEO follows the clip-length table in `references/omni-output-templates.md`. Trim adjectives and boilerplate before ever trimming a required structural element.
 
@@ -413,12 +415,13 @@ Rules:
 
 ### P0 - Rewrite Before Delivery
 
-- Any VIDEO lacks this clip length's full shot structure, or lacks the shot timeline sentence.
-- Any VIDEO names a shot scale that is not in this clip length's structure — in particular the retired `establishing long shot`, `full shot`, `medium shot`, or `wide outro shot`.
-- The returning wide shot does not state that it is the same camera setup as the opening wide working shot, or is framed differently from it.
-- Any VIDEO defaults to one-take / oner / one-shot language.
+- Any VIDEO lacks its role's ordered shot structure and explicit clean cuts, except the user's stated one-take override. Do not require a second-by-second timeline.
+- An ordinary construction VIDEO uses the retired `establishing long shot`, `full shot`, `medium shot` or `wide outro shot` scale rotation.
+- A default construction return omits the same-camera clause or contradicts its position, framing or focal length.
+- Any VIDEO defaults to one take without a user request.
+- A required IMAGE, VIDEO or requested edit is absent, or a requested action is replaced by a weaker different action.
 - Any ordinary beat combines more than one dominant physical operation.
-- Any ordinary beat delivers only a token patch, a one-corner edit, or a merely-begun state instead of one full named milestone.
+- Any ordinary beat leaves its declared milestone incomplete, or a full renovation is silently reduced to token local work. A user-requested local patch remains valid at its full local extent.
 - Any object or completed state appears without a source path, contact action, movement path, and persistent traces.
 - Any beat order violates the construction dependency order or a hard veto (wiring after enclosure, finish coat before primer, roof before structure, load-bearing removal without shoring, broken power chain, missing enclosed-space provenance, unconserved volume).
 - Any IMAGE anchor drops a permanent change or trace from an earlier beat without an explicit covering operation in a named beat — including dropping an object merely because it became occluded.
@@ -433,10 +436,10 @@ Rules:
 - Any referenced `<image>`, `<video>`, or `<audio>` is not explicitly used where needed.
 - Any prompt defaults to captions, subtitles, prompt text, labels, or rendered typography without user request.
 - Any transition language implies cross-dissolve, fade-in, magic, instant transformation, or teleportation.
-- Any prompt body contains a percent symbol, an arabic numeral used as a count, coordinate notation, or an internal acronym.
+- Any prompt body contains a percent symbol, an arabic numeral used as a count, numeric weight, invented coordinate notation, or an internal acronym; registered runtime IMAGE Grid cells are the documented exception.
 - IMAGE 1 uses a banned soft-focus word (`worn`, `aged`, `dirty`, `messy`, `in disrepair`) as its primary damage descriptor.
 - An enclosed interior prompt mentions a horizon, sky, clouds, or weather.
-- A primary landmark leaves frame in the main working shot or the returning wide shot, or changes its relationship to another landmark between anchors.
+- A primary landmark leaves the main working or returning wide shot of a locked construction family, its frame share drifts within that family, or its physical relationship to another feature changes across any anchors.
 - The lighting phase skips a step, regresses, or advances without an on-camera physical cause.
 - Any interior IMAGE omits the verbatim envelope signature or single roof-form clause, contains an opening absent from the aperture ledger, contains an item on the aperture denylist, or contradicts the exterior roof pitch.
 - Any visible registered material omits or rewords its immutable substrate phrase, advances state in a beat that does not work it, skips a state, or moves backward.
@@ -455,11 +458,11 @@ Rules:
 - The insert traces are not characteristic products of the current operation (roller work must leave roller stipple, not weld beads).
 - A hand tool is described vaguely instead of with specific colour, geometry, and material.
 - Bulk materials appear without staging or visible delivery, or removed debris disappears without visible removal.
-- Wet material at the end of a VIDEO is not shown cured or dried in the next IMAGE anchor.
+- Wet/dry states differ between a VIDEO's ending instant and its bound last-frame IMAGE, or required curing is skipped before subsequent work.
 - A progressive IMAGE anchor lacks a concrete completion extent.
 - Above-reach work lacks a ladder or scaffold, or a single worker handles a load beyond one-person capacity.
 - Erected scaffolding, formwork, or shoring appears or vanishes between anchors without a named erection or strike beat; or unset concrete is shown without its formwork.
-- A shot opens with more progress than the previous shot ended with (a cut carries progress).
+- A shot opens with unperformed construction progress beyond the previous shot; declared elapsed drying/curing follows the continuity reference and cannot hide other work.
 - Result-state wording appears before the returning wide shot.
 - Major countable elements lack counts, or counts drift between shots or anchors without on-camera cause.
 - State regresses anywhere.

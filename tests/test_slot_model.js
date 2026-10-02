@@ -37,7 +37,7 @@ assert.strictEqual(s.kind, 'ready');
 assert.strictEqual(s.label, 'IMG 003');
 assert.deepStrictEqual(badges(s), []);
 // 无问题的帧没有「修复此帧问题」出口
-assert.deepStrictEqual(acts(s), ['describe-frame', 'retry-frame', 'upload-frame', 'delete-slot']);
+assert.deepStrictEqual(acts(s), ['preview-slot', 'describe-frame', 'retry-frame', 'upload-frame', 'delete-slot']);
 
 s = ready({ quality_gate: 'i2i_fallback_degraded' });
 assert.deepStrictEqual(badges(s), ['degraded']);
@@ -202,7 +202,7 @@ busy.actions.filter(a => mutatingActs.includes(a.act)).forEach(a => {
     assert.ok(a.title.includes('请稍候'), `${a.act} 在 busy 态下必须带有稍候提示`);
 });
 // 只读/元数据操作在 busy 时保持可用
-const nonMutatingActs = ['view-candidates', 'describe-frame'];
+const nonMutatingActs = ['preview-slot', 'view-candidates', 'describe-frame'];
 busy.actions.filter(a => nonMutatingActs.includes(a.act)).forEach(a => {
     assert.ok(!a.disabled, `${a.act} 在 busy 态下必须保持可用`);
 });
@@ -217,7 +217,8 @@ assert.ok(busy.actions.find(a => a.act === 'fix-frame').idleTitle.includes('图�
 assert.ok(idle.actions.every(a => a.idleTitle === a.title), '不忙时 title 就是 idleTitle');
 
 const busyVideo = videoSlotState({ slot: 3, url: '/o/vid_003.mp4' }, { seq: 3, busy: true });
-assert.ok(busyVideo.actions.every(a => a.disabled && a.title.includes('请稍候')));
+assert.ok(busyVideo.actions.filter(a => a.act !== 'preview-slot').every(a => a.disabled && a.title.includes('请稍候')));
+assert.ok(!busyVideo.actions.find(a => a.act === 'preview-slot').disabled);
 assert.strictEqual(busyVideo.actions.find(a => a.act === 'upload-video').idleTitle,
     '手动上传本地视频文件覆盖此槽位');
 
@@ -228,7 +229,7 @@ assert.strictEqual(videoSlotLabel(11, true), 'VID 011 (英雄展示 · 完工全
 let v = videoSlotState({ slot: 3, url: '/outputs/x/videos/vid_003.mp4' }, { seq: 3 });
 assert.strictEqual(v.kind, 'ready');
 assert.strictEqual(v.label, 'VID 003 (IMG 003 ➔ IMG 004)');
-assert.deepStrictEqual(acts(v), ['retry-video', 'upload-video', 'delete-slot']);
+assert.deepStrictEqual(acts(v), ['preview-slot', 'retry-video', 'upload-video', 'delete-slot']);
 assert.ok(v.draggable);
 
 v = videoSlotState({ slot: 11, url: '/o/vid_011.mp4', is_hero: true }, { seq: 11 });
@@ -270,3 +271,12 @@ assert.deepStrictEqual(summarizeSlotStates(states),
     { total: 5, ready: 3, pending: 1, missing: 1, flagged: 1 });
 
 console.log('slot model tests passed');
+
+// Only the current useful action is promoted; every other action remains available.
+const primary = state => state.actions.filter(a => a.primary).map(a => a.act);
+assert.deepStrictEqual(primary(ready({})), ['preview-slot']);
+assert.deepStrictEqual(primary(ready({ manual_issue: '错位' })), ['fix-frame']);
+assert.deepStrictEqual(primary(ready({ candidates: [{ index: 1 }, { index: 2 }] })), ['view-candidates']);
+assert.deepStrictEqual(primary(frameSlotState(null, { seq: 2 })), ['retry-frame']);
+assert.deepStrictEqual(primary(videoSlotState({ slot: 2, status: 'failed' }, { seq: 2 })), ['retry-video']);
+assert.deepStrictEqual(primary(videoSlotState({ slot: 2, url: '/v.mp4' }, { seq: 2 })), ['preview-slot']);

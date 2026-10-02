@@ -18,7 +18,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import prompt_pipeline as pp
-from prompt_pipeline import reverse
+from prompt_pipeline import reference_context
 from prompt_pipeline.human_cast import (
     humanize_cast_entry,
     humanize_cast_list,
@@ -115,19 +115,10 @@ class TestDeliveryBoundary(unittest.TestCase):
 class TestSceneConstants(unittest.TestCase):
     """场景恒常：识别出来是假人，也要自动优化成真人的形式。"""
 
-    def test_attach_scene_constants_humanizes_the_cast_column(self):
-        doc = {'cast_identity': ['1:24 scale resin figurine couple: faded shirts']}
-        constants = reverse.attach_scene_constants(doc, {})
-        cast = constants.get('cast') or []
-        self.assertTrue(cast)
-        self.assertNotIn('figurine', cast[0].lower())
-        self.assertIn('real living human', cast[0].lower())
-        # 两处必须同步：合成器读的是 cast_identity，卡片读的是 scene_constants.cast
-        self.assertNotIn('figurine', doc['cast_identity'][0].lower())
 
     def test_legacy_docs_are_humanized_on_the_way_into_the_prompt(self):
         """本次改动之前存下的任务、以及人在卡点上手改回去的，都得在送进提示词时兜住。"""
-        lines = reverse.scene_constants_lines(
+        lines = reference_context.scene_constants_lines(
             {'cast': ['wax mannequin builder in blue overalls']})
         self.assertTrue(lines)
         joined = ' '.join(lines).lower()
@@ -135,141 +126,12 @@ class TestSceneConstants(unittest.TestCase):
         self.assertIn('blue overalls', joined)
 
 
-class TestScaleLockStillLocksSize(unittest.TestCase):
-    """尺寸与材质是两件事：比例锁照旧锁尺寸，只是不再管人叫人偶。"""
-
-    def test_clause_keeps_the_ratio_and_declares_real_people(self):
-        from prompt_pipeline import observed_grounding as og
-        clause = og.cast_scale_clause({'cast_scale': '1:24 scale — each standing person is about 7.1cm tall'})
-        self.assertIn('1:24', clause)
-        self.assertIn('7.1cm', clause)
-        self.assertIn('real living people', clause.lower())
-        self.assertIn('the same physical size in every frame', clause.lower())
-
-    def test_the_old_figurine_clause_is_still_recognised_for_dedupe(self):
-        """老任务正文里写的是改动之前那句 figurine 版。只认新记号的话，重跑一次会在
-        同一段里叠出两句互相矛盾的比例声明。"""
-        from prompt_pipeline import observed_grounding as og
-        old = ('The site is cleared. Figurine scale lock: 1:24 scale — each standing figurine '
-               'is about 7.1cm tall, the same physical size in every frame.')
-        self.assertNotIn('scale lock', og._strip_cast_scale(old).lower())
 
 
-class TestMiniatureRouting(unittest.TestCase):
-    """走不走微缩沙盘那套系统提示词——「还有假人」的真正源头。
-
-    2026-08-30 第二轮实测（replica_af8db0d7a95f）：措辞层已经全部真人化，交付正文里
-    figurine 归零，人却还是模型——因为这一单**整条通道**走错了。旧判据
-    `'craftsman' in cast_identity` 把「Caucasian male builder/craftsman in his 30s…」
-    当成了"巨手工匠"的证据，于是一单真人实拍的半挂车改造拿到了微缩沙盘的系统提示词：
-    39 处 miniature、33 处 giant hands、8 处 diorama，施工者成了拇指高的模型人。
-    """
-
-    def _doc(self, **kw):
-        doc = {'carrier': '半挂车底盘', 'scene_signature': '', 'cast_identity': []}
-        doc.update(kw)
-        return doc
-
-    def test_the_word_craftsman_no_longer_routes_a_real_build_into_miniature(self):
-        doc = self._doc(cast_identity=[
-            'Caucasian male builder/craftsman in his 30s with short trimmed beard, '
-            'wearing a vibrant royal blue button-up work jacket'])
-        is_mini, why = reverse.detect_miniature_scale(
-            doc, title='平板半挂车底盘改造全能奢华移动挂车住宅')
-        self.assertFalse(is_mini, f'职业词不是微缩证据，实际判据：{why}')
-
-    def test_real_miniature_evidence_still_routes_to_the_miniature_lane(self):
-        cases = [
-            ('题材词在场景一句话里',
-             self._doc(scene_signature='A miniature woodland clearing beside two figurines.')),
-            ('识别项里的人偶',
-             self._doc(cast_identity=['the male figurine: dark-skinned Black man, slim build'])),
-            ('识别项里的比例记号',
-             self._doc(cast_identity=['1:24 scale resident couple, roughly a thumb tall'])),
-            ('载体名里的微缩',
-             self._doc(carrier='微缩沙盘泥屋')),
-        ]
-        for label, doc in cases:
-            with self.subTest(label):
-                is_mini, why = reverse.detect_miniature_scale(doc, title='x')
-                self.assertTrue(is_mini, f'{label} 应当判为微缩，实际：{why}')
-
-    def test_an_explicit_profile_still_wins(self):
-        is_mini, _ = reverse.detect_miniature_scale(
-            self._doc(), title='x', config={'skillProfile': 'miniature'})
-        self.assertTrue(is_mini)
-
-    def test_the_verdict_is_frozen_on_the_doc_before_the_cast_is_humanized(self):
-        """真人化会把 figurine 换成真人措辞，而 figurine 正是判微缩的证据之一。
-        先归一再判就是把证据擦掉再断案——判定必须钉在 doc 上，只做一次。"""
-        doc = {'cast_identity': ['the male figurine: dark-skinned Black man, slim build'],
-               'carrier': '树桩', 'scene_signature': ''}
-        reverse.attach_scene_constants(doc, {})
-        self.assertEqual(doc.get('render_scale'), 'miniature')
-        # 识别项确实被真人化了（figurine 没了），但档已经定死，不会跟着翻
-        self.assertNotIn('figurine', doc['cast_identity'][0].lower())
-        is_mini, why = reverse.detect_miniature_scale(doc)
-        self.assertTrue(is_mini, why)
-
-    def test_a_full_scale_job_is_frozen_as_full(self):
-        doc = {'cast_identity': ['the lone builder/craftsman: Caucasian man'],
-               'carrier': '半挂车底盘', 'scene_signature': ''}
-        reverse.attach_scene_constants(doc, {})
-        self.assertEqual(doc.get('render_scale'), 'full')
 
 
-class TestMiniatureLeakSentinel(unittest.TestCase):
-    """路由修好了，还要有个哨兵：判据万一再漏，不能又是静默的。"""
-
-    def _run(self, block, beats):
-        import replica_pipeline as rp
-        state = {'prompt_block': block}
-        msgs = []
-        rp._warn_if_miniature_wording_leaked(
-            state, beats, on_progress=lambda evt, data: msgs.append(data.get('message') or ''))
-        return state, msgs
-
-    def test_it_shouts_when_a_full_scale_job_carries_miniature_wording(self):
-        block = ('图片提示词\n图片 1:\nA vertical macro diorama photograph. '
-                 'The giant hand lowers a beam while the miniature builder watches.')
-        state, msgs = self._run(block, {'render_scale': 'full'})
-        self.assertTrue(msgs, '走错道必须出声——这次误判烧掉一整单就是因为它全程没有声音')
-        self.assertIn('miniature', (state.get('miniature_wording_leak') or {}).get('hits', {}))
-
-    def test_it_stays_quiet_on_a_genuine_miniature_job(self):
-        block = 'A macro diorama photograph; the giant hand places a micro-tool.'
-        _state, msgs = self._run(block, {'render_scale': 'miniature'})
-        self.assertEqual(msgs, [], '微缩单里这些词本来就该有')
 
 
-class TestExplicitProfileBeatsTheFrozenVerdict(unittest.TestCase):
-    """定档是为了让**自动**判定稳定，不是为了压住用户的明确指定。
-
-    freeze_render_scale 把题材判定钉在任务上（识别项被改写、被人编辑都不该让同一单
-    换通道）。但显式 skillProfile=miniature 是当次的明确指定——它要是被一个早先自动
-    定下的 'full' 压过去，就又是一次「设置无效」。
-    """
-
-    def test_an_explicit_miniature_choice_overrides_a_frozen_full_verdict(self):
-        doc = {'render_scale': 'full', 'cast_identity': ['a lone builder'], 'carrier': '半挂车'}
-        is_mini, why = reverse.detect_miniature_scale(doc, config={'skillProfile': 'miniature'})
-        self.assertTrue(is_mini, why)
-        self.assertIn('显式', why)
-
-    def test_without_an_explicit_choice_the_frozen_verdict_still_rules(self):
-        doc = {'render_scale': 'full', 'cast_identity': ['1:24 scale figurine couple']}
-        is_mini, why = reverse.detect_miniature_scale(doc, config={'skillProfile': 'auto'})
-        self.assertFalse(is_mini, f'已定档就不该被识别项措辞翻案：{why}')
-
-    def test_the_sentinel_keeps_quiet_when_the_user_asked_for_miniature(self):
-        """用户自己把链路钉成微缩，正文里的微缩措辞是他要的，不是走错了道。"""
-        import replica_pipeline as rp
-        state = {'prompt_block': 'A macro diorama shot; the giant hand places a micro-tool.'}
-        msgs = []
-        rp._warn_if_miniature_wording_leaked(
-            state, {'render_scale': 'full'}, config={'skillProfile': 'miniature'},
-            on_progress=lambda evt, data: msgs.append(data.get('message') or ''))
-        self.assertEqual(msgs, [])
 
 
 if __name__ == '__main__':

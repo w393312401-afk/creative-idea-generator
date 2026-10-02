@@ -10,7 +10,7 @@
     padding: 24px;
     background: var(--bg-panel);
     border: 1px solid var(--border-color);
-    border-radius: 16px;
+    border-radius: var(--radius-xl);
     margin-bottom: 24px;
     position: relative;
     backdrop-filter: blur(16px);
@@ -55,13 +55,13 @@
     display: flex;
     align-items: center;
     justify-content: center;
-    font-size: 16px;
+    font-size: var(--fs-lg);
     transition: all var(--transition-normal);
     box-shadow: 0 2px 8px rgba(0, 0, 0, 0.05);
 }
 
 .stepped-stage-label {
-    font-size: 12px;
+    font-size: var(--fs-sm);
     font-weight: 600;
     color: var(--text-muted);
     text-align: center;
@@ -105,11 +105,11 @@
 .stepped-stage-badge {
     position: absolute;
     top: -24px;
-    font-size: 10px;
+    font-size: var(--fs-2xs);
     padding: 2px 6px;
     background: rgba(var(--ink-rgb), 0.05);
     border: 1px solid var(--border-color);
-    border-radius: 12px;
+    border-radius: var(--radius-lg);
     color: var(--text-secondary);
     white-space: nowrap;
 }
@@ -122,7 +122,7 @@
 .review-panel-glass {
     background: var(--bg-panel);
     border: 1px solid var(--border-color);
-    border-radius: 20px;
+    border-radius: var(--radius-2xl);
     padding: 24px;
     backdrop-filter: blur(16px);
     -webkit-backdrop-filter: blur(16px);
@@ -139,7 +139,7 @@
 }
 
 .review-title {
-    font-size: 18px;
+    font-size: var(--fs-xl);
     font-weight: 700;
     color: var(--text-primary);
     margin: 0;
@@ -151,15 +151,15 @@
     background: var(--primary-glow);
     color: var(--primary);
     border: 1px solid var(--primary);
-    border-radius: 16px;
-    font-size: 12px;
+    border-radius: var(--radius-xl);
+    font-size: var(--fs-sm);
     font-weight: 600;
 }
 
 /* --- Image Previews --- */
 .review-image-wrapper {
     position: relative;
-    border-radius: 12px;
+    border-radius: var(--radius-lg);
     overflow: hidden;
     border: 1px solid var(--border-color);
     background: var(--bg-card);
@@ -199,10 +199,10 @@
     background: rgba(0, 0, 0, 0.78);
     color: var(--neon-cyan, var(--primary, #00f5d4));
     border: 1px solid rgba(0, 245, 212, 0.4);
-    font-size: 11px;
+    font-size: var(--fs-xs);
     font-weight: 600;
     padding: 3px 8px;
-    border-radius: 6px;
+    border-radius: var(--radius-sm);
     backdrop-filter: blur(4px);
     pointer-events: none;
     transition: opacity 0.18s ease;
@@ -222,7 +222,7 @@
 }
 
 .stepped-batch-frame-title {
-    font-size: 12px;
+    font-size: var(--fs-sm);
     font-weight: 600;
     color: var(--text-secondary);
     margin-bottom: 8px;
@@ -258,7 +258,7 @@
     position: relative;
     width: 100%;
     aspect-ratio: 9/16;
-    border-radius: 6px;
+    border-radius: var(--radius-sm);
     overflow: hidden;
     border: 1px solid var(--border-color);
     background: #000;
@@ -283,7 +283,7 @@
     right: 4px;
     background: rgba(0, 0, 0, 0.8);
     color: #fff;
-    font-size: 10px;
+    font-size: var(--fs-2xs);
     padding: 2px 4px;
     border-radius: 3px;
     opacity: 0;
@@ -295,7 +295,7 @@
 }
 
 .stepped-frame-seq-name {
-    font-size: 10.5px;
+    font-size: var(--fs-xs);
     font-weight: 700;
     color: var(--text-muted);
     font-family: var(--font-mono, monospace);
@@ -325,10 +325,10 @@
     display: inline-flex;
     align-items: center;
     gap: 6px;
-    font-size: 12px;
+    font-size: var(--fs-sm);
     font-weight: 700;
     padding: 4px 10px;
-    border-radius: 6px;
+    border-radius: var(--radius-sm);
     width: fit-content;
 }
 
@@ -364,7 +364,7 @@
     padding: 6px;
     background: rgba(255, 255, 255, 0.03);
     border: 1px solid var(--border-color);
-    border-radius: 8px;
+    border-radius: var(--radius-md);
     transition: all 0.18s ease;
 }
 
@@ -386,7 +386,7 @@
     position: relative;
     width: 100%;
     aspect-ratio: 9/16;
-    border-radius: 4px;
+    border-radius: var(--radius-xs);
     overflow: hidden;
     border: 1px solid var(--border-color);
     background: #000;
@@ -411,7 +411,7 @@
     position: absolute;
     top: 2px;
     left: 2px;
-    font-size: 8.5px;
+    font-size: var(--fs-2xs);
     font-weight: 800;
     padding: 1px 3px;
     border-radius: 2px;
@@ -432,7 +432,7 @@
     display: flex;
     justify-content: space-between;
     align-items: center;
-    font-size: 10px;
+    font-size: var(--fs-2xs);
     font-family: var(--font-mono, monospace);
     color: var(--text-muted);
 }
@@ -444,7 +444,7 @@
 
 .stepped-paired-meta .diff-hint {
     color: var(--neon-cyan, #00f5d4);
-    font-size: 9px;
+    font-size: var(--fs-2xs);
 }
 
 .stepped-toolbar-actions {
@@ -463,10 +463,10 @@
     background: rgba(255, 255, 255, 0.06);
     border: 1px solid rgba(255, 255, 255, 0.15);
     color: #e2e8f0;
-    font-size: 12px;
+    font-size: var(--fs-sm);
     font-weight: 600;
     padding: 6px 12px;
-    border-radius: 6px;
+    border-radius: var(--radius-sm);
     cursor: pointer;
     transition: all 0.15s ease;
 }
@@ -498,8 +498,8 @@
     align-items: center;
     gap: 8px;
     padding: 12px 24px;
-    border-radius: 12px;
-    font-size: 14px;
+    border-radius: var(--radius-lg);
+    font-size: var(--fs-base);
     font-weight: 600;
     cursor: pointer;
     transition: all var(--transition-fast);
@@ -645,7 +645,7 @@
     background: rgba(0, 0, 0, 0.85);
     backdrop-filter: blur(16px);
     -webkit-backdrop-filter: blur(16px);
-    z-index: 1200;
+    z-index: var(--z-modal-nested);
     align-items: center;
     justify-content: center;
     padding: 24px;
@@ -659,7 +659,7 @@
 .stepped-triptych-content {
     background: var(--bg-panel-solid, #18181b);
     border: 1px solid var(--border-color, rgba(255, 255, 255, 0.15));
-    border-radius: 20px;
+    border-radius: var(--radius-2xl);
     width: 100%;
     max-width: 1280px;
     max-height: 94vh;
@@ -687,7 +687,7 @@
 
 .triptych-title-group h3 {
     margin: 0;
-    font-size: 17px;
+    font-size: var(--fs-lg);
     font-weight: 700;
     color: #fff;
 }
@@ -710,7 +710,7 @@
 .triptych-col-card {
     background: rgba(255, 255, 255, 0.03);
     border: 1px solid var(--border-color, rgba(255, 255, 255, 0.08));
-    border-radius: 14px;
+    border-radius: var(--radius-xl);
     overflow: hidden;
     display: flex;
     flex-direction: column;
@@ -732,10 +732,10 @@
 }
 
 .triptych-badge {
-    font-size: 11px;
+    font-size: var(--fs-xs);
     font-weight: 700;
     padding: 2px 8px;
-    border-radius: 6px;
+    border-radius: var(--radius-sm);
     text-transform: uppercase;
 }
 
@@ -781,7 +781,7 @@
     justify-content: center;
     height: 100%;
     color: var(--text-muted, #71717a);
-    font-size: 13px;
+    font-size: var(--fs-md);
     gap: 8px;
     padding: 20px;
     text-align: center;
@@ -789,7 +789,7 @@
 
 .triptych-col-meta {
     padding: 10px 14px;
-    font-size: 12px;
+    font-size: var(--fs-sm);
     color: var(--text-secondary, #a1a1aa);
     line-height: 1.4;
     border-top: 1px solid rgba(255, 255, 255, 0.05);
@@ -798,7 +798,7 @@
 .triptych-checklist-panel {
     background: rgba(255, 255, 255, 0.02);
     border: 1px solid rgba(255, 255, 255, 0.08);
-    border-radius: 12px;
+    border-radius: var(--radius-lg);
     padding: 14px 18px;
     display: flex;
     flex-direction: column;
@@ -806,7 +806,7 @@
 }
 
 .triptych-checklist-title {
-    font-size: 13px;
+    font-size: var(--fs-md);
     font-weight: 700;
     color: #e4e4e7;
     margin-bottom: 4px;
@@ -819,7 +819,7 @@
 }
 
 .triptych-check-item {
-    font-size: 12px;
+    font-size: var(--fs-sm);
     color: var(--text-secondary, #a1a1aa);
     line-height: 1.4;
     display: flex;
@@ -834,7 +834,7 @@
     padding: 12px 18px;
     background: rgba(255, 255, 255, 0.03);
     border: 1px solid rgba(255, 255, 255, 0.08);
-    border-radius: 12px;
+    border-radius: var(--radius-lg);
     gap: 12px;
     flex-wrap: wrap;
 }
@@ -847,9 +847,9 @@
 }
 
 .remediation-btn {
-    font-size: 12px;
+    font-size: var(--fs-sm);
     padding: 6px 12px;
-    border-radius: 8px;
+    border-radius: var(--radius-md);
     background: rgba(255, 255, 255, 0.05);
     border: 1px solid rgba(255, 255, 255, 0.12);
     color: #e4e4e7;
@@ -876,7 +876,7 @@
     background: rgba(0, 0, 0, 0.2);
 }
 
-@media (max-width: 900px) {
+@media (max-width: 1024px) {
     .triptych-grid {
         grid-template-columns: 1fr;
     }

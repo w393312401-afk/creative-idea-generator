@@ -84,6 +84,14 @@ def test_selector_probe_does_not_fail_idle_page_for_dialog_only_controls():
     assert probe['summary']['missing'] == 0
 
 
+def test_add_media_family_does_not_fall_back_to_config_button():
+    """页面没有上传入口时，add_media_btn 必须报 missing，不能误中底部配置按钮
+    （同为 aria-haspopup='dialog'）——误中会让上传流程去点模型/比例面板。"""
+    probe = probe_selectors(FakePage(flow_page_html(add_media_button=False)))
+    add_media = next(row for row in probe['families'] if row['family'] == 'add_media_btn')
+    assert add_media['state'] == 'missing'
+
+
 def test_probed_families_are_all_consumed_by_production_code():
     """探针只该探生产代码真读的族。
 
@@ -208,7 +216,7 @@ def test_account_pool_retries_rate_limited_pages(monkeypatch):
     assert len(rows) == 3, '限频是瞬时状态，退避重试后应拿到完整结果'
 
 
-def test_get_ads_ws_url_fails_fast_on_dead_debug_port(monkeypatch):
+def test_get_ads_ws_url_fails_fast_on_dead_debug_port(monkeypatch, ads_inventory_reader):
     """AdsPower 说"启动成功"但调试端口没起来：必须报错，不能返回一个连不上的 ws。"""
     from integrations.google_fx.utils import browser
     monkeypatch.setattr(browser.time, 'sleep', lambda _s: None)

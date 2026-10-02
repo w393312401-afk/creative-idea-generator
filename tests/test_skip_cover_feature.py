@@ -31,16 +31,16 @@ def test_media_renderer_supports_none_role():
     assert "不使用（纯文生图）" in js
 
 
-def test_index_html_settings_pop_default_open():
+def test_index_html_settings_pop_default_collapsed():
     html_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'index.html')
     with open(html_path, 'r', encoding='utf-8') as f:
         html = f.read()
-    # 确保设置弹层默认展开（不带 hidden 属性），且按钮带有 active 样式
-    assert '<div class="section-pop" id="frames-settings-pop">' in html
-    assert 'data-pop="frames-settings-pop"' in html
-    assert 'class="section-tool-btn active" data-pop="frames-settings-pop"' in html
-    assert '<div class="section-pop" id="videos-settings-pop">' in html
-    assert 'class="section-tool-btn active" data-pop="videos-settings-pop"' in html
+    # 设置弹层默认折叠（带 hidden），按钮通过 aria-expanded/aria-controls 声明展开状态；
+    # initSectionPops() 按 pop.hidden 同步 active 与 aria-expanded。
+    for pop in ('frames-settings-pop', 'videos-settings-pop'):
+        assert f'<div class="section-pop" id="{pop}" hidden>' in html
+        assert (f'class="section-tool-btn section-settings-btn" data-pop="{pop}" '
+                f'aria-expanded="false" aria-controls="{pop}"') in html
 
 
 def test_http_url_cover_candidate_path(tmp_path, monkeypatch):

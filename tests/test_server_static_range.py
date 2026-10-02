@@ -68,6 +68,19 @@ def _make_handler(path, headers=None, is_head=False):
     return h, sent_status, sent_headers, h.wfile
 
 
+@pytest.mark.parametrize('path', [
+    '/outputs/project/.pipeline_state.json',
+    '/outputs/project/%2eframe_facts_cache.json',
+    '/outputs/project/.internal/state.json',
+])
+@pytest.mark.parametrize('method', ['GET', 'HEAD'])
+def test_hidden_output_state_is_not_served(path, method):
+    h, status, _, wfile = _make_handler(path, is_head=method == 'HEAD')
+    getattr(h, 'do_' + method)()
+    assert status[0] == 404
+    assert wfile.getvalue() == b''
+
+
 @pytest.fixture
 def sample_video_file(tmp_path, monkeypatch):
     """创建一个 1000 字节的假 MP4 文件，并打桩 translate_path。"""

@@ -47,7 +47,7 @@ const slotCardJs = fs.readFileSync(path.join(__dirname, '..', 'js', 'slot_card.j
 assert.ok(slotModelJs.includes('hasBenchmarkRef'), 'slot_model.js must detect hasBenchmarkRef');
 assert.ok(slotModelJs.includes('compare-benchmark'), 'slot_model.js must include compare-benchmark action');
 assert.ok(slotCardJs.includes('\'compare-benchmark\':'), 'slot_card.js must handle compare-benchmark click');
-assert.ok(slotCardJs.includes('爆款原片基准抽帧'), 'slot_card.js openSlotLightbox must pair benchmark reference frames');
+assert.ok(slotCardJs.includes('参考原片基准抽帧'), 'slot_card.js openSlotLightbox must pair benchmark reference frames');
 
 // 7. Check app.js & media_renderer.js
 const appJs = fs.readFileSync(path.join(__dirname, '..', 'app.js'), 'utf8');

@@ -16,7 +16,6 @@ nested_space_payoff 写死两次，而反推层压根不产出空间信息。
 import unittest
 
 import prompt_pipeline as pp
-from prompt_pipeline import reverse
 from frame_continuity import family_map
 
 
@@ -28,67 +27,8 @@ def _plan(*spaces):
     return [{'text': f'entry {i}', 'space': s} for i, s in enumerate(spaces, 1)]
 
 
-class TestObservedSpacesFromTheReferenceFilm(unittest.TestCase):
-    """Pass B 逐拍写下的 space → 一条可数的序列。"""
-
-    def test_a_changed_label_is_a_crossing_and_there_is_no_cap_on_how_many(self):
-        doc = _beats('wooded slope', 'wooded slope', 'entrance tunnel',
-                     'main room', 'main room', 'sleeping alcove')
-        labels = reverse.normalize_beat_spaces(doc)
-        self.assertEqual(reverse.space_crossings(labels), [3, 4, 6])
-
-    def test_a_missing_label_inherits_the_previous_beat_instead_of_opening_a_new_space(self):
-        """漏写是最常见的失误。按「未知即新空间」处理会插进一串根本不存在的过门。"""
-        doc = {'beats': [{'space': 'main room'}, {}, {'space': ''}, {'space': 'alcove'}]}
-        self.assertEqual(reverse.normalize_beat_spaces(doc),
-                         ['main room', 'main room', 'main room', 'alcove'])
-        self.assertEqual(reverse.space_crossings(reverse.space_sequence(doc)), [4])
-
-    def test_a_legacy_document_without_the_field_stays_a_single_space(self):
-        """2026-08-14 之前跑的存量 beats 没有这个字段，行为必须逐字不变。"""
-        doc = {'beats': [{'id': 'B01'}, {'id': 'B02'}]}
-        self.assertEqual(reverse.space_crossings(reverse.space_sequence(doc)), [])
-
-    def test_case_and_spacing_do_not_split_one_space_into_two(self):
-        doc = _beats('Main Room', 'main  room', 'main room.')
-        self.assertEqual(reverse.space_crossings(reverse.normalize_beat_spaces(doc)), [])
-
-    def test_the_sequence_reaches_the_composer_through_beats_to_dimensions(self):
-        doc = _beats('slope', 'tunnel', 'tunnel')
-        for beat in doc['beats']:
-            beat.update({'visible_action': 'work', 'visible_result': 'done'})
-        dimensions = reverse.beats_to_dimensions(doc, {})
-        self.assertEqual(dimensions['space_sequence'], ['slope', 'tunnel', 'tunnel'])
-        self.assertEqual(dimensions['space_crossings'], [2])
-        self.assertEqual([e.get('space') for e in dimensions['beat_outline']],
-                         ['slope', 'tunnel', 'tunnel'])
 
 
-class TestAVariantKeepsTheSpaceSkeleton(unittest.TestCase):
-    """二创换的是名字，不是「进几次门」——那是被复用的节奏骨架的一部分。"""
-
-    SOURCE = {'beats': [{'id': 'B01', 'space': 'wooded slope'},
-                        {'id': 'B02', 'space': 'main room'},
-                        {'id': 'B03', 'space': 'sleeping alcove'}]}
-
-    def test_renaming_each_space_for_the_new_carrier_is_fine(self):
-        variant = {'beats': [{'id': 'B01', 'space': 'snowfield'},
-                             {'id': 'B02', 'space': 'bus saloon'},
-                             {'id': 'B03', 'space': 'rear bunk'}]}
-        self.assertEqual(reverse._validate_space_grouping(self.SOURCE, variant), [])
-
-    def test_collapsing_two_spaces_into_one_is_an_error(self):
-        variant = {'beats': [{'id': 'B01', 'space': 'snowfield'},
-                             {'id': 'B02', 'space': 'bus saloon'},
-                             {'id': 'B03', 'space': 'bus saloon'}]}
-        errors = reverse._validate_space_grouping(self.SOURCE, variant)
-        self.assertEqual([e['code'] for e in errors], ['space_grouping_changed'])
-        self.assertEqual(errors[0]['level'], 'error')
-        self.assertEqual(errors[0]['beat_id'], 'B03')
-
-    def test_a_legacy_source_without_labels_is_not_second_guessed(self):
-        plain = {'beats': [{'id': 'B01'}, {'id': 'B02'}]}
-        self.assertEqual(reverse._validate_space_grouping(plain, plain), [])
 
 
 class TestThePlannerIsToldWhereTheCrossingsAre(unittest.TestCase):

@@ -112,6 +112,8 @@ class TestModeEndpointReportsSkillContract:
     def _mode_payload(self, monkeypatch):
         import server
 
+        monkeypatch.setattr(server, 'get_image_gateway_model_catalog',
+                            lambda: {'status': 'unknown', 'models': [], 'message': 'offline test'})
         sent = []
         h = object.__new__(server.SparkRequestHandler)
         monkeypatch.setattr(server.SparkRequestHandler, '_send_json',

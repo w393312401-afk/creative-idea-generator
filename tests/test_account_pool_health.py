@@ -29,11 +29,14 @@ class TestAccountPoolHealthAndAutoPilot(unittest.TestCase):
         self.tmp_dir = tempfile.mkdtemp()
         self.patcher = patch.object(account_pool, '_STATE_FILE', Path(self.tmp_dir) / 'runtime' / 'account_pool.json')
         self.patcher.start()
+        self.profile_patcher = patch.object(AccountPool, '_profile_info_map', return_value={})
+        self.profile_patcher.start()
         self.pool = AccountPool()
 
     def tearDown(self):
         self.pool.stop_silent_inspector()
         self.patcher.stop()
+        self.profile_patcher.stop()
         shutil.rmtree(self.tmp_dir, ignore_errors=True)
 
     def test_calculate_account_health_score_rules(self):
@@ -90,7 +93,10 @@ class TestAccountPoolHealthAndAutoPilot(unittest.TestCase):
         # 预扣超出余额 -> 0 不变负数
         res3 = self.pool.optimistic_deduct_credit("user_opt", amount=200)
         self.assertEqual(res3["credit"], 0)
-        self.assertTrue(res3["disabled"])  # 积分低于 15 自动触发禁用同步
+        self.assertFalse(res3["disabled"])
+        self.assertEqual(res3["credit_source"], "estimated")
+        self.assertFalse(account_pool._read_state()["user_opt"]["disabled"])
+        self.assertTrue(account_pool._credit_is_stale(res3))
 
     def test_health_score_in_list_accounts(self):
         self.pool.add_account("user_h1", name="H1")

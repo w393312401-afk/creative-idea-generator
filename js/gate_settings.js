@@ -38,6 +38,43 @@ let gateSettingsSearchQuery = '';
 let gateSettingsActiveFilter = 'all';
 let gateSettingsToolbarBound = false;
 
+function gateReviewsDisabled() {
+    if (typeof config === 'object' && config && typeof config.reviewsDisabled === 'boolean') {
+        return config.reviewsDisabled;
+    }
+    const specs = window.GATE_SETTINGS_SPEC;
+    const master = Array.isArray(specs) && specs.find(spec => spec.key === 'reviewsDisabled');
+    return !!master && gateSettingCurrentValue(master) === true;
+}
+
+function renderGateReviewsMaster() {
+    const input = document.getElementById('gate-setting-reviewsDisabled');
+    const card = document.getElementById('gate-reviews-master');
+    const status = document.getElementById('gate-reviews-status');
+    if (!input) return;
+
+    const specs = window.GATE_SETTINGS_SPEC;
+    const master = Array.isArray(specs) && specs.find(spec => spec.key === 'reviewsDisabled');
+    const disabled = gateReviewsDisabled();
+    input.disabled = !master;
+    input.checked = disabled;
+    if (card) card.classList.toggle('is-active', disabled);
+    if (status) status.textContent = !master
+        ? '暂未读取到总开关配置，请刷新页面或重启后端服务。'
+        : disabled ? '全部审查已关闭 · 单项设置已保留'
+            : '按下方单项设置执行审查';
+
+    if (input.dataset.bound !== 'true') {
+        input.addEventListener('change', () => {
+            if (input.disabled || typeof config !== 'object' || !config) return;
+            config.reviewsDisabled = input.checked;
+            if (typeof autoSaveConfig === 'function') autoSaveConfig();
+            renderGateSettingsPanel();
+        });
+        input.dataset.bound = 'true';
+    }
+}
+
 const GATE_SECTION_META = {
     prompt: {
         title: '阶段 1 · 提示词生成与状态契约门禁',
@@ -81,6 +118,8 @@ const GATE_KEY_META = {
 function gateSettingControl(spec, current) {
     const wrap = document.createElement('div');
     wrap.className = 'gate-setting-card';
+    const paused = gateReviewsDisabled();
+    wrap.classList.toggle('is-disabled', paused);
     wrap.dataset.gateKey = spec.key;
     wrap.dataset.section = spec.section || 'env';
 
@@ -139,6 +178,8 @@ function gateSettingControl(spec, current) {
         input.value = String(current);
     }
     input.id = `gate-setting-${spec.key}`;
+    input.disabled = paused;
+    if (paused) input.setAttribute('aria-describedby', 'gate-reviews-status');
     controlWrap.appendChild(input);
     headerRow.appendChild(controlWrap);
     wrap.appendChild(headerRow);
@@ -159,6 +200,7 @@ function gateSettingControl(spec, current) {
     }
 
     input.addEventListener('change', () => {
+        if (input.disabled) return;
         applyGateSettingFromControl(spec, input);
         if (typeof autoSaveConfig === 'function') autoSaveConfig();
     });
@@ -227,6 +269,7 @@ function renderGateSettingsPanel() {
     const host = document.getElementById('gate-settings-list');
     if (!host) return;
     _initGateSettingsToolbar();
+    renderGateReviewsMaster();
 
     host.textContent = '';
     const specs = window.GATE_SETTINGS_SPEC;
@@ -242,6 +285,7 @@ function renderGateSettingsPanel() {
 
     const bySection = new Map();
     for (const spec of specs) {
+        if (spec.key === 'reviewsDisabled') continue;
         const section = spec.section || 'env';
         if (!bySection.has(section)) bySection.set(section, []);
         bySection.get(section).push(spec);
@@ -392,6 +436,6 @@ if (typeof module !== 'undefined' && module.exports) {
     module.exports = {
         gateSettingCurrentValue, gateSettingServerValue,
         applyGateSettingFromControl, renderGateSettingsPanel, resetGateSettings,
-        openSettingsToGate,
+        openSettingsToGate, gateReviewsDisabled,
     };
 }

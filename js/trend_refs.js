@@ -3,11 +3,7 @@
 // 负责列表渲染、多选勾选、删除与「搜一批新参考」（强制绕过 6 小时缓存重搜入库）。
 // 选中集合存 localStorage，由 getSelectedTrendRefIds() 取走。
 //
-// 当前唯一的消费方是「爆款复刻」面板的 🌐 联网参考案例库抽屉
-// （js/replica_pipeline.js replicaRenderTrendRefsDrawer），选中的案例作为 AI 正交
-// 发散的首要参考。原来的另一个消费方是「激发维度」页的灵感卡（走 /api/ideate 的
-// trend_ref_ids），那一页与整条卡片链路已于 2026-08-19 移除。
-// 本模块**不随那一页下线**——摘掉 index.html 里的 <script> 会让复刻侧的抽屉静默失效。
+// 项目工具栏打开管理弹窗，搜索方向与参考网址沿用配置中心。
 //
 // 全部文本用 textContent 渲染（LLM/网页产出不走 innerHTML，防注入）。
 
@@ -30,16 +26,11 @@ function refFilterMatches(ref, q) {
 
 function updateTrendRefsSelectedNote() {
     const notePrimary = document.getElementById('trend-refs-selected-note');
-    const noteReplica = document.getElementById('replica-trend-refs-selected-note');
     const n = getSelectedTrendRefIds().length;
     const textPrimary = n > 0
-        ? `已选 ${n} 条（本批优先用你选的）`
-        : '未勾选：本批将自动从案例库加权随机挑 1 条';
-    const textReplica = n > 0
-        ? `已选 ${n} 条（发散优先参考）`
-        : '未勾选：发散自动取材';
+        ? `已选 ${n} 条参考`
+        : '尚未勾选参考';
     if (notePrimary) notePrimary.textContent = textPrimary;
-    if (noteReplica) noteReplica.textContent = textReplica;
     // 这行同时是取材抽屉折叠态的摘要；勾选变化要让激发轨的 ① 芯片跟着变
     if (typeof updateSparkRail === 'function') updateSparkRail();
 }
@@ -59,8 +50,7 @@ function saveSelectedTrendRefIds(ids) {
 
 async function loadTrendRefs() {
     const primaryList = document.getElementById('trend-refs-list');
-    const replicaList = document.getElementById('replica-trend-refs-list');
-    if (!primaryList && !replicaList) return;
+    if (!primaryList && !document.getElementById('trend-refs-manage-modal')) return false;
     try {
         const resp = await fetch('/api/trend-refs');
         const data = await resp.json();
@@ -72,8 +62,10 @@ async function loadTrendRefs() {
             saveSelectedTrendRefIds(getSelectedTrendRefIds().filter(id => known.has(id)));
             renderTrendRefs();
             updateCapNote(data.cap, data.archived_count);
+            if (isTrendRefsManageModalOpen()) renderTrendRefsManageList();
+            return true;
         } else {
-            [primaryList, replicaList].forEach(list => {
+            [primaryList, document.getElementById('trend-refs-manage-list')].forEach(list => {
                 if (!list) return;
                 list.textContent = '';
                 const err = document.createElement('div');
@@ -84,7 +76,7 @@ async function loadTrendRefs() {
         }
     } catch (e) {
         console.error('Failed to load trend refs:', e);
-        [primaryList, replicaList].forEach(list => {
+        [primaryList, document.getElementById('trend-refs-manage-list')].forEach(list => {
             if (!list) return;
             list.textContent = '';
             const err = document.createElement('div');
@@ -93,20 +85,16 @@ async function loadTrendRefs() {
             list.appendChild(err);
         });
     }
+    return false;
 }
 
-// 挂载即取数：loadTrendRefs 只在「列表已经在 DOM 里」时才干活，而爆款复刻面板的
-// 抽屉是 js/replica_pipeline.js 后渲染进 #replica-root 的——DOMContentLoaded 那一刻
-// 两个列表都还不存在，那次调用会直接 return，缓存永远是空的。
-// 「激发维度」页还在时这个坑被盖住了：那一页的 #trend-refs-list 写在 index.html 里，
-// 启动时就在，顺手把缓存填满，复刻抽屉再渲染时正好有数据可用。那一页下线后，
-// 取数就没人负责了。所以让复刻侧自己认领：首次挂载拉一次，之后只重渲染。
+// 管理弹窗首次打开时加载主库；后续打开沿用缓存。
 async function ensureTrendRefsLoaded() {
     if (trendRefsLoaded) {
         renderTrendRefs();
-        return;
+        return true;
     }
-    await loadTrendRefs();
+    return await loadTrendRefs();
 }
 
 // 软上限徽标："N / 60 条 · 已归档 M 条"，超上限的老旧未用参考会自动挪进归档
@@ -115,14 +103,12 @@ function updateCapNote(cap, archivedCount) {
     if (typeof cap === 'number') trendRefsCapValue = cap;
     const capText = trendRefsCapValue ? `${trendRefsCache.length} / ${trendRefsCapValue} 条` : `${trendRefsCache.length} 条`;
     const notePrimary = document.getElementById('trend-refs-cap-note');
-    const noteReplica = document.getElementById('replica-trend-refs-cap-note');
     if (notePrimary) notePrimary.textContent = capText;
-    if (noteReplica) noteReplica.textContent = capText;
 
     // archivedCount 省略时只刷新计数(如手动删除后),不改动归档入口的显隐状态
     if (typeof archivedCount === 'undefined') return;
     const has = typeof archivedCount === 'number' && archivedCount > 0;
-    ['trend-refs-archive-toggle', 'replica-trend-refs-archive-toggle'].forEach(id => {
+    ['trend-refs-archive-toggle'].forEach(id => {
         const toggle = document.getElementById(id);
         if (toggle) {
             toggle.hidden = !has;
@@ -130,7 +116,7 @@ function updateCapNote(cap, archivedCount) {
         }
     });
     if (!has) {
-        ['trend-refs-archive-list', 'replica-trend-refs-archive-list'].forEach(id => {
+        ['trend-refs-archive-list'].forEach(id => {
             const archiveList = document.getElementById(id);
             if (archiveList) archiveList.hidden = true;
         });
@@ -187,7 +173,6 @@ async function toggleArchivePanel(targetPrefix = '') {
 function renderArchiveRefs() {
     const lists = [
         document.getElementById('trend-refs-archive-list'),
-        document.getElementById('replica-trend-refs-archive-list'),
     ].filter(Boolean);
     if (!lists.length) return;
 
@@ -438,15 +423,12 @@ async function deleteTrendRef(id, btn) {
 
 function renderTrendRefs() {
     const primaryList = document.getElementById('trend-refs-list');
-    const replicaList = document.getElementById('replica-trend-refs-list');
-    if (!primaryList && !replicaList) return;
+    if (!primaryList) return;
 
     updateTrendRefsSelectedNote();
 
     const primaryFilter = document.getElementById('trend-refs-filter');
-    const replicaFilter = document.getElementById('replica-trend-refs-filter');
     if (primaryFilter) primaryFilter.hidden = trendRefsCache.length === 0;
-    if (replicaFilter) replicaFilter.hidden = trendRefsCache.length === 0;
 
     // 空库时把取材抽屉摊开一次当引导（见 js/spark_rail.js）
     if (typeof maybeGuideEmptyRefLibrary === 'function') {
@@ -548,14 +530,11 @@ function renderTrendRefs() {
     };
 
     renderList(primaryList, trendRefsFilterQuery);
-    const replicaFilterVal = replicaFilter ? replicaFilter.value : trendRefsFilterQuery;
-    renderList(replicaList, replicaFilterVal);
 }
 
 async function searchNewTrendRefs() {
     const btns = [
         document.getElementById('trend-refs-search-btn'),
-        document.getElementById('replica-trend-refs-search-btn'),
     ].filter(Boolean);
 
     if (btns.some(b => b.disabled)) return;
@@ -577,19 +556,20 @@ async function searchNewTrendRefs() {
             trendRefsCache = data.refs;
             const batch = Array.isArray(data.added) ? data.added : [];
             const newCount = batch.filter(id => !prevIds.has(id)).length;
-            // 自动勾选本批搜到的参考（含与旧条目重复命中的），方便直接开下一批灵感/发散
+            // 保留新搜到参考的选择状态，供通用参考库调用方读取。
             const selected = new Set(getSelectedTrendRefIds());
             batch.forEach(id => selected.add(id));
             saveSelectedTrendRefIds([...selected]);
             renderTrendRefs();
             updateCapNote(data.cap, data.archived_count);
+            if (isTrendRefsManageModalOpen()) renderTrendRefsManageList();
             trendRefsArchiveLoaded = false; // 本轮搜索可能触发了新的自动归档,下次展开面板时重新拉取
             if (batch.length === 0) {
                 showToast('本次联网搜索没有返回结果（已回退旧缓存或搜索失败），请稍后再试', 'info');
             } else if (newCount === 0) {
-                showToast('搜索完成：结果与库中已有参考相同，已为你勾选', 'info');
+                showToast('搜索完成：结果与库中已有参考相同', 'info');
             } else {
-                showToast(`搜索完成：新增 ${newCount} 条联网参考，已自动勾选`, 'success');
+                showToast(`搜索完成：新增 ${newCount} 条联网参考`, 'success');
             }
         } else {
             showToast(`搜索失败：${data.message || '未知错误'}`, 'error');
@@ -636,18 +616,18 @@ function saveIdeationDirection(query, urls) {
         config.ideationSearchQuery = query;
         config.ideationTrendUrls = urls;
     }
-    ['settings-ideation-search-query', 'trend-refs-search-query', 'replica-trend-refs-search-query'].forEach(id => {
+    ['settings-ideation-search-query', 'trend-refs-search-query'].forEach(id => {
         const el = document.getElementById(id);
         if (el && el.value !== query) el.value = query;
     });
-    ['settings-ideation-trend-urls', 'trend-refs-trend-urls', 'replica-trend-refs-trend-urls'].forEach(id => {
+    ['settings-ideation-trend-urls', 'trend-refs-trend-urls'].forEach(id => {
         const el = document.getElementById(id);
         if (el && el.value !== urls) el.value = urls;
     });
 }
 
 function initTrendRefsDirectionPanel() {
-    ['trend-refs', 'replica-trend-refs'].forEach(prefix => {
+    ['trend-refs'].forEach(prefix => {
         const toggle = document.getElementById(`${prefix}-direction-toggle`);
         const panel = document.getElementById(`${prefix}-direction-panel`);
         const queryInput = document.getElementById(`${prefix}-search-query`);
@@ -702,7 +682,14 @@ async function openTrendRefsManageModal() {
     if (!modal) return;
     trendRefsManageBulkSelected = new Set();
     modal.classList.add('active');
-    renderTrendRefsManageList();
+    if (!trendRefsLoaded) {
+        const list = document.getElementById('trend-refs-manage-list');
+        if (list) list.textContent = '正在载入联网参考案例库…';
+    } else {
+        renderTrendRefsManageList();
+    }
+    const loaded = await ensureTrendRefsLoaded();
+    if (!loaded) return;
     await ensureTrendRefsArchiveLoaded();
     renderTrendRefsManageList(); // 归档懒加载完成后（若还没加载过）刷新一次统计/归档列表
 }
@@ -969,7 +956,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const searchBtn = document.getElementById('trend-refs-search-btn');
     if (searchBtn) searchBtn.addEventListener('click', searchNewTrendRefs);
     const archiveToggle = document.getElementById('trend-refs-archive-toggle');
-    if (archiveToggle) archiveToggle.addEventListener('click', toggleArchivePanel);
+    if (archiveToggle) archiveToggle.addEventListener('click', () => toggleArchivePanel());
     const filterInput = document.getElementById('trend-refs-filter');
     if (filterInput) {
         filterInput.addEventListener('input', () => {
@@ -979,10 +966,9 @@ document.addEventListener('DOMContentLoaded', () => {
     }
     initTrendRefsDirectionPanel();
     initTrendRefsManageModal();
-    loadTrendRefs();
 });
 
-// 暴露全局方法给其他模块（如复刻工作台 AI 正交发散激发器）调用
+// 暴露联网参考库的通用操作。
 window.renderTrendRefs = renderTrendRefs;
 window.searchNewTrendRefs = searchNewTrendRefs;
 window.toggleArchivePanel = toggleArchivePanel;

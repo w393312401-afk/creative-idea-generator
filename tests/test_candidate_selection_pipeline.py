@@ -959,6 +959,30 @@ def test_generate_frame_candidates_api_concurrent_execution(temp_project):
     assert any("并发生成" in (d.get('message') or '') for d in gen_events)
 
 
+def test_generate_frame_candidates_camera_cut_uses_new_viewpoint_control(temp_project):
+    controls = []
+
+    def fake_make_cand(config, prompt, reference_path, out_path, is_text_only, ctrl_prompt):
+        controls.append(ctrl_prompt)
+        with open(out_path, 'wb') as out:
+            out.write(b'candidate')
+
+    with patch.object(csp, '_generate_single_api_candidate', side_effect=fake_make_cand):
+        cands = csp.generate_frame_candidates(
+            config={'imageBackend': 'api', 'candidateConcurrency': 1},
+            title=temp_project['project_name'],
+            item={'prompt': 'CAM-E southeast exterior view.', 'meta': 'CAMERA CUT'},
+            reference_path=os.path.join(temp_project['frames_dir'], 'img_001.webp'),
+            seq=2, candidate_count=1, is_camera_cut=True,
+            frames_dir=temp_project['frames_dir'])
+
+    assert len(cands) == 1
+    assert len(controls) == 1
+    assert 'DECLARED CAMERA CUT' in controls[0]
+    assert 'CROSSING REVEAL' not in controls[0]
+    assert 'camera ABSOLUTELY locked' not in controls[0]
+
+
 def test_generate_frame_candidates_api_serial_fallback(temp_project):
     """测试 candidateConcurrency=1 时走串行兜底通道。"""
     called_prompts = []

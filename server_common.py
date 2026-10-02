@@ -2,6 +2,7 @@ import os
 import sys
 import json
 import hashlib
+import ipaddress
 import socket
 import contextlib
 import shutil
@@ -9,6 +10,7 @@ import urllib.request
 import urllib.error
 import urllib.parse
 from datetime import datetime
+from pathlib import Path
 import collections
 import threading
 import time
@@ -484,11 +486,15 @@ def http_access_logging():
 #     等阈值常量——每一个都挂着实测标定数据（见各自定义处的注释）。改成 25 不会
 #     报错，只会让串片静默通过。要给用户的是**档位**（内部映射一组标定过的阈值），
 #     不是裸数字。
-#   · detect_frozen_clip / detect_pace_break 的本地判据开关——纯本地、确定性、零
-#     成本、最高只到 warn 永不 reject。2026-07-31 复盘已经踩过一次：给它加开关的
-#     结果是把免费的客观测量一起关掉了（见 video_generator._VIDEO_PROCESS_GATE_DISABLED
-#     上方注释）。用户反对的是 VLM 误判删片，不是反对知情。
+# 本地冻结/节奏/惯性检测不另设单项开关；reviewsDisabled 总开关会一起跳过。
 GATE_SETTINGS = (
+    {
+        'key': 'reviewsDisabled', 'type': 'bool', 'default': False,
+        'env': 'SPARK_REVIEWS_DISABLED',
+        'section': 'env', 'label': '一键关闭所有审查',
+        'hint': '开启后跳过全部质量审查、提示词优化、自动重试和本地告警检查。'
+                '各单项设置会保留，关闭总开关后恢复原设置。',
+    },
     {
         'key': 'qaGateLevel', 'type': 'enum', 'default': 'standard',
         'env': 'SPARK_QA_GATE_LEVEL',
@@ -583,7 +589,7 @@ GATE_SETTINGS = (
         'key': 'autoSplitHighRiskBeats', 'type': 'bool', 'default': False,
         'section': 'prompt', 'label': '高风险拍自动拆分',
         'hint': '跨度过大的拍在提示词交付前自动插入一张正式锚点拍拆成两拍。'
-                '一比一复刻模式下永远跳过（会破坏「拍数=清单条数」不变式）。',
+                '严格清单模式下永远跳过（保持「拍数=清单条数」）。',
     },
     {
         'key': 'strictGates', 'type': 'bool', 'default': False,
@@ -626,8 +632,8 @@ def _coerce_gate_value(spec, raw):
     return raw
 
 
-def gate_setting(key, config=None):
-    """门禁配置的唯一读取入口。
+def _configured_gate_setting(key, config=None):
+    """读取用户保存的单项偏好，不应用全部审查总开关。
 
     优先级统一为：请求 config > server_config.json > 环境变量 > 表里的 default。
     请求 config 优先是因为一次生成任务要能临时放宽/收紧而不改服务端配置；环境
@@ -648,6 +654,24 @@ def gate_setting(key, config=None):
     return spec['default']
 
 
+def reviews_disabled(config=None):
+    """是否显式跳过全部审查；请求值优先，支持服务端与环境变量兜底。"""
+    return bool(_configured_gate_setting('reviewsDisabled', config))
+
+
+def gate_setting(key, config=None):
+    """读取运行时门禁值，总开关优先于所有单项设置但不改写保存的偏好。"""
+    value = _configured_gate_setting(key, config)
+    if key == 'reviewsDisabled' or not reviews_disabled(config):
+        return value
+    kind = _GATE_BY_KEY[key]['type']
+    if kind == 'bool':
+        return False
+    if kind == 'enum':
+        return 'off'
+    return 0
+
+
 def gate_settings_report():
     """/api/mode 下发用：表结构 + 当前服务端生效值。前端据此渲染开关面板，
     不必在 JS 里再抄一份默认值/选项列表（那正是白名单漂移的老路）。"""
@@ -656,8 +680,9 @@ def gate_settings_report():
         item = {k: v for k, v in spec.items() if k != 'env'}
         if 'options' in item:
             item['options'] = list(item['options'])
-        # server_value：不带请求 config 时的生效值，即前端没存过本项时的实际行为
-        item['server_value'] = gate_setting(spec['key'])
+        # 下发保存的偏好；总开关暂时关闭审查时不能把所有单项都写成 off，
+        # 否则用户再关掉总开关后无法恢复原来的设置。
+        item['server_value'] = _configured_gate_setting(spec['key'])
         item['server_pinned'] = SERVER_CONFIG.get(spec['key']) is not None
         items.append(item)
     return items
@@ -740,6 +765,19 @@ IMG2IMG_CONTROL_PROMPT = (
     "letters, numbers, percentages, captions, text, watermarks, extra people, or active "
     "machinery. Return one clean edited image only."
 )
+IMG2IMG_CAMERA_CUT_CONTROL_PROMPT = (
+    "IMAGE EDITING MODE (DECLARED CAMERA CUT — SAME WORLD, NEW VIEWPOINT). "
+    "The attached previous frame is the authoritative reference for the same physical site, "
+    "its completed construction state, materials, scale, daylight, and permanent landmarks. "
+    "The target IMAGE prompt declares a new camera position and framing; follow that viewpoint "
+    "instead of copying the previous frame's camera position, crop, horizon, or perspective. "
+    "Preserve the building's topology, compass relationships, dimensions, openings, and every "
+    "already completed element that remains visible from the new viewpoint. Execute only the "
+    "construction change declared by the target IMAGE prompt; do not regress completed work or "
+    "invent new rooms, doors, windows, or supports. Keep the same photographic style and material "
+    "finish. This is a camera cut within one continuous project, not a doorway crossing or an "
+    "unrelated scene. Return one clean image without captions, labels, text, or watermarks."
+)
 IMG2IMG_CROSSING_REVEAL_CONTROL_PROMPT = (
     "IMAGE EDITING MODE (CROSSING REVEAL — WEAK COMPOSITIONAL REFERENCE). The attached previous "
     "frame is the exterior shot taken immediately before the camera crossed the threshold, and its "
@@ -773,13 +811,14 @@ _BASE_CONTRACT_FILES = (
     'references/drift-lock-assembly-guide.md',
     'references/threshold-bridge-consistency-protocol.md',
 )
-# omni 包自己的 SKILL.md §Required Reference Loading 声明了 7 个"每次必读" + 4 个
+# omni 包自己的 SKILL.md §Required Reference Loading 声明了 8 个"每次必读" + 4 个
 # "按需读"，全都算契约：按需的那几个（过门、样例梯、Tier 0 的形态矩阵与台账）缺失
 # 同样是无声降级，只是触发条件更窄。
 _OMNI_CONTRACT_FILES = (
     'SKILL.md',
     'references/omni-scene-skeleton.md',
     'references/omni-multishot-language.md',
+    'references/omni-work-first-rhythm.md',
     'references/omni-restoration-continuity.md',
     'references/omni-beat-skeleton.md',
     'references/omni-damage-vocabulary.md',
@@ -1446,8 +1485,8 @@ def stamp_manifest_capabilities(manifest, stage):
 SERVICE_START_TIME = time.time()
 
 _CORE_SOURCE_GLOBS = (
-    'server.py', 'server_common.py', 'replica_pipeline.py', 'frame_generator.py', 'frame_continuity.py',
-    'pipeline_orchestrator.py', 'video_generator.py',
+    'server.py', 'server_common.py', 'frame_generator.py', 'frame_continuity.py',
+    'pipeline_orchestrator.py', 'video_generator.py', 'video_operations.py', 'project_archive.py',
     os.path.join('prompt_pipeline', '*.py'),
     os.path.join('prompt_pipeline', 'composers', '*.py'),
     os.path.join('integrations', 'google_fx', '*.py'),
@@ -1715,25 +1754,69 @@ def sequence_account_locked(config):
     return bool(config.get('googleFxSequenceUserLock')) and bool(sequence_default_account(config))
 
 
+def _selection_account_snapshot(pool):
+    """选号只读余额状态，不为补齐环境名称额外请求 AdsPower 资料。"""
+    try:
+        return pool.list_accounts(heal=False)
+    except TypeError:
+        return pool.list_accounts()
+
+
+def _leased_by_other_tasks():
+    """别的任务此刻租着的 AdsPower 环境（并发方案）。未启用并发/未装登记簿时是空集合。"""
+    try:
+        from integrations.google_fx.utils import lease_registry
+        return lease_registry.leased_by_others()
+    except Exception:
+        return set()
+
+
+def _claim_account_for_task(user_id):
+    """让当前任务的租约占下 user_id；被别的租约占着（或同出口）返回 False。"""
+    try:
+        from integrations.google_fx.utils import lease_registry
+        return lease_registry.claim(user_id)
+    except Exception:
+        return True
+
+
 def _select_pool_account(config, pool):
     """池子非空且未手动指定账号时，自动选一个还有额度的账号写回 config；
     手动填了 googleFxUserId 单字段 = 这一次的临时覆盖，跳过自动挑选；
     池子为空（还没添加任何账号）= 完全不介入，行为与手动单选时代一致。
     返回被自动选中的 user_id（未触发自动选号则返回 None）。
 
-    优先级：手动 googleFxUserId > 序列生成默认环境（googleFxSequenceUserId，
-    仅当它此刻确实可用）> 号池自动选号。默认环境不可用时如实降级到自动选号并
+    优先级：手动 googleFxUserId > 锁定的序列默认环境 > 已打开且可用的浏览器
+    > 未锁定的序列默认环境 > 号池自动选号。默认环境不可用时如实降级到自动选号并
     打一行原因——静默换号会让用户以为序列一直跑在他钉的那个环境上。"""
     manual_override = str(config.get('googleFxUserId') or '').strip()
     if manual_override:
         return None
-    accounts = pool.list_accounts()
+    accounts = _selection_account_snapshot(pool)
     if not accounts:
         return None
     min_credit = config.get('videoAccountPoolMinCredit', 1)
 
+    # 复用已打开且通过余额复核的环境，避免跨任务按最高积分重新开一个浏览器。
+    # 显式锁定仍优先；失效后的 fallback 由 pick_account 再尝试复用其他窗口。
+    open_checked = False
+    if not sequence_account_locked(config):
+        pick_open = getattr(pool, 'pick_open_account', None)
+        if callable(pick_open):
+            try:
+                opened = pick_open(min_credit=min_credit)
+                open_checked = True
+                if isinstance(opened, dict) and opened.get('user_id'):
+                    config['googleFxUserId'] = opened['user_id']
+                    return opened['user_id']
+            except Exception as e:
+                print(f"Warning: 检查已打开浏览器失败，继续自动选号 ({e})")
+
     preferred = sequence_default_account(config)
     if preferred:
+        if open_checked:
+            # 检查已打开窗口可能刚把首选账号判为耗尽并关闭，不能再用旧快照选回它。
+            accounts = _selection_account_snapshot(pool)
         match = next((a for a in accounts if str(a.get('user_id')) == preferred), None)
         if match is None:
             print(f"Warning: 序列生成默认环境 {preferred} 不在号池里，改为自动选号")
@@ -1743,6 +1826,10 @@ def _select_pool_account(config, pool):
             print(f"Warning: 序列生成默认环境 {preferred} 处于冷却期，改为自动选号")
         elif not _account_has_credit(match, min_credit):
             print(f"Warning: 序列生成默认环境 {preferred} 积分不足 {min_credit}，改为自动选号")
+        elif not _claim_account_for_task(preferred):
+            # 并发：这个号（或它的出口）正被另一个任务使用。默认环境只是"首选"，不是独占，
+            # 让出来改走自动选号，两个任务才不会同时开同一个浏览器。
+            print(f"Warning: 序列生成默认环境 {preferred} 正被其它任务使用，改为自动选号")
         elif match.get('credit') is None and not _probe_preferred_account(pool, preferred, min_credit):
             # 钉死的环境一旦选中，整条序列就跑到底，中间不再有人验第二次——
             # 所以"从来没探过积分"的默认环境要在这里先真实探一次，而不是凭
@@ -1759,7 +1846,8 @@ def _select_pool_account(config, pool):
     strategy = str(config.get('googleFxAccountStrategy') or 'credit_desc').strip()
 
     try:
-        chosen = pool.pick_account(min_credit=min_credit, priority_user_ids=priority_user_ids, strategy=strategy)
+        chosen = pool.pick_account(min_credit=min_credit, priority_user_ids=priority_user_ids,
+                                   strategy=strategy, prefer_open=not open_checked)
     except TypeError:
         chosen = pool.pick_account(min_credit=min_credit)
     if chosen is None:
@@ -1887,7 +1975,7 @@ def _account_rotation_ring(config, pool, first_user_id):
     if sequence_account_locked(config) and first_user_id == sequence_default_account(config):
         return [first_user_id]
     try:
-        accounts = pool.list_accounts() or []
+        accounts = _selection_account_snapshot(pool) or []
     except Exception as e:
         print(f"Warning: 读取号池轮转顺序失败，退回单账号模式 ({e})")
         return [first_user_id] if first_user_id else []
@@ -1973,21 +2061,23 @@ def revalidate_leg_account(config, pool, user_id, ring, exclude):
     if not user_id:
         return user_id
     min_credit = config.get('videoAccountPoolMinCredit', 1)
+    leased_elsewhere = _leased_by_other_tasks()   # 并发：别的任务正用着的号不能切过去
     try:
-        if pool.account_is_usable(user_id, min_credit=min_credit):
-            return user_id
+        if user_id not in leased_elsewhere and pool.account_is_usable(user_id, min_credit=min_credit):
+            if _claim_account_for_task(user_id):
+                return user_id
     except Exception as e:
         # 复核本身出错（老测试桩没有这个方法、状态文件读不动……）不该拖垮生成：
         # 按原计划继续，让生成过程中的页面检测去兜底。
         print(f"Warning: 复核账号 {user_id} 积分失败，按原计划继续 ({e})")
         return user_id
 
-    skip = set(exclude or ()) | {user_id}
+    skip = set(exclude or ()) | {user_id} | leased_elsewhere
     for candidate in (ring or []):
         if candidate in skip:
             continue
         try:
-            if pool.account_is_usable(candidate, min_credit=min_credit):
+            if pool.account_is_usable(candidate, min_credit=min_credit) and _claim_account_for_task(candidate):
                 return candidate
         except Exception:
             continue
@@ -2001,8 +2091,9 @@ def revalidate_leg_account(config, pool, user_id, ring, exclude):
 def _next_unused_account(config, pool, ring, exclude):
     """挑一个本次还没用过的号：先看轮转环，环里没有了再回头问一次号池
     （刷新过积分/冷却到期的账号可能这会儿又可用了）。都没有则返回 None。"""
+    leased_elsewhere = _leased_by_other_tasks()
     for uid in ring:
-        if uid not in exclude:
+        if uid not in exclude and uid not in leased_elsewhere and _claim_account_for_task(uid):
             return uid
     try:
         chosen = pool.pick_account(min_credit=config.get('videoAccountPoolMinCredit', 1))
@@ -2037,11 +2128,7 @@ _PASSTHROUGH_CLIENT_KEYS = (
     'adsPowerSilentMode', 'adsPowerWindowPosition', 'adsPowerHeadless',
     'videoAccountPoolMinCredit', 'frameContinuityLocalEdit',
     'ideationTrendUrls', 'ideationSearchQuery', 'coverReferencePath', 'skillProfile',
-    # 复刻线反推段的模型选择（前端「反推模型」两个下拉）：Pass A 逐帧识别
-    # frameFactsModel、峰值帧复核 peakVerifyModel（'off' 关掉）。不进这份白名单，
-    # 托管模式下用户选了哪个模型会被整个丢掉，页面上却照常显示已切换——和
-    # skillProfile / qaGateLevel 当年是同一个静默失效的口子。
-    'frameFactsModel', 'peakVerifyModel', 'reviewModel',
+    'reviewModel',
     'reviewConcurrency', 'candidateConcurrency',
     'candidateSelectionMode', 'candidateSelection', 'generation_mode', 'candidate_selection',
 ) + _GATE_KEYS + _COMPOSE_RUNTIME_KEYS
@@ -2082,7 +2169,7 @@ def effective_config(client_config):
         if 'googleFxImageModel' in merged:
             merged['googleFxImageModel'] = normalize_google_fx_image_model(
                 merged.get('googleFxImageModel'))
-        return merged
+        return _normalize_chat_model_config(merged)
     merged = {
         'baseUrl': SERVER_CONFIG.get('baseUrl') or 'http://127.0.0.1:8046/v1',
         'apiKey': SERVER_CONFIG.get('apiKey') or '',
@@ -2090,7 +2177,7 @@ def effective_config(client_config):
         'imageModel': SERVER_CONFIG.get('imageModel') or 'gemini-3.1-flash-image',
     }
     # cheapModel/auxModel 此前在托管模式下被静默丢弃（example 配置里承诺了
-    # cheapModel），补进白名单防复刻同类静默失效。
+    # cheapModel），补进白名单防止同类静默失效。
     # 已删除的三组键（不要再加回来）：
     #   · geminiDirectApiKey / geminiApiKey / geminiDirectImageModel —— 直连
     #     Google AI Studio 的暗路入口，整条路径已随之删除；
@@ -2106,22 +2193,14 @@ def effective_config(client_config):
     for k in ('cheapModel', 'auxModel', 'imageEditTransport'):
         if SERVER_CONFIG.get(k):
             merged[k] = SERVER_CONFIG.get(k)
-    _DEPRECATED_MODELS = {
-        'gemini-3-flash', 'gemini-3-flash-agent',
-        'gemini-3.6-flash-high', 'gemini-3.6-flash-low',
-        'gemini-3.5-flash', 'gemini-3.5-flash-low', 'gemini-3.5-flash-extra-low',
-        'gemini-3.1-pro-high', 'gemini-3.1-pro-low',
-    }
     if ALLOW_CLIENT_MODEL:
         if client_config.get('model'):
-            cm = client_config['model']
-            merged['model'] = 'gemini-3.8-flash-high' if cm in _DEPRECATED_MODELS else cm
+            merged['model'] = client_config['model']
         if client_config.get('imageModel'):
             merged['imageModel'] = client_config['imageModel']
         for k in ('cheapModel', 'auxModel'):
             if client_config.get(k):
-                cm = client_config[k]
-                merged[k] = 'gemini-3.8-flash-high' if cm in _DEPRECATED_MODELS else cm
+                merged[k] = client_config[k]
     # skillProfile 同批（2026-08-01）：激发页脚的「提示词链路」选择器就是靠它把
     # base/omni 送到服务端的（active_skill_profile 读的正是 config['skillProfile']）。
     # 不进这份白名单，托管模式下前端选了哪条链路会被整个丢掉——用户以为切了，
@@ -2147,33 +2226,215 @@ def effective_config(client_config):
     if 'googleFxImageModel' in merged:
         merged['googleFxImageModel'] = normalize_google_fx_image_model(
             merged.get('googleFxImageModel'))
-    return merged
+    return _normalize_chat_model_config(merged)
 
-def gpt_image_pixel_size(aspect_ratio):
-    """gpt-image-2 走独立的 codex 网关(65038)，不认 Gemini 网关(8046)那套
-    'w:h' 比例字符串——它是真正的 OpenAI images API，只认 1024x1024 /
-    1024x1536 / 1536x1024 / auto 这几个像素档位，传 '9:16' 会被忽略掉回默认方形。
-    按宽高比归到最接近的三档之一。"""
-    ratio = (aspect_ratio or '1:1').strip()
+
+def _normalize_chat_model_config(config):
+    # 合并完成后统一迁移，服务端配置与浏览器旧缓存走同一规则；图像模型独立处理。
+    for key in ('model', 'cheapModel', 'auxModel', 'reviewModel'):
+        if isinstance(config.get(key), str):
+            config[key] = resolve_chat_model(config[key])
+    if isinstance(config.get('imageModel'), str):
+        config['imageModel'] = resolve_image_model(config['imageModel'])
+    # Image transport capabilities are enabled only by the server operator.
+    config.pop('codexImageResponsesModels', None)
+    if isinstance(SERVER_CONFIG.get('codexImageResponsesModels'), list):
+        config['codexImageResponsesModels'] = list(SERVER_CONFIG['codexImageResponsesModels'])
+    return config
+
+
+def resolve_image_model(model_name):
+    """Retire GPT Image 2 in new requests without rewriting historical assets."""
+    model = str(model_name or '').strip()
+    if re.fullmatch(r'gpt-image-2(?:-\d{4}-\d{2}-\d{2})?', model, flags=re.IGNORECASE):
+        return 'gpt-image-2.5'
+    return model
+
+
+def is_gpt_image_model(model_name):
+    """Identify supported GPT Image names, including official dated snapshots."""
+    return bool(re.fullmatch(
+        r'gpt-image-(?:2|2\.5(?:-(?:sunburst|flare))?)'
+        r'(?:-\d{4}-\d{2}-\d{2})?',
+        str(model_name or '').strip(), flags=re.IGNORECASE))
+
+
+def gpt_image_render_quality(model_name, requested_quality=None):
+    """Rendering effort is separate from the UI's 1K/2K/4K resolution labels."""
+    quality = str(requested_quality or '').strip().lower()
+    if quality in ('low', 'medium', 'high', 'xhigh', 'max', 'auto'):
+        return quality
+    model = str(model_name or '').strip().lower()
+    if re.match(r'^gpt-image-2\.5-sunburst(?:-|$)', model):
+        return 'max'
+    if re.match(r'^gpt-image-2\.5-flare(?:-|$)', model):
+        return 'auto'
+    return {'1k': 'low', 'standard': 'low', '2k': 'medium',
+            '4k': 'high', 'hd': 'high'}.get(quality, 'auto')
+
+
+def gpt_image_pixel_size(aspect_ratio, resolution=None, model=None):
+    """Use valid pixels/auto; only the new variants scale ratios to the UI resolution."""
+    ratio = str(aspect_ratio or '1:1').strip().lower()
+    if ratio == 'auto':
+        return 'auto'
+    pixels = re.fullmatch(r'(\d+)x(\d+)', ratio)
+    if pixels:
+        width, height = map(int, pixels.groups())
+        if (width > 0 and height > 0 and width % 16 == 0 and height % 16 == 0
+                and max(width, height) <= 3840 and max(width, height) <= min(width, height) * 3
+                and 655360 <= width * height <= 8294400):
+            return f'{width}x{height}'
+        return '1024x1024'
     try:
         w_str, h_str = ratio.split(':', 1)
         w, h = float(w_str), float(h_str)
     except (ValueError, AttributeError):
         return '1024x1024'
-    if w <= 0 or h <= 0:
+    if not (0 < w < float('inf') and 0 < h < float('inf')):
         return '1024x1024'
+    resolution_label = str(resolution or '').strip().lower()
+    if (is_gpt_image_model(model)
+            and re.match(r'^gpt-image-2\.5-(?:sunburst|flare)(?:-|$)', str(model).strip().lower())
+            and resolution_label in ('2k', 'medium', '4k', 'hd')):
+        # 4K 的长边最多 3840；方图等宽画幅同时受官方总像素上限约束。
+        aspect = min(3.0, max(w, h) / min(w, h))
+        long_edge = 3840 if resolution_label in ('4k', 'hd') else 2048
+        long_edge = min(long_edge, int((8294400 * aspect) ** 0.5) // 16 * 16)
+        short_edge = round(long_edge / aspect / 16) * 16
+        while long_edge * short_edge > 8294400:
+            long_edge -= 16
+            short_edge = round(long_edge / aspect / 16) * 16
+        width, height = (short_edge, long_edge) if h > w else (long_edge, short_edge)
+        return f'{width}x{height}'
     if abs(w - h) / max(w, h) < 0.05:
         return '1024x1024'
     return '1024x1536' if h > w else '1536x1024'
 
 
 _CODEX_BASE_URL_DEFAULT = 'http://127.0.0.1:65038/v1'
+_COCKPIT_IMAGE_SIDECAR_DIR = Path.home() / '.cockpit_tools' / 'codex_local_access_sidecar'
+_IMAGE_GATEWAY_MODEL_CATALOG_CACHE = {}
+_IMAGE_GATEWAY_MODEL_CATALOG_LOCK = threading.Lock()
+
+
+def _copy_image_gateway_catalog(result):
+    copy = dict(result, models=list(result['models']))
+    if 'responses_models' in result:
+        copy['responses_models'] = list(result['responses_models'])
+    return copy
+
+
+def _cockpit_runtime_image_tool_model(base_url, api_key):
+    """Read a matching local sidecar's runtime tool model, never its saved preferences."""
+    def loopback_host(host):
+        if not isinstance(host, str):
+            return None
+        host = host.strip().lower()
+        if host == 'localhost':
+            return host
+        try:
+            address = ipaddress.ip_address(host)
+            return str(address) if address.is_loopback else None
+        except ValueError:
+            return None
+
+    try:
+        url = urllib.parse.urlsplit(base_url)
+        if (url.scheme not in ('http', 'https') or url.path not in ('/v1', '/v1/')
+                or url.query or url.fragment or url.username is not None or url.password is not None):
+            return None
+        host = loopback_host(url.hostname)
+        if host is None or not isinstance(api_key, str) or not api_key:
+            return None
+        port = url.port if url.port is not None else (443 if url.scheme == 'https' else 80)
+        with (_COCKPIT_IMAGE_SIDECAR_DIR / 'config.json').open(encoding='utf-8') as source:
+            sidecar = json.load(source)
+        if not isinstance(sidecar, dict):
+            return None
+        sidecar_port = sidecar.get('port')
+        keys = sidecar.get('api-keys')
+        if (host != loopback_host(sidecar.get('host'))
+                or type(sidecar_port) is not int or not 1 <= sidecar_port <= 65535
+                or port != sidecar_port or not isinstance(keys, list)
+                or not any(isinstance(key, str) and key == api_key for key in keys)):
+            return None
+        with (_COCKPIT_IMAGE_SIDECAR_DIR / 'manifest.json').open(encoding='utf-8') as source:
+            manifest = json.load(source)
+        model = manifest.get('imageGenerationModel') if isinstance(manifest, dict) else None
+        if not isinstance(model, str):
+            return None
+        model = model.strip()
+        if is_gpt_image_model(model) and model.lower().startswith('gpt-image-2.5'):
+            return model
+    except (OSError, ValueError, TypeError):
+        pass
+    return None
+
+
+def _cockpit_configured_image_tool_model(base_url, api_key):
+    model = _cockpit_runtime_image_tool_model(base_url, api_key)
+    return model if model and re.match(r'^gpt-image-2\.5-(?:sunburst|flare)(?:-|$)', model, re.I) else None
+
+
+def cockpit_image_responses_models(base_url, api_key):
+    """Return explicitly verified Responses models for this exact local runtime."""
+    enabled = SERVER_CONFIG.get('codexImageResponsesModels')
+    if (isinstance(enabled, list) and 'gpt-image-2.5-flare' in enabled
+            and _cockpit_runtime_image_tool_model(base_url, api_key)):
+        return ['gpt-image-2.5-flare']
+    return []
+
+
+def get_image_gateway_model_catalog(config=None):
+    """Read the configured image gateway's registry; unknown never means unavailable."""
+    base_url, api_key = resolve_gateway('gpt-image-2.5', effective_config(config))
+    image_tool_model = _cockpit_configured_image_tool_model(base_url, api_key)
+    responses_models = cockpit_image_responses_models(base_url, api_key)
+    cache_key = hashlib.sha256(
+        f'{base_url}\0{api_key}\0{image_tool_model or ""}\0{",".join(responses_models)}'.encode('utf-8')).hexdigest()
+    now = time.monotonic()
+    with _IMAGE_GATEWAY_MODEL_CATALOG_LOCK:
+        cached = _IMAGE_GATEWAY_MODEL_CATALOG_CACHE.get(cache_key)
+        if cached and cached[0] > now:
+            return _copy_image_gateway_catalog(cached[1])
+        result = {'status': 'unknown', 'models': [], 'message': '暂时无法读取图片网关的型号列表。'}
+        try:
+            request = urllib.request.Request(
+                f'{base_url.rstrip("/")}/models',
+                headers={'Authorization': f'Bearer {api_key}'}, method='GET')
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            with opener.open(request, timeout=3) as response:
+                registry = json.loads(response.read().decode('utf-8'))
+            rows = registry.get('data') if isinstance(registry, dict) else None
+            if (isinstance(rows, list) and all(
+                    isinstance(row, dict) and isinstance(row.get('id'), str) and row['id'].strip()
+                    for row in rows)):
+                models = list(dict.fromkeys(
+                    row['id'] for row in rows
+                    if is_gpt_image_model(row['id']) and row['id'].lower().startswith('gpt-image-2.5')))
+                if image_tool_model and image_tool_model not in models:
+                    models.append(image_tool_model)
+                models.extend(model for model in responses_models if model not in models)
+                result = {'status': 'known', 'models': models,
+                          'message': ('已读取图片网关的可用型号。' if models
+                                      else '图片网关未列出 GPT Image 2.5 可用型号。')}
+                if image_tool_model:
+                    result.update(source='configured_image_tool_model', image_tool_model=image_tool_model)
+                if responses_models:
+                    result['responses_models'] = list(responses_models)
+        except Exception:
+            pass
+        ttl = 60 if result['status'] == 'known' else 10
+        _IMAGE_GATEWAY_MODEL_CATALOG_CACHE[cache_key] = (now + ttl, result)
+        return _copy_image_gateway_catalog(result)
 
 
 def resolve_gateway(model_name, config):
     base_url = (config.get('baseUrl') or 'http://127.0.0.1:8046/v1').rstrip('/')
     api_key = config.get('apiKey') or ''
-    m_lower = (model_name or '').lower()
+    # 先迁移再选网关：旧 Claude 配置现在发送 GPT，不能继续使用 Gemini 凭据。
+    m_lower = resolve_chat_model(model_name).lower()
     if 'gpt-5' in m_lower or 'gpt-6' in m_lower or 'codex' in m_lower or 'gpt-image-2' in m_lower:
         base_url = (config.get('codexBaseUrl')
                     or SERVER_CONFIG.get('codexBaseUrl')
@@ -2184,25 +2445,20 @@ def resolve_gateway(model_name, config):
     return base_url, api_key
 
 
-_UPSTREAM_MODEL_MAP = {
-    'gemini-3-flash': 'gemini-3.8-flash-high',
-    'gemini-3-flash-agent': 'gemini-3.8-flash-high',
-    'gemini-3.6-flash-high': 'gemini-3.8-flash-high',
-    'gemini-3.6-flash-low': 'gemini-3.8-flash-high',
-    'gemini-3.5-flash': 'gemini-3.8-flash-high',
-    'gemini-3.5-flash-low': 'gemini-3.8-flash-high',
-    'gemini-3.5-flash-extra-low': 'gemini-3.8-flash-high',
-    'gemini-3.1-pro-high': 'gemini-3.8-flash-high',
-    'gemini-3.1-pro-low': 'gemini-3.8-flash-high',
-}
-
-
 def resolve_chat_model(model_name):
-    """Normalize project model names to the upstream gateway model name.
-    Preserves valid models (e.g. gemini-3.8-flash-high, gemini-3.7-flash-high),
-    and redirects obsolete/offline models to gemini-3.8-flash-high."""
+    """Migrate retired text models while preserving current/custom and image models."""
     m = (model_name or '').strip()
-    return _UPSTREAM_MODEL_MAP.get(m, m)
+    lower = m.lower()
+    if 'image' in lower:
+        return m
+    if re.match(r'^claude(?:[-.]|$)', lower) or re.match(
+            r'^gpt-(?:3\.5|4o?|4\.\d+|5(?:\.\d+)?)(?:-|$)', lower):
+        return 'gpt-6.1-sol'
+    if re.fullmatch(
+            r'gemini-(?:3-flash(?:-agent)?|3\.1-pro(?:-[a-z-]+)?|'
+            r'3\.[567]-flash(?:-[a-z-]+)?)', lower):
+        return 'gemini-3.8-flash-high'
+    return m
 
 
 def _safe_project_name(title):
@@ -2599,7 +2855,7 @@ def resolve_cover_reference(config, title, project_key=None, project_dir=None):
     后两处都按 mtime 取最新的一张。
 
     project_dir：调用方**正在往里写帧的那个目录**。它比标题/键靠谱：这里的项目目录一律
-    由 `_get_project_dir(标题或键)` 现算，而复刻线的磁盘命名空间是 `run_<job>__<标题>`
+    由 `_get_project_dir(标题或键)` 现算，而带有任务编号的磁盘命名空间是 `run_<job>__<标题>`
     经 `_safe_project_name` 截到 60 字符之后的样子——只拿到人类标题的调用方算出来的是
     另一个（不存在的）目录，封面于是「就在盘上却找不到」，链头静默退化成纯文生图。
     渲染层已经算过一次那个目录了，直接传进来，不要在这里重算。
@@ -2670,20 +2926,21 @@ def delete_idea_output_files(title, covers=None):
 
     新布局下封面就在项目目录里，第一步的 rmtree 已经把它带走；covers 参数只对
     迁移前留在全局封面池里的历史封面还有用（清不掉的 URL 会被静默跳过）。
-    【安全防呆】：严禁删除 OUTPUT_ROOT 根目录或 outputs/replica_jobs 及其子目录。
+    【安全防呆】：只允许删除 OUTPUT_ROOT 内的项目目录，严禁删除根目录或其外部路径。
     """
     deleted = {"project_dir": None, "covers": []}
 
     output_root_abs = os.path.abspath(OUTPUT_ROOT)
-    replica_jobs_abs = os.path.abspath(os.path.join(output_root_abs, 'replica_jobs'))
+    output_root_real = os.path.realpath(output_root_abs)
 
     if title:
         try:
             project_dir = _get_project_dir(title)
             if project_dir and os.path.isdir(project_dir):
                 norm_pdir = os.path.abspath(project_dir)
-                # 严禁删除 outputs 根目录或 replica_jobs 目录
-                if norm_pdir != output_root_abs and norm_pdir != replica_jobs_abs and not replica_jobs_abs.startswith(norm_pdir + os.sep):
+                # 只清理输出根目录内的具体项目。
+                if (norm_pdir.startswith(output_root_abs + os.sep)
+                        and os.path.realpath(norm_pdir).startswith(output_root_real + os.sep)):
                     shutil.rmtree(project_dir, ignore_errors=True)
                     deleted["project_dir"] = project_dir
         except Exception as e:
@@ -2701,8 +2958,7 @@ def delete_idea_output_files(title, covers=None):
         cover_path = os.path.abspath(rel)
         if not (cover_path == output_root_abs or cover_path.startswith(output_root_abs + os.sep)):
             continue
-        # 保护 replica_jobs 下的封面/拼图
-        if cover_path == replica_jobs_abs or cover_path.startswith(replica_jobs_abs + os.sep):
+        if not os.path.realpath(cover_path).startswith(output_root_real + os.sep):
             continue
         try:
             if os.path.isfile(cover_path):
@@ -2883,13 +3139,96 @@ def gallery_collect_references(library_items=None, tasks=None):
     }
 
 
+def _gallery_mark_manifest_output(pdir, base_dir, items):
+    """Honor an explicit legacy merged output even when it lives in videos/."""
+    manifest_path = os.path.join(pdir, 'manifest.json')
+    if os.path.islink(manifest_path):
+        return
+    try:
+        with open(manifest_path, encoding='utf-8') as stream:
+            manifest = json.load(stream)
+        merged = manifest.get('merged_video') if isinstance(manifest, dict) else None
+        if not isinstance(merged, dict) or merged.get('status') not in (None, '', 'success', 'completed'):
+            return
+        raw = merged.get('file') or merged.get('url')
+        if not isinstance(raw, str) or not raw:
+            return
+        raw = raw.replace('\\', '/')
+        if raw.startswith('/outputs/') or not merged.get('file'):
+            raw = urllib.parse.unquote(urllib.parse.urlsplit(raw).path).lstrip('/')
+        elif os.path.isabs(raw):
+            raw = os.path.relpath(raw, base_dir).replace('\\', '/')
+        # Only classify an already scanned asset; manifest paths never add files.
+        for item in items:
+            if item['type'] == 'video' and item['path'] == raw:
+                item['kind'] = 'merged'
+    except (OSError, ValueError, TypeError):
+        return
+
+
+def _gallery_completed_edit_items(pdir, base_dir):
+    """Only published, completed edit outputs are gallery assets; evidence stays private."""
+    from project_archive import receipt, _url_path, _safe
+    archived = receipt(pdir)
+    if archived and archived.get('status') == 'archived':
+        items = []
+        root = Path(os.path.abspath(os.path.join(base_dir, OUTPUT_ROOT)))
+        videos = archived.get('final_videos', archived.get('refined_videos', [])) or []
+        for video in videos:
+            try:
+                path = _safe(_url_path(video['url'], root), Path(os.path.abspath(pdir)))
+                if path.suffix.lower() != '.mp4' or not path.is_file() or path.stat().st_size <= 0:
+                    continue
+                item = _gallery_item(str(path), base_dir, 'merged')
+                item['is_edited'] = video.get('kind', 'refined_video') == 'refined_video'
+                items.append(item)
+            except (OSError, ValueError, KeyError, TypeError):
+                continue
+        return items
+    edits = os.path.join(pdir, 'codex_edits')
+    if not os.path.isdir(edits) or os.path.islink(edits):
+        return []
+    items = []
+    for job_id in sorted(os.listdir(edits)):
+        if not re.fullmatch(r'[a-f0-9]{32}', job_id):
+            continue
+        job_dir = os.path.join(edits, job_id)
+        state_path = os.path.join(job_dir, '.state.json')
+        if os.path.islink(job_dir) or os.path.islink(state_path):
+            continue
+        try:
+            with open(state_path, encoding='utf-8') as stream:
+                job = json.load(stream)
+            if not isinstance(job, dict) or job.get('status') != 'completed' or job.get('id') != job_id:
+                continue
+            output = job.get('output') or {}
+            file_path = output.get('file') if isinstance(output, dict) else None
+            if not isinstance(file_path, str) or not os.path.isabs(file_path):
+                continue
+            file_path = os.path.abspath(file_path)
+            workspace = os.path.abspath(os.path.join(job_dir, 'work'))
+            if not file_path.startswith(workspace + os.sep) or os.path.realpath(file_path) != file_path:
+                continue
+            if any(part.startswith('.') for part in os.path.relpath(file_path, workspace).split(os.sep)):
+                continue
+            if not file_path.lower().endswith('.mp4') or not os.path.isfile(file_path) or os.path.getsize(file_path) <= 0:
+                continue
+            item = _gallery_item(file_path, base_dir, 'merged')
+            item['is_edited'] = True
+            items.append(item)
+        except (OSError, ValueError, TypeError):
+            continue
+    return items
+
+
 def scan_gallery(base_dir=None, refs=None):
     """扫描 outputs/ 下全部历史媒体资产，按来源分组返回（画廊页数据源）。
 
     分组：image-station（图像工坊出图）、每个项目目录一组（frames/ 帧序列 +
     videos/ 分段视频 + 项目根的合成视频与封面），以及 covers（历史全局封面池，
     迁移干净后自然消失——新封面已经跟着项目走了）。项目根下的插帧中间产物目录
-    （*_frames，成百上千张 jpg）不属于用户资产，不进画廊。
+    （*_frames，成百上千张 jpg）不属于用户资产，不进画廊。精剪任务只收集
+    completed 记录指向的最终成片，不收集输入副本、证据图片或未发布输出。
 
     refs 传 gallery_collect_references() 的返回值时做引用标注：封面 item 加
     in_use（被点子库/任务引用），项目组加 orphan（无任何引用且超过活跃宽限期），
@@ -2903,11 +3242,11 @@ def scan_gallery(base_dir=None, refs=None):
 
     def collect_dir(dpath, kind, only_type=None):
         items = []
-        if not os.path.isdir(dpath):
+        if not os.path.isdir(dpath) or os.path.islink(dpath):
             return items
         for fname in sorted(os.listdir(dpath)):
             fpath = os.path.join(dpath, fname)
-            if not os.path.isfile(fpath):
+            if fname.startswith('.') or os.path.islink(fpath) or not os.path.isfile(fpath):
                 continue
             mtype = _gallery_media_type(fname)
             if mtype is None or (only_type and mtype != only_type):
@@ -2948,16 +3287,40 @@ def scan_gallery(base_dir=None, refs=None):
               collect_dir(os.path.join(out_dir, 'image-station'), 'studio', only_type='image'))
 
     now = time.time()
+    from project_archive import receipt
     for name in sorted(os.listdir(out_dir)):
         if name in GALLERY_SPECIAL_DIRS:
             continue
         pdir = os.path.join(out_dir, name)
-        if not os.path.isdir(pdir):
+        if name.startswith('.') or not os.path.isdir(pdir) or os.path.islink(pdir):
             continue
-        items = collect_dir(os.path.join(pdir, 'frames'), 'frame')
+        archive = receipt(pdir)
+        if archive and archive.get('status') == 'archived':
+            # Archive thumbnails serve project navigation; gallery contains only
+            # published final videos, so they never appear as disposable images.
+            items = _gallery_completed_edit_items(pdir, base_dir)
+            add_group(name, name, 'project', items)
+            if refs is not None and items:
+                groups[-1]['orphan'] = False
+                owner = (refs.get('project_owners') or {}).get(name)
+                if owner:
+                    groups[-1]['idea_id'] = owner['idea_id']
+                    groups[-1]['idea_title'] = owner['idea_title']
+            continue
+        items = collect_dir(os.path.join(pdir, 'frames'), 'frame', only_type='image')
         items += collect_dir(os.path.join(pdir, 'videos'), 'video', only_type='video')
         # 项目根：合成视频（含 _2x/_配音字幕 等成品）与零散图片
         items += collect_dir(pdir, 'merged', only_type='video')
+        _gallery_mark_manifest_output(pdir, base_dir, items)
+        scanned = {item['path']: item for item in items}
+        for published in _gallery_completed_edit_items(pdir, base_dir):
+            # A retained merged video may already be in the root/videos scan.
+            # Receipt metadata gives its final classification without double counting.
+            if published['path'] in scanned:
+                scanned[published['path']].update(published)
+            else:
+                items.append(published)
+                scanned[published['path']] = published
         # 项目根的图片里，cover_* 是这个项目的封面——单独标出 kind='cover'，
         # 画廊的「封面」筛选与「在用」角标才能照常认得它（前端按 item.kind 分类）
         root_images = collect_dir(pdir, 'other', only_type='image')
@@ -2983,10 +3346,17 @@ def scan_gallery(base_dir=None, refs=None):
 
 
 def _project_dir_has_gallery_media(pdir):
-    """项目目录里是否还剩"画廊可见"的媒体：frames/ 任意媒体、videos/ 视频、
-    项目根的图片/视频。与 scan_gallery 的收集范围一一对应——插帧中间产物
-    （*_2x_frames 等隐藏产物）刻意不算数，否则"删除本组"后文件夹永远删不掉，
-    留下带残渣的空壳。"""
+    """项目里是否还有媒体或需要保留的精剪任务。
+
+    精剪任务有独立记录、输入副本和输出，虽未列入画廊也不能随最后一张
+    画廊媒体被清理。除此之外仅检查 scan_gallery 的收集范围；插帧中间产物
+    （*_2x_frames 等隐藏产物）刻意不算数，避免留下带残渣的空壳。
+    """
+    edits_dir = os.path.join(pdir, 'codex_edits')
+    if os.path.isdir(edits_dir):
+        with os.scandir(edits_dir) as entries:
+            if next(entries, None) is not None:
+                return True
     frames_dir = os.path.join(pdir, 'frames')
     if os.path.isdir(frames_dir):
         for f in os.listdir(frames_dir):
@@ -3351,13 +3721,14 @@ def reveal_media_in_file_manager(raw, base_dir=None):
     return abs_p
 
 
-def gallery_delete_files(paths, base_dir=None):
+def gallery_delete_files(paths, base_dir=None, remove_empty_projects=True):
     """删除 outputs/ 内指定的媒体文件（画廊删除接口的后端）。
 
     安全边界：只接受规范化后仍落在 outputs/ 内、且扩展名在媒体白名单内的路径；
     目录、manifest、越界路径一律进 failed 而不是抛异常。项目目录删到不再有
-    画廊可见媒体时，整个项目文件夹（含 manifest、插帧中间产物等隐藏残留）一并
-    rmtree——"删除本组"的预期就是文件夹也消失。
+    画廊可见媒体且没有独立精剪任务时，整个项目文件夹（含 manifest、插帧
+    中间产物等隐藏残留）一并 rmtree；精剪任务及其输入、结果应继续保留。
+    remove_empty_projects=False 时仅删除传入的媒体，项目记录与其余文件均保留。
     返回 affected_project_dirs（仍存活、需要重同步 manifest 的项目目录绝对路径），
     manifest 同步函数在 server.py 里，由调用方负责执行。
     """
@@ -3374,6 +3745,9 @@ def gallery_delete_files(paths, base_dir=None):
         abs_p = os.path.abspath(os.path.join(base_dir, rel))
         if not abs_p.startswith(out_root_abs + os.sep):
             result['failed'].append({'path': raw, 'error': '路径不在 outputs/ 内'})
+            continue
+        if not os.path.realpath(abs_p).startswith(os.path.realpath(out_root_abs) + os.sep):
+            result['failed'].append({'path': raw, 'error': '文件实际路径不在 outputs/ 内'})
             continue
         if _gallery_media_type(abs_p) is None:
             result['failed'].append({'path': raw, 'error': '仅允许删除图片/视频文件'})
@@ -3393,7 +3767,7 @@ def gallery_delete_files(paths, base_dir=None):
     for pdir in sorted(touched):
         if not os.path.isdir(pdir):
             continue
-        if _project_dir_has_gallery_media(pdir):
+        if not remove_empty_projects or _project_dir_has_gallery_media(pdir):
             result['affected_project_dirs'].append(pdir)
         else:
             shutil.rmtree(pdir, ignore_errors=True)
@@ -3650,7 +4024,7 @@ LIBRARY_INDEX_FIELDS = (
     'id', 'project_key', 'title', 'theme', 'english_title',
     'social_title_cn', 'social_title_en', 'timestamp', 'creativity',
     'image_count', 'video_count', 'activeCoverUrl', 'coverRoles', 'collage_url',
-    'status', 'tags', 'note', 'updated_at',
+    'status', 'tags', 'note', 'updated_at', 'archived', 'archive',
 )
 
 
@@ -3714,6 +4088,10 @@ def item_project_cover(item):
     """
     if not isinstance(item, dict):
         return None
+    if item.get('archived'):
+        archive = item.get('archive') if isinstance(item.get('archive'), dict) else {}
+        cover = archive.get('cover_url')
+        return cover if isinstance(cover, str) and cover.startswith('/outputs/') else None
     roles = item.get('coverRoles') if isinstance(item.get('coverRoles'), dict) else {}
     covers = item.get('covers') if isinstance(item.get('covers'), list) else []
     cov = (roles.get('project') or item.get('activeCoverUrl')
@@ -3858,6 +4236,14 @@ def write_library_item(item, library_dir=None):
         _ensure_library_split(library_dir)
         root, _, items_dir = _library_paths(library_dir)
         path = _library_item_path(item.get('id'), library_dir)
+        if os.path.isfile(path):
+            try:
+                with open(path, encoding='utf-8') as existing_file:
+                    existing = json.load(existing_file)
+            except (OSError, ValueError):
+                existing = None
+            if isinstance(existing, dict) and existing.get('archived') and not item.get('archived'):
+                raise ValueError('项目已归档，请在项目工作台查看保留文件')
         os.makedirs(items_dir, exist_ok=True)
 
         item = dict(item)
@@ -3922,9 +4308,8 @@ def delete_library_items(item_ids, library_dir=None):
         return deleted_ids
 
 
-def clear_regular_library(library_dir=None):
-    """清空所有常规点子库条目（100% 永久保留爆款复刻创意条目）。
-    返回被删除的常规点子库 id 列表。
+def clear_library(library_dir=None):
+    """清空所有点子库条目，返回被删除的 id 列表。
     """
     with LIBRARY_LOCK:
         _ensure_library_split(library_dir)
@@ -3932,30 +4317,25 @@ def clear_regular_library(library_dir=None):
         if index is None:
             raise RuntimeError('创意库索引损坏，已停止清空')
 
-        kept_index = []
-        regular_ids = []
+        item_ids = []
         for r in index:
             if not isinstance(r, dict):
                 continue
-            if is_replica_library_item(r):
-                kept_index.append(r)
-            else:
-                iid = str(r.get('id') or '').strip()
-                if iid:
-                    regular_ids.append(iid)
+            iid = str(r.get('id') or '').strip()
+            if iid:
+                item_ids.append(iid)
 
-        if len(kept_index) != len(index):
-            _write_library_index(kept_index, library_dir)
+        _write_library_index([], library_dir)
 
-        deleted_ids = list(regular_ids)
-        for iid in regular_ids:
+        deleted_ids = list(item_ids)
+        for iid in item_ids:
             try:
                 path = _library_item_path(iid, library_dir)
                 if os.path.exists(path):
                     os.remove(path)
             except Exception as e:
                 if sys.stdout:
-                    print(f"[WARN] 清理常规创意正文 {iid} 失败: {e}")
+                    print(f"[WARN] 清理创意正文 {iid} 失败: {e}")
         return deleted_ids
 
 
@@ -4631,6 +5011,10 @@ def resolve_candidate_selection_mode(body, config, manifest, default=False):
 def write_manifest(project_dir, data):
     manifest_path = os.path.join(project_dir, 'manifest.json')
     with manifest_lock(project_dir):
+        from project_archive import receipt
+        archived = receipt(project_dir)
+        if archived and archived.get('status') in ('prepared', 'archived'):
+            raise ValueError('项目已归档，不能重新写入生成素材')
         try:
             write_json_atomic(manifest_path, data)
         except (OSError, PermissionError):
@@ -4745,6 +5129,10 @@ def save_task_to_disk(task_id, tasks_dir=None):
         return False
 
     with _TASK_IO_LOCK:
+        # A terminal worker may have taken its snapshot just before archival.
+        # Do not recreate explicitly removed task records after waiting for I/O.
+        if ACTIVE_TASKS.get(task_id) is not t:
+            return False
         try:
             os.makedirs(os.path.dirname(meta_path) or '.', exist_ok=True)
             # 原子替换：写一半崩溃会留下半截 JSON，重启加载时整个任务丢失
@@ -5006,87 +5394,6 @@ def load_tasks_from_disk(tasks_dir=None):
             print(f"[TASKS] 已把 {len(legacy_ids)} 个任务记录迁移到拆分形态"
                   f"（meta / events.jsonl / results）")
 
-    # 复刻账本治理迁移：清理孤儿复刻任务，并收敛 paused 状态为 completed
-    try:
-        migrate_cleanup_orphan_replica_tasks(tasks_dir=root)
-    except Exception as e:
-        if sys.stdout:
-            print(f"[WARN] 复刻任务孤儿清理迁移失败: {e}")
-
-
-def migrate_cleanup_orphan_replica_tasks(tasks_dir=None, jobs_root_dir=None):
-    """清理指向不存在 job 的复刻孤儿 task，并将残留的 paused 复刻 task 状态收敛为 completed。"""
-    root = tasks_dir or TASKS_DIR
-    jroot = jobs_root_dir or os.path.join(OUTPUT_ROOT, 'replica_jobs')
-    if not os.path.isdir(root):
-        return {'cleaned_orphans': 0, 'migrated_paused': 0}
-
-    cleaned_orphans = 0
-    migrated_paused = 0
-
-    with ACTIVE_TASKS_LOCK:
-        active_items = list(ACTIVE_TASKS.items())
-
-    for tid, t in active_items:
-        if not _is_replica_task(t):
-            continue
-        dims = t.get('dimensions') if isinstance(t.get('dimensions'), dict) else {}
-        job_id = _replica_job_of(dims)
-
-        job_exists = False
-        if job_id and os.path.isdir(os.path.join(jroot, job_id)):
-            job_exists = True
-
-        if not job_exists and job_id:
-            # 孤儿任务：指向已不存在的 job
-            with ACTIVE_TASKS_LOCK:
-                ACTIVE_TASKS.pop(tid, None)
-            delete_task_files(tid, tasks_dir=root)
-            cleaned_orphans += 1
-        elif t.get('status') == 'paused':
-            # 状态收敛：paused -> completed
-            with ACTIVE_TASKS_LOCK:
-                if tid in ACTIVE_TASKS:
-                    ACTIVE_TASKS[tid]['status'] = 'completed'
-            save_task_to_disk(tid, tasks_dir=root)
-            migrated_paused += 1
-
-    # 磁盘防漏扫描：检查磁盘上存在但不在内存中的复刻任务文件
-    try:
-        with ACTIVE_TASKS_LOCK:
-            active_fids = {_task_file_id(k) for k in ACTIVE_TASKS}
-        for fname in os.listdir(root):
-            if not fname.endswith('.json'):
-                continue
-            fid = fname[:-5]
-            if fid in active_fids:
-                continue
-            fpath = os.path.join(root, fname)
-            try:
-                with open(fpath, 'r', encoding='utf-8') as fp:
-                    mdata = json.load(fp)
-                if not _is_replica_task(mdata):
-                    continue
-                mdims = mdata.get('dimensions') if isinstance(mdata.get('dimensions'), dict) else {}
-                mjob_id = _replica_job_of(mdims)
-                if mjob_id and not os.path.isdir(os.path.join(jroot, mjob_id)):
-                    delete_task_files(fid, tasks_dir=root)
-                    cleaned_orphans += 1
-                elif mdata.get('status') == 'paused':
-                    mdata['status'] = 'completed'
-                    write_json_atomic(fpath, mdata)
-                    migrated_paused += 1
-            except Exception:
-                pass
-    except Exception:
-        pass
-
-    if (cleaned_orphans or migrated_paused) and sys.stdout:
-        print(f"[REPLICA] 账本治理迁移完成: 清理孤儿任务 {cleaned_orphans} 条，收敛 paused 状态 {migrated_paused} 条")
-
-    return {'cleaned_orphans': cleaned_orphans, 'migrated_paused': migrated_paused}
-
-
 
 def ensure_task_project_key(task_id, dimensions):
     """在 dimensions 里就位 project_key，并返回它。
@@ -5116,6 +5423,9 @@ def get_or_create_task(task_id, dimensions=None):
     ensure_task_project_key(task_id, dimensions)
     save_on_create = False
     with ACTIVE_TASKS_LOCK:
+        from project_archive import archived_request
+        if archived_request({'dimensions': dimensions}):
+            raise ValueError('项目已归档，不能继续生成')
         if task_id not in ACTIVE_TASKS:
             ACTIVE_TASKS[task_id] = {
                 "id": task_id,
@@ -5160,6 +5470,9 @@ def prepare_task_for_run(task_id, dimensions=None):
     """
     ensure_task_project_key(task_id, dimensions)
     with ACTIVE_TASKS_LOCK:
+        from project_archive import archived_request
+        if archived_request({'dimensions': dimensions}):
+            raise ValueError('项目已归档，不能继续生成')
         t = ACTIVE_TASKS.get(task_id)
         if t is not None and t["status"] == "running":
             return t, True
@@ -5398,12 +5711,11 @@ def cleanup_old_tasks():
 # ============================================================================
 
 # 帧序列/分步渲染/视频/封面：它们不是独立项目，而是某个激发项目下的子作业。
-# 与 app.js 的 MEDIA_TASK_TYPES 同口径（那边用它把媒体任务整类挡在任务列表外，
-# 结果是失败的媒体任务完全不可见；这里改成挂成子作业，失败照样看得到）。
+# 媒体任务挂在项目的子作业列表，失败和取消状态也保持可见。
 MEDIA_TASK_TYPES = frozenset({'frames', 'staged_render', 'videos', 'cover', 'video_chain'})
 
-# 复刻线的任务类型：抽帧 / Pass A / Pass B / 节拍推进 / 提示词合成 / 正交发散等
-REPLICA_TASK_TYPES = frozenset({'replica', 'replica_extract', 'replica_advance', 'replica_mutate'})
+# 只有受支持的创意任务可作为项目主任务；历史停用任务不会混入工作台。
+PROJECT_TASK_TYPES = frozenset({'', 'idea', 'spark', 'spark_seed', 'spark_followup', 'compose', 'stepped', 'stepped_advance'})
 
 _PROJECT_TITLE_PREFIXES = ('做一个', '做个', '设计一个', '设计个')
 
@@ -5444,6 +5756,280 @@ def _proj_epoch(timestamp):
 
 
 _PROJ_ASSET_STATS_CACHE = {}  # pdir -> (cached_mtimes, cached_stats, cached_time)
+_PROJ_PROGRESS_CACHE = {}  # pdir -> (manifest/directory fingerprint, adopted media counts)
+
+
+def _proj_output_dir(project_key, title, base_dir):
+    """Use the same project namespaces as asset statistics, without scanning outputs/."""
+    names = []
+    if project_key:
+        names.append(_safe_project_name(project_key))
+    if title:
+        names.extend((_safe_project_name(title), _legacy_ascii_project_name(title),
+                      re.sub(r'\s+', '_', re.sub(r'[\\/:*?"<>|]+', '_', title.strip()))))
+    for name in dict.fromkeys(names):
+        candidate = os.path.join(base_dir, OUTPUT_ROOT, name)
+        if os.path.isdir(candidate):
+            return candidate
+    if title:
+        legacy = _get_project_dir(title)
+        candidate = legacy if os.path.isabs(legacy) else os.path.join(base_dir, legacy)
+        if os.path.isdir(candidate):
+            return candidate
+    return None
+
+
+def _proj_edit_epoch(value):
+    try:
+        return datetime.fromisoformat(str(value).replace('Z', '+00:00')).timestamp()
+    except (ValueError, TypeError, OverflowError, OSError):
+        return 0.0
+
+
+def _proj_video_edit(project_key, title, base_dir):
+    """Read only durable edit states; lightweight polls never enumerate video assets.
+
+    Active jobs take precedence over newer terminal jobs on other project videos.
+    Lost workers are projected as interrupted without writing from an index read.
+    """
+    import codex_video_editor as editor
+    from project_archive import _safe, _url_path
+    pdir = _proj_output_dir(project_key, title, base_dir)
+    if not pdir:
+        return None
+    root = Path(os.path.abspath(os.path.join(base_dir, OUTPUT_ROOT)))
+    try:
+        project = _safe(pdir, root)
+        if project_key and project.name != _safe_project_name(project_key):
+            # A shared title is insufficient evidence that an edit belongs to this run.
+            with _safe(project / 'manifest.json', project).open(encoding='utf-8') as stream:
+                manifest = json.load(stream)
+            if not isinstance(manifest, dict) or manifest.get('project_key') != project_key:
+                return None
+        edits = _safe(project / 'codex_edits', project)
+        if not edits.is_dir():
+            return None
+        directories = list(edits.iterdir())
+    except (OSError, ValueError, TypeError):
+        return None
+
+    summaries = []
+    terminal = {'completed', 'failed', 'cancelled', 'interrupted'}
+    for directory in directories:
+        if not re.fullmatch(r'[a-f0-9]{32}', directory.name):
+            continue
+        try:
+            state = _safe(directory / '.state.json', project)
+            with state.open(encoding='utf-8') as stream:
+                job = json.load(stream)
+            if (not isinstance(job, dict) or job.get('id') != directory.name
+                    or job.get('status') not in editor.ACTIVE | terminal):
+                continue
+            source = job.get('source') if isinstance(job.get('source'), str) else None
+            source_path = _safe(_url_path(source, root), project)
+            if source_path.suffix.lower() != '.mp4':
+                continue
+        except (OSError, ValueError, TypeError):
+            continue
+
+        status = job['status']
+        stage = job.get('stage') if isinstance(job.get('stage'), str) else status
+        message = editor._clean_message(job.get('message') or job.get('error'))
+        # Match the editor's five-second grace period while Popen is still exec'ing.
+        created = _proj_edit_epoch(job.get('created_at'))
+        pending_start = status == 'queued' and created and time.time() - created < 5
+        try:
+            alive = status in editor.ACTIVE and (pending_start or editor._worker_alive(job) or editor._guardian_alive(job))
+        except (ValueError, TypeError, KeyError):
+            alive = False
+        if status in editor.ACTIVE and not alive:
+            status = stage = 'interrupted'
+            message = '后台进程已停止，原片和已有文件均保留；请重新发起精剪。'
+
+        source_changed = True
+        try:
+            if (source_path.suffix.lower() == '.mp4' and source_path.is_file()
+                    and source_path.stat().st_size > 0):
+                identity = editor._identity(source_path)
+                source_changed = identity != job.get('_source_identity', identity)
+        except (OSError, ValueError, TypeError):
+            pass
+
+        output_url = None
+        output_missing = False
+        if status == 'completed':
+            output_missing = True
+            output = job.get('output') if isinstance(job.get('output'), dict) else {}
+            try:
+                raw = output.get('url') or output.get('file')
+                path = _url_path(raw, root) if isinstance(raw, str) and raw.startswith('/outputs/') else raw
+                output_path = _safe(path, directory / 'work')
+                if (output_path.suffix.lower() == '.mp4' and output_path.is_file()
+                        and output_path.stat().st_size > 0
+                        and not any(part.startswith('.') for part in output_path.relative_to(directory / 'work').parts)):
+                    output_url = '/outputs/' + urllib.parse.quote(output_path.relative_to(root).as_posix(), safe='/')
+                    output_missing = False
+            except (OSError, ValueError, TypeError):
+                pass
+            if output_missing:
+                message = '精剪结果文件已删除或不可用，可以重新精剪。'
+
+        summaries.append({
+            'id': job['id'], 'status': status, 'stage': stage, 'message': message,
+            # The worker records stages, not a measured completion percentage.
+            'progress': None, 'source': source, 'source_changed': source_changed,
+            'created_at': job.get('created_at'), 'updated_at': job.get('updated_at'),
+            'finished_at': (job.get('finished_at') or job.get('updated_at')) if status in terminal else None,
+            'output_url': output_url, 'output_missing': output_missing,
+        })
+    return max(summaries, key=lambda item: (
+        item['status'] in editor.ACTIVE, _proj_edit_epoch(item['created_at']),
+        _proj_edit_epoch(item['updated_at']), item['id'])) if summaries else None
+
+
+def _proj_media_progress(project_key, title, base_dir, fallback, image_total, video_total):
+    """Count adopted, available media, never planned slots or candidate files.
+
+    Light workbench polls share the directory/manifest fingerprint cache. No directory
+    enumeration is needed; only a changed manifest or media directory rechecks its paths.
+    """
+    pdir = _proj_output_dir(project_key, title, base_dir)
+    source = fallback if isinstance(fallback, dict) else {}
+    counts = {'image_ready': 0, 'video_ready': 0, 'merged': False,
+              'merged_available': False, 'merged_partial': False, 'merged_stale': False,
+              '_merged_mtime': 0}
+    if pdir:
+        stamps = []
+        for sub in ('', 'frames', 'videos', 'manifest.json'):
+            try:
+                stat = os.stat(os.path.join(pdir, sub))
+                stamps.append((sub, stat.st_mtime_ns, stat.st_size))
+            except OSError:
+                stamps.append((sub, None, None))
+        # The manifest is authoritative when present; avoid serializing saved prompts/candidates
+        # on every poll. Legacy fallback fingerprints include only adopted media paths.
+        fallback_signature = None
+        if stamps[-1][1] is None:
+            fallback_signature = json.dumps({
+                key: [(m.get('slot') or m.get('sequence'), m.get('file'), m.get('url'))
+                      for m in (source.get(key) if isinstance(source.get(key), list) else [])
+                      if isinstance(m, dict)]
+                for key in ('frames', 'videos')}, sort_keys=True, default=str)
+            fallback_signature += json.dumps(source.get('merged_video'), sort_keys=True, default=str)
+        fingerprint = (tuple(stamps), fallback_signature)
+        cached = _PROJ_PROGRESS_CACHE.get(pdir)
+        if cached and cached[0] == fingerprint:
+            counts = cached[1]
+        else:
+            manifest = read_manifest(pdir)
+            if isinstance(manifest, dict):
+                source = manifest
+
+            def media_mtime(media):
+                if not isinstance(media, dict):
+                    return 0
+                for raw in (media.get('file'), media.get('url')):
+                    if not isinstance(raw, str) or not raw:
+                        continue
+                    # Both project-relative and outputs-relative paths occur in older manifests.
+                    candidates = [raw]
+                    if os.path.isabs(raw) and raw.startswith(os.path.abspath(base_dir) + os.sep):
+                        candidates.insert(0, os.path.relpath(raw, base_dir))
+                    if not raw.lstrip('/').startswith(OUTPUT_ROOT + '/'):
+                        candidates.append(os.path.relpath(os.path.join(pdir, raw), base_dir))
+                    for candidate in candidates:
+                        try:
+                            path = resolve_gallery_media_path(candidate, base_dir)
+                            stat = os.stat(path)
+                            if stat.st_size > 0:
+                                return stat.st_mtime
+                        except (ValueError, OSError):
+                            pass
+                return 0
+
+            latest_media_mtime = 0
+            def ready_slots(key):
+                nonlocal latest_media_mtime
+                slots = set()
+                media_rows = source.get(key) if isinstance(source.get(key), list) else []
+                for index, media in enumerate(media_rows):
+                    mtime = media_mtime(media)
+                    if mtime:
+                        latest_media_mtime = max(latest_media_mtime, mtime)
+                        slots.add(str(media.get('slot') or media.get('sequence') or index + 1))
+                return len(slots)
+
+            merged = source.get('merged_video') if isinstance(source.get('merged_video'), dict) else {}
+            merged_mtime = media_mtime(merged)
+            counts = {'image_ready': ready_slots('frames'), 'video_ready': ready_slots('videos')}
+            partial = bool(merged_mtime and (merged.get('partial') or merged.get('outcome') == 'partial_failed'))
+            stale = bool(merged_mtime and (merged.get('stale') or merged.get('status') == 'stale'
+                                          or latest_media_mtime > merged_mtime))
+            counts.update(merged_available=bool(merged_mtime), merged_partial=partial,
+                          merged_stale=stale, _merged_mtime=merged_mtime,
+                          merged=bool(merged_mtime and not partial and not stale))
+            _PROJ_PROGRESS_CACHE[pdir] = (fingerprint, counts)
+
+    def total(value, ready):
+        try:
+            return max(ready, int(value or 0))
+        except (TypeError, ValueError):
+            return ready
+
+    return {**counts, 'image_total': total(image_total, counts['image_ready']),
+            'video_total': total(video_total, counts['video_ready'])}
+
+
+def _proj_latest_jobs(entry):
+    latest = {}
+    for job in sorted(entry.get('sub_jobs') or [],
+                      key=lambda j: j.get('last_active') or 0, reverse=True):
+        latest.setdefault(job.get('type'), job)
+    return list(latest.values())
+
+
+def _proj_has_current_failure(entry):
+    edit = entry.get('video_edit') or {}
+    if edit.get('status') in ('failed', 'interrupted') or edit.get('output_missing'):
+        return True
+    progress = entry.get('progress') or {}
+    if progress.get('merged'):
+        return False
+    if progress.get('merged_partial') or progress.get('merged_stale'):
+        return True
+    for job in _proj_latest_jobs(entry):
+        if job.get('status') != 'failed' and job.get('outcome') != 'partial_failed':
+            continue
+        field = ('image' if job.get('type') in ('frames', 'staged_render') else
+                 'video' if job.get('type') in ('videos', 'video_chain') else None)
+        if job.get('outcome') != 'partial_failed' and field and progress.get(field + '_total', 0) > 0:
+            if progress.get(field + '_ready', 0) >= progress[field + '_total']:
+                continue
+        return True
+    return False
+
+def _proj_beat_files(project_key, title, base_dir):
+    """已补入项目根目录的节拍数据；只检查固定名称，不遍历媒体子目录。"""
+    from project_archive import BEAT_NAMES, _entry, _safe
+    pdir = _proj_output_dir(project_key, title, base_dir)
+    if not pdir:
+        return []
+    root = Path(os.path.abspath(os.path.join(base_dir, OUTPUT_ROOT)))
+    try:
+        project = _safe(pdir, root)
+    except (OSError, ValueError):
+        return []
+    files = []
+    for name in sorted(BEAT_NAMES):
+        path = project / name
+        try:
+            if path.is_symlink() or not path.is_file():
+                continue
+            files.append(_entry(_safe(path, project), root, 'beats'))
+        except (OSError, ValueError):
+            continue
+    return files
+
 
 def _proj_asset_stats(project_key, title, base_dir):
     """项目目录下的资产统计（文件数 / 字节数 / 最近产出时间 / 封面）。
@@ -5453,17 +6039,25 @@ def _proj_asset_stats(project_key, title, base_dir):
     顺着 project_key 撞不上时回落到 _get_project_dir(title)，它本来就负责认全三套。
     收集范围与 scan_gallery 的项目组一致：frames/ + videos/ + 项目根。
     """
-    rel_candidates = []
-    if project_key:
-        rel_candidates.append(os.path.join(OUTPUT_ROOT, _safe_project_name(project_key)))
-    if title:
-        rel_candidates.append(_get_project_dir(title))
-
-    for rel in rel_candidates:
-        pdir = rel if os.path.isabs(rel) else os.path.join(base_dir, rel)
-        if not os.path.isdir(pdir):
-            continue
-
+    pdir = _proj_output_dir(project_key, title, base_dir)
+    if pdir:
+        from project_archive import receipt, _url_path, _safe, archive_cover_url
+        archived = receipt(pdir)
+        if archived and archived.get('status') == 'archived':
+            count, size, latest = 0, 0, 0
+            root = Path(os.path.abspath(os.path.join(base_dir, OUTPUT_ROOT)))
+            for entry in archived.get('retained_files', []):
+                try:
+                    path = _safe(_url_path(entry['url'], root), Path(os.path.abspath(pdir)))
+                    stat = path.stat()
+                    count += 1
+                    size += stat.st_size
+                    latest = max(latest, stat.st_mtime)
+                except (OSError, ValueError, KeyError, TypeError):
+                    continue
+            return {'dir': os.path.relpath(pdir, base_dir).replace('\\', '/'),
+                    'file_count': count, 'bytes': size, 'latest_mtime': latest,
+                    'cover': archive_cover_url(archived, pdir, root)}
         # 获取目录以及子目录（frames, videos）的最近修改时间，以判断是否需要重新扫描
         mtimes = {}
         for sub in ('', 'frames', 'videos'):
@@ -5551,6 +6145,10 @@ def _proj_blank(project_key, kind='project'):
         'ledger': None,
         'sub_jobs': [],
         'assets': None,
+        'progress': None,
+        'video_edit': None,
+        'archived': False,
+        'archive': None,
         # 这一行的媒体住在哪个命名空间下。默认就是行键，点子库条目会把它改写成
         # 条目自己的 project_key（见第 2 步）——两者不一定相等。
         'media_key': project_key if kind == 'project' else '',
@@ -5672,120 +6270,16 @@ def library_item_has_cover(item, base_dir=None):
     return False
 
 
-def is_replica_task(task):
-    """判断是否为爆款复刻模块的任务。
-
-    复刻模块的所有流水线任务（视频抽帧/Pass A/Pass B/节拍阶梯/提示词合成/正交变体等）
-    仅在其专属的爆款复刻工作台中流转与管理，不作为激发任务或子作业出现在「项目」工作台（/api/projects）中。
-    在清空任务（/api/tasks/clear）等清理动作中也受到永久保护。
-    """
-    if not isinstance(task, dict):
-        return False
-    dims = task.get('dimensions') if isinstance(task.get('dimensions'), dict) else {}
-    task_type = str(dims.get('type') or '').strip()
-    if task_type in REPLICA_TASK_TYPES or task_type.startswith('replica'):
-        return True
-    if dims.get('replica_job_id') or dims.get('replica_variant_of'):
-        return True
-    if str(dims.get('source') or '').strip() == 'replica':
-        return True
-    task_id = str(task.get('id') or '').strip()
-    if task_id.startswith('replica'):
-        return True
-    result = task.get('result') if isinstance(task.get('result'), dict) else {}
-    if str(result.get('source') or '').strip() == 'replica' or result.get('replica_job_id') or result.get('replica_variant_of'):
-        return True
-    pk = str(dims.get('project_key') or result.get('project_key') or '').strip()
-    if 'replica_' in pk or pk.startswith('replica'):
-        return True
-    title = str(result.get('title') or dims.get('task_label') or dims.get('theme') or '').strip()
-    if '爆款 1:1 复刻' in title or '二创变体' in title or '· 爆款' in title or '· 二创' in title:
-        return True
-    return False
 
 
-_is_replica_task = is_replica_task
 
 
-def is_replica_library_item(item):
-    """判断一条点子库条目是否源自「爆款复刻」工作台。
-
-    复刻产出入库时具有 source='replica'、id=job_id（以 replica_ 开头）、
-    replica_job_id、creativity='爆款 1:1 复刻' 或 '二创变体' 等特征。
-    在执行各类项目或任务清空时必须 100% 豁免并保留。
-    """
-    if not isinstance(item, dict):
-        return False
-    item_id = str(item.get('id') or '').strip()
-    if item_id.startswith('replica'):
-        return True
-    if str(item.get('source') or '').strip() == 'replica':
-        return True
-    if item.get('replica_job_id') or item.get('replica_variant_of'):
-        return True
-    project_key = str(item.get('project_key') or '').strip()
-    if 'replica_' in project_key or project_key.startswith('replica'):
-        return True
-    creativity = str(item.get('creativity') or '').strip()
-    if '爆款' in creativity or '复刻' in creativity or '二创变体' in creativity:
-        return True
-    title = str(item.get('title') or '').strip()
-    theme = str(item.get('theme') or '').strip()
-    if '爆款 1:1 复刻' in title or '二创变体' in title or '爆款 1:1 复刻' in theme or '二创变体' in theme or '· 爆款' in title or '· 二创' in title:
-        return True
-    return False
 
 
-def is_replica_protected_path(path_or_name, base_dir=None):
-    """判断 outputs/ 下的某个路径或目录名是否属于爆款复刻受保护资产。
-
-    受到绝对保护的路径包括：
-    1. outputs/replica_jobs 目录及其所有子路径；
-    2. 目录名以 replica_ 或 run_replica_ 开头的目录；
-    3. 任何以 replica 开头的工程资产路径。
-    """
-    if not path_or_name:
-        return False
-    base_dir = base_dir or os.path.dirname(os.path.abspath(__file__))
-    out_root = os.path.abspath(OUTPUT_ROOT if os.path.isabs(OUTPUT_ROOT) else os.path.join(base_dir, OUTPUT_ROOT))
-    replica_jobs_abs = os.path.abspath(os.path.join(out_root, 'replica_jobs'))
-
-    clean_str = str(path_or_name).strip()
-    base_name = os.path.basename(clean_str.rstrip('\\/'))
-    if base_name in ('replica_jobs', '.gitkeep'):
-        return True
-    if base_name.startswith('replica_') or base_name.startswith('run_replica_') or 'replica' in base_name.lower():
-        return True
-
-    target_abs = os.path.abspath(clean_str if os.path.isabs(clean_str) else os.path.join(out_root, clean_str))
-    if target_abs == replica_jobs_abs or target_abs.startswith(replica_jobs_abs + os.sep):
-        return True
-
-    return False
 
 
-def _replica_job_of(dims):
-    """任务属于哪条复刻 job。老任务（2026-08-10 之前）dimensions 里只有 theme=job_id。"""
-    if not isinstance(dims, dict):
-        return ''
-    task_type = str(dims.get('type') or '').strip()
-    if task_type in REPLICA_TASK_TYPES or task_type.startswith('replica') or dims.get('replica_job_id'):
-        return str(dims.get('replica_job_id') or dims.get('theme') or '').strip()
-    return ''
 
 
-def _replica_live_name(job_id, cache):
-    """按 job 状态现算显示名：compose 之后标题会变，任务创建时抄下的那份会过期。"""
-    if job_id in cache:
-        return cache[job_id]
-    name = ''
-    try:
-        from replica_pipeline import job_display_name
-        name = job_display_name(job_id)
-    except Exception:
-        name = ''
-    cache[job_id] = name
-    return name
 
 
 def _proj_task_view(task):
@@ -5799,6 +6293,7 @@ def _proj_task_view(task):
         'id': task.get('id'),
         'status': task.get('status'),
         'error': task.get('error'),
+        'outcome': task.get('outcome') or result.get('completion_state'),
         'last_active': task.get('last_active') or 0,
         'stage': (timeline[-1].get('stage') if timeline else None),
         'model': result.get('model'),
@@ -5815,28 +6310,41 @@ def _proj_task_view(task):
 
 
 def _proj_state(entry):
-    """项目行的主状态（工作台顶部 chips 的分桶依据）。
-
-    运行中 > 失败/取消 > 已收藏 > 已完成。收藏排在失败之后是因为：compose 失败时
-    根本没有结果可收藏，两者几乎不会同时成立；真同时成立时"失败"更需要被看见。
-    媒体子作业的失败不改主状态（母项目本身是好的），只置 has_failed_jobs 让 UI 打旗。
-
-    孤立媒体作业行（kind='job'，母项目的任务记录已被 7 天清理规则删掉）没有 task，
-    主状态取它自己那批作业里最重的一档——否则它们会全部落进 'unknown'，
-    连"失败"筛选都捞不出来，等于白挂了一行。
-    """
+    """Current activity wins; an available merged result clears historical failure badges."""
     task = entry.get('task') or {}
     status = task.get('status')
-    if status == 'running' or any(j.get('status') == 'running' for j in entry['sub_jobs']):
+    if ((entry.get('video_edit') or {}).get('status') in ('queued', 'running')
+            or status == 'running' or any(j.get('status') == 'running' for j in entry['sub_jobs'])):
         return 'running'
+    edit = entry.get('video_edit') or {}
+    if edit.get('status') in ('failed', 'interrupted') or edit.get('output_missing'):
+        return 'failed'
+    if edit.get('status') == 'cancelled':
+        return 'cancelled'
+    progress = entry.get('progress') or {}
+    if (edit.get('status') == 'completed' and edit.get('output_url')
+            and not progress.get('merged_stale') and not progress.get('merged_partial')):
+        return 'completed'
+    if (entry.get('progress') or {}).get('merged'):
+        return 'completed'
+    if entry.get('has_failed_jobs'):
+        return 'failed'
     if status in ('failed', 'cancelled'):
         return status
-    if entry['saved']:
-        return 'saved'
+    if task.get('outcome') == 'partial_failed':
+        return 'failed'
+    if entry.get('kind') != 'job':
+        progress = entry.get('progress') or {}
+        has_media = bool(progress.get('image_ready') or progress.get('video_ready'))
+        if entry.get('saved') or status == 'completed' or has_media:
+            incomplete = any(0 < progress.get(kind + '_ready', 0) < progress.get(kind + '_total', 0)
+                             for kind in ('image', 'video'))
+            return 'partial' if incomplete else 'ready'
+        return status or 'unknown'
     if status == 'completed':
         return 'completed'
     if not task and entry['sub_jobs']:
-        job_states = {j.get('status') for j in entry['sub_jobs']}
+        job_states = {j.get('status') for j in _proj_latest_jobs(entry)}
         for candidate in ('failed', 'cancelled', 'completed'):
             if candidate in job_states:
                 return candidate
@@ -5873,6 +6381,7 @@ def build_projects_index(tasks=None, library_items=None, ledger_rows=None,
     ledger_rows = [r for r in (ledger_rows or []) if isinstance(r, dict)]
 
     projects = {}
+    progress_sources = {}
     alias = {}
 
     def bind(project_key, *keys):
@@ -5899,10 +6408,10 @@ def build_projects_index(tasks=None, library_items=None, ledger_rows=None,
 
     # ── 1. 激发任务：项目表的脊柱，project_key 由它产生 ──────────────────
     for task in tasks:
-        if _is_replica_task(task) or _is_synthetic_test_task(task):
+        if _is_synthetic_test_task(task):
             continue
         dims = dims_of(task)
-        if dims.get('type') in MEDIA_TASK_TYPES:
+        if str(dims.get('type') or '') not in PROJECT_TASK_TYPES:
             continue
         result = result_of(task)
         title = result.get('title') or dims.get('task_label') or dims.get('theme') or ''
@@ -5916,6 +6425,7 @@ def build_projects_index(tasks=None, library_items=None, ledger_rows=None,
         # 否则行上的状态/进度取决于 ACTIVE_TASKS 的遍历顺序。
         if (entry['task'] or {}).get('last_active', -1) <= float(task.get('last_active') or 0):
             entry['task'] = _proj_task_view(task)
+            progress_sources[key] = result.get('frameRun') or {}
         if result.get('image_count') is not None:
             entry['image_count'] = result.get('image_count')
         if result.get('video_count') is not None:
@@ -5940,6 +6450,8 @@ def build_projects_index(tasks=None, library_items=None, ledger_rows=None,
         entry['title'] = title or entry['title']
         entry['theme'] = item.get('theme') or entry['theme']
         entry['saved'] = True
+        entry['archived'] = bool(item.get('archived'))
+        entry['archive'] = item.get('archive') if entry['archived'] else None
         entry['media_key'] = item.get('project_key') or entry.get('media_key') or ''
         entry['timestamp'] = item.get('timestamp') or entry['timestamp']
         entry['cover'] = item_project_cover(item) or entry['cover']
@@ -5948,6 +6460,7 @@ def build_projects_index(tasks=None, library_items=None, ledger_rows=None,
         if item.get('video_count') is not None:
             entry['video_count'] = item.get('video_count')
         frame_run = item.get('frameRun') if isinstance(item.get('frameRun'), dict) else {}
+        progress_sources[key] = frame_run
         entry['library'] = {
             'id': item.get('id'),
             'timestamp': item.get('timestamp'),
@@ -5960,10 +6473,38 @@ def build_projects_index(tasks=None, library_items=None, ledger_rows=None,
              f"key:{item.get('project_key')}" if item.get('project_key') else '',
              *[f"title:{v}" for v in _proj_title_variants(title, item.get('theme'))])
 
+    # A durable receipt is also a recovery entry if cleanup outlived its task or
+    # the compact library write failed. These tiny files never enumerate media.
+    from project_archive import receipt
+    output_root = os.path.abspath(os.path.join(base_dir, OUTPUT_ROOT))
+    if os.path.isdir(output_root) and not os.path.islink(output_root):
+        for directory in os.scandir(output_root):
+            if directory.name.startswith('.') or directory.is_symlink() or not directory.is_dir():
+                continue
+            record = receipt(directory.path)
+            if not record or record.get('status') not in ('prepared', 'archived'):
+                continue
+            key = record.get('project_key')
+            if not isinstance(key, str) or not key:
+                continue
+            entry = projects.setdefault(key, _proj_blank(key))
+            entry['title'] = record.get('title') or entry['title']
+            entry['theme'] = entry['theme'] or entry['title']
+            entry['archived'] = True
+            entry['archive_pending'] = record['status'] == 'prepared'
+            entry['archive'] = {field: record.get(field) for field in (
+                'archived_at', 'refined_videos', 'prompts_url', 'beats_url', 'retained_files', 'deleted_bytes',
+                'cover_url')}
+            for field in ('final_videos', 'video_retention'):
+                if field in record:
+                    entry['archive'][field] = record[field]
+            if record.get('library_id') and not entry.get('library'):
+                entry['library'] = {'id': record['library_id']}
+
     # ── 3. 媒体子作业：挂回母项目；挂不上的自成一行（否则失败的帧/视频任务
     #      像现在的任务抽屉那样被整类过滤掉，用户永远看不见）──────────────
     for task in tasks:
-        if _is_replica_task(task) or _is_synthetic_test_task(task):
+        if _is_synthetic_test_task(task):
             continue
         dims = dims_of(task)
         job_type = dims.get('type')
@@ -5974,6 +6515,7 @@ def build_projects_index(tasks=None, library_items=None, ledger_rows=None,
             'type': job_type,
             'status': task.get('status'),
             'error': task.get('error'),
+            'outcome': task.get('outcome') or result_of(task).get('completion_state'),
             'last_active': task.get('last_active') or 0,
             'theme': dims.get('theme') or '',
         }
@@ -6020,6 +6562,26 @@ def build_projects_index(tasks=None, library_items=None, ledger_rows=None,
     # ── 5. 资产统计 + 主状态 + 排序 ──────────────────────────────────────
     rows = []
     for key, entry in projects.items():
+        if entry.get('archived'):
+            entry['state'] = 'archived'
+            entry['saved'] = False
+            from project_archive import archive_cover_url
+            pdir = _proj_output_dir(entry.get('media_key') or key, entry['title'], base_dir)
+            entry['cover'] = (archive_cover_url(entry.get('archive'), pdir, Path(output_root))
+                              if pdir else None)
+            entry['task'] = None
+            entry['sub_jobs'] = []
+            entry['image_count'] = 0
+            archive = entry.get('archive') or {}
+            entry['video_count'] = len(archive.get('final_videos', archive.get('refined_videos', [])) or [])
+            entry['updated_at'] = float((entry.get('archive') or {}).get('archived_at') or entry['updated_at'])
+            entry['progress'] = {'image_ready': 0, 'image_total': 0, 'video_ready': 0, 'video_total': 0,
+                                 'merged': bool(entry['video_count']), 'merged_available': bool(entry['video_count']),
+                                 'merged_partial': False, 'merged_stale': False}
+            if with_assets:
+                entry['assets'] = _proj_asset_stats(entry.get('media_key') or key, entry['title'], base_dir)
+            rows.append(entry)
+            continue
         if with_assets:
             # 孤立作业行的 key 是 job:<标题>，不是合法 project_key——只能靠标题
             # 回落到 _get_project_dir 的三套历史命名去找目录
@@ -6030,7 +6592,27 @@ def build_projects_index(tasks=None, library_items=None, ledger_rows=None,
             # 点子库记的封面优先（用户可能在多张里选过一张 activeCoverUrl），
             # 没收藏过的项目才用磁盘上那张兜底
             entry['cover'] = entry['cover'] or entry['assets'].get('cover')
-        entry['has_failed_jobs'] = any(j.get('status') == 'failed' for j in entry['sub_jobs'])
+        entry['video_edit'] = _proj_video_edit(
+            entry.get('media_key') or (key if entry['kind'] == 'project' else None),
+            entry['title'], base_dir)
+        if entry['video_edit']:
+            entry['updated_at'] = max(entry['updated_at'], _proj_edit_epoch(entry['video_edit'].get('updated_at')))
+        entry['beat_files'] = _proj_beat_files(
+            entry.get('media_key') or (key if entry['kind'] == 'project' else None),
+            entry['title'], base_dir)
+        entry['progress'] = _proj_media_progress(
+            entry.get('media_key') or (key if entry['kind'] == 'project' else None),
+            entry['title'], base_dir, progress_sources.get(key),
+            entry['image_count'], entry['video_count'])
+        progress = entry['progress']
+        merged_mtime = progress.pop('_merged_mtime', 0)
+        recent = _proj_latest_jobs(entry) + ([entry['task']] if entry.get('task') else [])
+        if progress['merged_available'] and any(
+                (job.get('status') in ('failed', 'cancelled') or job.get('outcome') == 'partial_failed')
+                and float(job.get('last_active') or 0) > merged_mtime for job in recent):
+            progress['merged_stale'] = True
+            progress['merged'] = False
+        entry['has_failed_jobs'] = _proj_has_current_failure(entry)
         entry['sub_jobs'].sort(key=lambda j: j.get('last_active') or 0, reverse=True)
         entry['state'] = _proj_state(entry)
         rows.append(entry)

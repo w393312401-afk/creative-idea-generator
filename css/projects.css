@@ -23,7 +23,7 @@
        理由与实测数据见 css/tokens.css 的 .glass-panel。 */
     background: var(--bg-panel);
     border: 1px solid var(--border-color);
-    border-radius: 20px;
+    border-radius: var(--radius-2xl);
     overflow: hidden;
 }
 
@@ -45,7 +45,46 @@
     color: var(--text-muted);
 }
 
-/* ── 工具栏 ────────────────────────────────────────────────────────────── */
+/* ── 项目分区与工具栏 ──────────────────────────────────────────────────── */
+
+#panel-projects .projects-section-tabs {
+    display: flex;
+    gap: 6px;
+    padding: 0 1.5rem 10px;
+    flex-shrink: 0;
+}
+
+#panel-projects .projects-section-btn {
+    border: 1px solid transparent;
+    border-radius: var(--radius-md);
+    background: transparent;
+    color: var(--text-muted);
+    padding: 8px 18px;
+    font-size: var(--fs-md);
+    font-weight: 600;
+    cursor: pointer;
+    transition: var(--transition-fast);
+}
+
+#panel-projects .projects-section-btn:hover {
+    color: var(--text-main);
+    background: rgba(var(--ink-rgb), 0.04);
+}
+
+#panel-projects .projects-section-btn.active {
+    color: var(--neon-cyan);
+    background: rgba(176, 123, 82, 0.1);
+    border-color: rgba(176, 123, 82, 0.35);
+}
+
+#panel-projects .projects-section-btn:focus-visible {
+    outline: 2px solid var(--neon-cyan);
+    outline-offset: 2px;
+}
+
+#panel-projects .projects-filters[hidden] {
+    display: none;
+}
 
 #panel-projects .projects-toolbar {
     display: flex;
@@ -68,9 +107,9 @@
 #panel-projects .projects-filter-chip {
     background: transparent;
     border: 1px solid var(--border-color);
-    border-radius: 20px;
+    border-radius: var(--radius-2xl);
     color: var(--text-secondary);
-    font-size: 12px;
+    font-size: var(--fs-sm);
     font-weight: 600;
     padding: 5px 14px;
     cursor: pointer;
@@ -107,9 +146,9 @@
 #panel-projects .projects-sort-select {
     background: rgba(var(--ink-rgb), 0.04);
     border: 1px solid var(--border-color);
-    border-radius: 8px;
+    border-radius: var(--radius-md);
     color: var(--text-main);
-    font-size: 12px;
+    font-size: var(--fs-sm);
     padding: 6px 12px;
     outline: none;
     transition: var(--transition-fast);
@@ -140,7 +179,7 @@
     gap: 2px;
     padding: 2px;
     border: 1px solid var(--border-color);
-    border-radius: 8px;
+    border-radius: var(--radius-md);
     background: rgba(var(--ink-rgb), 0.04);
     flex-shrink: 0;
 }
@@ -148,9 +187,9 @@
 #panel-projects .projects-view-btn {
     background: transparent;
     border: none;
-    border-radius: 6px;
+    border-radius: var(--radius-sm);
     color: var(--text-muted);
-    font-size: 13px;
+    font-size: var(--fs-md);
     line-height: 1;
     padding: 5px 9px;
     cursor: pointer;
@@ -168,7 +207,69 @@
     display: flex;
     align-items: center;
     gap: 8px;
+    flex-wrap: wrap;
+    margin-left: auto;
 }
+
+#panel-projects .projects-tool-btn.primary {
+    background: var(--neon-cyan);
+    border-color: var(--neon-cyan);
+    color: var(--bg-panel-solid);
+    padding: 8px 14px;
+}
+
+#panel-projects .workspace-more { position: relative; }
+#panel-projects .workspace-more > summary { list-style: none; }
+#panel-projects .workspace-more > summary::-webkit-details-marker { display: none; }
+#panel-projects .workspace-more-menu {
+    position: absolute;
+    right: 0;
+    top: calc(100% + 6px);
+    min-width: 190px;
+    padding: 6px;
+    background: var(--bg-panel-solid);
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-md);
+    box-shadow: 0 8px 28px rgba(0, 0, 0, 0.16);
+    z-index: 80;
+}
+#panel-projects .workspace-more-menu .projects-tool-btn {
+    display: block;
+    width: 100%;
+    border: 0;
+    background: transparent;
+    text-align: left;
+    padding: 9px 10px;
+}
+#panel-projects .workspace-more-menu .projects-tool-btn:hover { background: var(--bg-card-hover); }
+#panel-projects .workspace-menu-divider { border-top: 1px solid var(--border-color); margin: 5px; }
+
+#panel-projects .projects-history,
+#panel-projects .projects-technical {
+    margin-top: 16px;
+    padding-top: 12px;
+    border-top: 1px solid var(--border-color);
+}
+#panel-projects .projects-history > summary,
+#panel-projects .projects-technical > summary,
+#panel-projects .projects-more-actions > summary {
+    color: var(--text-secondary);
+    cursor: pointer;
+    font-size: var(--fs-sm);
+    padding: 6px 0;
+}
+#panel-projects .project-current-status {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px 12px;
+    margin: 12px 0 4px;
+    color: var(--text-main);
+}
+#panel-projects .project-current-status > span:not(.project-spinner) { font-size: var(--fs-sm); color: var(--text-secondary); }
+#panel-projects .project-main .project-current-status { margin: 4px 0 0; }
+#panel-projects .project-next-hint { font-size: var(--fs-sm); color: var(--text-secondary); line-height: 1.6; margin-bottom: 12px; }
+#panel-projects .projects-more-actions .projects-detail-actions { margin-top: 8px; }
 
 /* ── 多选批量条 ────────────────────────────────────────────────────── */
 #panel-projects .projects-bulkbar {
@@ -186,7 +287,7 @@
 #panel-projects .projects-bulkbar[hidden] { display: none; }
 
 #panel-projects .projects-bulk-count {
-    font-size: 12px;
+    font-size: var(--fs-sm);
     font-weight: 700;
     color: var(--text-main);
     white-space: nowrap;
@@ -200,7 +301,7 @@
 }
 
 #panel-projects .projects-stats {
-    font-size: 11px;
+    font-size: var(--fs-xs);
     color: var(--text-muted);
     white-space: nowrap;
 }
@@ -209,9 +310,9 @@
 #panel-projects .projects-btn {
     background: rgba(var(--ink-rgb), 0.04);
     border: 1px solid var(--border-color);
-    border-radius: 8px;
+    border-radius: var(--radius-md);
     color: var(--text-secondary);
-    font-size: 12px;
+    font-size: var(--fs-sm);
     font-weight: 600;
     padding: 6px 12px;
     cursor: pointer;
@@ -259,7 +360,7 @@
 #panel-projects .projects-status {
     padding: 32px 8px;
     text-align: center;
-    font-size: 13px;
+    font-size: var(--fs-md);
     color: var(--text-muted);
 }
 
@@ -273,7 +374,7 @@
     gap: 12px;
     padding: 10px 12px;
     border: 1px solid var(--border-color);
-    border-radius: 12px;
+    border-radius: var(--radius-lg);
     background: rgba(var(--ink-rgb), 0.02);
     cursor: pointer;
     transition: transform 0.18s cubic-bezier(0.16, 1, 0.3, 1),
@@ -336,7 +437,7 @@
     width: 80px;
     height: 56px;
     flex-shrink: 0;
-    border-radius: 8px;
+    border-radius: var(--radius-md);
     overflow: hidden;
     background: rgba(var(--ink-rgb), 0.06);
     display: flex;
@@ -396,8 +497,8 @@
     background: rgba(18, 18, 22, 0.8);
     border: 1px solid rgba(255, 255, 255, 0.2);
     color: #f1f5f9;
-    border-radius: 5px;
-    font-size: 10px;
+    border-radius: var(--radius-sm);
+    font-size: var(--fs-2xs);
     font-weight: 600;
     padding: 3px 7px;
     cursor: pointer;
@@ -435,7 +536,7 @@
 }
 
 #panel-projects .project-title {
-    font-size: 13px;
+    font-size: var(--fs-md);
     font-weight: 600;
     color: var(--text-main);
     overflow: hidden;
@@ -451,13 +552,13 @@
 }
 
 #panel-projects .project-meta {
-    font-size: 11px;
+    font-size: var(--fs-xs);
     color: var(--text-muted);
     line-height: 1.3;
 }
 
 #panel-projects .project-error {
-    font-size: 11px;
+    font-size: var(--fs-xs);
     color: #d9534f;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -466,10 +567,10 @@
 
 /* 状态徽章 */
 #panel-projects .project-badge {
-    font-size: 10px;
+    font-size: var(--fs-2xs);
     font-weight: 700;
     padding: 2px 7px;
-    border-radius: 6px;
+    border-radius: var(--radius-sm);
     white-space: nowrap;
     border: 1px solid transparent;
     line-height: 1.2;
@@ -479,6 +580,18 @@
     background: rgba(176, 123, 82, 0.16);
     color: #8A5A32;
     border-color: rgba(176, 123, 82, 0.35);
+}
+
+#panel-projects .project-badge.fx-queue.waiting {
+    background: transparent;
+    color: var(--warning);
+    border: 1px dashed var(--warning);
+}
+
+#panel-projects .project-badge.fx-queue.active {
+    background: transparent;
+    color: var(--text-secondary);
+    border-color: var(--border-color);
 }
 
 #panel-projects .project-badge.state-completed {
@@ -519,7 +632,7 @@
     display: flex;
     align-items: center;
     gap: 8px;
-    font-size: 11px;
+    font-size: var(--fs-xs);
     color: var(--text-secondary);
 }
 
@@ -548,10 +661,10 @@
 }
 
 #panel-projects .project-job {
-    font-size: 10px;
+    font-size: var(--fs-2xs);
     font-weight: 600;
     padding: 2px 7px;
-    border-radius: 5px;
+    border-radius: var(--radius-sm);
     background: rgba(var(--ink-rgb), 0.04);
     color: var(--text-muted);
     border: 1px solid var(--border-color);
@@ -613,7 +726,7 @@
     width: 100%;
     height: auto;
     aspect-ratio: 16 / 9;
-    border-radius: 9px;
+    border-radius: var(--radius-md);
 }
 
 #panel-projects .projects-list.view-grid .project-thumb-icon { font-size: 32px; }
@@ -625,7 +738,7 @@
     z-index: 3;
     width: 22px;
     height: 22px;
-    border-radius: 6px;
+    border-radius: var(--radius-sm);
     background: rgba(0, 0, 0, 0.5);
     backdrop-filter: blur(4px);
 }
@@ -702,16 +815,16 @@
     align-items: center;
     gap: 8px;
     padding: 5px 10px;
-    border-radius: 8px;
+    border-radius: var(--radius-md);
 }
 
 #panel-projects .projects-list.view-compact .project-thumb {
     width: 32px;
     height: 32px;
-    border-radius: 6px;
+    border-radius: var(--radius-sm);
 }
 
-#panel-projects .projects-list.view-compact .project-thumb-icon { font-size: 14px; }
+#panel-projects .projects-list.view-compact .project-thumb-icon { font-size: var(--fs-base); }
 
 #panel-projects .projects-list.view-compact .project-main {
     flex-direction: row;
@@ -740,7 +853,8 @@
 /* ── 详情栏 ────────────────────────────────────────────────────────────── */
 
 #panel-projects .projects-detail {
-    width: 340px;
+    /* 随面板宽度伸缩（1352px 宽 ≈ 380px，窄一点收到 300px），不再固定 340px */
+    width: clamp(300px, 28%, 380px);
     flex-shrink: 0;
     border-left: 1px solid var(--border-color);
     background: rgba(var(--ink-rgb), 0.02);
@@ -750,7 +864,7 @@
 }
 
 #panel-projects .projects-detail-empty {
-    font-size: 12px;
+    font-size: var(--fs-sm);
     color: var(--text-muted);
     text-align: center;
     padding-top: 40px;
@@ -764,7 +878,7 @@
 }
 
 #panel-projects .projects-detail-head h3 {
-    font-size: 14px;
+    font-size: var(--fs-base);
     font-weight: 600;
     color: var(--text-main);
     line-height: 1.4;
@@ -774,7 +888,7 @@
     background: transparent;
     border: none;
     color: var(--text-muted);
-    font-size: 20px;
+    font-size: var(--fs-2xl);
     line-height: 1;
     cursor: pointer;
     flex-shrink: 0;
@@ -784,7 +898,7 @@
 
 #panel-projects .projects-detail-theme {
     margin-top: 6px;
-    font-size: 11px;
+    font-size: var(--fs-xs);
     color: var(--text-muted);
     line-height: 1.5;
 }
@@ -795,9 +909,9 @@
     padding: 8px 10px;
     border: 1px solid var(--border-color);
     border-left: 2px solid rgba(176, 123, 82, 0.5);
-    border-radius: 6px;
+    border-radius: var(--radius-sm);
     background: rgba(var(--ink-rgb), 0.04);
-    font-size: 11px;
+    font-size: var(--fs-xs);
     line-height: 1.6;
     color: var(--text-muted);
 }
@@ -830,7 +944,7 @@
     display: grid;
     grid-template-columns: auto 1fr;
     gap: 5px 12px;
-    font-size: 11px;
+    font-size: var(--fs-xs);
     align-items: baseline;
 }
 
@@ -847,7 +961,7 @@
 #panel-projects .projects-detail-section { margin-top: 18px; }
 
 #panel-projects .projects-detail-section h4 {
-    font-size: 11px;
+    font-size: var(--fs-xs);
     font-weight: 700;
     color: var(--text-muted);
     text-transform: uppercase;
@@ -866,10 +980,10 @@
     display: flex;
     flex-direction: column;
     gap: 2px;
-    font-size: 11px;
+    font-size: var(--fs-xs);
     padding: 6px 8px;
     border: 1px solid var(--border-color);
-    border-radius: 8px;
+    border-radius: var(--radius-md);
     color: var(--text-secondary);
 }
 
@@ -890,12 +1004,12 @@
 
 #panel-projects .projects-job-btn {
     border: 1px solid var(--border-color);
-    border-radius: 6px;
+    border-radius: var(--radius-sm);
     background: transparent;
     color: var(--text-secondary);
     padding: 2px 7px;
     font: inherit;
-    font-size: 10px;
+    font-size: var(--fs-2xs);
     cursor: pointer;
 }
 
@@ -911,13 +1025,13 @@
 
 #panel-projects .projects-job-id {
     font-family: var(--font-mono, monospace);
-    font-size: 10px;
+    font-size: var(--fs-2xs);
     color: var(--text-muted);
     word-break: break-all;
 }
 
 #panel-projects .projects-job-error {
-    font-size: 10px;
+    font-size: var(--fs-2xs);
     color: #c0453f;
 }
 
@@ -932,7 +1046,7 @@
 }
 
 /* ── 窄屏：详情降级为覆盖在列表上的浮层 ───────────────────────────── */
-@media (max-width: 900px) {
+@media (max-width: 1024px) {
     #panel-projects .projects-body { position: relative; }
 
     #panel-projects .projects-detail {
@@ -963,4 +1077,101 @@
     outline: 2px dashed rgba(176, 123, 82, 0.55);
     outline-offset: -6px;
     background: rgba(176, 123, 82, 0.06);
+}
+
+/* 归档只展示最终交付文件，预览确认对话框位于 body 下。 */
+#panel-projects .project-badge.state-archived {
+    color: #60826a;
+    background: rgba(96, 130, 106, 0.12);
+}
+
+#panel-projects .project-badge.state-archive_pending {
+    color: #ad7b36;
+    background: rgba(173, 123, 54, 0.12);
+}
+
+#panel-projects .projects-btn:disabled {
+    opacity: 0.5;
+    cursor: wait;
+}
+
+#panel-projects .projects-archive-files h4 {
+    margin: 18px 0 8px;
+    font-size: var(--fs-md);
+}
+
+#panel-projects .projects-archive-files ul {
+    list-style: none;
+    margin: 12px 0;
+    padding: 0;
+}
+
+#panel-projects .projects-archive-files li {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 10px 0;
+    border-bottom: 1px solid var(--border-color);
+}
+
+#panel-projects .projects-archive-files li > span {
+    flex: 1;
+    min-width: 0;
+    font-size: var(--fs-sm);
+}
+
+#panel-projects .projects-archive-files small {
+    display: block;
+    margin-top: 3px;
+    color: var(--text-muted);
+    overflow-wrap: anywhere;
+}
+
+#panel-projects .projects-archive-files a {
+    text-decoration: none;
+    flex: 0 0 auto;
+}
+
+#panel-projects .projects-archive-video {
+    margin: 12px 0;
+}
+
+#panel-projects .projects-archive-video video {
+    display: block;
+    width: 100%;
+    max-height: 320px;
+    background: #161616;
+    border-radius: var(--radius-md);
+}
+
+#panel-projects .projects-archive-video figcaption {
+    margin-top: 5px;
+    color: var(--text-muted);
+    font-size: var(--fs-xs);
+    overflow-wrap: anywhere;
+}
+
+.projects-archive-preview {
+    display: block;
+    max-height: 220px;
+    margin: 12px 0;
+    overflow-y: auto;
+}
+
+.projects-archive-preview-project {
+    display: block;
+    margin-bottom: 10px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid var(--border-color);
+    overflow-wrap: anywhere;
+}
+
+.projects-archive-preview-project > span {
+    display: block;
+    margin-top: 3px;
+    font-size: var(--fs-sm);
+}
+
+.projects-archive-warning {
+    color: #c0453f;
 }

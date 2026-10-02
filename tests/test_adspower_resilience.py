@@ -5,8 +5,8 @@ import requests
 from integrations.google_fx.utils import browser
 
 
-def test_get_ads_ws_url_reuses_running_browser_on_conn_error(monkeypatch, tmp_path):
-    """当 AdsPower Local API 端口完全连不上 (ConnectionError) 时，如果有正在运行的浏览器，应直接复用。"""
+def test_get_ads_ws_url_reuses_running_browser_on_conn_error(monkeypatch, tmp_path, ads_inventory_reader):
+    """清单确认仅一个环境后，active API故障仍可从缓存复用目标。"""
     user_id = "test_user_active"
     cache_dir = tmp_path / f"{user_id}_profile"
     cache_dir.mkdir(parents=True)
@@ -23,6 +23,9 @@ def test_get_ads_ws_url_reuses_running_browser_on_conn_error(monkeypatch, tmp_pa
     monkeypatch.setattr(browser, "suppress_browser_window", lambda *args, **kwargs: False)
 
     def mock_get(url, *args, **kwargs):
+        if url.endswith('/browser/local-active'):
+            from types import SimpleNamespace
+            return SimpleNamespace(json=lambda: {'code': 0, 'data': {'list': [{'user_id': user_id}]}})
         raise requests.exceptions.ConnectionError("Connection refused")
 
     monkeypatch.setattr("requests.get", mock_get)
@@ -31,7 +34,7 @@ def test_get_ads_ws_url_reuses_running_browser_on_conn_error(monkeypatch, tmp_pa
     assert ws == "ws://127.0.0.1:9222/devtools/browser/abc-123"
 
 
-def test_get_ads_ws_url_provides_clear_error_when_adspower_down(monkeypatch):
+def test_get_ads_ws_url_provides_clear_error_when_adspower_down(monkeypatch, ads_inventory_reader):
     """当 AdsPower 未启动且无法自愈拉起时，应抛出包含明确指引的异常。"""
     monkeypatch.setattr(browser, "_find_running_browser_ws", lambda uid: None)
     monkeypatch.setattr(browser, "_try_revive_adspower", lambda port: False)

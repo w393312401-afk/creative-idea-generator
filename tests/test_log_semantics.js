@@ -1,5 +1,5 @@
 const assert = require('assert');
-const { classify, eventKeyOf, aggregate, summarize } = require('../js/log_semantics.js');
+const { classify, eventKeyOf, aggregate, summarize, taskIdsForProject } = require('../js/log_semantics.js');
 
 // 输入用的是 server.log 里真实出现过的行（数字/标题按需缩短），不是编出来的样例。
 function entry(level, tag, text, task) {
@@ -29,6 +29,7 @@ function entry(level, tag, text, task) {
     '帧序列任务失败: 第 3 帧图生图失败: All accounts exhausted. Last error: HTTP 429',
     '帧序列任务失败: Google FX 批量生图失败: AdsPower 启动失败 (已尝试 3 次)',
     '帧间调色不可用，已跳过（本进程仅提示一次）: No module named \'cv2\'',
+    'video_error message=视频 5 的锚点帧 IMAGE 6 派生自旧的 i2i 链（血统过期），已拦截以防跨链跳变',
     'video_error index=2 message=视频 2 所需的起始帧 IMAGE 3 不存在。请重新生成该帧！',
     'error message=IMG 4 当前没有记录待修复的问题——请先在帧网格点「描述问题」写下这一帧哪里不对',
   ];
@@ -46,9 +47,7 @@ function entry(level, tag, text, task) {
     'Request timed out: TimeoutError(\'timed out\')',
     'video_warning message=视频 3 的锚点帧 IMAGE 4 未通过一致性审查（sequence_review_flagged）',
     'video_warning message=视频 2 的首尾锚点帧差异过大（MAD=31.4），疑似空间断裂',
-    'video_error message=视频 5 的锚点帧 IMAGE 6 派生自旧的 i2i 链（上游帧已被单独重渲，血统过期），已拦截以防跨链跳变',
     '任务 credit_probe_k9 超时后 30s 内未自行退出临界区，看门狗执行强行槽位释放',
-    'SSE client disconnected (/api/logs/stream): [WinError 10053] 你的主机中的软件中止了一个已建立的连接。',
   ];
   selfHealing.forEach(t => {
     const r = classify(entry('WARN', 'HTTP', t));
@@ -177,3 +176,50 @@ assert.strictEqual(classify(null), null);
 assert.strictEqual(classify({}), null);
 
 console.log('log_semantics tests passed');
+
+// Task lifecycle, rather than raw historical ERROR lines, drives actionable counts.
+{
+  const fail = index => entry('ERROR', 'TASK', `video_error index=${index} current=${index} total=47 message=warning`, 'v1');
+  const done = index => entry('INFO', 'TASK', `video_done index=${index} current=${index} total=47`, 'v1');
+  const rows = [fail(44), fail(45)];
+  rows[0].unread = rows[1].unread = true;
+  let events = aggregate(rows);
+  assert.equal(events.length, 2, 'different failed slots must remain distinct');
+  assert.equal(events[0].title, '第 44 段视频未生成成功');
+  assert(!events[0].hint.includes('没有对应的说明'));
+  events = aggregate([...rows, done(44)]);
+  assert.equal(events.length, 1);
+  assert.equal(events[0].slot, 45);
+  assert.equal(events[0].unread, true);
+  assert.equal(aggregate([...rows, done(44), fail(44)]).length, 2, 'new failures reopen resolved items');
+  const cancelled = { v1: { status: 'cancelled' } };
+  assert.equal(aggregate(rows, { tasks: cancelled }).length, 0);
+  assert.equal(aggregate(rows, { tasks: { v1: { status: 'completed', outcome: 'completed' } } }).length, 0);
+  assert.equal(aggregate(rows, { tasks: { v1: { status: 'completed', outcome: 'partial_failed' } } }).length, 2);
+  assert.equal(aggregate(rows, { tasks: { another: { status: 'completed', outcome: 'completed' } } }).length, 2);
+}
+{
+  const rows = [entry('WARN', 'TASK', 'upstream_retry attempt=2 max_attempts=5 error=HTTP 429', 'f1')];
+  assert.equal(aggregate(rows)[0].title, '正在自动恢复');
+  assert.equal(aggregate([...rows, entry('INFO', 'TASK', 'frame sequence=1', 'f1')]).length, 0);
+  assert.equal(aggregate(rows, { tasks: { f1: { status: 'failed' } } })[0].severity, 'error');
+  assert.equal(classify(entry('ERROR', 'TASK', 'error message=HTTP 429')).severity, 'error');
+  assert.equal(classify(entry('WARN', 'TASK', 'HTTP 403 unusual activity')).id, 'flow-restricted');
+  assert.equal(classify(entry('WARN', 'HTTP', 'SSE client disconnected: [WinError 10053]')).severity, 'ignore');
+  const manual = entry('ERROR', 'TASK', 'manual_intervention_detected code=login_required', 'f1');
+  assert.equal(aggregate([manual, entry('INFO', 'TASK', 'manual_intervention_cleared', 'f1')]).length, 0);
+  const warned = entry('WARN', 'TASK', 'video_warning message=未通过一致性审查', 'f1');
+  const resolved = aggregate([manual, warned], { tasks: { f1: { status: 'completed', outcome: 'completed_with_warnings' } } });
+  assert.equal(resolved.length, 1, 'successful tasks retain real quality warnings only');
+  assert.equal(resolved[0].id, 'review-flagged');
+}
+{
+  const idea = { id: 'idea1', project_key: 'project-one', title: '同名项目' };
+  const tasks = [
+    { id: 'v1', dimensions: { project_key: 'project-one' } },
+    { id: 'f1', result: { project_key: 'project-one' } },
+    { id: 'other', dimensions: { project_key: 'project-two', theme: '同名项目' } },
+  ];
+  assert.deepEqual([...taskIdsForProject(tasks, idea, { cover: { taskId: 'cover1' } })], ['cover1', 'v1', 'f1']);
+  assert.equal(taskIdsForProject(tasks, null), null);
+}

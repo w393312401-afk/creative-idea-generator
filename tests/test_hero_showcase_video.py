@@ -23,6 +23,7 @@ import re
 import shutil
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from PIL import Image
@@ -266,6 +267,14 @@ class TestPlanVideoSlotsHero(_TmpDirCase):
 # ─────────────────────────────────────────────────────────────────────────
 
 class TestMergeHeroClip(_TmpDirCase):
+    def setUp(self):
+        super().setUp()
+        # This fixture checks HERO selection and ordering, not internal retiming.
+        retime = patch('video_generator.retime_clips_for_merge',
+                       side_effect=lambda files, tmp, metas=None: (list(files), []))
+        retime.start()
+        self.addCleanup(retime.stop)
+
     def _write_manifest(self, frames_n, videos_entries, title='Hero Merge Test'):
         frames = []
         for i in range(1, frames_n + 1):
@@ -277,24 +286,27 @@ class TestMergeHeroClip(_TmpDirCase):
         with open(os.path.join(self.tmp, 'manifest.json'), 'w', encoding='utf-8') as f:
             json.dump(manifest, f)
 
-    def _fake_run_factory(self, captured):
+    def _fake_run_factory(self, captured, output_duration):
         def fake_run(cmd, cwd=None, **kwargs):
             captured.setdefault('calls', []).append(cmd)
             if cmd[0] == 'ffprobe':
-                class Probe:
-                    returncode = 0
-                    stderr = ''
-                    stdout = '5.0'
-                return Probe()
-            # ffmpeg concat merge: capture the concat list content before it's deleted
-            i_idx = cmd.index('-i')
-            concat_list_path = cmd[i_idx + 1]
-            with open(concat_list_path, 'r', encoding='utf-8') as f:
-                captured['concat_list'] = f.read()
+                if '-select_streams' in cmd and cmd[cmd.index('-select_streams') + 1].startswith('a'):
+                    stdout = json.dumps({'streams': []}) if 'json' in cmd else ''
+                else:
+                    duration = output_duration if cmd[-1] == captured.get('output_path') else 8.0
+                    stdout = json.dumps({
+                        'streams': [{'codec_type': 'video', 'width': 1080, 'height': 1920,
+                                     'r_frame_rate': '30/1', 'avg_frame_rate': '30/1',
+                                     'duration': str(duration)}],
+                        'format': {'duration': str(duration)},
+                    })
+                return SimpleNamespace(returncode=0, stderr='', stdout=stdout)
+            captured['inputs'] = [cmd[i + 1] for i, value in enumerate(cmd) if value == '-i']
             out_path = cmd[-1]
             os.makedirs(os.path.dirname(out_path) or '.', exist_ok=True)
             with open(out_path, 'wb') as f:
                 f.write(b'fake-merged-mp4')
+            captured['output_path'] = out_path
 
             class Ok:
                 returncode = 0
@@ -313,16 +325,15 @@ class TestMergeHeroClip(_TmpDirCase):
              'meta': 'HERO', 'is_hero': True},
         ])
         captured = {}
-        with patch('video_generator.subprocess.run', side_effect=self._fake_run_factory(captured)):
+        with patch('video_generator.subprocess.run',
+                   side_effect=self._fake_run_factory(captured, output_duration=6.0)):
             result = merge_project_videos(self.tmp)
 
         self.assertIsNotNone(result)
         self.assertEqual(result['status'], 'success')
-        concat_lines = [l for l in captured['concat_list'].splitlines() if l.strip()]
-        self.assertEqual(len(concat_lines), 3)
-        self.assertIn(os.path.basename(vid_hero), concat_lines[-1],
-                      "英雄片段必须排在拼接列表的最后一位")
-        self.assertNotIn(os.path.basename(vid1), concat_lines[-1])
+        self.assertEqual(captured['inputs'], [vid1, vid2, vid_hero],
+                         "英雄片段必须排在拼接列表的最后一位")
+        self.assertEqual(result['duration_seconds'], 6.0)
 
     def test_failed_hero_clip_is_skipped_without_blocking_main_merge(self):
         self._touch(os.path.join(self.videos_dir, 'vid_001.mp4'))
@@ -334,13 +345,15 @@ class TestMergeHeroClip(_TmpDirCase):
              'meta': 'HERO', 'is_hero': True},
         ])
         captured = {}
-        with patch('video_generator.subprocess.run', side_effect=self._fake_run_factory(captured)):
+        with patch('video_generator.subprocess.run',
+                   side_effect=self._fake_run_factory(captured, output_duration=4.0)):
             result = merge_project_videos(self.tmp)  # must not raise PartialMergeBlocked
 
         self.assertIsNotNone(result)
         self.assertEqual(result['status'], 'success')
-        concat_lines = [l for l in captured['concat_list'].splitlines() if l.strip()]
-        self.assertEqual(len(concat_lines), 2, "失败的英雄片段不应计入拼接列表")
+        self.assertEqual(captured['inputs'], [os.path.join(self.videos_dir, f'vid_{slot:03d}.mp4')
+                                              for slot in (1, 2)],
+                         "失败的英雄片段不应计入拼接列表")
 
     def test_missing_hero_entry_behaves_exactly_like_before_the_feature(self):
         self._touch(os.path.join(self.videos_dir, 'vid_001.mp4'))
@@ -350,13 +363,14 @@ class TestMergeHeroClip(_TmpDirCase):
             {'slot': 2, 'status': 'success', 'file': 'videos/vid_002.mp4', 'start_anchor_slot': 2},
         ])
         captured = {}
-        with patch('video_generator.subprocess.run', side_effect=self._fake_run_factory(captured)):
+        with patch('video_generator.subprocess.run',
+                   side_effect=self._fake_run_factory(captured, output_duration=4.0)):
             result = merge_project_videos(self.tmp)
 
         self.assertIsNotNone(result)
         self.assertEqual(result['status'], 'success')
-        concat_lines = [l for l in captured['concat_list'].splitlines() if l.strip()]
-        self.assertEqual(len(concat_lines), 2)
+        self.assertEqual(captured['inputs'], [os.path.join(self.videos_dir, f'vid_{slot:03d}.mp4')
+                                              for slot in (1, 2)])
 
 
 if __name__ == '__main__':

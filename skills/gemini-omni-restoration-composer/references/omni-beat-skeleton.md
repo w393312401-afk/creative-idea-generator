@@ -8,7 +8,7 @@ against, not a form you fill into the output.
 
 ## 1. Temporal Physics Skeleton (per beat)
 
-Before writing a single prompt, convert every beat into these nine fields. A beat that
+Before writing a single prompt, convert every beat into the required fields below. A beat that
 cannot fill all nine is not a beat yet — it is a wish.
 
 | Field | Meaning |
@@ -52,6 +52,10 @@ doing **too little**. Both must hold.
 Every ordinary beat ends in one named, immediately legible stage product at its **full
 declared extent or count**:
 
+The declared scope comes from the request or observed reference, not a conveniently smaller
+target invented during writing. A requested one-screw repair is complete at one screw;
+whole-room panel installation cannot be satisfied by its first panel. Do not enlarge local work.
+
 - ✅ `all six wall panels installed across the full wall`
 - ❌ `the first panel installed in the corner` (token patch)
 - ❌ `panel installation underway` (merely begun)
@@ -75,12 +79,16 @@ a token patch.
 
 ## 3. Spatial Anchoring Without Coordinates
 
-Omni prompts carry no grid coordinate system, and coordinate notation is banned from
-output. Anchoring is still required — it is done in prose, in two tiers.
+Chat-created Omni anchors use positional prose, without invented grid coordinates.
+An existing application-supplied IMAGE Grid cell is the registered parser exception in
+`omni-output-templates.md`; never add Grid cells to VIDEO. Anchoring has two tiers.
 
 ### Tier 1 — Three primary landmarks, one per depth zone
 
-Pick exactly three fixed features and hold them for the entire pack:
+Pick three fixed features for each locked anchor family and keep their identities throughout
+that family. When a declared entry/reframe/reward changes viewpoint, link the old and new
+views through a shared original feature and preserve the physical layout; do not demand
+identical screen positions or frame shares across different viewpoints:
 
 - one foreground landmark (a floor seam, a threshold sill, a stacked-material edge)
 - one midground landmark (a column, a rib, a door frame, the carrier's dominant mass)

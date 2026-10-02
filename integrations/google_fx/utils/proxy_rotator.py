@@ -17,6 +17,8 @@ import uuid
 import random
 import string
 import json
+import ipaddress
+import threading
 from typing import Optional, Dict
 import requests
 from .logger import log
@@ -27,6 +29,8 @@ from ..config import (
     runtime_env_or_default,
     AI_DIR,
 )
+
+_VERIFIED_ROTATION_LOCK = threading.Lock()
 
 
 class ProxyRotator:
@@ -289,6 +293,223 @@ class ProxyRotator:
         """兼容旧调用的空操作"""
         pass
 
+    def _read_profile_proxy(self, user_id, port):
+        """Read only the requested profile; never log its proxy credentials."""
+        data = requests.get(
+            f"http://127.0.0.1:{port}/api/v1/user/list",
+            params={"user_id": user_id, "page_size": 100}, timeout=15,
+        ).json()
+        if data.get("code") != 0:
+            raise RuntimeError("无法读取 AdsPower 当前代理配置")
+        for profile in (data.get("data") or {}).get("list", []):
+            if str(profile.get("user_id")) == str(user_id):
+                config = profile.get("user_proxy_config")
+                if isinstance(config, dict) and config.get("proxy_type"):
+                    return dict(config)
+                raise RuntimeError("当前环境未返回完整代理配置，不能确认换 IP")
+        raise RuntimeError("未找到指定 AdsPower 环境")
+
+    @staticmethod
+    def _proxy_identity(config):
+        return tuple(str(config.get(k) or "") for k in (
+            "proxy_type", "proxy_host", "proxy_port", "proxy_user", "proxy_password"))
+
+    @staticmethod
+    def _probe_proxy_ip(config):
+        """Measure the configured route, without inheriting system proxy variables."""
+        from .proxy_pool import proxy_url
+        proxy_type = str(config.get("proxy_type") or "").lower()
+        proxies = {}
+        if proxy_type != "no_proxy":
+            if proxy_type not in ("http", "https", "socks5"):
+                raise RuntimeError("不支持当前代理类型的出口验证")
+            if not config.get("proxy_host") or not config.get("proxy_port"):
+                raise RuntimeError("代理地址不完整")
+            url = proxy_url({
+                # Resolve at the SOCKS exit. The system DNS may return a
+                # local Clash fake IP which a remote proxy cannot route.
+                "proxy_type": "socks5h" if proxy_type == "socks5" else proxy_type,
+                "host": config["proxy_host"],
+                "port": config["proxy_port"], "user": config.get("proxy_user"),
+                "password": config.get("proxy_password"),
+            })
+            proxies = {"http": url, "https": url}
+        with requests.Session() as session:
+            session.trust_env = False
+            try:
+                response = session.get("https://ipinfo.io/json", proxies=proxies, timeout=12)
+            except requests.exceptions.InvalidSchema:
+                if proxy_type == "socks5":
+                    # requests caches a missing SOCKS transport at import time.
+                    # Keep the diagnosis safe even when the original exception
+                    # contains a proxy URL with credentials.
+                    raise RuntimeError(
+                        "SOCKS5 出口验证缺少 PySocks 运行依赖，请安装 requirements.txt 并重启服务"
+                    ) from None
+                raise
+            response.raise_for_status()
+            return str(ipaddress.ip_address(str(response.json().get("ip") or "").strip()))
+
+    def _verified_rotation_candidates(self):
+        """Bounded candidates; the forced path does not use the normal counter gate."""
+        from .proxy_pool import ProxyPool, to_adspower_config
+        pool = ProxyPool()
+        count = len(pool.usable_proxies())
+        if count:
+            # Exhaust each priority tier once before trying the next. A global
+            # 20-entry cap can make fallback routes unreachable in larger pools;
+            # the initial pool size bounds this pass even if new routes appear.
+            tried_ids = set()
+            for _ in range(count):
+                entry = pool.pick_proxy(exclude_proxy_ids=tried_ids)
+                if not entry:
+                    break
+                proxy_id = entry["proxy_id"]
+                if proxy_id in tried_ids:
+                    break
+                tried_ids.add(proxy_id)
+                yield to_adspower_config(entry)
+            return
+        if self.rotate_mode == "list":
+            pool_file = AI_DIR / "runtime" / "proxy_pool.txt"
+            if pool_file.exists():
+                rows = [s.strip() for s in pool_file.read_text().splitlines()
+                        if s.strip() and not s.strip().startswith("#")]
+                start = self._read_counter_info()["proxy_index"] + 1
+                for offset in range(min(len(rows), 20)):
+                    index = (start + offset) % len(rows)
+                    row = rows[index]
+                    parts = row.split(":", 3)
+                    if len(parts) >= 2:
+                        config = to_adspower_config({
+                            "host": parts[0], "port": parts[1],
+                            "proxy_type": self.proxy_type,
+                            "user": parts[2] if len(parts) == 4 else "",
+                            "password": parts[3] if len(parts) == 4 else "",
+                        })
+                        config["_rotation_index"] = index
+                        yield config
+            return
+        for _ in range(3):
+            config = self.get_proxy_config()
+            if config:
+                yield config
+
+    def _stop_browser_verified(self, user_id, port):
+        requests.get(
+            f"http://127.0.0.1:{port}/api/v1/browser/stop",
+            params={"user_id": user_id}, timeout=15,
+        ).json()
+        # The active check is authoritative even when stop reports already stopped.
+        # AdsPower can acknowledge stop before the Chromium process has exited.
+        for _ in range(20):
+            time.sleep(1)
+            active = requests.get(
+                f"http://127.0.0.1:{port}/api/v1/browser/active",
+                params={"user_id": user_id}, timeout=5,
+            ).json()
+            if active.get("code") == 0 and str((active.get("data") or {}).get("status", "")).lower() == "inactive":
+                return
+        raise RuntimeError("浏览器未确认关闭，未修改代理")
+
+    def rotate_proxy_verified(self, user_id, port=None, cancel_check=None, excluded_ips=None):
+        """Force a same-account route change for explicit unusual-activity errors.
+
+        Verify both exits and read back AdsPower's saved settings. The browser is
+        stopped only after a different working route is found; the caller then
+        reconnects the same profile. Exits rejected earlier in this task stay
+        excluded across recoveries, so reachable static routes cannot starve
+        the airport fallback tiers. No credentials leave this method's result.
+        """
+        user_id = str(user_id or "").strip()
+        port = port or get_runtime_default_port()
+        result = {"success": False, "old_ip": "", "new_ip": "", "message": ""}
+        blocked_ips = {str(ip).strip() for ip in (excluded_ips or ()) if str(ip).strip()}
+        if not user_id:
+            result["message"] = "缺少待换 IP 的账号，已停止重试"
+            return result
+        cancelled = False
+
+        def check_cancel():
+            nonlocal cancelled
+            if cancel_check is not None:
+                try:
+                    cancel_check()
+                except Exception:
+                    cancelled = True
+                    raise
+
+        with _VERIFIED_ROTATION_LOCK:
+            old_config = None
+            mutation_attempted = False
+            try:
+                check_cancel()
+                old_config = self._read_profile_proxy(user_id, port)
+                result["old_ip"] = self._probe_proxy_ip(old_config)
+                blocked_ips.add(result["old_ip"])
+                chosen = None
+                chosen_index = None
+                seen = set()
+                for raw_candidate in self._verified_rotation_candidates():
+                    check_cancel()
+                    candidate = dict(raw_candidate)
+                    candidate_index = candidate.pop("_rotation_index", None)
+                    identity = self._proxy_identity(candidate)
+                    if identity in seen or (identity == self._proxy_identity(old_config)
+                                            and self.rotate_mode != "gateway"):
+                        continue
+                    seen.add(identity)
+                    try:
+                        new_ip = self._probe_proxy_ip(candidate)
+                    except Exception as exc:
+                        log(f"⚠️ 候选代理出口检测失败（{type(exc).__name__}），继续检查下一条", "代理轮换")
+                        continue
+                    if new_ip in blocked_ips:
+                        continue
+                    chosen = candidate
+                    chosen_index = candidate_index
+                    break
+                if chosen is None:
+                    raise RuntimeError("没有验证通过且未被本任务拦截的新出口，保留原 IP 并停止重试")
+                check_cancel()
+                self._stop_browser_verified(user_id, port)
+                check_cancel()
+                mutation_attempted = True
+                if not self._update_profile_proxy(user_id, port, chosen):
+                    raise RuntimeError("AdsPower 代理更新失败")
+                saved = self._read_profile_proxy(user_id, port)
+                if self._proxy_identity(saved) != self._proxy_identity(chosen):
+                    raise RuntimeError("AdsPower 代理配置回读不一致")
+                check_cancel()
+                result["new_ip"] = self._probe_proxy_ip(saved)
+                if result["new_ip"] == result["old_ip"]:
+                    raise RuntimeError("代理更新后出口 IP 未变化")
+                if result["new_ip"] in blocked_ips:
+                    raise RuntimeError("代理更新后出口已被本任务拦截，停止重试")
+                check_cancel()
+                state = self._read_counter_info()
+                self._write_counter_info(0, chosen_index if chosen_index is not None else state["proxy_index"])
+                result.update(success=True, message="新代理已下发，出口 IP 已验证变化；重新连接原账号后重试")
+                log(f"✅ 异常活动强制换 IP 已验证（账号 {user_id}）: "
+                    f"{result['old_ip']} → {result['new_ip']}", "代理轮换")
+            except Exception as exc:
+                # Do not expose requests exceptions: they can contain proxy auth.
+                message = str(exc) if type(exc) is RuntimeError else type(exc).__name__
+                if mutation_attempted and old_config is not None:
+                    restored = self._update_profile_proxy(user_id, port, old_config)
+                    if restored:
+                        try:
+                            restored = self._proxy_identity(self._read_profile_proxy(user_id, port)) == self._proxy_identity(old_config)
+                        except Exception:
+                            restored = False
+                    message += "；已恢复原代理" if restored else "；恢复原代理失败，需检查环境配置"
+                if cancelled:
+                    log(f"🛑 换 IP 操作已取消（账号 {user_id}）: {message}", "代理轮换")
+                    raise
+                result["message"] = message
+                log(f"⛔ 强制换 IP 未完成（账号 {user_id}）: {message}", "代理轮换")
+        return result
+
     def rotate_proxy(self, user_id=None, port=None, force=False) -> dict:
         """
         执行完整的代理轮换流程：
@@ -325,7 +546,7 @@ class ProxyRotator:
                 self._write_counter_info(counter, proxy_index)
                 should_rotate = True
             else:
-                log(f"ℹ️ 累计发送请求数: {counter}/{self.rotate_threshold}，未达{self.rotate_threshold}次，跳过代理轮换，直接连接浏览器", "代理轮换")
+                log(f"ℹ️ 常规计数轮换未触发（{counter}/{self.rotate_threshold}），使用当前已配置代理连接浏览器", "代理轮换")
                 return {}
 
         ads_user_id = user_id or get_runtime_default_user_id()
@@ -385,12 +606,14 @@ class ProxyRotator:
             resp = requests.post(url, json=payload, timeout=15)
             data = resp.json()
             if data.get("code") == 0:
+                from . import egress
+                egress.invalidate(user_id)  # 出口变了：并发时的"同出口"判定不能再用旧缓存
                 return True
             else:
-                log(f"⚠️ 更新 Profile 代理失败: {data}", "代理轮换")
+                log(f"⚠️ 更新 Profile 代理失败（code={data.get('code')}）", "代理轮换")
                 return False
         except Exception as e:
-            log(f"❌ 更新 Profile 代理异常: {type(e).__name__}: {e}", "代理轮换")
+            log(f"❌ 更新 Profile 代理异常: {type(e).__name__}", "代理轮换")
             return False
 
     # ──────────────────────────────────────────────

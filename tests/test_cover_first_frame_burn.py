@@ -13,6 +13,7 @@ import os
 import shutil
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import server_common
@@ -164,7 +165,7 @@ class TestBuildCoverIntroClip(unittest.TestCase):
 
 
 class TestMergeBurnsCoverFirstFrame(unittest.TestCase):
-    """合并主路径：封面段进队首、进 concat 清单、进返回值。"""
+    """合并主路径：封面段进队首、进独立输入列表、进返回值。"""
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
@@ -197,20 +198,31 @@ class TestMergeBurnsCoverFirstFrame(unittest.TestCase):
         with open(os.path.join(self.tmp, 'manifest.json'), 'w', encoding='utf-8') as f:
             json.dump(manifest, f)
 
-    def _fake_run_factory(self, captured):
+    def _fake_run_factory(self, captured, output_duration):
         def fake_run(cmd, **kwargs):
             captured.setdefault('calls', []).append(cmd)
             if cmd[0] == 'ffprobe':
-                class Probe:
-                    returncode = 0
-                    stderr = ''
-                    stdout = '5.0'
-                return Probe()
+                if '-select_streams' in cmd and cmd[cmd.index('-select_streams') + 1].startswith('a'):
+                    stdout = json.dumps({'streams': []}) if 'json' in cmd else ''
+                else:
+                    if cmd[-1] == captured.get('output_path'):
+                        duration = output_duration
+                    elif os.path.basename(cmd[-1]) == 'cover_intro.mp4':
+                        duration = float(captured['intro_cmd'][captured['intro_cmd'].index('-t') + 1])
+                    else:
+                        duration = 8.0
+                    stdout = json.dumps({
+                        'streams': [{'codec_type': 'video', 'width': 1080, 'height': 1920,
+                                     'r_frame_rate': '30/1', 'avg_frame_rate': '30/1',
+                                     'duration': str(duration)}],
+                        'format': {'duration': str(duration)},
+                    })
+                return SimpleNamespace(returncode=0, stderr='', stdout=stdout)
             if '-loop' in cmd:            # 封面静帧段
                 captured['intro_cmd'] = cmd
-            elif '-f' in cmd and 'concat' in cmd:
-                with open(cmd[cmd.index('-i') + 1], 'r', encoding='utf-8') as f:
-                    captured['concat_list'] = f.read()
+            elif '-filter_complex' in cmd:
+                captured['inputs'] = [cmd[i + 1] for i, value in enumerate(cmd) if value == '-i']
+                captured['output_path'] = cmd[-1]
             self._touch(cmd[-1], b'fake-mp4')
 
             class Ok:
@@ -219,14 +231,13 @@ class TestMergeBurnsCoverFirstFrame(unittest.TestCase):
             return Ok()
         return fake_run
 
-    def _merge(self, captured, **kwargs):
+    def _merge(self, captured, output_duration=4 + 1 / 30, **kwargs):
         # 段内节奏重映射会额外跑一轮 ffmpeg 探测/编码，与本用例无关，整体关掉
         with patch.object(video_generator, 'retime_clips_for_merge',
                           side_effect=lambda files, tmp, metas=None: (list(files), [])), \
-             patch.object(video_generator, '_ffprobe_video_params',
-                          return_value={'width': 1080, 'height': 1920, 'fps': 30.0, 'duration': 8.0}), \
              patch('video_generator.verify_video_anchors', return_value=(True, '')), \
-             patch('video_generator.subprocess.run', side_effect=self._fake_run_factory(captured)):
+             patch('video_generator.subprocess.run',
+                   side_effect=self._fake_run_factory(captured, output_duration)):
             return merge_project_videos(self.tmp, **kwargs)
 
     def test_封面被接在所有片段之前(self):
@@ -235,11 +246,11 @@ class TestMergeBurnsCoverFirstFrame(unittest.TestCase):
         captured = {}
         result = self._merge(captured)
 
-        lines = [l for l in captured['concat_list'].splitlines() if l.strip()]
-        self.assertEqual(len(lines), 3)                       # 封面 + 2 段正片
-        self.assertIn('cover_intro.mp4', lines[0])
+        self.assertEqual([os.path.basename(path) for path in captured['inputs']],
+                         ['cover_intro.mp4', 'vid_001.mp4', 'vid_002.mp4'])
         self.assertIn('cover_001.webp', result['cover_first_frame']['url'])
         self.assertEqual(result['cover_first_frame']['seconds'], 0.0)
+        self.assertEqual(result['duration_seconds'], 4.03)
 
     def test_按用途登记的那张优先于目录里最新的(self):
         self._touch(os.path.join(self.tmp, 'cover_newest.webp'), b'cover')
@@ -255,20 +266,20 @@ class TestMergeBurnsCoverFirstFrame(unittest.TestCase):
         self._touch(os.path.join(self.tmp, 'cover_001.webp'), b'cover')
         self._write_manifest()
         captured = {}
-        result = self._merge(captured, cover_burn='off')
+        result = self._merge(captured, cover_burn='off', output_duration=4.0)
 
-        lines = [l for l in captured['concat_list'].splitlines() if l.strip()]
-        self.assertEqual(len(lines), 2)
+        self.assertEqual([os.path.basename(path) for path in captured['inputs']],
+                         ['vid_001.mp4', 'vid_002.mp4'])
         self.assertNotIn('cover_first_frame', result)
 
     def test_没有封面时合并照常完成(self):
         self._write_manifest()
         captured = {}
-        result = self._merge(captured)
+        result = self._merge(captured, output_duration=4.0)
         self.assertEqual(result['status'], 'success')
         self.assertNotIn('cover_first_frame', result)
-        lines = [l for l in captured['concat_list'].splitlines() if l.strip()]
-        self.assertEqual(len(lines), 2)
+        self.assertEqual([os.path.basename(path) for path in captured['inputs']],
+                         ['vid_001.mp4', 'vid_002.mp4'])
 
     def test_封面编码失败不影响成片(self):
         """fail-open：封面是锦上添花，绝不能因为它让用户拿不到成片。"""
@@ -276,9 +287,11 @@ class TestMergeBurnsCoverFirstFrame(unittest.TestCase):
         self._write_manifest()
         captured = {}
         with patch.object(video_generator, 'build_cover_intro_clip', return_value=None):
-            result = self._merge(captured)
+            result = self._merge(captured, output_duration=4.0)
         self.assertEqual(result['status'], 'success')
         self.assertNotIn('cover_first_frame', result)
+        self.assertEqual([os.path.basename(path) for path in captured['inputs']],
+                         ['vid_001.mp4', 'vid_002.mp4'])
 
     def test_按拍重变速时封面占住队首且系数为_1(self):
         """clip_speeds 与 video_files 必须逐位对齐，否则每段都套上别人的时间缩放。"""
@@ -291,15 +304,17 @@ class TestMergeBurnsCoverFirstFrame(unittest.TestCase):
             json.dump(data, f)
 
         captured = {}
-        result = self._merge(captured)
+        result = self._merge(captured, speed=2, output_duration=9 + 1 / 30)
         merge_cmd = next(c for c in captured['calls']
                          if c[0] == 'ffmpeg' and '-filter_complex' in c and '-loop' not in c)
         filt = merge_cmd[merge_cmd.index('-filter_complex') + 1]
         inputs = [merge_cmd[i + 1] for i, tok in enumerate(merge_cmd) if tok == '-i']
         self.assertIn('cover_intro.mp4', inputs[0])
         # 封面段（输入 0）：clip_speed=1.0 → setpts=1/2；正片首段带 PACE 1.25 → 0.625
-        self.assertIn('[0:v]setpts=0.5*PTS[v0]', filt)
-        self.assertIn('[1:v]setpts=0.625*PTS[v1]', filt)
+        self.assertIn('[0:v:0]setpts=(PTS-STARTPTS)*0.5,', filt)
+        self.assertIn('[1:v:0]setpts=(PTS-STARTPTS)*0.625,', filt)
+        self.assertIn('[2:v:0]setpts=(PTS-STARTPTS)*0.5,', filt)
+        self.assertEqual(result['duration_seconds'], 9.03)
         self.assertIn('cover_001.webp', result['cover_first_frame']['url'])
 
 

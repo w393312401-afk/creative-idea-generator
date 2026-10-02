@@ -203,7 +203,7 @@ function syncSlotToolbar(type) {
             const refCount = refMap && typeof refMap === 'object' ? Object.keys(refMap).length : 0;
             const totalCount = (curIdea && (curIdea.image_count || (curIdea.frameRun && curIdea.frameRun.image_count) || (curIdea.frameRun && curIdea.frameRun.frames && curIdea.frameRun.frames.length))) || refCount || 0;
             if (refCount > 0) {
-                bmBtn.title = `打开爆款原片对标滑块 (${totalCount > 0 ? `${totalCount} 拍中 ` : ''}${refCount} 拍已绑定原片抽帧)`;
+                bmBtn.title = `打开参考原片对标滑块 (${totalCount > 0 ? `${totalCount} 拍中 ` : ''}${refCount} 拍已绑定原片抽帧)`;
             } else {
                 bmBtn.title = '打开交互式多宫格检查器与对标滑块（逐拍对标、地平透视线、5列拼图总览）';
             }
@@ -270,22 +270,23 @@ function jumpToFirstFlagged(type) {
 // ── 批量操作 ────────────────────────────────────────────────────────
 
 /**
- * 批量重试：串行，一格一格来。并行提交没有意义——服务端本来就是串行锁，
- * 同时发只会让后来的几个直接吃到"已在生成中"的错误。
+ * 视频整批交给同一个服务端任务，复用共享参考帧并同时等待生成。
+ * 帧序列仍按原来的逐帧路径处理，保留前后帧的继承关系。
  */
 async function bulkRetrySlots(type) {
     const st = slotToolbarState[type];
     const seqs = Array.from(st.selected).sort((a, b) => a - b);
     if (!seqs.length) return;
+    const ownerIdea = (typeof currentIdea !== 'undefined' && currentIdea) || null;
     const label = type === 'video' ? 'VID' : 'IMG';
     const proceed = await customConfirm(
-        `将依次重新生成 ${seqs.length} 个槽位：${seqs.map(padSlot).map(s => label + ' ' + s).join('、')}`);
+        `将${type === 'video' ? '批量' : '依次'}重新生成 ${seqs.length} 个槽位：${seqs.map(padSlot).map(s => label + ' ' + s).join('、')}`);
     if (!proceed) return;
 
     clearSlotSelection(type);
+    if (type === 'video') return retryVideoSlots(seqs, { ownerIdea });
     for (const seq of seqs) {
-        if (type === 'video') await retrySingleVideo(seq);
-        else await retrySingleFrame(seq);
+        await retrySingleFrame(seq);
     }
     showToast(`已依次重试 ${seqs.length} 个槽位。`, 'success');
 }
@@ -353,7 +354,7 @@ function dirtySlotSequences(type) {
 }
 
 /**
- * 「一键重渲已改动帧」：把所有被标脏（prompt_dirty）的槽位按编号升序自动依次重新生成。
+ * 「一键重渲已改动帧」：视频按一个子集任务提交，图片按编号升序依次重新生成。
  */
 async function bulkRetryDirtySlots(type = 'image') {
     const idea = (typeof currentIdea !== 'undefined' && currentIdea) || null;
@@ -375,23 +376,28 @@ async function bulkRetryDirtySlots(type = 'image') {
     try {
         const label = type === 'video' ? 'VID' : 'IMG';
         const proceed = await customConfirm(
-            `将按编号依次重新生成 <b>${seqs.length}</b> 个提示词已改动的槽位：<br><br>`
+            `将${type === 'video' ? '批量' : '按编号依次'}重新生成 <b>${seqs.length}</b> 个提示词已改动的槽位：<br><br>`
             + `<b>${seqs.map(s => label + ' ' + padSlot(s)).join('、')}</b><br><br>`
-            + '生成完成后将自动刷新画面并清除「提示词已改」徽标。');
+            + '成功生成的槽位将自动刷新画面并清除「提示词已改」徽标。');
         if (!proceed) return;
 
         const feed = (text, cls) => {
             if (typeof framesFeedLine === 'function') framesFeedLine(idea.id, text, cls);
         };
-        feed(`⚡ 一键重渲已改动槽位：共 ${seqs.length} 帧待重跑，按编号依次处理…`);
+        feed(`⚡ 一键重渲已改动槽位：共 ${seqs.length} 个待重跑，${type === 'video' ? '批量处理' : '按编号依次处理'}…`);
+
+        if (type === 'video') {
+            const outcome = await retryVideoSlots(seqs, { ownerIdea: idea });
+            if (outcome && (outcome.status === 'completed' || outcome.status === 'partial_failed')) {
+                feed(`⚡ ${outcome.message || `视频重渲结束：成功 ${outcome.succeeded} 段，失败 ${outcome.failed} 段。`}`,
+                    outcome.status === 'completed' ? 'ok' : 'warn');
+            }
+            return outcome;
+        }
 
         let count = 0;
         for (const seq of seqs) {
-            if (type === 'video') {
-                await retrySingleVideo(seq);
-            } else {
-                await retrySingleFrame(seq);
-            }
+            await retrySingleFrame(seq);
             count += 1;
             if (typeof reloadManifestIntoIdea === 'function') await reloadManifestIntoIdea(idea);
             if (typeof isViewingIdea === 'function' && isViewingIdea(idea.id)) {

@@ -13,7 +13,7 @@
 .cv-modal-content {
     background: #0d111a;
     border: 1px solid rgba(0, 245, 212, 0.3);
-    border-radius: 12px;
+    border-radius: var(--radius-lg);
     box-shadow: 0 25px 60px rgba(0, 0, 0, 0.8), 0 0 35px rgba(0, 245, 212, 0.15);
     width: 96vw;
     height: 94vh;
@@ -55,14 +55,14 @@
 
 .cv-title-text h3 {
     margin: 0;
-    font-size: 14.5px;
+    font-size: var(--fs-base);
     font-weight: 700;
     color: #fff;
     letter-spacing: 0.3px;
 }
 
 .cv-subtitle {
-    font-size: 11px;
+    font-size: var(--fs-xs);
     color: #94a3b8;
 }
 
@@ -78,7 +78,7 @@
     align-items: center;
     background: rgba(255, 255, 255, 0.05);
     border: 1px solid rgba(255, 255, 255, 0.1);
-    border-radius: 6px;
+    border-radius: var(--radius-sm);
     padding: 2px;
     gap: 2px;
 }
@@ -87,9 +87,9 @@
     background: transparent;
     border: none;
     color: #cbd5e1;
-    font-size: 12px;
+    font-size: var(--fs-sm);
     padding: 4px 8px;
-    border-radius: 4px;
+    border-radius: var(--radius-xs);
     cursor: pointer;
     transition: all 0.15s ease;
     display: inline-flex;
@@ -112,7 +112,7 @@
 }
 
 .cv-zoom-display {
-    font-size: 11.5px;
+    font-size: var(--fs-sm);
     font-family: var(--font-mono, monospace);
     color: #94a3b8;
     padding: 0 6px;
@@ -158,7 +158,7 @@
     display: inline-block;
     box-shadow: 0 10px 40px rgba(0, 0, 0, 0.8);
     border: 1px solid rgba(255, 255, 255, 0.15);
-    border-radius: 4px;
+    border-radius: var(--radius-xs);
     overflow: hidden;
 }
 
@@ -212,8 +212,8 @@
     color: var(--neon-cyan, #00f5d4);
     border: 1px solid rgba(0, 245, 212, 0.5);
     padding: 2px 8px;
-    border-radius: 4px;
-    font-size: 10.5px;
+    border-radius: var(--radius-xs);
+    font-size: var(--fs-xs);
     font-weight: 700;
     font-family: var(--font-mono, monospace);
     opacity: 0;
@@ -235,14 +235,14 @@
     gap: 6px;
     background: #000;
     padding: 6px;
-    border-radius: 6px;
+    border-radius: var(--radius-sm);
 }
 
 .cv-dyn-cell {
     position: relative;
     cursor: pointer;
     overflow: hidden;
-    border-radius: 4px;
+    border-radius: var(--radius-xs);
     border: 1px solid rgba(255, 255, 255, 0.12);
     background: #000;
     transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
@@ -275,7 +275,7 @@
     left: 4px;
     background: rgba(0, 0, 0, 0.75);
     color: #fff;
-    font-size: 10px;
+    font-size: var(--fs-2xs);
     font-weight: 700;
     font-family: var(--font-mono, monospace);
     padding: 2px 6px;
@@ -290,10 +290,10 @@
     background: rgba(0, 0, 0, 0.85);
     color: var(--neon-cyan, #00f5d4);
     border: 1px solid rgba(0, 245, 212, 0.4);
-    font-size: 10.5px;
+    font-size: var(--fs-xs);
     font-weight: 600;
     padding: 2px 6px;
-    border-radius: 4px;
+    border-radius: var(--radius-xs);
     opacity: 0;
     transform: translateY(3px);
     transition: all 0.18s ease;
@@ -334,7 +334,7 @@
     top: -20px;
     background: rgba(0, 245, 212, 0.95);
     color: #000;
-    font-size: 10px;
+    font-size: var(--fs-2xs);
     font-weight: 700;
     padding: 1px 6px;
     border-radius: 3px;
@@ -447,10 +447,10 @@
     transform: translateX(-50%);
     background: rgba(0, 0, 0, 0.75);
     color: #00f5d4;
-    font-size: 10px;
+    font-size: var(--fs-2xs);
     font-weight: 700;
     padding: 1px 6px;
-    border-radius: 4px;
+    border-radius: var(--radius-xs);
     font-family: var(--font-mono, monospace);
 }
 
@@ -474,7 +474,7 @@
     padding: 4px 10px;
     margin-bottom: 6px;
     background: rgba(255, 255, 255, 0.03);
-    border-radius: 6px;
+    border-radius: var(--radius-sm);
     border: 1px solid rgba(255, 255, 255, 0.08);
 }
 
@@ -485,7 +485,7 @@
 }
 
 .cv-beat-tag {
-    font-size: 12px;
+    font-size: var(--fs-sm);
     font-weight: 700;
     color: #fff;
     font-family: var(--font-mono, monospace);
@@ -499,7 +499,7 @@
     display: flex;
     align-items: center;
     gap: 8px;
-    font-size: 11.5px;
+    font-size: var(--fs-sm);
     color: #94a3b8;
     font-weight: 600;
 }
@@ -514,7 +514,7 @@
 .cv-blink-btn {
     border-color: rgba(245, 158, 11, 0.4);
     color: #f59e0b;
-    font-size: 11px;
+    font-size: var(--fs-xs);
 }
 
 /* 共享 Stage 视口 */
@@ -523,7 +523,7 @@
     position: relative;
     overflow: hidden;
     background: #000;
-    border-radius: 8px;
+    border-radius: var(--radius-md);
     border: 1px solid rgba(255, 255, 255, 0.15);
     display: flex;
     align-items: center;
@@ -553,7 +553,7 @@
     background: #000;
     box-shadow: 0 10px 40px rgba(0, 0, 0, 0.85);
     border: 1px solid rgba(255, 255, 255, 0.18);
-    border-radius: 4px;
+    border-radius: var(--radius-xs);
     overflow: hidden;
 }
 
@@ -642,7 +642,7 @@
     height: 100%;
     aspect-ratio: 9 / 16;
     background: #000;
-    border-radius: 4px;
+    border-radius: var(--radius-xs);
     border: 1px solid rgba(255, 255, 255, 0.15);
     overflow: hidden;
     display: flex;
@@ -666,7 +666,7 @@
     height: 100%;
     background: rgba(15, 23, 42, 0.92);
     color: #94a3b8;
-    font-size: 13px;
+    font-size: var(--fs-md);
     font-family: var(--font-mono, monospace);
     text-align: center;
     padding: 16px;
@@ -688,8 +688,8 @@
     position: absolute;
     top: 10px;
     padding: 3px 8px;
-    border-radius: 4px;
-    font-size: 11px;
+    border-radius: var(--radius-xs);
+    font-size: var(--fs-xs);
     font-weight: 700;
     font-family: var(--font-mono, monospace);
     z-index: 10;
@@ -750,10 +750,10 @@
 }
 
 .cv-dual-collage-title {
-    font-size: 13px;
+    font-size: var(--fs-md);
     font-weight: 700;
     padding: 3px 10px;
-    border-radius: 4px;
+    border-radius: var(--radius-xs);
     letter-spacing: 0.3px;
 }
 
@@ -771,7 +771,7 @@
 
 .cv-dual-collage-img {
     max-height: 75vh;
-    border-radius: 6px;
+    border-radius: var(--radius-sm);
     border: 1px solid rgba(255, 255, 255, 0.15);
     box-shadow: 0 8px 32px rgba(0, 0, 0, 0.6);
 }
@@ -809,7 +809,7 @@
     display: flex;
     align-items: center;
     justify-content: center;
-    font-size: 10px;
+    font-size: var(--fs-2xs);
     font-weight: 900;
     box-shadow: 0 0 15px rgba(0, 0, 0, 0.6);
     pointer-events: none;
@@ -824,7 +824,7 @@
     padding: 5px 12px;
     margin-top: 6px;
     background: rgba(13, 20, 32, 0.95);
-    border-radius: 6px;
+    border-radius: var(--radius-sm);
     border: 1px solid rgba(255, 255, 255, 0.1);
     gap: 12px;
     min-height: 36px;
@@ -840,10 +840,10 @@
 }
 
 .cv-issue-badge {
-    font-size: 11px;
+    font-size: var(--fs-xs);
     font-weight: 700;
     padding: 2px 8px;
-    border-radius: 4px;
+    border-radius: var(--radius-xs);
     white-space: nowrap;
     font-family: var(--font-mono, monospace);
 }
@@ -885,7 +885,7 @@
 }
 
 .cv-issue-text {
-    font-size: 12px;
+    font-size: var(--fs-sm);
     color: #cbd5e1;
     white-space: nowrap;
     overflow: hidden;
@@ -934,7 +934,7 @@
     display: flex;
     align-items: center;
     justify-content: space-between;
-    font-size: 11px;
+    font-size: var(--fs-xs);
     color: #94a3b8;
 }
 
@@ -951,7 +951,7 @@
     background: rgba(255, 255, 255, 0.05);
     border: 1px solid rgba(255, 255, 255, 0.1);
     border-radius: 3px;
-    font-size: 10.5px;
+    font-size: var(--fs-xs);
     color: #94a3b8;
     padding: 1px 6px;
     cursor: pointer;
@@ -987,7 +987,7 @@
     flex-shrink: 0;
     background: rgba(255, 255, 255, 0.03);
     border: 1px solid rgba(255, 255, 255, 0.12);
-    border-radius: 4px;
+    border-radius: var(--radius-xs);
     cursor: pointer;
     transition: all 0.15s ease;
     position: relative;
@@ -1006,7 +1006,7 @@
 }
 
 .cv-strip-header {
-    font-size: 9.5px;
+    font-size: var(--fs-2xs);
     font-weight: 700;
     font-family: var(--font-mono, monospace);
     text-align: center;
@@ -1043,7 +1043,7 @@
 }
 
 .cv-strip-placeholder {
-    font-size: 9px;
+    font-size: var(--fs-2xs);
     color: #64748b;
     text-align: center;
     pointer-events: none;
@@ -1057,7 +1057,7 @@
     display: flex;
     align-items: center;
     justify-content: center;
-    font-size: 10px;
+    font-size: var(--fs-2xs);
     color: #64748b;
     background: rgba(15, 23, 42, 0.9);
     border: 1px dashed rgba(148, 163, 184, 0.35);
@@ -1072,7 +1072,7 @@
     display: flex;
     align-items: center;
     justify-content: center;
-    font-size: 13px;
+    font-size: var(--fs-md);
     font-family: var(--font-mono, monospace);
     color: #67e8f9;
     background: rgba(15, 23, 42, 0.92);
@@ -1106,7 +1106,7 @@
 }
 
 .cv-strip-empty-hint {
-    font-size: 11px;
+    font-size: var(--fs-xs);
     color: #64748b;
     padding: 10px;
     text-align: center;
@@ -1126,7 +1126,7 @@
     justify-content: space-between;
     align-items: center;
     padding: 6px 18px;
-    font-size: 11.5px;
+    font-size: var(--fs-sm);
     color: #94a3b8;
 }
 

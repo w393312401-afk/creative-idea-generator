@@ -14,7 +14,6 @@ from unittest.mock import patch, MagicMock
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'skills', 'gemini-omni-restoration-composer', 'scripts'))
 import analyze_timelapse_video as atv
 
-from prompt_pipeline import reverse
 
 
 class TestSmartSampling(unittest.TestCase):
@@ -72,30 +71,6 @@ class TestSmartSampling(unittest.TestCase):
         self.assertTrue(has_t1, f"Expected 4.52s in timestamps: {timestamps}")
         self.assertTrue(has_t2, f"Expected 9.15s in timestamps: {timestamps}")
 
-    def test_events_digest_renders_triad_and_audio_sfx(self):
-        events = [
-            {
-                "event_id": "E01",
-                "start": 1.0,
-                "peak": 2.5,
-                "end": 4.0,
-                "evidence_frames": ["review_002.png", "review_005.png", "review_008.png"],
-                "triad_frames": {
-                    "pre_state": "review_002.png",
-                    "action_peak": "review_005.png",
-                    "post_state": "review_008.png",
-                },
-                "audio_cue": {
-                    "transient_time": 2.45,
-                    "delta_db": 11.2,
-                    "has_acoustic_spike": True,
-                }
-            }
-        ]
-        digest = reverse._events_digest(events)
-        self.assertIn("E01:", digest)
-        self.assertIn("triad=[pre:review_002.png, action:review_005.png, post:review_008.png]", digest)
-        self.assertIn("audio_sfx=[spike@2.45s, +11.2dB]", digest)
 
     def test_safe_print_unicode_emoji(self):
         # Must not throw even when string contains emojis like 🛠️

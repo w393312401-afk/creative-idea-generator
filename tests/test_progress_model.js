@@ -51,3 +51,15 @@ assert.strictEqual(p.status, 'retrying');
 assert.match(p.label, /发现漂移/);
 
 console.log('progress_model tests passed');
+
+const partialVideos = [
+  ['start', { total: 2 }],
+  ['video_error', { index: 1, total: 2 }],
+  ['video_done', { index: 2, total: 2 }],
+];
+p = progressFromEvents(partialVideos, 'videos', 'running');
+assert.strictEqual(p.label, '已生成 1/2 段视频 · 1 段待重试');
+p = progressFromEvents(partialVideos, 'videos', 'completed');
+assert.strictEqual(p.label, '本次生成已结束 · 1 段待重试');
+p = progressFromEvents(partialVideos.concat([['video_done', { index: 1, total: 2 }]]), 'videos', 'completed');
+assert.strictEqual(p.label, '视频序列生成完成');

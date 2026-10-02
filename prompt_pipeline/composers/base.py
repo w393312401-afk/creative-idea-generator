@@ -111,8 +111,8 @@ class BaseComposer:
         同一道工序的通用想象——干净的混凝土、没有落叶青苔——工序全对，就是不像那条片子。
         """
         brief = (self.state or {}).get('parsed_brief') or {}
-        from prompt_pipeline import reverse
-        lines = reverse.scene_constants_lines(brief.get('scene_constants'),
+        from prompt_pipeline.reference_context import scene_constants_lines
+        lines = scene_constants_lines(brief.get('scene_constants'),
                                               brief.get('scene_signature'))
         if not lines:
             return ""
@@ -435,6 +435,8 @@ Instructions:
         Returns (v_p, i_p, structural, style_errs, reworked, image_reworked,
                  outline_missing_before)。
         """
+        if pp.reviews_disabled(config):
+            return (v_p, i_p, [], [], None, None, [])
         beat = contract['beat']
         image_reworked = None
 
@@ -511,6 +513,7 @@ Instructions:
         的拍会被跳过，只重新生成尚未成功的那些拍，不必推倒重来整单重跑。落到占位符兜底的拍
         不算成功，仍会在续传时重新尝试真实生成。"""
         self.begin_run(config, state)
+        skip_reviews = pp.reviews_disabled(config)
         theme = state['theme']
         total_beats = state['total_beats']
         parsed_brief = state['parsed_brief']
@@ -601,11 +604,6 @@ Instructions:
                 config, i, contract, packet, compiled_images, compiled_videos,
                 scup_ref, tbcp_ref_i)
             beat_user = f"Generate prompts for Beat {i}: {beat.get('operation', '')} - {beat.get('description', '')}."
-            # 单拍兜底也要吃到原片实拍事实卡：批量那一窗失败退到这里的拍，如果反而看不见
-            # 画面依据，同一单里就会出现"多数拍照着原片写、少数拍凭空想"的花斑。
-            _observed = pp._observed_block_for_beat(config.get('_observed_digests'), i)
-            if _observed:
-                beat_user = f"{beat_user}\n\n{_observed}"
 
             vid_prompt = ""
             img_prompt = ""
@@ -652,8 +650,10 @@ Instructions:
                     # i2v 将无画面可拍（静止/冻结闪切/自造空间），对该拍定向回炉一轮。
                     prev_v = compiled_videos.get(i - 1) if i > 1 else None
                     prev_i = compiled_images.get(i) if i > 1 else None
-                    errs = self.validate_beat_prompts(i, v_p, i_p, beat_packet, mode, is_last, is_threshold_or_reveal, prev_v, prev_i, beat=beat, family=family, is_pre_bridge=is_pre_bridge,
-                                                      is_post_reveal_cleanup=contract['is_post_reveal_cleanup'])
+                    errs = [] if skip_reviews else self.validate_beat_prompts(
+                        i, v_p, i_p, beat_packet, mode, is_last, is_threshold_or_reveal,
+                        prev_v, prev_i, beat=beat, family=family, is_pre_bridge=is_pre_bridge,
+                        is_post_reveal_cleanup=contract['is_post_reveal_cleanup'])
                     structural, style_errs = self.split_structural_video_errors(errs)
                     reworked = None
                     if structural:
@@ -684,6 +684,12 @@ Instructions:
                         except Exception as e:
                             if sys.stdout:
                                 print(f"[DEBUG] Failed to parse prompt-embedded TRACES JSON: {e}")
+                    if skip_reviews:
+                        # 保留真实生成内容与自带台账；关闭审查时不回炉、不做质量硬拦，
+                        # 也不把未审过的稿子写成「审查通过」。缺段仍由上面的提取检查处理。
+                        vid_prompt, img_prompt = v_p, i_p
+                        new_ledger_items = parsed_traces
+                        break
                     (v_p, i_p, structural, style_errs, reworked, image_reworked,
                      outline_missing_before) = self.repair_beat_prompts(
                         config, i, v_p, i_p, contract, packet, beat_ladder, parsed_traces,
@@ -887,8 +893,7 @@ Instructions:
             batch_system = self.batch_system_prompt(config, packet, scup_ref, tbcp_ref)
             first_anchor_image = compiled_images.get(batch_beats[0], '')
             batch_user = pp._build_batch_user_message(
-                batch_beats, contracts, first_anchor_image,
-                observed_digests=config.get('_observed_digests'))
+                batch_beats, contracts, first_anchor_image)
             markers = []
             for i in batch_beats:
                 markers += [f'===BEAT {i} VIDEO===', f'===BEAT {i} IMAGE===', f'===BEAT {i} TRACES===']
@@ -1011,7 +1016,7 @@ Instructions:
                     # 2026-07-30：声明式切入拍的 VIDEO 不再被占位声明覆盖（同单拍通路的注释）。
                     prev_v = compiled_videos.get(i - 1) if i > 1 else None
                     prev_i = compiled_images.get(i) if i > 1 else None
-                    errs = self.validate_beat_prompts(
+                    errs = [] if skip_reviews else self.validate_beat_prompts(
                         i, v_p, i_p, _pkt, mode, contract['is_last'], contract['is_threshold_or_reveal'],
                         prev_v, prev_i, beat=contract['beat'], family=contract['family'],
                         is_pre_bridge=contract['is_pre_bridge'],
@@ -1044,54 +1049,58 @@ Instructions:
                     except Exception as e:
                         if sys.stdout:
                             print(f"[DEBUG] Failed to parse prompt-embedded TRACES JSON for beat {i}: {e}")
-                # skill 直出模式：批量直出的结果只要有 VIDEO/IMAGE 两段就直接采纳——风格
-                # 瑕疵只记录不打回（确定性修复已兜住渲染硬伤，剩余瑕疵交给帧渲染后对真实
-                # 画面的审查）。例外：结构性硬伤（VIDEO 无动作正文/桥接无运镜/幽灵施工）
-                # 会让 i2v 无画面可拍，对命中的拍定向回炉一轮（只重写 VIDEO，失败保留原稿）。
-                structural, style_errs = self.split_structural_video_errors(errs)
-                reworked = None
-                if structural:
-                    if sys.stdout:
-                        print(f"[DIRECT] Batch beat {i} 结构性硬伤，定向回炉一轮: {structural}")
-                    v_p, reworked = self.rework_structural_video_beat(config, i, v_p, structural, packet, beat=contract['beat'])
-                    if sys.stdout:
-                        print(f"[DIRECT] Batch beat {i} 回炉{'成功，已采用重写稿' if reworked else '未通过，保留原稿（仅留痕）'}")
-                (v_p, i_p, structural, style_errs, reworked, image_reworked,
-                 outline_missing_before) = self.repair_beat_prompts(
-                    config, i, v_p, i_p, contract, packet, beat_ladder, parsed_traces,
-                    prev_i, structural, style_errs, reworked, f'Batch beat {i}')
-                # 回读校验：修没修以最终文本为准（见 pp.reverify_beat_repairs）
-                residual = pp.reverify_beat_repairs(
-                    i, v_p, i_p, contract['beat'], parsed_traces=parsed_traces,
-                    stage_scope=contract['stage_scope'],
-                            beat_ladder=beat_ladder, family=contract['family'])
-                remaining_milestone_errors = (
-                    pp.check_milestone_video_prompt(v_p, contract['beat'])
-                    + pp.check_milestone_image_prompt(i_p, contract['beat']))
-                if remaining_milestone_errors:
-                    v_p = self.patch_milestone_video_prompt(v_p, contract['beat'])
-                    i_p = self.patch_milestone_image_prompt(i_p, contract['beat'])
+                if skip_reviews:
+                    vid_prompt, img_prompt, beat_succeeded = v_p, i_p, True
+                    new_ledger_items = parsed_traces
+                else:
+                    # skill 直出模式：批量直出的结果只要有 VIDEO/IMAGE 两段就直接采纳——风格
+                    # 瑕疵只记录不打回（确定性修复已兜住渲染硬伤，剩余瑕疵交给帧渲染后对真实
+                    # 画面的审查）。例外：结构性硬伤（VIDEO 无动作正文/桥接无运镜/幽灵施工）
+                    # 会让 i2v 无画面可拍，对命中的拍定向回炉一轮（只重写 VIDEO，失败保留原稿）。
+                    structural, style_errs = self.split_structural_video_errors(errs)
+                    reworked = None
+                    if structural:
+                        if sys.stdout:
+                            print(f"[DIRECT] Batch beat {i} 结构性硬伤，定向回炉一轮: {structural}")
+                        v_p, reworked = self.rework_structural_video_beat(config, i, v_p, structural, packet, beat=contract['beat'])
+                        if sys.stdout:
+                            print(f"[DIRECT] Batch beat {i} 回炉{'成功，已采用重写稿' if reworked else '未通过，保留原稿（仅留痕）'}")
+                    (v_p, i_p, structural, style_errs, reworked, image_reworked,
+                     outline_missing_before) = self.repair_beat_prompts(
+                        config, i, v_p, i_p, contract, packet, beat_ladder, parsed_traces,
+                        prev_i, structural, style_errs, reworked, f'Batch beat {i}')
+                    # 回读校验：修没修以最终文本为准（见 pp.reverify_beat_repairs）
+                    residual = pp.reverify_beat_repairs(
+                        i, v_p, i_p, contract['beat'], parsed_traces=parsed_traces,
+                        stage_scope=contract['stage_scope'],
+                                beat_ladder=beat_ladder, family=contract['family'])
                     remaining_milestone_errors = (
                         pp.check_milestone_video_prompt(v_p, contract['beat'])
                         + pp.check_milestone_image_prompt(i_p, contract['beat']))
-                payoff_blocking = pp.payoff_blocking_residual(residual, contract['is_last'])
-                if style_errs and sys.stdout:
-                    print(f"[DIRECT] Batch beat {i} 校验有瑕疵（直出模式仅记录，不重写）: {style_errs}")
-                # 同上：批量稿已有完整内容，硬门仅阻断终帧严重倒退（payoff_blocking）及彻底无法修复的里程碑硬伤
-                hard_gate_errors = list(dict.fromkeys(
-                    remaining_milestone_errors + payoff_blocking))
-                if not hard_gate_errors:
-                    if residual and sys.stdout:
-                        print(f"[DIRECT] Batch beat {i} 回读校验仍有残留（回炉未真正生效）: {residual}")
-                    pp.record_beat_audit(config, i, structural, style_errs, reworked, image_reworked,
-                                         milestone_name=contract['beat'].get('milestone_name'),
-                                         residual=residual)
-                    pp.record_outline_delivery(config, i, i_p, contract['beat'],
-                                               missing_before=outline_missing_before)
-                    vid_prompt, img_prompt, beat_succeeded = v_p, i_p, True
-                    new_ledger_items = parsed_traces
-                elif sys.stdout:
-                    print(f"[DIRECT] Batch beat {i} 硬门未通过，转入单拍重试: {hard_gate_errors}")
+                    if remaining_milestone_errors:
+                        v_p = self.patch_milestone_video_prompt(v_p, contract['beat'])
+                        i_p = self.patch_milestone_image_prompt(i_p, contract['beat'])
+                        remaining_milestone_errors = (
+                            pp.check_milestone_video_prompt(v_p, contract['beat'])
+                            + pp.check_milestone_image_prompt(i_p, contract['beat']))
+                    payoff_blocking = pp.payoff_blocking_residual(residual, contract['is_last'])
+                    if style_errs and sys.stdout:
+                        print(f"[DIRECT] Batch beat {i} 校验有瑕疵（直出模式仅记录，不重写）: {style_errs}")
+                    # 同上：批量稿已有完整内容，硬门仅阻断终帧严重倒退（payoff_blocking）及彻底无法修复的里程碑硬伤
+                    hard_gate_errors = list(dict.fromkeys(
+                        remaining_milestone_errors + payoff_blocking))
+                    if not hard_gate_errors:
+                        if residual and sys.stdout:
+                            print(f"[DIRECT] Batch beat {i} 回读校验仍有残留（回炉未真正生效）: {residual}")
+                        pp.record_beat_audit(config, i, structural, style_errs, reworked, image_reworked,
+                                             milestone_name=contract['beat'].get('milestone_name'),
+                                             residual=residual)
+                        pp.record_outline_delivery(config, i, i_p, contract['beat'],
+                                                   missing_before=outline_missing_before)
+                        vid_prompt, img_prompt, beat_succeeded = v_p, i_p, True
+                        new_ledger_items = parsed_traces
+                    elif sys.stdout:
+                        print(f"[DIRECT] Batch beat {i} 硬门未通过，转入单拍重试: {hard_gate_errors}")
 
             if not beat_succeeded:
                 if sys.stdout:

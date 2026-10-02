@@ -9,20 +9,22 @@
 启动时会 activate 自己——两件事叠加，任务一开浏览器就抢走最前端焦点，正在打字
 的人被打断。实测（server.log 287 次静默启动）参数确实传进去了，窗口照样弹到最前。
 
-macOS 上真正有效的手段是 app 级隐藏：`set visible of process ... to false`。
+macOS 使用 AppKit 的 NSRunningApplication.hide 做 app 级隐藏；不可用时才尝试
+System Events 的 `set visible of process ... to false` 兼容路径。
 它跟"最小化"不是一回事——隐藏后窗口仍然存在、仍然参与渲染，CDP 连接和 Playwright
 的 page 对象全程有效，所以人工介入时只要取消隐藏就能看见，不需要重启浏览器重连。
 
 三种模式（ADSPOWER_MACOS_WINDOW_MODE）：
   hide  : 隐藏浏览器 app + 把焦点还给原前台应用（默认，效果最彻底）
-  focus : 只把焦点还给原前台应用，窗口留在屏幕上（零权限，保底方案）
+  focus : 只尝试把焦点还给原前台应用，窗口留在屏幕上
   off   : 什么都不做，沿用旧行为
 
-hide 依赖"辅助功能"权限（系统设置 → 隐私与安全性 → 辅助功能），授权对象是启动本
-服务的那个程序（终端 / VSCode）。没授权时 osascript 会报 -1719，本模块会自动降级
-到 focus 并只提示一次，不会让任务失败。
+AppKit 路径不访问辅助功能 UI 元素。旧 System Events 兼容路径依赖"辅助功能"权限；
+权限拒绝后只停用该隐藏兼容路径，后续仍尝试 AppKit。所有失败都不阻塞生成任务。
+macOS 的应用激活是系统请求，不能保证焦点一定恢复。
 """
 
+import json
 import os
 import shutil
 import subprocess
@@ -32,7 +34,7 @@ from .logger import log
 
 # 辅助功能权限缺失只提示一次，避免每次启动浏览器都刷屏
 _ACCESSIBILITY_WARNED = False
-# 进程级降级开关：hide 一旦确认无权限，后续直接走 focus，不再每次都试
+# 只停用已确认无权限的 System Events 隐藏路径，不影响 AppKit 的后续尝试。
 _HIDE_DEGRADED = False
 # 被本模块隐藏过的浏览器 PID。人工接管时要把窗口翻出来给人看，但那条链路上只拿得到
 # Playwright 的 page 对象、拿不到 CDP 端口（Playwright 不暴露 ws_url），所以这里自己
@@ -55,6 +57,52 @@ def _osascript(script: str):
         return proc.returncode == 0, proc.stdout.strip(), proc.stderr.strip()
     except Exception as e:
         return False, "", f"{type(e).__name__}: {e}"
+
+
+def _jxa(script: str):
+    """运行内置 JavaScript Objective-C 桥，返回 (ok, stdout, stderr)。"""
+    binary = shutil.which("osascript")
+    if not binary:
+        return False, "", "osascript not found"
+    try:
+        proc = subprocess.run(
+            [binary, "-l", "JavaScript", "-e", script],
+            capture_output=True, text=True, timeout=_OSASCRIPT_TIMEOUT,
+        )
+        return proc.returncode == 0, proc.stdout.strip(), proc.stderr.strip()
+    except Exception as e:
+        return False, "", f"{type(e).__name__}: {e}"
+
+
+def _jxa_boolean(script: str) -> tuple:
+    """解析 API 的 BOOL；osascript 的退出码成功不能代替操作结果。"""
+    try:
+        ok, out, err = _jxa(script)
+        if not ok:
+            return False, out, err
+        if json.loads(out) is True:
+            return True, out, ""
+        return False, out, "AppKit operation returned false"
+    except (TypeError, ValueError) as e:
+        return False, "", f"invalid AppKit result: {e}"
+
+
+def _native_app_action(pid: int, action: str) -> tuple:
+    """按 PID 调用公共 AppKit API。"""
+    expressions = {"hide": "app.hide", "unhide": "app.unhide",
+                   "activate": "app.activateWithOptions(0)"}
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False, "", "invalid AppKit PID"
+    if pid <= 0 or action not in expressions:
+        return False, "", "invalid AppKit action or PID"
+    # JXA 的无参 Objective-C 方法用属性访问执行，不能写成 app.hide()。
+    return _jxa_boolean(
+        'ObjC.import("AppKit"); '
+        f'var app = $.NSRunningApplication.runningApplicationWithProcessIdentifier({pid}); '
+        f'JSON.stringify(app.isNil() ? false : Boolean({expressions[action]}));'
+    )
 
 
 def _is_permission_error(stderr: str) -> bool:
@@ -97,9 +145,20 @@ def browser_pid_from_ws(ws_url: str):
 def frontmost_app() -> str:
     """返回当前前台应用名，供启动浏览器后把焦点还回去。取不到时返回空串。
 
-    只读 System Events 的 frontmost 属性同样要辅助功能权限，所以拿不到是常态；
-    拿不到就退回 activate 上一个应用的通用做法（见 restore_focus）。
+    优先读 NSWorkspace；仅当原生读取失败时使用 System Events 兼容路径。
     """
+    ok, out, _ = _jxa(
+        'ObjC.import("AppKit"); '
+        'var app = $.NSWorkspace.sharedWorkspace.frontmostApplication; '
+        'JSON.stringify(app.isNil() ? "" : ObjC.unwrap(app.localizedName));'
+    )
+    if ok:
+        try:
+            name = json.loads(out)
+            if isinstance(name, str) and name:
+                return name
+        except (TypeError, ValueError):
+            pass
     ok, out, _ = _osascript(
         'tell application "System Events" to get name of first process whose frontmost is true'
     )
@@ -107,13 +166,25 @@ def frontmost_app() -> str:
 
 
 def restore_focus(app_name: str = "") -> bool:
-    """把焦点还给 app_name（拿不到名字时用 Cmd+Tab 等价的"切回上一个应用"）。
+    """请求把焦点还给 app_name；名字为空时不切换应用。
 
-    `activate` 是标准 AppleScript 命令，不需要辅助功能权限，所以这条路在任何机器上
-    都能用——它是 hide 不可用时的保底方案。
+    `activate` 不访问辅助功能 UI 元素，但 macOS 仍可能不接受激活请求。
     """
     if app_name:
-        ok, _, _ = _osascript(f'tell application "{app_name}" to activate')
+        ok, _, _ = _jxa_boolean(
+            'ObjC.import("AppKit"); '
+            'var apps = $.NSWorkspace.sharedWorkspace.runningApplications; '
+            'var activated = false; '
+            'for (var i = 0; i < apps.count; i++) { '
+            'var app = apps.objectAtIndex(i); '
+            f'if (ObjC.unwrap(app.localizedName) === {json.dumps(app_name)}) {{ '
+            'activated = Boolean(app.activateWithOptions(0)); break; } } '
+            'JSON.stringify(activated);'
+        )
+        if ok:
+            return True
+        quoted_name = app_name.replace("\\", "\\\\").replace('"', '\\"')
+        ok, _, _ = _osascript(f'tell application "{quoted_name}" to activate')
         if ok:
             return True
     # 没有目标应用名：让 Finder 之外的上一个应用回到前台不可靠，直接放弃而不是乱切，
@@ -122,11 +193,27 @@ def restore_focus(app_name: str = "") -> bool:
 
 
 def _set_visible(pid: int, visible: bool) -> tuple:
+    native_result = _native_app_action(pid, "unhide" if visible else "hide")
+    if native_result[0]:
+        return native_result
+    if not visible and _HIDE_DEGRADED:
+        return native_result
     state = "true" if visible else "false"
     return _osascript(
         f'tell application "System Events" to set visible of '
         f'(first process whose unix id is {pid}) to {state}'
     )
+
+
+def _activate_pid(pid: int) -> bool:
+    """请求激活浏览器供人工接管；系统可能拒绝，不能保证窗口立即前置。"""
+    if _native_app_action(pid, "activate")[0]:
+        return True
+    ok, _, _ = _osascript(
+        f'tell application "System Events" to set frontmost of '
+        f'(first process whose unix id is {pid}) to true'
+    )
+    return ok
 
 
 def hide_browser(ws_url: str, previous_app: str = "") -> bool:
@@ -138,26 +225,25 @@ def hide_browser(ws_url: str, previous_app: str = "") -> bool:
     global _ACCESSIBILITY_WARNED, _HIDE_DEGRADED
 
     hidden = False
-    if not _HIDE_DEGRADED:
-        pid = browser_pid_from_ws(ws_url)
-        if pid:
-            ok, _, err = _set_visible(pid, False)
-            if ok:
-                hidden = True
-                _HIDDEN_PIDS.add(pid)
-            elif _is_permission_error(err):
-                _HIDE_DEGRADED = True
-                if not _ACCESSIBILITY_WARNED:
-                    _ACCESSIBILITY_WARNED = True
-                    log(
-                        "⚠️ 无法隐藏浏览器窗口：缺少「辅助功能」权限。"
-                        "到 系统设置 → 隐私与安全性 → 辅助功能 里勾选启动本服务的程序"
-                        "（终端 / VSCode）即可彻底隐藏；在那之前只把焦点还给你，"
-                        "窗口仍会留在屏幕上。",
-                        "浏览器启动",
-                    )
-            else:
-                log(f"⚠️ 隐藏浏览器窗口失败（不影响任务）: {err}", "浏览器启动")
+    pid = browser_pid_from_ws(ws_url)
+    if pid:
+        ok, _, err = _set_visible(pid, False)
+        if ok:
+            hidden = True
+            _HIDDEN_PIDS.add(pid)
+        elif _is_permission_error(err):
+            _HIDE_DEGRADED = True
+            if not _ACCESSIBILITY_WARNED:
+                _ACCESSIBILITY_WARNED = True
+                log(
+                    "⚠️ AppKit 未能隐藏浏览器，兼容隐藏方式缺少「辅助功能」权限。"
+                    "可在 系统设置 → 隐私与安全性 → 辅助功能 中授权实际启动服务的程序"
+                    "（如终端 / VSCode / Python）；后续仍会尝试 AppKit，"
+                    "当前仅尝试归还焦点。",
+                    "浏览器启动",
+                )
+        elif not _HIDE_DEGRADED:
+            log(f"⚠️ 隐藏浏览器窗口失败（不影响任务）: {err}", "浏览器启动")
 
     restore_focus(previous_app)
     return hidden
@@ -185,10 +271,7 @@ def reveal_hidden(activate: bool = True) -> int:
         if ok:
             shown += 1
             if activate:
-                _osascript(
-                    f'tell application "System Events" to set frontmost of '
-                    f'(first process whose unix id is {pid}) to true'
-                )
+                _activate_pid(pid)
     return shown
 
 
@@ -227,8 +310,5 @@ def show_browser(ws_url: str) -> bool:
     if not ok and not _is_permission_error(err):
         log(f"⚠️ 恢复浏览器窗口显示失败: {err}", "浏览器启动")
     # 隐藏状态解除后还要把它 activate 到最前，否则窗口可能仍压在其它应用下面。
-    _osascript(
-        f'tell application "System Events" to set frontmost of '
-        f'(first process whose unix id is {pid}) to true'
-    )
+    _activate_pid(pid)
     return ok

@@ -25,7 +25,7 @@ from typing import Optional
 import requests
 
 from ..config import AI_DIR, get_runtime_default_port
-from . import account_binding, account_credentials
+from . import account_binding, account_credentials, lease_registry
 from .logger import log
 
 _STATE_FILE = AI_DIR / "runtime" / "account_pool.json"
@@ -92,7 +92,7 @@ def _parse_iso(value) -> Optional[datetime]:
         return None
 
 
-def _read_state() -> dict:
+def _read_state(*, persist_normalization: bool = True) -> dict:
     if not _STATE_FILE.parent.exists():
         _STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
     if not _STATE_FILE.exists():
@@ -106,6 +106,7 @@ def _read_state() -> dict:
         return {}
     # 老数据迁移：曾经用一个 label 字段兼职"命名"和"备注"两种含义，
     # 现在拆成 name（账号命名，默认用邮箱）+ note（备注，选填）两个独立字段。
+    normalized_cooldown = False
     for info in data.values():
         if not isinstance(info, dict):
             continue
@@ -127,11 +128,24 @@ def _read_state() -> dict:
         # A measured balance below threshold (default 15) is not usable. Normalize legacy state on
         # read as well, so accounts that reached low credit before this rule was
         # introduced are excluded immediately without waiting for a new probe.
-        min_threshold = _get_min_credit_threshold()
-        credit_val = info.get("credit")
-        if credit_val is not None and credit_val < min_threshold and not info.get("disabled"):
-            info["disabled"] = True
-            info["disabled_reason"] = _ZERO_CREDIT_DISABLED_REASON
+        before_cooldown = dict(info)
+        cooldown_until = _parse_iso(info.get("cooldown_until"))
+        if (info.get("disabled_reason") == _ZERO_CREDIT_DISABLED_REASON
+                and cooldown_until is not None and cooldown_until <= _now()):
+            # Re-enter the pool only to measure again. The old depleted balance
+            # remains visible until Flow actually reports a refreshed balance.
+            info["disabled"] = False
+            info.pop("disabled_reason", None)
+            info["cooldown_until"] = None
+            info.pop("cooldown_reason", None)
+            info["credit_recheck_required"] = True
+        if not info.get("credit_recheck_required"):
+            _sync_zero_credit_disabled(info, info.get("credit"))
+        normalized_cooldown |= info != before_cooldown
+    if normalized_cooldown and persist_normalization:
+        # Persist migration/re-entry once so repeated status reads cannot keep
+        # moving an old account's automatic cooldown into the future.
+        _write_state(data)
     return data
 
 
@@ -162,6 +176,12 @@ def _credit_is_stale(info: dict) -> bool:
     只写在 pick_account 里，于是每多一条绕过 pick_account 的选号路径（轮转环切腿
     就是），那条路径就凭一个可能几小时前的缓存值决定用不用这个号。
     """
+    if info.get("credit_recheck_required"):
+        return True
+    if info.get("credit_source") == "estimated" and (
+        info.get("credit") is None or info["credit"] < _get_min_credit_threshold()
+    ):
+        return True
     last_checked = _parse_iso(info.get("last_checked_at"))
     last_success = _parse_iso(info.get("last_success_at"))
     is_unprobed = (last_checked is None or info.get("credit") is None)
@@ -198,16 +218,26 @@ def _probe_backoff_remaining(info: dict) -> float:
 
 def _sync_zero_credit_disabled(info: dict, credit) -> None:
     """Keep automatic low-credit disabling separate from manual disabling."""
+    if info.get("credit_source") == "estimated":
+        return
     min_threshold = _get_min_credit_threshold()
     if credit is not None and credit < min_threshold:
         if not info.get("disabled"):
             info["disabled"] = True
             info["disabled_reason"] = _ZERO_CREDIT_DISABLED_REASON
+        if info.get("disabled_reason") == _ZERO_CREDIT_DISABLED_REASON:
+            until = _parse_iso(info.get("cooldown_until"))
+            if until is None or until <= _now():
+                info["cooldown_until"] = (_now() + timedelta(hours=24)).isoformat()
+                info["cooldown_reason"] = _ZERO_CREDIT_DISABLED_REASON
     elif credit is not None and credit >= min_threshold and info.get("disabled_reason") == _ZERO_CREDIT_DISABLED_REASON:
         # A later successful probe found usable credit again. Only undo the
         # automatic disable; a manually disabled account must stay disabled.
         info["disabled"] = False
         info.pop("disabled_reason", None)
+        if info.get("cooldown_reason") == _ZERO_CREDIT_DISABLED_REASON:
+            info["cooldown_until"] = None
+            info.pop("cooldown_reason", None)
 
 
 def calculate_account_health_score(info: dict, credentials_info: Optional[dict] = None) -> int:
@@ -365,11 +395,7 @@ class AccountPool:
             entry["auto_login_error"] = cred.get("auto_login_error")
             entry["auto_login_at"] = cred.get("auto_login_at")
             entry["auto_login_blocked"] = bool(cred.get("auto_login_blocked"))
-            checked = _parse_iso(entry.get("last_checked_at"))
-            if STALE_AFTER_SECONDS is not None and checked is not None:
-                entry["credit_stale"] = (_now() - checked).total_seconds() >= STALE_AFTER_SECONDS
-            else:
-                entry["credit_stale"] = (checked is None)
+            entry["credit_stale"] = _credit_is_stale(info)
             entry["credit_trustworthy"] = bool(
                 entry.get("credit") is not None
                 and not entry["credit_stale"]
@@ -443,7 +469,9 @@ class AccountPool:
 
         with _LOCK:
             state = _read_state()
+            existing = dict(state.get(user_id, {}))
             state[user_id] = {
+                **existing,
                 "name": resolved_name,
                 "note": (note or "").strip(),
                 "serial_number": resolved_serial,
@@ -528,7 +556,7 @@ class AccountPool:
         return entry
 
     def optimistic_deduct_credit(self, user_id: str, amount: int = 1) -> Optional[dict]:
-        """任务发起时乐观扣减预估积分（图片 -1，视频 -10），防止并发重复耗尽。"""
+        """按调用方给定成本更新余额估算；估算耗尽只能触发复核，不能冒充实测禁用。"""
         user_id = (user_id or "").strip()
         if not user_id or amount <= 0:
             return None
@@ -541,13 +569,42 @@ class AccountPool:
             if current_credit is not None:
                 new_credit = max(0, int(current_credit) - int(amount))
                 info["credit"] = new_credit
-                _sync_zero_credit_disabled(info, new_credit)
+                info["credit_source"] = "estimated"
+                info["estimated_spent_since_measurement"] = int(info.get("estimated_spent_since_measurement", 0)) + int(amount)
                 _write_state(state)
                 entry = dict(info)
                 entry["user_id"] = user_id
                 log(f"⚡ 账号 {user_id} 乐观预扣积分 -{amount}: {current_credit} → {new_credit}", "账号池")
                 return entry
         return None
+
+    def record_video_submission(self, user_id: str, submission_id: str, cost: int) -> Optional[dict]:
+        """Atomically count a confirmed submission and its estimate exactly once.
+
+        A later measured balance replaces earlier estimates. Estimated depletion
+        requests a fresh measurement; it never disables an account as measured zero.
+        """
+        user_id = str(user_id or "").strip()
+        if not user_id or not submission_id:
+            return None
+        with _LOCK:
+            state = _read_state()
+            info = state.get(user_id)
+            if info is None:
+                return None
+            receipts = list(info.get("video_submission_receipts") or [])
+            if submission_id not in receipts:
+                receipts.append(submission_id)
+                info["video_submission_receipts"] = receipts[-2048:]
+                info["video_task_count"] = max(0, int(info.get("video_task_count", 0))) + 1
+                info["last_submitted_at"] = _now_iso()
+                if info.get("credit") is not None:
+                    cost = max(0, int(cost))
+                    info["credit"] = max(0, int(info["credit"]) - cost)
+                    info["credit_source"] = "estimated"
+                    info["estimated_spent_since_measurement"] = int(info.get("estimated_spent_since_measurement", 0)) + cost
+                _write_state(state)
+            return dict(info, user_id=user_id)
 
     def record_generation_failure(self, user_id: str, reason) -> Optional[dict]:
         """Persist a generation failure so selection/diagnostics do not forget it."""
@@ -654,6 +711,10 @@ class AccountPool:
                 return None
             state[user_id]["cooldown_until"] = None
             state[user_id].pop("cooldown_reason", None)
+            if state[user_id].get("disabled_reason") == _ZERO_CREDIT_DISABLED_REASON:
+                state[user_id]["disabled"] = False
+                state[user_id].pop("disabled_reason", None)
+                state[user_id]["credit_recheck_required"] = True
             _write_state(state)
             entry = dict(state[user_id])
         entry["user_id"] = user_id
@@ -673,6 +734,10 @@ class AccountPool:
                 if u in state:
                     state[u]["cooldown_until"] = None
                     state[u].pop("cooldown_reason", None)
+                    if state[u].get("disabled_reason") == _ZERO_CREDIT_DISABLED_REASON:
+                        state[u]["disabled"] = False
+                        state[u].pop("disabled_reason", None)
+                        state[u]["credit_recheck_required"] = True
                     changed = True
                     entry = dict(state[u])
                     entry["user_id"] = u
@@ -950,12 +1015,10 @@ class AccountPool:
                 return None
             info = dict(state[user_id])
 
-        last_checked = _parse_iso(info.get("last_checked_at"))
-        if not force and last_checked is not None:
-            if STALE_AFTER_SECONDS is None or (_now() - last_checked).total_seconds() < STALE_AFTER_SECONDS:
-                entry = dict(info)
-                entry["user_id"] = user_id
-                return entry
+        if not force and not _credit_is_stale(info):
+            entry = dict(info)
+            entry["user_id"] = user_id
+            return entry
 
         # 上一轮探测失败/被挡：先退避，别再拉一次浏览器。返回的还是当前缓存条目
         # （带着 last_probe_status='failed'/'blocked'），调用方的判断口径不变——
@@ -985,6 +1048,10 @@ class AccountPool:
                 return None
             if credit is not None:
                 state[user_id]["credit"] = credit
+                state[user_id]["credit_source"] = "measured"
+                state[user_id]["last_measured_credit"] = credit
+                state[user_id]["estimated_spent_since_measurement"] = 0
+                state[user_id].pop("credit_recheck_required", None)
                 _sync_zero_credit_disabled(state[user_id], credit)
                 state[user_id]["last_checked_at"] = attempted_at
                 state[user_id]["last_probe_status"] = "ok"
@@ -1038,6 +1105,10 @@ class AccountPool:
             if user_id not in state:
                 return
             state[user_id]["credit"] = int(credit)
+            state[user_id]["credit_source"] = "measured"
+            state[user_id]["last_measured_credit"] = int(credit)
+            state[user_id]["estimated_spent_since_measurement"] = 0
+            state[user_id].pop("credit_recheck_required", None)
             _sync_zero_credit_disabled(state[user_id], int(credit))
             now = _now_iso()
             state[user_id]["last_checked_at"] = now
@@ -1055,7 +1126,8 @@ class AccountPool:
         credit：页面实测到的余额。传了就按实测值写回——"积分不足"跟"余额为 0"
         是两回事，一律写 0 会在控制台显示一个页面上根本不存在的余额，跟本模块
         "积分数字只信真实探测"的规矩直接冲突。没实测到（只命中了耗尽关键词）
-        才退回写 0。
+        才退回写 0。同一次未解除的耗尽状态被上层重复标记时，保留先前已写入的
+        实测余额，不能让缺少读数的重复通知把 1 积分覆盖成 0。
 
         reason="image_quota_exceeded"（图片单日配额）是个例外：那是"今天的图片份额
         用完了"，跟积分余额无关，没实测到余额时**一个字都不改**——照旧写 0 会伪造
@@ -1071,11 +1143,21 @@ class AccountPool:
             # 的余额（本模块"积分数字只信真实探测"的规矩），还会顺手把账号按
             # zero_credit 自动禁用——那是另一种故障的标记，人看了会误判。
             image_capped = (reason == "image_quota_exceeded")
-            if credit is None and image_capped:
+            previous_until = _parse_iso(state[user_id].get("cooldown_until"))
+            repeat_measured_exhaustion = (
+                reason == "quota_exhausted"
+                and state[user_id].get("cooldown_reason") == "quota_exhausted"
+                and state[user_id].get("credit_source") == "measured"
+                and state[user_id].get("credit") is not None
+                and previous_until is not None and previous_until > _now()
+            )
+            if credit is None and (image_capped or repeat_measured_exhaustion):
                 measured = state[user_id].get("credit")
             else:
                 measured = 0 if credit is None else max(0, int(credit))
                 state[user_id]["credit"] = measured
+                state[user_id]["credit_source"] = "measured" if credit is not None else "exhaustion_signal"
+                state[user_id]["estimated_spent_since_measurement"] = 0
                 _sync_zero_credit_disabled(state[user_id], measured)
             state[user_id]["cooldown_until"] = cooldown_until
             state[user_id]["cooldown_reason"] = reason
@@ -1115,10 +1197,78 @@ class AccountPool:
 
     # ── 选号 ──────────────────────────────────────
 
+    def pick_open_account(self, min_credit: int = 1, exclude=None) -> Optional[dict]:
+        """Reuse an open pool profile while it can still fund the next request.
+
+        Only existing pool accounts are eligible. Exhausted open profiles are
+        closed before selection can open a replacement; manual disables and
+        login failures never authorize closing an unrelated user window.
+        """
+        from .browser import list_running_ads_browsers, stop_ads_browser
+
+        excluded = {str(uid) for uid in (exclude or ()) if uid}
+        with _LOCK:
+            state = _read_state()
+        if not state:
+            return None
+        running = list_running_ads_browsers()
+        # Keep a task binding sticky when several usable windows are open.
+        bound = account_binding.current_task_account()
+        running.sort(key=lambda profile: str(profile.get("user_id")) != bound)
+        # 并发方案 R3：别的任务租着的环境既不能"捡来复用"，也不能因为额度耗尽被我们关掉。
+        leased_elsewhere = lease_registry.leased_by_others()
+        for profile in running:
+            user_id = str(profile.get("user_id") or "").strip()
+            if user_id in excluded or user_id not in state:
+                continue
+            if user_id in leased_elsewhere:
+                continue
+            if self.account_is_usable(user_id, min_credit=min_credit):
+                with _LOCK:
+                    entry = dict(_read_state().get(user_id) or {})
+                if entry:
+                    # 并发方案 R7：占账号是原子步骤；被别的租约抢先（含同出口）就换下一个窗口。
+                    if not lease_registry.claim(user_id):
+                        continue
+                    log(f"⚡ 沿用已打开的账号 {user_id}（积分 {entry.get('credit')}）", "账号池")
+                    return dict(entry, user_id=user_id)
+            with _LOCK:
+                info = dict(_read_state().get(user_id) or {})
+            if info.get("disabled") and info.get("disabled_reason") != _ZERO_CREDIT_DISABLED_REASON:
+                continue
+            credit = info.get("credit")
+            depleted = (credit is not None and credit < min_credit
+                        and info.get("credit_source") != "estimated")
+            quota_cooldown = info.get("cooldown_reason") in {
+                _ZERO_CREDIT_DISABLED_REASON, "quota_exhausted", "image_quota_exceeded",
+            }
+            if depleted and not quota_cooldown:
+                self.mark_exhausted(user_id, credit=credit)
+            if depleted or quota_cooldown:
+                stop_ads_browser(user_id=user_id)
+        return None
+
     def pick_account(self, min_credit: int = 1, exclude=None,
-                     priority_user_ids=None, strategy: str = "credit_desc") -> Optional[dict]:
+                     priority_user_ids=None, strategy: str = "credit_desc",
+                     prefer_open: bool = True) -> Optional[dict]:
+        """选号并**原子地占用**该账号（并发方案 R7）。没选到时把租约账号恢复成选号前的样子。
+
+        实现见 _pick_account_inner；这里只负责"失败要还原"，避免一次落空的选号把
+        最后一个试过的候选账号一直挂在当前租约上。
+        """
+        previous = lease_registry.current_claim()
+        chosen = None
+        try:
+            chosen = self._pick_account_inner(min_credit, exclude, priority_user_ids, strategy, prefer_open)
+            return chosen
+        finally:
+            if chosen is None:
+                lease_registry.restore_claim(previous)
+
+    def _pick_account_inner(self, min_credit, exclude, priority_user_ids, strategy, prefer_open):
         """从池子里挑一个未禁用、不在冷却期、积分足够的账号。
 
+        prefer_open：默认先复用仍有额度的已打开环境，再应用下列排序策略。
         priority_user_ids：多选指定的优先级账号集合。优先从中选号；若全部不可用则回退到全池。
         strategy：选号排序策略：
             - 'credit_desc'：积分最多优先（默认）
@@ -1127,6 +1277,12 @@ class AccountPool:
             - 'serial_asc'：环境编号升序
         """
         excluded = {str(u) for u in (exclude or ()) if u}
+        # 并发方案 R7：别的任务正租着的账号不参与选号（没有他人租约时这是空集合 = 旧行为）。
+        excluded |= lease_registry.leased_by_others()
+        if prefer_open:
+            opened = self.pick_open_account(min_credit=min_credit, exclude=excluded)
+            if opened is not None:
+                return opened
         priority_set = {str(u).strip() for u in (priority_user_ids or ()) if str(u).strip()}
         with _LOCK:
             state = _read_state()
@@ -1185,6 +1341,11 @@ class AccountPool:
 
         for queue in search_queues:
             for user_id, info in queue:
+                # 先占再探：探测会打开这个账号的浏览器，必须保证此刻没有别的任务在用它；
+                # 占不到（别的租约先到，或出口与运行中的环境相同）就换下一个候选。
+                if not lease_registry.claim(user_id):
+                    continue
+                probed = False
                 if _credit_is_stale(info):
                     refreshed = self.refresh_credit(user_id, force=True)
                     if refreshed is not None:
@@ -1197,11 +1358,22 @@ class AccountPool:
                         else:
                             log(f"⏭️ 账号 {user_id} 初始积分探测未成功，跳过", "账号池")
                         continue
+                    probed = True
 
                 credit = info.get("credit")
                 if credit is None:
                     # 探测失败且从来没探测成功过：不知道有没有额度，跳过而不是当成有。
                     log(f"⏭️ 账号 {user_id} 积分仍未探测成功，跳过（不假设有额度）", "账号池")
+                    continue
+                if probed and credit < min_credit:
+                    # This probe may have opened a previously closed profile.
+                    # Retire it before the following probe opens another one.
+                    self.mark_exhausted(user_id, credit=credit)
+                    from .browser import stop_ads_browser
+                    stop_ads_browser(user_id=user_id)
+                    continue
+                cooldown_until = _parse_iso(info.get("cooldown_until"))
+                if info.get("disabled") or (cooldown_until is not None and cooldown_until > _now()):
                     continue
                 if credit >= min_credit:
                     entry = dict(info)
@@ -1217,7 +1389,7 @@ class AccountPool:
         账号余额不足。只返回固定原因分类，避免把探测异常里的凭据等内容带给用户。
         """
         with _LOCK:
-            state = _read_state()
+            state = _read_state(persist_normalization=False)
         now = _now()
         counts = {}
         backoffs = []
@@ -1300,6 +1472,9 @@ class AccountPool:
                     "账号池")
                 return False
             info = refreshed
+        cooldown_until = _parse_iso(info.get("cooldown_until"))
+        if info.get("disabled") or (cooldown_until is not None and cooldown_until > _now()):
+            return False
         credit = info.get("credit")
         if credit is None:
             return False
@@ -1310,6 +1485,26 @@ class AccountPool:
 
     _inspector_thread = None
     _inspector_stop_event = None
+
+    def _silent_inspection_candidates(self) -> list:
+        from .browser import list_running_ads_browsers
+
+        open_ids = {str(profile["user_id"]) for profile in list_running_ads_browsers()}
+        candidates = []
+        for account in self.list_accounts(heal=False):
+            uid = account.get("user_id")
+            until = _parse_iso(account.get("cooldown_until"))
+            if (not uid or not account.get("credit_stale")
+                    or account.get("disabled") or (until is not None and until > _now())):
+                continue
+            # Background checks must not create extra windows while a browser
+            # is already serving the user's generation work.
+            if open_ids and uid not in open_ids:
+                continue
+            candidates.append(account)
+        # One probe can itself open a browser. An idle pass must not retain a
+        # snapshot of every closed profile and then open all of them in turn.
+        return candidates if open_ids else candidates[:1]
 
     def start_silent_inspector(self, interval_seconds: int = 1800):
         """启动后台静默低频积分巡检守护线程。"""
@@ -1323,18 +1518,7 @@ class AccountPool:
                 if AccountPool._inspector_stop_event.wait(timeout=interval_seconds):
                     break
                 try:
-                    accounts = self.list_accounts(heal=False)
-                    # 被「积分低于阈值」自动停用的账号也要巡检：这条停用可能来自
-                    # optimistic_deduct_credit 的**预估**扣减（图片按 -1、视频按 -10 猜），
-                    # 猜错了就是把一个还有额度的账号锁死——它既进不了 pick_account 的候选，
-                    # 也不会有别的路径去探它的真值。refresh_credit 探到真额度后
-                    # _sync_zero_credit_disabled 会自动把它放回来。手动停用的账号仍然跳过。
-                    stale_accounts = [
-                        a for a in accounts
-                        if a.get("credit_stale") and a.get("user_id")
-                        and (not a.get("disabled")
-                             or a.get("disabled_reason") == _ZERO_CREDIT_DISABLED_REASON)
-                    ]
+                    stale_accounts = self._silent_inspection_candidates()
                     for acc in stale_accounts:
                         if AccountPool._inspector_stop_event.is_set():
                             break
@@ -1405,6 +1589,15 @@ def switch_to_next_account(exclude=(), min_credit: Optional[int] = None,
     if current:
         skip.add(current)
 
+    # Selecting a replacement can itself probe (and open) its browser. Release
+    # the old profile first, including when the pool has no replacement left.
+    if stop_current and current:
+        try:
+            from .browser import stop_ads_browser
+            stop_ads_browser(user_id=current, port=get_runtime_default_port())
+        except Exception as e:
+            log(f"⚠️ 关闭旧账号浏览器失败（不阻塞换号）: {e}", "账号池")
+
     try:
         chosen = AccountPool().pick_account(min_credit=min_credit, exclude=skip)
     except Exception as e:
@@ -1414,15 +1607,6 @@ def switch_to_next_account(exclude=(), min_credit: Optional[int] = None,
     if chosen is None:
         log(f"⚠️ 号池里没有可换的账号（已排除 {len(skip)} 个），本轮沿用当前账号重试", "账号池")
         return None
-
-    if stop_current and current:
-        try:
-            port = get_runtime_default_port()
-            requests.get(
-                f"http://127.0.0.1:{port}/api/v1/browser/stop?user_id={current}", timeout=10
-            )
-        except Exception as e:
-            log(f"⚠️ 关闭旧账号浏览器失败（不阻塞换号）: {e}", "账号池")
 
     account_binding.set_task_account(chosen["user_id"])
     log(

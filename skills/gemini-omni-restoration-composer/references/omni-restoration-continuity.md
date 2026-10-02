@@ -185,11 +185,14 @@ Timelapse must compress time. Allowed channels, and only these:
 
 1. Repeated action cycles inside one shot (prying the first, second, third board on screen).
 2. A cut may skip repetitions of an action already shown once in full, and the prose must state it: `after several more boards come loose the same way`.
-3. The time jump between anchors absorbs drying, curing, and settling.
+3. Declared elapsed drying, curing and settling before the ending anchor, with no unrelated
+   work hidden in the interval. The VIDEO's final instant still matches its last-frame IMAGE.
 
 First occurrence on camera: the first instance of every change type — first board, first brush stroke, first fastener — must appear in full with its causal chain. A cut may never skip a first occurrence, introduce a new object, or finish a different sub-task.
 
-Cuts carry no progress: every shot opens at the completion level the previous shot ended with. Progress advances only during visible work.
+Cuts carry no construction progress: every shot opens at the completion level the previous
+shot ended with. Construction advances only during visible work; separately declared
+drying/curing may advance the material state through elapsed time, without hidden construction.
 
 ## State Monotonicity
 
@@ -212,15 +215,33 @@ The final reveal anchor contains only objects installed or carried in during pri
 Follow `omni-work-first-rhythm.md`: source and destination are causal requirements, not compulsory delivery/removal scenes. Use inherited stock or a brief direct handoff; keep installed materials and retained stock, and show waste captured during the operation.
 
 - Bulk materials must be staged as a visible stockpile in a prior anchor or visibly carried/delivered into the scene inside the VIDEO before use.
+
+Choose a camera family that can actually see the required transfer. For a carry-in or
+carry-out milestone, the working shots must see the relevant source/exit boundary, the
+any declared threshold crossing and the destination/contact area. An entrance behind the
+locked camera cannot support a claimed visible through-door route; saying “show the whole
+route” does not repair that geometry. Reframe visibly before this operation, or split the
+transfer into adjacent stages with their own anchors. Retain the original opening position
+and the existing room state; never move the entrance to make the shot easier. A detail
+insert on later contact cannot substitute for the first occurrence of an unseen transfer.
+
 - Removed material either visibly exits the scene boundary or persists as a stockpile in later anchors until it visibly exits.
 - Stockpile volume should roughly match what was removed or what will be installed.
 
 ## Wet-To-Dry State Mapping
 
-If a VIDEO ends with wet material, the next IMAGE anchor shows its cured or dried state, using the time jump between anchors as the drying interval:
-- wet glossy paint with roller stipple → matte dry finish with the same stipple
-- fresh concrete pour with float marks → set pale-gray surface with the same float marks
-- adhesive squeeze-out → hardened bead with the same squeeze line
+The final VIDEO instant and its bound last-frame IMAGE must share the same moisture state.
+If the subsequent operation requires dry/cured material, explicitly place elapsed curing
+after the last application and before the ending anchor, or allocate a separate no-work
+drying transition. Do not write a wet VIDEO tail and claim it exactly matches a dry IMAGE.
+
+The permitted change is material state only, with the same coverage and traces:
+- wet paint with roller stipple → dry finish with the same stipple
+- fresh concrete with float marks → set surface with the same float marks and required support
+- fresh adhesive squeeze-out → hardened bead with the same squeeze line
+
+Application/first contact remains visible; curing never hides new coating, fasteners,
+cleanup, stock removal or another operation. The audit states which endpoint/interval it uses.
 
 ## Clean IMAGE Frames
 

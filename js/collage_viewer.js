@@ -283,7 +283,7 @@ function openBenchmarkCompare(opts = {}) {
  * 打开交互式多宫格检查器弹窗
  * @param {Object} opts
  * @param {string} [opts.collageUrl] 拼图 URL
- * @param {string} [opts.sourceCollageUrl] 爆款原片拼图 URL
+ * @param {string} [opts.sourceCollageUrl] 参考原片拼图 URL
  * @param {Object} [opts.refFrames] 节拍原片抽帧字典 { seq: url }
  * @param {Object} [opts.idea] 创意对象
  * @param {number} [opts.initialFrameSeq] 初始定位帧号
@@ -412,26 +412,6 @@ function openCollageViewer(opts = {}) {
 
     // 异步拉取原片基准抽帧（增强嗅探）
     let projTitle = (idea && (idea.title || idea.project_title || idea.project_key)) || opts.title || '';
-    let replicaJobId = (idea && (idea.replica_job_id || idea.source_job_id || (typeof idea.id === 'string' && idea.id.startsWith('replica_') ? idea.id : ''))) || opts.jobId || '';
-
-    if (!replicaJobId) {
-        const candidateStrings = [
-            projTitle,
-            idea && idea.collage_url,
-            idea && idea.source_collage,
-            idea && idea.frameRun && idea.frameRun.collage_url,
-            ...(Array.isArray(frames) ? frames.map(f => f.url || f.file || '') : [])
-        ].filter(Boolean);
-
-        for (const str of candidateStrings) {
-            const m = str.match(/(?:replica_|run_replica_)([a-f0-9]{12})/i);
-            if (m) {
-                replicaJobId = `replica_${m[1]}`;
-                break;
-            }
-        }
-    }
-
     if (!projTitle && Array.isArray(frames) && frames.length) {
         const firstUrl = frames[0].url || frames[0].file || '';
         const mDir = firstUrl.match(/\/outputs\/([^/]+)\//);
@@ -440,8 +420,8 @@ function openCollageViewer(opts = {}) {
         }
     }
 
-    if (projTitle || replicaJobId) {
-        const fetchUrl = `/api/project/references?title=${encodeURIComponent(projTitle)}&job_id=${encodeURIComponent(replicaJobId)}&total_beats=${beatAxis.length || ''}`;
+    if (projTitle) {
+        const fetchUrl = `/api/project/references?title=${encodeURIComponent(projTitle)}&total_beats=${beatAxis.length || ''}`;
         fetch(fetchUrl)
             .then(res => res.json())
             .then(data => {
@@ -580,7 +560,7 @@ function renderCollageViewerModal() {
                     ${(st.mode === 'collage' && hasSourceCollage) ? `
                     <div class="cv-toolgroup cv-collage-only">
                         <button type="button" class="cv-tool-btn ${st.activeCollageTab === 'generated' ? 'is-active' : ''}" data-act="collage-tab-gen" title="查看本次生成的 5 列拼图">🌟 生成拼图</button>
-                        <button type="button" class="cv-tool-btn ${st.activeCollageTab === 'source' ? 'is-active' : ''}" data-act="collage-tab-source" title="查看爆款原片 5 列拼图">🎯 原片拼图</button>
+                        <button type="button" class="cv-tool-btn ${st.activeCollageTab === 'source' ? 'is-active' : ''}" data-act="collage-tab-source" title="查看参考原片 5 列拼图">🎯 原片拼图</button>
                         <button type="button" class="cv-tool-btn ${st.activeCollageTab === 'dual' ? 'is-active' : ''}" data-act="collage-tab-dual" title="左右并排双拼图同屏比对">⚡ 左右双拼</button>
                     </div>
                     ` : ''}
@@ -596,7 +576,7 @@ function renderCollageViewerModal() {
                     <!-- 对比子模式 (Compare模式 + 存在原片抽帧) -->
                     ${hasRefs ? `
                     <div class="cv-toolgroup cv-compare-only" ${st.mode !== 'compare' ? 'style="display:none;"' : ''}>
-                        <button type="button" class="cv-tool-btn ${st.compareType === 'benchmark' ? 'is-active' : ''}" data-act="compare-type-benchmark" title="生成帧 vs 爆款原片抽帧 (Gen vs Ref)">🎯 原片对标</button>
+                        <button type="button" class="cv-tool-btn ${st.compareType === 'benchmark' ? 'is-active' : ''}" data-act="compare-type-benchmark" title="生成帧 vs 参考原片抽帧 (Gen vs Ref)">🎯 原片对标</button>
                         <button type="button" class="cv-tool-btn ${st.compareType === 'adjacent' ? 'is-active' : ''}" data-act="compare-type-adjacent" title="前后帧递进对比 (A vs B)">⇄ 邻帧前后</button>
                     </div>
                     ` : ''}
@@ -698,7 +678,7 @@ function renderCollageViewHtml() {
                             }
                         </div>
                         <div class="cv-dual-collage-col">
-                            <span class="cv-dual-collage-title ref-title">🎯 爆款原片 5 列拼图</span>
+                            <span class="cv-dual-collage-title ref-title">🎯 参考原片 5 列拼图</span>
                             <img src="${st.sourceCollageUrl}" class="cv-dual-collage-img" draggable="false" />
                         </div>
                     </div>

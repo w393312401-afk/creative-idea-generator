@@ -9,7 +9,9 @@
 
 #panel-image-studio .imgstudio-grid {
     display: grid;
-    grid-template-columns: 460px 1fr;
+    /* 控制栏随窗口伸缩：1400px 宽时 ≈460px（与原固定值一致），1025–1200px 不再把右侧
+       画廊压成窄条。minmax(0,1fr) 让右列可以收缩，避免内部网格撑破。 */
+    grid-template-columns: clamp(340px, 34%, 480px) minmax(0, 1fr);
     gap: 24px;
     flex-grow: 1;
     min-height: 0;
@@ -22,7 +24,7 @@
        理由与实测数据见 css/tokens.css 的 .glass-panel。 */
     background: var(--bg-panel);
     border: 1px solid var(--border-color);
-    border-radius: 20px;
+    border-radius: var(--radius-2xl);
     display: flex;
     flex-direction: column;
     overflow: hidden;
@@ -145,7 +147,7 @@
     background: var(--bg-card);
     border: 1px solid var(--border-color);
     color: var(--text-main);
-    border-radius: 12px;
+    border-radius: var(--radius-lg);
     padding: 0.75rem;
     padding-bottom: 2.25rem;
     font-size: 0.875rem;
@@ -169,7 +171,7 @@
     background: rgba(176, 123, 82, 0.15);
     border: 1px solid rgba(176, 123, 82, 0.3);
     color: var(--text-main);
-    border-radius: 6px;
+    border-radius: var(--radius-sm);
     padding: 0.3rem 0.6rem;
     font-size: 0.75rem;
     font-weight: 500;
@@ -194,7 +196,7 @@
     background: var(--bg-card);
     border: 1px solid var(--border-color);
     color: var(--text-main);
-    border-radius: 12px;
+    border-radius: var(--radius-lg);
     padding: 0.75rem;
     font-size: 0.875rem;
     cursor: pointer;
@@ -232,7 +234,7 @@
     color: var(--text-muted);
     font-size: 0.75rem;
     padding: 0.35rem 0.65rem;
-    border-radius: 20px;
+    border-radius: var(--radius-2xl);
     cursor: pointer;
     transition: var(--transition-fast);
     user-select: none;
@@ -262,7 +264,7 @@
 #panel-image-studio .ratio-card {
     background: rgba(var(--ink-rgb), 0.04);
     border: 1px solid var(--border-color);
-    border-radius: 12px;
+    border-radius: var(--radius-lg);
     padding: 0.75rem;
     display: flex;
     flex-direction: column;
@@ -286,7 +288,7 @@
 #panel-image-studio .ratio-box {
     background: rgba(var(--ink-rgb), 0.08);
     border: 1px solid rgba(var(--ink-rgb), 0.16);
-    border-radius: 4px;
+    border-radius: var(--radius-xs);
     transition: var(--transition-fast);
 }
 
@@ -332,7 +334,7 @@
 #panel-image-studio .quality-card {
     background: rgba(var(--ink-rgb), 0.04);
     border: 1px solid var(--border-color);
-    border-radius: 12px;
+    border-radius: var(--radius-lg);
     padding: 0.6rem;
     display: flex;
     flex-direction: column;
@@ -364,6 +366,10 @@
     font-size: 0.6rem;
     color: var(--text-dark);
     margin-top: 0.15rem;
+}
+
+#panel-image-studio .quality-desc[data-variant-size-description="1"] {
+    display: block;
 }
 
 #panel-image-studio .quality-card.active .quality-title {
@@ -406,7 +412,7 @@
     gap: 1.25rem;
     padding: 0.75rem;
     background: rgba(var(--ink-rgb), 0.04);
-    border-radius: 12px;
+    border-radius: var(--radius-lg);
     border: 1px solid var(--border-color);
 }
 
@@ -416,7 +422,7 @@
     background: linear-gradient(135deg, var(--primary) 0%, #6f22c4 50%, var(--accent) 100%);
     border: none;
     color: #ffffff !important;
-    border-radius: 12px;
+    border-radius: var(--radius-lg);
     padding: 0.9rem 1.5rem;
     font-size: 0.95rem;
     font-weight: 700 !important;
@@ -451,7 +457,7 @@
 
 #panel-image-studio .btn-shortcut-hint {
     display: block;
-    font-size: 11px;
+    font-size: var(--fs-xs);
     font-weight: normal;
     opacity: 0.8;
     margin-top: 2px;
@@ -477,7 +483,7 @@
 /* Drag & Drop File Upload */
 #panel-image-studio .upload-drag-area {
     border: 2px dashed var(--border-color);
-    border-radius: 12px;
+    border-radius: var(--radius-lg);
     padding: 1.5rem;
     text-align: center;
     background: rgba(var(--ink-rgb), 0.04);
@@ -529,7 +535,7 @@
     margin-top: 0.5rem;
     background: rgba(var(--ink-rgb), 0.05);
     padding: 0.5rem;
-    border-radius: 8px;
+    border-radius: var(--radius-md);
     border: 1px solid var(--border-color);
 }
 
@@ -537,7 +543,7 @@
     position: relative;
     width: 60px;
     height: 60px;
-    border-radius: 6px;
+    border-radius: var(--radius-sm);
     overflow: hidden;
     border: 1px solid rgba(var(--ink-rgb), 0.08);
 }
@@ -591,7 +597,7 @@
     width: 100%;
     background: rgba(var(--ink-rgb), 0.04);
     border: 1px solid var(--border-color);
-    border-radius: 16px;
+    border-radius: var(--radius-xl);
     overflow: hidden;
     position: relative;
     display: flex;
@@ -680,7 +686,7 @@
     background: rgba(176, 123, 82, 0.2);
     border: 1px solid rgba(176, 123, 82, 0.4);
     padding: 0.15rem 0.5rem;
-    border-radius: 4px;
+    border-radius: var(--radius-xs);
     width: fit-content;
     color: var(--primary);
 }
@@ -704,7 +710,7 @@
     color: var(--text-main);
     width: 36px;
     height: 36px;
-    border-radius: 8px;
+    border-radius: var(--radius-md);
     display: flex;
     align-items: center;
     justify-content: center;
@@ -813,7 +819,7 @@
 
 #panel-image-studio .history-card {
     aspect-ratio: 1 / 1;
-    border-radius: 10px;
+    border-radius: var(--radius-md);
     overflow: hidden;
     background: rgba(var(--ink-rgb), 0.05);
     border: 1px solid var(--border-color);
@@ -860,7 +866,7 @@
     color: #fff;
     width: 28px;
     height: 28px;
-    border-radius: 6px;
+    border-radius: var(--radius-sm);
     display: flex;
     align-items: center;
     justify-content: center;
@@ -881,7 +887,7 @@
     color: var(--text-dark);
     font-size: 0.85rem;
     border: 1px dashed var(--border-color);
-    border-radius: 10px;
+    border-radius: var(--radius-md);
 }
 
 /* Concurrency Tasks Section */
@@ -929,7 +935,7 @@
        css/tokens.css。 */
     background: rgba(var(--panel-rgb), 0.4);
     border: 1px solid var(--border-color);
-    border-radius: 12px;
+    border-radius: var(--radius-lg);
     padding: 10px 14px;
     transition: var(--transition-normal);
     position: relative;
@@ -945,7 +951,7 @@
 #panel-image-studio .task-visual {
     width: 44px;
     height: 44px;
-    border-radius: 8px;
+    border-radius: var(--radius-md);
     display: flex;
     align-items: center;
     justify-content: center;
@@ -1047,7 +1053,7 @@
 #panel-image-studio .task-status-badge {
     font-size: 0.75rem;
     padding: 3px 8px;
-    border-radius: 6px;
+    border-radius: var(--radius-sm);
     font-weight: 600;
     display: flex;
     align-items: center;
@@ -1085,7 +1091,7 @@
     color: var(--text-muted);
     width: 28px;
     height: 28px;
-    border-radius: 6px;
+    border-radius: var(--radius-sm);
     display: flex;
     align-items: center;
     justify-content: center;
@@ -1157,7 +1163,7 @@
     background: rgba(var(--panel-rgb), 0.4);
     border: 1px solid rgba(var(--ink-rgb), 0.1);
     border-left: 3px solid rgba(var(--ink-rgb), 0.18);
-    border-radius: 10px;
+    border-radius: var(--radius-md);
     padding: 10px 12px;
 }
 
@@ -1228,7 +1234,7 @@
     margin-top: 8px;
     padding: 8px 10px;
     background: rgba(var(--ink-rgb), 0.045);
-    border-radius: 8px;
+    border-radius: var(--radius-md);
     font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
     font-size: 0.72rem;
     line-height: 1.65;
@@ -1256,7 +1262,7 @@
 
 #panel-image-studio .feed-entry-result img {
     height: 72px;
-    border-radius: 8px;
+    border-radius: var(--radius-md);
     cursor: zoom-in;
     border: 1px solid rgba(var(--ink-rgb), 0.12);
     transition: transform 0.15s ease;
@@ -1448,7 +1454,7 @@
     /* P1: iOS Safari 输入控件 >= 16px 避免页面自动放大 */
     #panel-image-studio textarea,
     #panel-image-studio .styled-select {
-        font-size: 16px;
+        font-size: var(--fs-lg);
     }
 
     /* P0: 底部生成按钮粘底吸附 + 安全区支持 */
@@ -1583,7 +1589,7 @@
         justify-content: center;
         gap: 6px;
         padding: 8px 12px;
-        border-radius: 8px;
+        border-radius: var(--radius-md);
         border: 1px solid transparent;
         background: transparent;
         color: var(--text-muted);
@@ -1602,7 +1608,7 @@
     #panel-image-studio .imgstudio-mobile-badge {
         font-size: 0.7rem;
         padding: 1px 6px;
-        border-radius: 10px;
+        border-radius: var(--radius-md);
         background: var(--primary);
         color: #fff;
         font-weight: 700;
@@ -1632,3 +1638,28 @@
         grid-template-columns: repeat(auto-fill, minmax(84px, 1fr));
     }
 }
+
+/* Current result stays visible; the detailed process is opened only when needed. */
+#panel-image-studio .feed-current-status {
+    margin: 7px 0 0;
+    color: var(--text-secondary);
+    font-size: .78rem;
+    line-height: 1.6;
+    overflow-wrap: anywhere;
+}
+#panel-image-studio .feed-entry.st-failed .feed-current-status { color: var(--color-warning, #b45309); }
+#panel-image-studio .feed-entry.st-needs_reference { border-left-color: #d97706; }
+#panel-image-studio .task-status-badge.needs_reference {
+    color: var(--color-warning, #b45309);
+    background: rgba(217, 119, 6, .08);
+    border: 1px solid rgba(217, 119, 6, .2);
+}
+#panel-image-studio .feed-action-text { width: auto; min-width: 44px; padding: 5px 9px; font-size: .75rem; color: var(--text-main); }
+#panel-image-studio .feed-action-text:disabled { opacity: .55; cursor: default; }
+#panel-image-studio .feed-process { margin-top: 7px; }
+#panel-image-studio .feed-process > summary { cursor: pointer; color: var(--text-muted); font-size: .72rem; }
+#panel-image-studio .feed-process > summary:focus-visible,
+#panel-image-studio .feed-action-text:focus-visible { outline: 2px solid var(--primary); outline-offset: 3px; }
+#panel-image-studio .feed-error-details { margin: 7px 0 0; font-size: .72rem; line-height: 1.6; color: var(--text-secondary); overflow-wrap: anywhere; }
+#panel-image-studio .feed-error-details[hidden] { display: none; }
+#panel-image-studio #clear-completed-tasks-btn:disabled { opacity: .45; cursor: default; }

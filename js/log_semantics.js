@@ -5,7 +5,7 @@
 //
 // severity 的语义（同时决定卡片长相和要不要出现）：
 //   'error'   需要你处理，不会自己好
-//   'warn'    系统正在自行处理，通常会自愈
+//   'warn'    重试或生成提醒；不等同于任务失败
 //   'ignore'  认识它，且确定不用管——不出卡、不计数
 //
 // 'ignore' 不是可有可无的：实测日志里出现次数最多的 ERROR 是
@@ -18,11 +18,12 @@
     // 具体规则必须排在宽泛规则前面：「用户取消」在所有任务失败规则之前，
     // 「账号全部用尽」在泛化的「限流」之前（前者是终态，后者还在重试）。
     const RULES = [
+        { id: 'log-reader-disconnected', severity: 'ignore', match: /SSE client disconnected/i },
         // ── 认识但不用管 ──────────────────────────────────────────────
         {
             id: 'user-cancelled',
             severity: 'ignore',
-            match: /用户取消了生成任务|已被用户取消|GenerationCancelled|收到取消请求/,
+            match: /用户取消(?:了)?|已被用户取消|GenerationCancelled|收到取消请求/,
         },
 
         // ── 需要你处理（不会自愈） ────────────────────────────────────
@@ -71,6 +72,13 @@
             hint: '点「修复」之前，先在帧网格里点「描述问题」写清楚哪儿不对，或者先跑一次一致性审查。',
         },
         {
+            id: 'flow-restricted',
+            severity: 'warn',
+            match: /unusual activity|异常活动|风控拦截/i,
+            title: 'Flow 暂时限制了这次请求',
+            hint: '请查看当前任务是否仍在恢复。只有任务已停止时才需要手动重试。',
+        },
+        {
             id: 'api-auth',
             severity: 'error',
             match: /Unauthorized|Invalid API key|API ?key.{0,10}(?:invalid|无效|过期)|HTTP (?:401|403)/i,
@@ -91,8 +99,8 @@
             id: 'rate-limited',
             severity: 'warn',
             match: /Too Many Requests|HTTP (?:Error )?429|限流|限频|rate.?limit/i,
-            title: '上游限流，正在自动重试',
-            hint: '请求太密被上游挡了一下。系统会隔几秒自己重试，一般不用管。',
+            title: '上游请求暂时受限',
+            hint: '一次请求被上游限制；是否仍在自动重试，以当前任务状态为准。',
         },
         {
             id: 'upstream-retry',
@@ -134,7 +142,7 @@
             severity: 'warn',
             match: /WinError 100(?:53|54)|Connection (?:aborted|reset)|连接被中止|Client disconnected/i,
             title: '本机连接被中断了一次',
-            hint: '浏览器和本地服务之间断了一下，通常是刷新页面或杀软拦截造成的，会自动重连。',
+            hint: '一次连接中断已记入日志。当前是否已恢复，请查看日志同步和任务状态。',
         },
         {
             id: 'fx-watchdog',
@@ -155,15 +163,63 @@
         return entry.raw || entry.text || '';
     }
 
-    /** 命中的规则，或 null。 */
+    function eventTypeOf(entry) {
+        const text = (entry && entry.text) || textOf(entry);
+        const match = String(text).match(/(?:^|\]\s+)(video_error|video_done|video_warning|video_retry_autonomous|upstream_retry|frame_start|frame|result|error|manual_intervention_detected|manual_intervention_cleared|manual_intervention_timeout|ip_rotating|ip_rotated|ip_rotation_failed)\b/);
+        return match ? match[1] : '';
+    }
+
+    function slotOf(entry) {
+        const match = textOf(entry).match(/(?:^|\s)(?:index|slot|sequence|seq)=(\d+)\b/);
+        return match ? Number(match[1]) : null;
+    }
+
+    /** Chinese event labels, with terminal failures taking precedence over retry wording. */
     function classify(entry) {
         const text = textOf(entry);
         if (!text) return null;
-        for (let i = 0; i < RULES.length; i++) {
-            // 规则表里没有一条带 /g，test() 不会有 lastIndex 粘连问题
-            if (RULES[i].match.test(text)) return RULES[i];
+        const type = eventTypeOf(entry);
+        if (/^(manual_intervention_cleared|ip_rotated|video_done|frame|result)$/.test(type)) {
+            return { id: 'recovery', severity: 'ignore' };
         }
-        return null;
+        const rule = RULES.find(item => item.match.test(text)) || null;
+        if (rule && rule.severity === 'ignore') return rule;
+        if (type === 'video_error') {
+            const slot = slotOf(entry);
+            return {
+                id: 'video-failed', severity: 'error',
+                title: slot ? `第 ${slot} 段视频未生成成功` : '有视频片段未生成成功',
+                hint: rule ? rule.hint : '请在视频列表查看这个片段；其他已完成片段会保留，可单独重试失败片段。',
+                action: rule && rule.action,
+            };
+        }
+        if (type === 'manual_intervention_detected') {
+            return { id: 'fx-login-required', severity: 'error', title: '需要完成登录或验证',
+                hint: '切到对应浏览器完成登录或验证，完成后任务会继续。' };
+        }
+        if (type === 'manual_intervention_timeout') {
+            return { id: 'manual-timeout', severity: 'error', title: '等待人工处理已超时',
+                hint: '请先完成浏览器中的登录或验证，再从项目里重试。' };
+        }
+        if (type === 'ip_rotation_failed') {
+            return { id: 'ip-rotation-failed', severity: 'error', title: '网络恢复未成功',
+                hint: '本次自动恢复已停止，请查看任务详情后重试。' };
+        }
+        if (type === 'video_retry_autonomous' || type === 'upstream_retry' || type === 'ip_rotating') {
+            return { id: 'upstream-retry', severity: 'warn', title: '正在自动恢复',
+                hint: '系统正在重试，暂时无需重复点击生成。' };
+        }
+        if (type === 'video_warning' && !rule) {
+            return { id: 'video-warning', severity: 'warn', title: '视频生成有一条提醒',
+                hint: '任务仍会继续；需要时展开明细查看原因。' };
+        }
+        if (rule && rule.severity === 'warn' && (type === 'error'
+            || /任务失败|任务已中断|retries exhausted/i.test(text))
+            && !/后重试|正在重试|尝试 \d+\/\d+ 失败/.test(text)) {
+            return Object.assign({}, rule, { severity: 'error', title: '任务已停止，需要检查',
+                hint: '自动处理没有完成任务。查看明细确认原因后，再从项目里重试。' });
+        }
+        return rule;
     }
 
     // 未识别的错误按"抹掉数字后的形状"归并：「第 3 帧失败」和「第 7 帧失败」是
@@ -196,19 +252,38 @@
         const rule = classify(entry);
         if (rule) {
             if (rule.severity === 'ignore') return null;
-            return rule.id + ' ' + ((entry && entry.task) || '');
+            const slot = rule.id === 'video-failed' ? slotOf(entry) : null;
+            return rule.id + (slot === null ? '' : ':' + slot) + ' ' + ((entry && entry.task) || '');
         }
         if (!entry || entry.level !== 'ERROR') return null;
         return 'unknown ' + shapeOf(textOf(entry)) + ' ' + (entry.task || '');
     }
 
     /** 把日志条目聚成事件卡（error 在前，同级最近的在前）。 */
-    function aggregate(entries) {
+    function aggregate(entries, options = {}) {
         const byKey = new Map();
         const list = Array.isArray(entries) ? entries : [];
 
         for (let i = 0; i < list.length; i++) {
             const entry = list[i];
+            const type = eventTypeOf(entry);
+            const task = entry.task || '';
+            const slot = slotOf(entry);
+            if (task) {
+                for (const ev of byKey.values()) {
+                    if (ev.task !== task) continue;
+                    const videoRecovered = type === 'video_done' && slot !== null
+                        && ev.id === 'video-failed' && ev.slot === slot;
+                    const loginRecovered = type === 'manual_intervention_cleared'
+                        && ev.id === 'fx-login-required';
+                    const retryRecovered = /^(frame|video_done|ip_rotated)$/.test(type)
+                        && ['upstream-retry', 'rate-limited', 'flow-restricted', 'timeout', 'network-drop', 'ip-rotation-failed'].includes(ev.id);
+                    const cancelled = /用户取消(?:了)?|已被用户取消|GenerationCancelled/.test(textOf(entry));
+                    const completed = type === 'result'
+                        && /completion_state=completed(?:\s|$)/.test(textOf(entry));
+                    if (videoRecovered || loginRecovered || retryRecovered || cancelled || completed) ev.resolved = true;
+                }
+            }
             const rule = classify(entry);
             let key, seed;
 
@@ -245,6 +320,9 @@
                 ev = Object.assign(seed, {
                     key: key,
                     task: entry.task || '',
+                    slot: slotOf(entry),
+                    resolved: false,
+                    unread: false,
                     count: 0,
                     firstTime: entry.time || '',
                     lastTime: entry.time || '',
@@ -253,6 +331,9 @@
                 byKey.set(key, ev);
             }
             // 一行本身可能已经是折叠过的 ×N（api_client 的连续重复折叠）
+            Object.assign(ev, seed);
+            ev.resolved = false;
+            ev.unread = ev.unread || !!entry.unread;
             ev.count += entry.repeatCount || 1;
             if (entry.time) {
                 if (!ev.firstTime) ev.firstTime = entry.time;
@@ -266,7 +347,28 @@
         // || 当成假值换成 9，排序直接反过来。
         const order = { error: 0, warn: 1 };
         const rank = (s) => (Object.prototype.hasOwnProperty.call(order, s) ? order[s] : 9);
-        return Array.from(byKey.values()).sort(function (a, b) {
+        const tasks = options.tasks || {};
+        for (const ev of byKey.values()) {
+            const task = tasks[ev.task];
+            if (!task) continue;
+            const result = task.result || {};
+            const outcome = task.outcome || result.completion_state;
+            if (task.status === 'cancelled' || (task.status === 'completed'
+                && outcome === 'completed' && !result.has_failures)) {
+                ev.resolved = true;
+            } else if (task.status === 'completed' && outcome === 'completed_with_warnings'
+                && !['review-flagged', 'spatial-break', 'stale-lineage', 'video-warning'].includes(ev.id)) {
+                ev.resolved = true;
+            } else if (task.status === 'completed' && outcome === 'partial_failed'
+                && ['upstream-retry', 'rate-limited', 'flow-restricted', 'timeout', 'network-drop'].includes(ev.id)) {
+                ev.resolved = true;
+            } else if (task.status === 'failed' && ev.severity === 'warn') {
+                ev.severity = 'error';
+                ev.title = '任务已停止，需要检查';
+                ev.hint = '自动处理没有完成任务。请查看任务详情后重试。';
+            }
+        }
+        return Array.from(byKey.values()).filter(ev => options.includeResolved || !ev.resolved).sort(function (a, b) {
             const d = rank(a.severity) - rank(b.severity);
             if (d !== 0) return d;
             return String(b.lastTime).localeCompare(String(a.lastTime));
@@ -280,13 +382,18 @@
         let error = 0;
         let warn = 0;
         for (let i = 0; i < evs.length; i++) {
+            if (evs[i].resolved) continue;
             if (evs[i].severity === 'error') error++;
             else if (evs[i].severity === 'warn') warn++;
         }
-        let done = 0;
-        for (let i = 0; i < list.length; i++) {
-            if (DONE_RE.test(textOf(list[i]))) done++;
+        const completedTasks = new Set();
+        let unscopedDone = 0;
+        for (const entry of list) {
+            if (!DONE_RE.test(textOf(entry))) continue;
+            if (entry.task) completedTasks.add(entry.task);
+            else unscopedDone++;
         }
+        const done = completedTasks.size + unscopedDone;
 
         let headline;
         let tone;
@@ -294,18 +401,36 @@
             headline = error === 1 ? '有 1 件事需要你处理' : `有 ${error} 件事需要你处理`;
             tone = 'error';
         } else if (warn > 0) {
-            headline = '服务运行中，有一些会自行恢复的小问题';
+            headline = '有生成提醒，可查看当前任务进度';
             tone = 'warn';
         } else {
-            headline = '本地服务运行正常';
+            headline = '日志已同步，暂无待处理事项';
             tone = 'ok';
         }
         return { error: error, warn: warn, done: done, headline: headline, tone: tone };
     }
 
+    function taskIdsForProject(tasks, idea, records = {}) {
+        if (!idea) return null; // No selected project: show all tasks.
+        const ids = new Set(Object.values(records || {}).map(row => row && row.taskId).filter(Boolean));
+        const projectKey = idea.project_key || '';
+        for (const task of tasks || []) {
+            if (!task || !task.id) continue;
+            const dimensions = task.dimensions || {};
+            const taskProject = dimensions.project_key || task.result?.project_key || '';
+            if (task.id === idea.id || (projectKey && taskProject === projectKey)
+                || (!projectKey && !taskProject && idea.title && (dimensions.theme || dimensions.task_label) === idea.title)) {
+                ids.add(task.id);
+            }
+        }
+        return ids;
+    }
+
     const api = {
         RULES: RULES,
         classify: classify,
+        eventTypeOf: eventTypeOf,
+        taskIdsForProject: taskIdsForProject,
         eventKeyOf: eventKeyOf,
         aggregate: aggregate,
         summarize: summarize,

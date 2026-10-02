@@ -46,6 +46,12 @@ THRESHOLDS = {
 }
 
 _GRID_RE = re.compile(r"(?<![A-Za-z0-9])([ABCabc][123])(?![A-Za-z0-9])")
+_CAMERA_CUT_RE = re.compile(r"(?<!\w)CAMERA[ _-]+CUT(?!\w)", re.IGNORECASE)
+
+
+def is_camera_cut_frame(image_meta: str = "") -> bool:
+    """An explicit target IMAGE tag permits a new viewpoint of the same world."""
+    return bool(_CAMERA_CUT_RE.search(str(image_meta or "")))
 
 
 def _gate(key: str, config: dict[str, Any] | None):
@@ -74,6 +80,8 @@ def continuity_max_retries(config: dict[str, Any] | None) -> int:
     # 独有的（GATE_SETTINGS 里 frameContinuityMaxRetries 的 default=1 只在没有档位
     # 上下文时用），所以显式配了才走总表，没配就按档位推。
     mode = continuity_mode(config)
+    if mode == "off":
+        return 0
     default = 2 if mode == "strict" else 1
     raw = (config or {}).get("frameContinuityMaxRetries")
     if raw is None:
@@ -120,6 +128,7 @@ def is_transition_frame(sequence: int, image_meta: str = "", incoming_video_meta
     meta = f"{image_meta or ''} {incoming_video_meta or ''}".upper()
     return bool(
         sequence <= 1
+        or is_camera_cut_frame(image_meta)
         or any(tag in meta for tag in ("BRIDGE", "CUT", "REFRAME", "TURN"))
         or (beat or {}).get("bridge_stage")
         or (beat or {}).get("hard_cut")
@@ -127,13 +136,20 @@ def is_transition_frame(sequence: int, image_meta: str = "", incoming_video_meta
     )
 
 
-def family_map(image_sequences: list[int], videos: dict[int, Any]) -> dict[int, str]:
+def family_map(image_sequences: list[int], videos: dict[int, Any],
+               image_meta_by_seq: dict[int, Any] | None = None) -> dict[int, str]:
     family = 1
     result: dict[int, str] = {}
     for seq in sorted(image_sequences):
         incoming = videos.get(seq - 1) if seq > 1 else None
         meta = incoming.get("meta", "") if isinstance(incoming, dict) else ""
-        if seq > 1 and any(tag in str(meta).upper() for tag in ("BRIDGE", "CUT", "REFRAME")):
+        image_meta = (image_meta_by_seq or {}).get(seq, "")
+        if isinstance(image_meta, dict):
+            image_meta = image_meta.get("meta", "")
+        if seq > 1 and (
+            is_camera_cut_frame(image_meta)
+            or any(tag in str(meta).upper() for tag in ("BRIDGE", "CUT", "REFRAME"))
+        ):
             family += 1
         result[seq] = f"family-{family}"
     return result

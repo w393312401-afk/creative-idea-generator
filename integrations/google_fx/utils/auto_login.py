@@ -833,7 +833,7 @@ def run_standalone_login(user_id: str, port=None,
     flow_url = FLOW_HOME_URL
     entered_slot = False
     try:
-        with browser_slot('auto_login', priority=40, task_id=f'auto_login_{user_id}'):
+        with browser_slot('auto_login', priority=40, task_id=f'auto_login_{user_id}', user_id=user_id):
             entered_slot = True
             ws_url = get_ads_ws_url(user_id=user_id, port=port, auto_rotate_proxy=False)
             with sync_playwright() as p:

@@ -160,7 +160,7 @@ def get_runtime_default_user_id() -> str:
 
 
 def get_runtime_adspower_silent_mode() -> bool:
-    """返回 AdsPower 是否开启屏幕外静默后台模式（默认开启，窗口位于屏幕外避免抢焦点）。"""
+    """是否后台静默运行（默认开启；macOS 隐藏窗口，常规任务不主动前置）。"""
     val = runtime_env_or_default("ADSPOWER_SILENT_MODE", "1").strip().lower()
     return val in ("1", "true", "yes", "on")
 
@@ -183,7 +183,7 @@ def get_runtime_adspower_headless() -> bool:
 
 # macOS 上 --window-position 的屏幕外坐标会被窗口服务器 clamp 回可见区域，静默模式
 # 形同虚设（详见 utils/macos_window 模块头）。这里的模式决定改用哪种 macOS 原生手段：
-#   hide  : 隐藏浏览器 app + 归还焦点（默认；需要「辅助功能」权限，缺权限自动降级）
+#   hide  : 隐藏浏览器 app + 归还焦点（默认；AppKit 优先，UI 脚本作为兼容回退）
 #   focus : 只归还焦点，窗口留在屏幕上（零权限保底）
 #   off   : 不干预，沿用旧行为
 _ADSPOWER_MACOS_WINDOW_MODES = ("hide", "focus", "off")

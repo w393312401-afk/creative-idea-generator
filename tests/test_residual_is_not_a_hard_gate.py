@@ -22,9 +22,11 @@ import re
 import shutil
 import tempfile
 import unittest
+from contextlib import ExitStack
 from unittest.mock import patch
 
 import prompt_pipeline as pp
+from prompt_pipeline.composers.base import BaseComposer
 
 
 _NON_BLOCKING_RESIDUAL = [
@@ -135,6 +137,52 @@ class TestResidualDoesNotForceRegeneration(unittest.TestCase):
         self.assertGreater(calls.count(3), 1,
                            "终帧（第 3 拍）命中 payoff 倒退必须重生成，不能留痕放行")
         self.assertEqual(calls.count(1), 1, "非终帧不受 payoff 硬门影响")
+
+    def test_master_switch_skips_batch_and_single_prompt_reviews(self):
+        for single_fallback in (False, True):
+            with self.subTest(single_fallback=single_fallback), ExitStack() as stack:
+                config = {'reviewsDisabled': True}
+                state = self._make_state(total_beats=2)
+                calls = []
+                real_reply = self._fake_chat_factory(calls)
+
+                def reply(config, system, user, **kwargs):
+                    if single_fallback and re.search(r'====================\s*BEAT', user):
+                        return ''  # Force the real individual-generation fallback.
+                    return real_reply(config, system, user, **kwargs)
+
+                stack.enter_context(patch.object(pp, '_chat', side_effect=reply))
+                for name in (
+                    'validate_beat_prompts', 'rework_structural_video_beat',
+                    'reverify_beat_repairs', 'check_milestone_video_prompt',
+                    'check_milestone_image_prompt', 'payoff_blocking_residual',
+                    'record_beat_audit', 'record_outline_delivery',
+                ):
+                    stack.enter_context(patch.object(
+                        pp, name, side_effect=AssertionError(f'{name} must not run with reviews disabled')))
+                stack.enter_context(patch.object(
+                    BaseComposer, 'repair_beat_prompts',
+                    side_effect=AssertionError('Disabled reviews must not trigger paid repairs')))
+
+                output = pp.compose_remaining_beats(config, state)
+
+                self.assertEqual(calls, [1, 2], 'Each requested beat should be generated exactly once')
+                self.assertIn('Image prompt for beat 3', output)
+                self.assertFalse(config.get('_beat_audit'), 'Skipped review must not record a passed audit')
+
+    def test_master_switch_keeps_missing_output_failure(self):
+        with patch.object(pp, '_chat', return_value='No image or video sections returned'):
+            with self.assertRaises(pp.ComposeFailure):
+                pp.compose_remaining_beats(
+                    {'reviewsDisabled': True, 'composeBatchRetryCount': 0},
+                    self._make_state(total_beats=1))
+
+    def test_direct_repair_respects_master_switch(self):
+        with patch.object(pp, '_chat', side_effect=AssertionError('No paid repair is allowed')):
+            result = BaseComposer().repair_beat_prompts(
+                {'reviewsDisabled': True}, 1, 'Original video', 'Original image',
+                {}, {}, [], None, None, ['old failure'], ['old warning'], True, 'Test')
+        self.assertEqual(result, ('Original video', 'Original image', [], [], None, None, []))
 
 
 if __name__ == '__main__':

@@ -139,6 +139,34 @@ class TestGalleryDelete:
         assert res['affected_project_dirs'] == [] and res['removed_project_dirs'] == []
         assert os.path.isdir(os.path.join(media_tree, 'outputs', 'covers'))
 
+    @pytest.mark.parametrize('artifact', ['.state.json', 'input.mp4', 'work/edited.mp4'])
+    def test_last_gallery_media_keeps_independent_edit_artifacts(self, tmp_path, artifact):
+        project = tmp_path / 'outputs' / '精剪项目'
+        source = project / 'merged.mp4'
+        edit_artifact = project / 'codex_edits' / ('a' * 32) / artifact
+        _touch(str(source))
+        _touch(str(edit_artifact), content=b'preserve this edit')
+
+        res = gallery_delete_files(['outputs/精剪项目/merged.mp4'], base_dir=str(tmp_path))
+
+        assert res['deleted'] == ['outputs/精剪项目/merged.mp4']
+        assert res['failed'] == []
+        assert not source.exists()
+        assert edit_artifact.read_bytes() == b'preserve this edit'
+        assert res['affected_project_dirs'] == [str(project)]
+        assert res['removed_project_dirs'] == []
+
+    def test_empty_edit_root_does_not_keep_empty_project(self, tmp_path):
+        project = tmp_path / 'outputs' / '精剪项目'
+        _touch(str(project / 'merged.mp4'))
+        (project / 'codex_edits').mkdir()
+
+        res = gallery_delete_files(['outputs/精剪项目/merged.mp4'], base_dir=str(tmp_path))
+
+        assert res['failed'] == []
+        assert res['removed_project_dirs'] == [str(project)]
+        assert not project.exists()
+
     def test_rejects_unsafe_and_non_media_paths(self, media_tree):
         _touch(os.path.join(media_tree, 'secret.webp'), mtime=1)
         res = gallery_delete_files([

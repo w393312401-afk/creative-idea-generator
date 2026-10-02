@@ -6,7 +6,7 @@ Use this six-dimensional skeleton for every Gemini Omni restoration VIDEO prompt
 
 Use professional shot-scale terms, but make the capture style feel like casual UGC phone footage by default. The default is edited multi-shot coverage with clean cuts or match cuts, recorded as if different usable moments were captured on a phone or small consumer camera.
 
-Required shot vocabulary — these four names, and no other shot-scale names:
+Ordinary construction shot vocabulary (reward and physical entry use their dedicated roles):
 - wide working shot (the main shot; opens the clip)
 - close-up insert
 - extreme close-up insert (8s and 10s clips only)
@@ -33,9 +33,9 @@ Optional cinematic terms, only when useful or requested:
 - low-angle insert
 - rack focus / lens breathing
 
-Do not use one-take, oner, one-shot, or single continuous take unless the user explicitly requests that override. This ban has no exemption — the final reward beat is cut too, with
-its reveal push carried out as motion **inside** the shots rather than as a single unbroken
-take.
+Do not default to one take. When the user explicitly requests it, follow that coverage
+directly and mark the replaced cut/insert checks as user overrides. Default reward coverage
+is detail shot → pull-back shot → final wide shot; its reveal push occurs within a shot.
 
 ### Location DNA vs. Shot Coverage
 
@@ -56,9 +56,11 @@ identity of the world and never varies:
 - which landmarks are in view (see `omni-beat-skeleton.md` for the per-shot rule)
 - shot-local capture artifacts
 
-There are only two distances in a clip, and the wide one is used twice from an identical
+In an ordinary construction clip there are two distances, and the wide one is used twice from an identical
 camera setup. IMAGE anchors are rendered at that same **wide working scale**, which is what
 lets the returning wide shot match the next anchor exactly instead of approximately.
+Entry, no-work reframe and reward clips use their own declared viewpoints and adjacent
+anchors; changing viewpoint never changes the world's physical geometry.
 
 ### Anchor Stability Under Handheld Capture
 
@@ -72,16 +74,17 @@ Allowed, and wanted:
 - brief focus hunting that resolves
 - exposure pumping tied to a visible bright source
 
-Not allowed, ever:
-- a primary landmark leaving frame in shots 1, 2, or 6
-- a landmark changing its relationship to another landmark (the column crossing to the
-  other side of the window)
-- a landmark changing its rough frame share between anchors
+Not allowed:
+- a primary landmark leaving an ordinary construction working or returning shot
+- a landmark changing its physical relationship to another landmark
+- a landmark changing its rough frame share between anchors of the same locked family
 - camera height or lens feel changing between anchors of the same shot family
 - so much shake, blur, or glare that the operation's causal evidence is unreadable
 
-Test: if a viewer could not overlay IMAGE N and IMAGE N+1 and see the same room from the
-same place, the handheld freedom went too far.
+Test within a locked construction family: a viewer can overlay IMAGE N and IMAGE N+1 and
+see the same room from the same place. Inserts may crop to their spatial handle. A declared
+entry, reframe or reward viewpoint change can alter screen position and frame share while
+preserving physical feature identity and the actual path between its own anchors.
 
 Shot-family conditional attitude wording — use the phrasing that matches the space, and
 never claim geometry the space cannot have:

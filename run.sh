@@ -137,7 +137,7 @@ start_service() {
     mkdir -p outputs
 
     # 检查并安装依赖
-    $PYTHON_CMD -c "import PIL, requests, numpy, playwright, pydantic, dotenv" &>/dev/null
+    $PYTHON_CMD -c "import PIL, requests, socks, numpy, playwright, pydantic, dotenv" &>/dev/null
     if [ $? -ne 0 ]; then
         echo "[SPARK] 缺少依赖，正在安装 (pip install -r requirements.txt)..."
         $PYTHON_CMD -m pip install -r requirements.txt

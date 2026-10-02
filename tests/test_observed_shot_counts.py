@@ -28,7 +28,6 @@ import os
 
 import prompt_pipeline as pp
 import server_common
-from prompt_pipeline import reverse
 from prompt_pipeline.composers import get_composer, MiniatureComposer
 
 
@@ -52,75 +51,8 @@ def _composer(profile, beats=None):
     return composer
 
 
-class TestDerivedShotCounts(unittest.TestCase):
-    def test_cut_points_become_a_per_beat_shot_count(self):
-        doc = _doc((0.0, 6.0), (6.0, 12.0))
-        reverse.attach_shot_cuts(doc, {'cut_points': [2.0, 4.0, 6.0]})
-        self.assertEqual(doc['beats'][0]['observed_shot_count'], 3)
-        self.assertEqual(doc['beats'][1]['observed_shot_count'], 1)
 
 
-class TestTheThreeGates(unittest.TestCase):
-    """三道关任意一道漏配，镜头梯都会静默退回按片长排。"""
-
-    def _outline(self):
-        doc = _doc((0.0, 6.0), (6.0, 12.0))
-        reverse.attach_shot_cuts(doc, {'cut_points': [2.0, 4.0, 6.0]})
-        return reverse.beats_to_dimensions(doc, {})['beat_outline']
-
-    def test_gate_one_puts_the_count_on_the_outline_entry(self):
-        outline = self._outline()
-        self.assertEqual([e.get('shot_count') for e in outline], ['3', '1'])
-
-    def test_gate_two_carries_it_through_normalization(self):
-        """这一道是最容易漏的：gate 1 照发、gate 3 不渲染它，漏了不会有任何信号。"""
-        normalized = pp._outline_normalized_entries(self._outline())
-        self.assertEqual([e.get('shot_count') for e in normalized], ['3', '1'])
-
-    def test_gate_three_pins_it_back_onto_the_ladder(self):
-        brief = {'beat_outline': pp._outline_normalized_entries(self._outline())}
-        ladder = [{'operation': 'build'}, {'operation': 'build'}]
-        applied, deviations = pp.apply_observed_shot_plan(ladder, brief)
-        self.assertEqual(applied, 2)
-        self.assertEqual([b['observed_shot_count'] for b in ladder], [3, 1])
-        # 每镜时长一起贴上：偏差判据要用它
-        self.assertEqual([b['observed_shot_seconds'] for b in ladder], [2.0, 6.0])
-        # 没给 composer 就不判偏差——交付几镜、每镜多长只有它知道
-        self.assertEqual(deviations, [])
-
-    def test_the_insert_subject_rides_the_same_relay(self):
-        doc = _doc((0.0, 6.0), (6.0, 12.0))
-        reverse.attach_shot_cuts(doc, {'cut_points': [2.0, 4.0]})
-        doc['beats'][0]['insert_subject'] = 'the tweezer tip pressing a roof tile'
-        outline = reverse.beats_to_dimensions(doc, {})['beat_outline']
-        self.assertEqual(outline[0]['insert'], 'the tweezer tip pressing a roof tile')
-        brief = {'beat_outline': pp._outline_normalized_entries(outline)}
-        self.assertEqual(brief['beat_outline'][0]['insert'],
-                         'the tweezer tip pressing a roof tile')
-        ladder = [{'operation': 'build'}, {'operation': 'build'}]
-        pp.apply_observed_shot_plan(ladder, brief, composer=_composer('miniature'))
-        self.assertEqual(ladder[0]['insert_subject'], 'the tweezer tip pressing a roof tile')
-        self.assertNotIn('insert_subject', ladder[1])
-
-        # 单镜链路一个字都不贴：它的一拍就是一条不间断的镜头，给它一个「切进特写拍这个」
-        # 的指令是它的语法切不出来的。
-        base_ladder = [{'operation': 'build'}, {'operation': 'build'}]
-        pp.apply_observed_shot_plan(base_ladder, brief, composer=_composer('base'))
-        self.assertNotIn('insert_subject', base_ladder[0])
-
-    def test_a_ladder_that_does_not_match_the_plan_is_left_alone(self):
-        """规划四轮全灭退回兜底梯子时，条数对不上——按下标硬贴等于把 A 拍的剪辑节奏
-        贴到 B 拍上，与 apply_observed_space_sequence 同一条纪律。"""
-        brief = {'beat_outline': pp._outline_normalized_entries(self._outline())}
-        ladder = [{'operation': 'build'}]
-        self.assertEqual(pp.apply_observed_shot_plan(ladder, brief), (0, []))
-        self.assertNotIn('observed_shot_count', ladder[0])
-
-    def test_a_legacy_plan_without_the_field_changes_nothing(self):
-        brief = {'beat_outline': [{'text': 'a'}, {'text': 'b'}]}
-        ladder = [{'operation': 'build'}, {'operation': 'build'}]
-        self.assertEqual(pp.apply_observed_shot_plan(ladder, brief), (0, []))
-        self.assertIsNone(pp.observed_shot_count_of(ladder[0]))
 
 
 class TestLadderSelection(unittest.TestCase):
@@ -354,18 +286,6 @@ class TestCastActionReachesTheWriter(unittest.TestCase):
     姿态、朝向、视线、位移一个字段都没有，原片里那两个小人在做什么从来没被采下来过。
     """
 
-    def test_it_rides_the_relay_onto_the_ladder(self):
-        doc = _doc((0.0, 6.0), (6.0, 12.0))
-        doc['beats'][0]['cast_action'] = ('the two figurines turn from the moss to face '
-                                          'the rising wall, the one in red half a step closer')
-        outline = reverse.beats_to_dimensions(doc, {})['beat_outline']
-        self.assertIn('turn from the moss', outline[0]['cast'])
-        brief = {'beat_outline': pp._outline_normalized_entries(outline)}
-        self.assertIn('turn from the moss', brief['beat_outline'][0]['cast'])
-        ladder = [{'operation': 'build'}, {'operation': 'build'}]
-        pp.apply_observed_shot_plan(ladder, brief, composer=_composer('miniature'))
-        self.assertIn('turn from the moss', ladder[0]['cast_action'])
-        self.assertNotIn('cast_action', ladder[1])
 
     def test_single_shot_profiles_get_it_too(self):
         """冻住的不只是微缩人偶——真人线的工人同样需要姿态与视线。

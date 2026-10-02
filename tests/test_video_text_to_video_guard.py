@@ -49,9 +49,12 @@ class _FakeUploadPage:
         self.captured = list(captured)
         self.escaped = False
 
-    # -- _find_add2_btn / file input 走 locator --
+    # -- Create/Add media returns its own Upload action and native chooser. --
     def locator(self, selector):
         return _FakeLocator(self)
+
+    def expect_file_chooser(self, **kwargs):
+        return _FakeChooser(self)
 
     def evaluate(self, script, *args):
         srcs = []
@@ -84,7 +87,19 @@ class _FakeLocator:
     def click(self, **kwargs):
         return None
 
-    def set_input_files(self, paths):
+
+class _FakeChooser:
+    def __init__(self, page):
+        self.page = page
+        self.value = self
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def set_files(self, paths):
         # 上传一发起，监听器就"收到"了这些响应
         for url in self.page.captured:
             self.page._handler(_FakeResponse(url))
@@ -104,6 +119,8 @@ class _FakeResponse:
 @pytest.fixture
 def _patch_upload_deps(monkeypatch, tmp_path):
     monkeypatch.setattr(V, "_find_add2_btn", lambda page: _FakeLocator(page))
+    monkeypatch.setattr(V, "_find_canvas_upload_action", lambda page, trigger: _FakeLocator(page))
+    monkeypatch.setattr(V, "_open_canvas_upload_menu", lambda page: True)
     monkeypatch.setattr(V, "_safe_press_escape", lambda *a, **k: None)
     monkeypatch.setattr(V, "random_sleep", lambda *a, **k: None)
     monkeypatch.setattr(V.time, "sleep", lambda *_a: None)

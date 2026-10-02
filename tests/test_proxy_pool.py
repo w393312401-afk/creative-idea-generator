@@ -79,6 +79,39 @@ def test_edit_keeps_password_when_not_resubmitted(pool):
     assert pool.get(created['proxy_id'])['password'] == ''
 
 
+def test_edit_preserves_airport_source_and_bridge_metadata(pool):
+    created = pool.add_proxy(host='127.0.0.1', port='21001', source='airport')
+    pid = created['proxy_id']
+    state = proxy_pool_module._read_state()
+    bridge_metadata = {
+        'bridge_id': 'mihomo-local', 'node_name': 'test-node',
+        'source_profile': '/local/private-profile.yaml',
+    }
+    state['proxies'][pid].update(bridge_metadata)
+    state['proxies'][pid]['fallback_tier'] = 1
+    proxy_pool_module._write_state(state)
+
+    edited = pool.add_proxy(proxy_id=pid, host='127.0.0.1', port='21001',
+                            note='edited label', keep_password=True)
+    assert edited['source'] == 'airport'
+    assert edited['priority'] == 100
+    assert edited['fallback_tier'] == 1
+    stored = pool.get(pid)
+    for key, value in bridge_metadata.items():
+        assert stored[key] == value
+        assert key not in edited  # 来源公开，内部桥接配置不进入对外视图。
+
+
+def test_legacy_source_defaults_to_static(pool):
+    state = proxy_pool_module._blank_state()
+    state['proxies']['legacy'] = {'host': 'h', 'port': '80'}
+    proxy_pool_module._write_state(state)
+    row = pool.list_proxies()[0]
+    assert (row['source'], row['priority']) == ('static', 0)
+    picked = pool.pick_proxy()
+    assert (picked['source'], picked['priority']) == ('static', 0)
+
+
 def test_changing_endpoint_clears_stale_check_result(pool):
     created = pool.add_proxy(host='h1', port='1')
     pid = created['proxy_id']
@@ -230,6 +263,80 @@ def test_empty_pool_picks_nothing(pool):
     assert pool.usable_proxies() == []
     assert pool.summary() == {'total': 0, 'enabled': 0, 'disabled': 0, 'ok': 0,
                               'failed': 0, 'unchecked': 0, 'bound': 0}
+
+
+def test_static_is_preferred_even_when_airport_is_checked_and_cursor_points_past_static(pool):
+    airport = pool.add_proxy(host='airport', port='80', source='airport')
+    first = pool.add_proxy(host='static-1', port='80')
+    second = pool.add_proxy(host='static-2', port='80')
+    state = proxy_pool_module._read_state()
+    state['proxies'][airport['proxy_id']]['last_check_status'] = 'ok'
+    state['rotate_index'] = 2
+    proxy_pool_module._write_state(state)
+
+    assert [row['source'] for row in pool.usable_proxies()] == ['static', 'static', 'airport']
+    assert {pool.pick_proxy()['proxy_id'] for _ in range(6)} == {
+        first['proxy_id'], second['proxy_id']}
+
+
+def test_attempt_exclusions_exhaust_static_before_airport_without_duplicates(pool):
+    airports = [pool.add_proxy(host=f'airport-{i}', port='80', source='airport')
+                for i in range(2)]
+    statics = [pool.add_proxy(host=f'static-{i}', port='80') for i in range(3)]
+    for cursor in range(7):
+        state = proxy_pool_module._read_state()
+        state['rotate_index'] = cursor
+        proxy_pool_module._write_state(state)
+        tried = set()
+        picked = []
+        for _ in range(5):
+            entry = pool.pick_proxy(exclude_proxy_ids=tried)
+            assert entry['proxy_id'] not in tried
+            tried.add(entry['proxy_id'])
+            picked.append(entry)
+        assert [entry['source'] for entry in picked] == ['static'] * 3 + ['airport'] * 2
+        assert tried == {row['proxy_id'] for row in statics + airports}
+        assert pool.pick_proxy(exclude_proxy_ids=tried) is None
+
+
+def test_airport_fallback_only_after_static_disabled_failed_or_excluded(pool):
+    disabled = pool.add_proxy(host='disabled', port='80')
+    failed = pool.add_proxy(host='failed', port='80')
+    available = pool.add_proxy(host='available', port='80')
+    airport = pool.add_proxy(host='airport', port='80', source='airport')
+    pool.set_disabled(disabled['proxy_id'], True)
+    state = proxy_pool_module._read_state()
+    state['proxies'][failed['proxy_id']]['last_check_status'] = 'failed'
+    proxy_pool_module._write_state(state)
+
+    assert pool.pick_proxy()['proxy_id'] == available['proxy_id']
+    assert pool.pick_proxy(exclude_proxy_ids=[available['proxy_id']])['proxy_id'] == airport['proxy_id']
+    pool.set_disabled(available['proxy_id'], True)
+    assert pool.pick_proxy()['proxy_id'] == airport['proxy_id']
+    pool.set_disabled(airport['proxy_id'], True)
+    assert pool.pick_proxy() is None
+
+
+def test_airport_prefers_us_tier_before_other_regions(pool):
+    other = pool.add_proxy(host='other-country', port='80', source='airport')
+    us = pool.add_proxy(host='us', port='80', source='airport')
+    static = pool.add_proxy(host='static', port='80')
+    state = proxy_pool_module._read_state()
+    state['proxies'][other['proxy_id']].update(fallback_tier=1, last_check_status='ok')
+    # 静态不受机场地区层级影响。
+    state['proxies'][static['proxy_id']]['fallback_tier'] = 9
+    state['rotate_index'] = 101
+    proxy_pool_module._write_state(state)
+
+    assert [row['proxy_id'] for row in pool.usable_proxies()] == [
+        static['proxy_id'], us['proxy_id'], other['proxy_id']]
+    assert pool.pick_proxy()['proxy_id'] == static['proxy_id']
+    assert pool.pick_proxy(exclude_proxy_ids=[static['proxy_id']])['proxy_id'] == us['proxy_id']
+    assert pool.pick_proxy(exclude_proxy_ids=[static['proxy_id'], us['proxy_id']])['proxy_id'] == other['proxy_id']
+
+    pool.set_disabled(static['proxy_id'], True)
+    pool.set_disabled(us['proxy_id'], True)
+    assert pool.pick_proxy()['proxy_id'] == other['proxy_id']
 
 
 def test_summary_counts_unchecked_separately_from_ok(pool, monkeypatch):

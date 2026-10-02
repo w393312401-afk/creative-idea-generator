@@ -78,13 +78,13 @@
   <link rel="stylesheet" href="css/tokens.css?v=1.1.1">
   <!-- console.css split into ordered contiguous slices (concatenation == original); load order = cascade order -->
   <link rel="stylesheet" href="css/console/base.css?v=1.2.1">
-  <link rel="stylesheet" href="css/console/dashboard.css?v=1.2.0">
-  <link rel="stylesheet" href="css/console/google-fx.css?v=1.1.0">
-  <link rel="stylesheet" href="css/console/marketplace.css?v=1.3.0">
-  <link rel="stylesheet" href="css/console/sandbox-layout.css?v=1.3.0">
-  <link rel="stylesheet" href="css/shared/lightbox.css?v=1.1.0">
+  <link rel="stylesheet" href="css/console/dashboard.css?v=1.3.0">
+  <link rel="stylesheet" href="css/console/google-fx.css?v=1.2.3">
+  <link rel="stylesheet" href="css/console/fx-board.css?v=1.0.0">
+  <link rel="stylesheet" href="css/console/marketplace.css?v=1.4.0">
+  <link rel="stylesheet" href="css/console/sandbox-layout.css?v=1.4.0">
 </head>
-<body>
+<body class="fx-console-page">
   <div class="app-container">
     <!-- Top Header (spans full width!) -->
     <header class="app-header">
@@ -210,19 +210,23 @@
         <div class="fx-console" id="fx-console-root">
           <div class="fx-hero">
             <div>
-              <div class="fx-eyebrow">FLOW AUTOMATION RUNTIME</div>
-              <h3>Google FX 服务管理中心</h3>
-              <p>集中查看运行时、AdsPower、账号池与浏览器状态；状态检查不会启动或关闭浏览器。</p>
+              <p>自动同步运行状态 · 状态检查不会启动浏览器</p>
             </div>
             <div class="fx-hero-actions">
               <span class="fx-sync-time" id="fx-sync-time">尚未同步</span>
               <span class="fx-lock-badge" id="fx-service-mode">运行中</span>
+              <button class="fx-button" type="button" data-fx-section="monitor" data-fx-target="fx-log-panel">查看日志</button>
               <button class="fx-button" id="fx-open-manual" type="button" title="打开 Google FX 服务管理中心使用说明书">📖 使用说明书</button>
               <button class="fx-button fx-button-primary" id="fx-refresh-status" type="button">刷新状态</button>
             </div>
           </div>
-
-          <div class="fx-status-grid">
+          <nav class="fx-section-nav" role="tablist" aria-label="控制台分区">
+            <button id="fx-tab-monitor" class="fx-section-tab active" type="button" role="tab" aria-controls="fx-section-monitor" aria-selected="true" data-fx-section="monitor">运行监控</button>
+            <button id="fx-tab-accounts" class="fx-section-tab" type="button" role="tab" aria-controls="fx-section-accounts" aria-selected="false" tabindex="-1" data-fx-section="accounts">账号与代理</button>
+            <button id="fx-tab-maintenance" class="fx-section-tab" type="button" role="tab" aria-controls="fx-section-maintenance" aria-selected="false" tabindex="-1" data-fx-section="maintenance">配置与维护 <span id="fx-config-tab-indicator" hidden>· 有修改</span></button>
+          </nav>
+          <section class="fx-console-section" id="fx-section-monitor" role="tabpanel" aria-labelledby="fx-tab-monitor">
+<div class="fx-status-grid">
             <article class="fx-status-card" data-tone="neutral">
               <div class="fx-status-icon">⌁</div>
               <div><span>内置运行时</span><strong id="fx-runtime-state">检测中</strong><small id="fx-runtime-sub">integrations.google_fx</small></div>
@@ -237,37 +241,30 @@
             </article>
             <article class="fx-status-card" data-tone="neutral">
               <div class="fx-status-icon">◎</div>
-              <div><span>可用账号</span><strong id="fx-account-state">检测中</strong><small id="fx-account-sub">等待号池</small></div>
+              <div><a class="fx-status-link" href="#fx-accounts-panel" data-fx-section="accounts" data-fx-target="fx-accounts-panel">可用账号 ↗</a><strong id="fx-account-state">检测中</strong><small id="fx-account-sub">等待号池</small></div>
             </article>
             <article class="fx-status-card" data-tone="neutral">
               <div class="fx-status-icon">⇄</div>
-              <div><span>可用代理</span><strong id="fx-proxy-state">检测中</strong><small id="fx-proxy-sub">等待代理号池</small></div>
+              <div><a class="fx-status-link" href="#fx-proxy-panel" data-fx-section="accounts" data-fx-target="fx-proxy-panel">可用代理 ↗</a><strong id="fx-proxy-state">检测中</strong><small id="fx-proxy-sub">等待代理号池</small></div>
             </article>
           </div>
-
-          <div class="fx-config-strip">
-            <div><span>图片模型</span><strong id="fx-config-image-model">—</strong></div>
-            <div><span>视频模型</span><strong id="fx-config-video-model">—</strong></div>
-            <div><span>参考模式</span><strong id="fx-config-video-ref-mode">—</strong></div>
-            <div><span>换号节拍</span><strong id="fx-config-switch">—</strong></div>
-            <div><span>当前环境</span><strong id="fx-config-account">自动选择</strong></div>
-            <div><span>序列默认环境</span><strong id="fx-config-sequence-account">自动选择</strong></div>
-            <div><span>IP 轮换</span><strong class="fx-safe-value" id="fx-config-rotation">检测中</strong></div>
-            <div><span>提交模式</span><strong class="fx-safe-value" id="fx-config-dryrun">检测中</strong></div>
-            <div><span>运行模式</span><strong class="fx-safe-value" id="fx-config-silent-mode">检测中</strong></div>
-          </div>
-
-          <div class="fx-orphaned" id="fx-orphaned" hidden></div>
-
-          <!-- ⚡ 浏览器执行状态 -->
-          <article class="fx-panel fx-slot-panel" id="fx-slot-panel">
+<article class="fx-panel fx-board-panel" id="fx-board-panel">
             <div class="fx-panel-header">
               <div>
-                <h4>⚡ 浏览器执行状态 (Browser Activity)</h4>
-                <p>实时监控独占浏览器的当前任务。若遇任务异常退出导致锁未释放，可点击强行释放。</p>
+                <h4>并发作战板</h4>
+                <p>所有项目的浏览器占用、排队和阶段进度，一屏看清（只读）。</p>
+              </div>
+            </div>
+            <div id="fx-board"><div class="fx-empty">正在读取…</div></div>
+          </article>
+<article class="fx-panel fx-slot-panel" id="fx-slot-panel">
+            <div class="fx-panel-header">
+              <div>
+                <h4>当前浏览器任务</h4>
+                <p>查看正在执行的任务；排查异常占用请前往「配置与维护」。</p>
               </div>
               <div class="fx-inline-actions">
-                <button class="fx-button fx-button-danger" id="fx-force-release-all" type="button" title="点击强行释放当前浏览器占用">🧹 强行释放占用</button>
+
                 <button class="fx-button" id="fx-slot-refresh" type="button">刷新</button>
               </div>
             </div>
@@ -275,73 +272,44 @@
               <div class="fx-empty">当前空闲（无任务占用浏览器）</div>
             </div>
           </article>
-
-          <article class="fx-panel fx-config-panel">
-            <div class="fx-panel-header">
-              <div><h4>运行配置</h4><p>仅开放非敏感白名单字段。标「需重启」的字段其读取方是启动时求值的常量，保存后不会热生效。</p></div>
-              <div class="fx-inline-actions">
-                <button class="fx-button fx-button-primary" id="fx-config-save" type="button">保存配置</button>
+<article class="fx-panel fx-diagnostics-panel">
+              <div class="fx-panel-header"><div><h4>运行诊断</h4><p>根据实时状态给出可操作结论。</p></div></div>
+              <div class="fx-diagnostic-list" id="fx-diagnostic-list">
+                <div class="fx-empty">正在检查…</div>
               </div>
-            </div>
-            <div class="fx-config-form" id="fx-config-form"></div>
-            <div class="fx-config-note" id="fx-config-note">尚未读取配置</div>
+              <details class="fx-selector-summary"><summary>选择器详情</summary>
+                <div class="fx-selector-title"><span>Flow UI 选择器</span><strong id="fx-selector-count">—</strong></div>
+                <div id="fx-selector-warnings" class="fx-selector-warnings"></div>
+              </details>
+            </article>
+<article class="fx-panel fx-tasks-panel" id="fx-tasks-panel">
+            <div class="fx-panel-header"><div><h4>当前与最近任务</h4><p>查看任务进度、等待原因和结果；点阶段可展开记录，点日志可定位任务。</p></div></div>
+            <div class="fx-table-wrap"><table class="fx-table">
+              <thead><tr><th>任务</th><th>类型</th><th>排队 / 耗时</th><th>当前阶段</th><th>账号</th><th>状态</th><th>操作</th></tr></thead>
+              <tbody id="fx-task-table-body"><tr><td colspan="7" class="fx-empty">正在读取任务…</td></tr></tbody>
+            </table></div>
           </article>
-
-          <article class="fx-panel fx-debug-panel">
-            <div class="fx-panel-header">
-              <div><h4>调试与自检</h4><p>先跑 L0（只读）判断环境，再用 L1 验证 Flow UI 还认不认得我们；L2 会真的消耗一次额度。</p></div>
-              <div class="fx-inline-actions">
-                <button class="fx-button" id="fx-selftest-l0" type="button">L0 只读自检</button>
-                <button class="fx-button" id="fx-selftest-l1" type="button">L1 连浏览器不提交</button>
-                <button class="fx-button fx-button-danger" id="fx-selftest-l2" type="button">L2 真实最小提交</button>
+<article class="fx-panel fx-log-panel" id="fx-log-panel">
+            <div class="fx-panel-header"><div><h4>FX 日志</h4><p>查看当前任务的过程与错误，也可切换全部日志。</p></div></div>
+            <div class="fx-log-toolbar">
+              <div class="fx-inline-actions" id="fx-log-scope-controls">
+                <span class="fx-log-control-label">范围</span>
+                <input id="fx-log-task" class="fx-input" type="text" placeholder="任务编号（自动跟随当前任务）" aria-label="按任务过滤日志">
               </div>
-            </div>
-            <div class="fx-selftest-result" id="fx-selftest-result">
-              <div class="fx-empty">尚未运行自检。排查问题请从 L0 开始。</div>
-            </div>
-            <div class="fx-panel-subheader">
-              <h5>选择器探针</h5>
-              <div class="fx-inline-actions">
-                <button class="fx-button" id="fx-run-probe" type="button">连浏览器探测选择器</button>
-                <button class="fx-button" id="fx-run-deep-probe" type="button"
-                        title="额外点开账号菜单和配置面板，验证弹窗态的选择器。会真的点击页面。">深度探测（会点击页面）</button>
-                <button class="fx-button" id="fx-reset-selector-stats" type="button">清空命中统计</button>
-              </div>
-            </div>
-            <div class="fx-probe-result" id="fx-probe-result">
-              <div class="fx-empty">Flow 改版后先跑这个：它会告出哪个选择器族已经失效、哪些在靠兜底命中。</div>
-            </div>
-          </article>
-
-          <article class="fx-panel fx-capture-panel">
-            <div class="fx-panel-header">
-              <div><h4>失败现场</h4><p>截图 / DOM / 页面文字 / 可见按钮 / 选择器快照，自动落在 runtime/fx_debug/。</p></div>
-              <div class="fx-inline-actions">
-                <button class="fx-button fx-button-danger" id="fx-clear-captures" type="button">清空现场</button>
-                <button class="fx-button" id="fx-reload-captures" type="button">刷新</button>
-              </div>
-            </div>
-            <div class="fx-capture-list" id="fx-capture-list">
-              <div class="fx-empty">正在读取…</div>
-            </div>
-          </article>
-
-          <article class="fx-panel fx-log-panel">
-            <div class="fx-panel-header">
-              <div><h4>FX 日志</h4><p>只筛 FX 相关模块，避免被提示词合成等日志冲走。</p></div>
-              <div class="fx-inline-actions">
-                <input id="fx-log-task" class="fx-input" type="text" placeholder="按 task_id 过滤" aria-label="按任务过滤日志">
-                <input id="fx-log-keyword" class="fx-input" type="text" placeholder="关键字" aria-label="按关键字过滤日志">
+              <div class="fx-inline-actions" id="fx-log-filter-controls">
+                <span class="fx-log-control-label">筛选</span>
+                <input id="fx-log-keyword" class="fx-input" type="text" placeholder="搜索日志" aria-label="按关键字过滤日志">
                 <button class="fx-button" id="fx-log-refresh" type="button">刷新</button>
               </div>
             </div>
             <pre class="fx-log-view" id="fx-log-view">正在读取…</pre>
           </article>
-
-          <div class="fx-main-grid">
-            <article class="fx-panel fx-accounts-panel">
+          </section>
+          <section class="fx-console-section" id="fx-section-accounts" role="tabpanel" aria-labelledby="fx-tab-accounts" hidden>
+<div class="fx-section-intro"><h3>账号与代理</h3><p>查看账号健康和代理出口。选择一项后再进行添加、检测或维护。</p><div class="fx-inline-actions"><a class="fx-button" href="#fx-accounts-panel" data-fx-section="accounts" data-fx-target="fx-accounts-panel">账号池</a><a class="fx-button" href="#fx-proxy-panel" data-fx-section="accounts" data-fx-target="fx-proxy-panel">代理池</a></div></div>
+<article class="fx-panel fx-accounts-panel" id="fx-accounts-panel">
               <div class="fx-panel-header">
-                <div><h4>Flow 账号池</h4><p>账号凭据与登录会话仍由 AdsPower 保管。</p></div>
+                <div><h4>Flow 账号池</h4><p>自动选号优先复用有额度的浏览器；额度不足后周期停用 24 小时，关闭窗口并换号继续。</p></div>
                 <div class="fx-inline-actions">
                   <select id="fx-account-sort-select" class="fx-select" aria-label="账号排序">
                     <option value="serial_asc">环境编号 升序</option>
@@ -388,24 +356,11 @@
                 </table>
               </div>
             </article>
-
-            <article class="fx-panel fx-diagnostics-panel">
-              <div class="fx-panel-header"><div><h4>运行诊断</h4><p>根据实时状态给出可操作结论。</p></div></div>
-              <div class="fx-diagnostic-list" id="fx-diagnostic-list">
-                <div class="fx-empty">正在检查…</div>
-              </div>
-              <div class="fx-selector-summary">
-                <div class="fx-selector-title"><span>Flow UI 选择器</span><strong id="fx-selector-count">—</strong></div>
-                <div id="fx-selector-warnings" class="fx-selector-warnings"></div>
-              </div>
-            </article>
-          </div>
-
-          <article class="fx-panel fx-proxy-panel" id="fx-proxy-panel">
+<article class="fx-panel fx-proxy-panel" id="fx-proxy-panel">
             <div class="fx-panel-header">
               <div>
                 <h4>代理号池</h4>
-                <p>出口代理清单。检测只走网络拿真实出口 IP，不开浏览器；下发是把代理写进 AdsPower 环境，该浏览器<strong>下次启动</strong>时才换出口。</p>
+                <p>优先使用静态代理；静态代理不可用时才使用机场，先美国节点，再用其余节点备用。检测只走网络拿真实出口 IP，不开浏览器；下发是把代理写进 AdsPower 环境，该浏览器<strong>下次启动</strong>时才换出口。</p>
               </div>
               <div class="fx-inline-actions">
                 <button class="fx-button" id="fx-proxy-import" type="button"
@@ -448,6 +403,71 @@
               </table>
             </div>
           </article>
+          </section>
+          <section class="fx-console-section" id="fx-section-maintenance" role="tabpanel" aria-labelledby="fx-tab-maintenance" hidden>
+<article class="fx-panel fx-config-panel" id="fx-config-panel">
+            <div class="fx-panel-header">
+              <div><h4>运行配置</h4><p>常用项直接调整，高级参数按需展开。仅保存修改过的项；标注「需重启」的设置在服务重启后生效。</p></div>
+              <div class="fx-inline-actions">
+                <span id="fx-config-state" class="fx-config-state" role="status" aria-live="polite">正在读取配置</span>
+                <button class="fx-button" id="fx-config-reload" type="button">重新读取</button>
+                <button class="fx-button fx-button-primary" id="fx-config-save" type="button" disabled>保存配置</button>
+              </div>
+            </div>
+            <div class="fx-config-form" id="fx-config-form"></div>
+            <div class="fx-config-note" id="fx-config-note" role="status" aria-live="polite">尚未读取配置</div>
+          </article>
+<details class="fx-maintenance-fold" ><summary><strong>当前运行设置</strong><span>查看服务端当前读取到的模型、浏览器与提交模式</span></summary><div class="fx-fold-content"><div class="fx-config-strip">
+            <div><span>图片模型</span><strong id="fx-config-image-model">—</strong></div>
+            <div><span>视频模型</span><strong id="fx-config-video-model">—</strong></div>
+            <div><span>参考模式</span><strong id="fx-config-video-ref-mode">—</strong></div>
+            <div><span>浏览器复用</span><strong id="fx-config-switch">—</strong></div>
+            <div><span>当前环境</span><strong id="fx-config-account">自动选择</strong></div>
+            <div><span>序列默认环境</span><strong id="fx-config-sequence-account">自动选择</strong></div>
+            <div><span>IP 轮换</span><strong class="fx-safe-value" id="fx-config-rotation">检测中</strong></div>
+            <div><span>提交模式</span><strong class="fx-safe-value" id="fx-config-dryrun">检测中</strong></div>
+            <div><span>运行模式</span><strong class="fx-safe-value" id="fx-config-silent-mode">检测中</strong></div>
+          </div></div></details>
+<details class="fx-maintenance-fold" ><summary><strong>调试与自检</strong><span>需要排查时再运行，真实提交会消耗额度</span></summary><div class="fx-fold-content"><article class="fx-panel fx-debug-panel">
+            <div class="fx-panel-header">
+              <div><h4>调试与自检</h4><p>先跑 L0（只读）判断环境，再用 L1 验证 Flow UI 还认不认得我们；L2 会真的消耗一次额度。</p></div>
+              <div class="fx-inline-actions">
+                <button class="fx-button" id="fx-selftest-l0" type="button">L0 只读自检</button>
+                <button class="fx-button" id="fx-selftest-l1" type="button">L1 连浏览器不提交</button>
+                <button class="fx-button fx-button-danger" id="fx-selftest-l2" type="button">L2 真实最小提交</button>
+              </div>
+            </div>
+            <div class="fx-selftest-result" id="fx-selftest-result">
+              <div class="fx-empty">尚未运行自检。排查问题请从 L0 开始。</div>
+            </div>
+            <div class="fx-panel-subheader">
+              <h5>选择器探针</h5>
+              <div class="fx-inline-actions">
+                <button class="fx-button" id="fx-run-probe" type="button">连浏览器探测选择器</button>
+                <button class="fx-button" id="fx-run-deep-probe" type="button"
+                        title="额外点开账号菜单和配置面板，验证弹窗态的选择器。会真的点击页面。">深度探测（会点击页面）</button>
+                <button class="fx-button" id="fx-reset-selector-stats" type="button">清空命中统计</button>
+              </div>
+            </div>
+            <div class="fx-probe-result" id="fx-probe-result">
+              <div class="fx-empty">Flow 改版后先跑这个：它会告出哪个选择器族已经失效、哪些在靠兜底命中。</div>
+            </div>
+          </article></div></details>
+<details class="fx-maintenance-fold" ><summary><strong>失败现场</strong><span>查看历史截图和页面快照，清空操作在此处</span></summary><div class="fx-fold-content"><article class="fx-panel fx-capture-panel">
+            <div class="fx-panel-header">
+              <div><h4>失败现场</h4><p>截图 / DOM / 页面文字 / 可见按钮 / 选择器快照，自动落在 runtime/fx_debug/。</p></div>
+              <div class="fx-inline-actions">
+                <button class="fx-button fx-button-danger" id="fx-clear-captures" type="button">清空现场</button>
+                <button class="fx-button" id="fx-reload-captures" type="button">刷新</button>
+              </div>
+            </div>
+            <div class="fx-capture-list" id="fx-capture-list">
+              <div class="fx-empty">正在读取…</div>
+            </div>
+          </article></div></details>
+<details class="fx-maintenance-fold" id="fx-audit-details"><summary><strong>操作记录</strong><span>按需查看配置和维护操作的审计记录</span></summary><div class="fx-fold-content"><div class="fx-inline-actions"><button id="fx-audit-refresh" class="fx-button" type="button">刷新记录</button></div><div id="fx-audit-list" class="fx-audit-list"><div class="fx-empty">展开后读取操作记录。</div></div></div></details>
+<details class="fx-maintenance-fold" ><summary><strong>异常占用维护</strong><span>仅在任务已异常退出、占用仍未释放时使用</span></summary><div class="fx-fold-content"><p class="fx-maintenance-note">强行释放不会取消或终止仍在运行的任务，请先在运行监控确认任务状态。</p><button class="fx-button fx-button-danger" id="fx-force-release-all" type="button" title="点击强行释放当前浏览器占用">🧹 强行释放占用</button></div></details>
+          </section>
         </div>
         <div class="fx-toast" id="fx-toast" role="status" aria-live="polite"></div>
       </section>
@@ -642,18 +662,6 @@
 </div>
   <div class="sidebar-backdrop" id="sidebar-backdrop"></div>
 
-  <!-- Lightbox Screen Overlay (for zoomed image/video) -->
-  <div class="lightbox-overlay" id="lightbox-modal" style="display: none;">
-      <span class="lightbox-close" id="close-lightbox-btn">✕</span>
-      <button class="lightbox-nav lightbox-prev" id="prev-lightbox-btn" title="上一张 (Left Arrow)">◀</button>
-      <div class="lightbox-content">
-          <img id="lightbox-img" src="" alt="Fullscreen view" style="display: none;">
-          <video id="lightbox-video" src="" controls autoplay loop style="display: none; max-width: 100%; max-height: 80vh; object-fit: contain; border-radius: 8px; box-shadow: 0 10px 50px rgba(0,0,0,0.8);"></video>
-          <div class="lightbox-caption" id="lightbox-caption">Caption text...</div>
-      </div>
-      <button class="lightbox-nav lightbox-next" id="next-lightbox-btn" title="下一张 (Right Arrow)">▶</button>
-  </div>
-
   <!-- Google FX 使用说明书顶级浮层（避免被父级 Tab hidden 或 CSS 变形遮挡） -->
   <div class="fx-manual-overlay" id="fx-manual-overlay" hidden role="dialog"
        aria-modal="true" aria-labelledby="fx-manual-title">
@@ -672,8 +680,8 @@
   <!-- 共享工具（escapeHtml/copyText 等）必须先于 console.js 加载 -->
   <script src="js/utils.js?v=1.1.1"></script>
   <script src="js/theme_toggle.js?v=1.1.0"></script>
-  <script src="js/lightbox.js?v=1.1.0"></script>
-  <script src="js/google_fx_console.js?v=1.1.0"></script>
+  <script src="js/fx_board.js?v=1.0.0"></script>
+  <script src="js/google_fx_console.js?v=1.2.1"></script>
   <script src="console.js?v=1.2.0"></script>
 </body>
 </html>

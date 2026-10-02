@@ -1,274 +1,128 @@
 # Omni Multi-Shot Language
 
-Every VIDEO prompt in this skill must be an edited multi-shot sequence, with UGC-like phone
-capture imperfections layered into each shot. What that sequence is, though, is not a tour
-of shot scales.
+Choose coverage by the beat's role. This file owns ordinary construction and reward coverage;
+`omni-threshold-bridge.md` owns physical-entry stages. The user's explicit one-take request
+overrides the default directly, without asking for reconfirmation.
 
-## One Main Working Shot, Cut By One Or Two Close-Up Inserts
-
-**A beat is one sustained working shot, interrupted by one or two close-up inserts, and cut
-back to the same camera setup to land.** That is the whole grammar.
+## Ordinary construction: work, inserts, return
 
 | Clip length | Shots | Structure |
 |---|---|---|
-| 4s | 3 | **wide working shot** → close-up insert → returning wide shot |
-| 6s | 3 | **wide working shot** → close-up insert → returning wide shot |
-| 8s | 4 | **wide working shot** → close-up insert → extreme close-up insert → returning wide shot |
-| 10s | 4 | **wide working shot** → close-up insert → extreme close-up insert → returning wide shot |
+| 4s / 6s | 3 | wide working shot → close-up insert → returning wide shot |
+| 8s / 10s | 4 | wide working shot → close-up insert → extreme close-up insert → returning wide shot |
 
-Longer clips do not buy more shot scales. They buy a second insert and a longer main shot.
+More time buys another insert, not a scale rotation. Do not use the retired construction
+labels `establishing long shot`, `full shot`, `medium shot` or `wide outro shot`.
 
-**The first and last shots are the same camera setup** — same position, same framing, same
-focal length — differing only in how far the work has got. This is the point of the
-structure: the first-frame anchor and the last-frame anchor land in one composition, so
-anchor continuity is a property of the camera rather than something the prose has to keep
-re-asserting across five changing scales. The returning shot must say so, in words: `the
-same camera setup as the opening wide working shot`.
+Opening and returning construction shots use the **same position, framing and focal length**.
+The return says `the same camera setup as the opening wide working shot`. A later clause
+about a new overhead, different lens or changed framing contradicts that lock even if the
+required words appear. The inserts change viewing distance; the return restores the opening
+setup and anchors.
 
-**Never write a shot-scale rotation.** The retired grammar's names — `establishing long
-shot`, `full shot`, `medium shot`, `wide outro shot` — are banned outright, and writing one
-is a P0 rewrite, not a stylistic wobble. Two things go wrong at once when they appear: every
-shot drops under a second at short lengths and reads as flicker, and the camera moves in a
-clip whose whole continuity argument rests on it not moving.
+### What each shot does
 
-**With only one insert (4s and 6s), the second insert's duty folds into it** — the close-up
-carries the tool contact *and* at least two persistent traces. A duty is never dropped with
-the shot that would have carried it.
+| Shot | Action and continuity |
+|---|---|
+| wide working shot | Match the person-free first-frame anchor instant. Immediately start reachable hand/tool contact from the adjacent edge. Show the first causal action fully, then operation-specific repeated work. Locate stock/source, access and captured waste. |
+| close-up insert | Cut to contact and material resistance in the already-worked area. It adds no completion. At 4s/6s also show both persistent traces. |
+| extreme close-up insert | At 8s/10s, inspect two characteristic traces **already formed by visible contact**; no new result appears here. |
+| returning wide shot | Cut back to the same setup and completion level. Finish the remaining repetitions the stated same way; integrate worker withdrawal into the last action and match the person-free endpoint exactly. |
 
-**Threshold bridge videos and the final reward video keep their own three-station ladders**,
-at every clip length: `wide approach shot → threshold shot → interior wide shot` for a
-crossing, and `detail shot → pull-back shot → final wide shot` for the reward. A crossing is
-a traverse, not a work beat: it has three natural stations and no work face to insert into.
-Both are exempt from the pacing declaration below — they traverse or reveal rather than
-compress work — but neither is exempt from the One-Take Ban.
+Use `omni-work-first-rhythm.md` for access, sources, retained materials and operation-specific
+rhythm. A worker's visible extent follows the task; do not require full-body arrival or
+departure shots. Static stock, resting tools, scaffolds and parked plant remain when the
+next anchor retains them.
 
-## Cinematic Multi-Shot Narrative Flow (纯自然语言多镜头因果流)
+An insert may show ongoing contact without a measurable progress jump. It cannot show a
+new terminal crimp, fastener impression or dried coat before the work that creates it.
+Changing words from “new” to “existing” does not repair a missing causal action.
 
-**We do NOT use rigid numeric timestamp tables or robotic cut mark sentences (e.g. `Cut this ten-second clip on these marks...` is forbidden).** Video diffusion models (Veo, Kling, Sora) respond best to **fluent cinematic narrative transitions** that naturally guide camera shifts, macro close-ups, and worker actions in pure English prose:
+## Clean cuts in natural prose
+
+Use explicit connectors such as `A clean cut moves into a close-up insert` and
+`A final clean cut returns to a returning wide shot from the same camera setup`.
+Describe shot order and duration naturally; do not output timecode tables, bracketed seconds,
+numeric cut marks or a boilerplate “cut on these marks” timeline sentence.
 
 ```text
-The sequence opens with a wide working shot of the restoration area in its initial state, then immediately after the person-free anchor instant the worker reaches in from the adjacent frame edge into [primary action] with [tool]. The camera then cuts in closer to a tight close-up insert on the tool contact point, showing [material physics: mortar extrusion, wood shavings curling, adhesive spreading]. Next, an extreme close-up insert reveals [two persistent craft traces and micro-textures]. Finally, the camera cuts back to a returning wide shot from the exact same camera setup as the opening shot, where the last working motion reaches the finished state and withdraws all visible hands/body to match the person-free ending anchor.
+The wide working shot matches the opening anchor, then the worker reaches directly into the first tool contact. A clean cut moves into a close-up insert on resistance and traces already created. A second clean cut shows the extreme close-up insert without advancing completion. Finally, a clean cut returns to a returning wide shot from the same camera setup as the opening wide working shot; the remaining repetitions finish the same way and the last working gesture withdraws the worker to match the ending anchor.
 ```
 
-Rules:
-- Express temporal progression and cut sequences using natural cinematic connectors (`The sequence opens with...`, `Cutting in closer to a close-up insert on...`, `An extreme close-up insert captures...`, `Cutting back to a returning wide shot from the same camera setup...`).
-- Never output robotic timecode tables, bracketed seconds (`0.0 to 3.2s:`), or decimal cut marks.
-- Keep the entire prompt in 100% natural prose. All counts and dimensions are written in English words.
+This illustrates four-shot syntax, not a ready-made work description. Three-shot clips omit
+the second insert and combine contact plus both traces in the first. Vary the work, contact,
+trace evidence and last gesture across beats instead of reproducing this paragraph.
 
-## Pacing Declaration
+Use clean cuts or match cuts, without dissolves, fades, magical replacements or montage
+that skips the physical path. A required shot label alone is not an edit instruction.
 
-Every ordinary construction VIDEO must state its time base once, in prose, so the model
-does not render real-time labour or invent instant completion:
+## Time base and progress
+
+Ordinary default construction states once:
 
 `edited construction time-lapse assembled from multiple camera setups, not real-time footage`
 
-Do **not** use the word `continuous` in this phrase. In a cut pack it reads as an
-instruction to shoot a oner and collides with the One-Take Ban.
+Describe motion through each shot without pauses for arrival, packing-up or empty holds.
+Work progresses in the working shots; inserts inspect it. State concisely, for example:
 
-The threshold bridge videos and the final reward video are exempt from the pacing phrase —
-they traverse or reveal rather than compress work.
+`Work continues within the working shots; inserts hold completion fixed, and cuts compress only repetitions already shown in full.`
 
-## In-Shot Continuity
+At every cut:
 
-Inside each shot, the dominant motion runs from the shot's first moment to its last: no
-static holds, no stable starts, no deceleration or settling zones. Compression happens at
-the cuts, never by freezing inside a shot. State it once, in prose:
+- Resume the same completion level as before the insert.
+- Show the first occurrence of each change type fully from contact to result.
+- Compress only demonstrated repetitions and name that compression, for example
+  `after the remaining boards are removed the same way`.
+- Keep quantities, object positions, waste destinations and lighting phases continuous.
+- Never introduce a new object, finish another task or add unperformed anchor changes at a cut.
 
-```text
-Inside every shot the frame keeps moving from its first to its last moment — handheld drift, ambient motion, and the subject's own action never freeze — while this beat's change advances only during the work shots. The only compressions in the clip fall exactly on the listed cut marks; no shot contains a hold, a stall, or a deferred step that is then delivered all at once.
-```
+For drying/curing, follow `omni-restoration-continuity.md`: a wet tail cannot bind to an
+exact dry anchor. Declare elapsed curing before the final anchor instant or add a transition.
 
-**Do not** instead demand that the change itself advance at an even rate across the whole
-clip. Frame motion and beat progress are two different things: the inserts add no progress
-by contract, and the returning shot is precisely where a stated same-way compression lands.
-A clip cannot be continuously progressing and obey its own shot-level progress locks at the
-same time.
+## Reward: demonstrate the finished use
 
-## Work-Integrated Worker Boundaries
+Reward clips use **detail shot → pull-back shot → final wide shot**, at every clip length.
+Use two explicit clean cuts. The construction shot table and same-camera-return clause do
+not apply to this changing viewpoint; its first and last shots still match their own anchors.
 
-Follow `omni-work-first-rhythm.md`. Keep person-free boundary instants, not arrival/departure scenes.
+Allocate the user's complete usage sequence across the three shots. A person-free detail
+anchor may open on the existing bed, book or work surface, followed immediately by the
+requested person entering and using it. The pull-back continues that action; the final wide
+finishes any required closing, returning an item and exit before its person-free endpoint.
+A reveal push happens within a shot. Do not replace requested usage with an empty room reveal.
 
-| Shot | Worker state |
-|---|---|
-| wide working shot | Immediately after the opening anchor instant, a short adjacent-edge reach/lean or step starts first effective tool contact; repeated work cycles carry progress. Show plausible access, source and weight; full-body visibility is not mandatory. |
-| close-up insert | Operation-specific hand/tool contact and material physics, not a generic beauty shot. |
-| extreme close-up insert | Existing characteristic traces; no new completion. |
-| returning wide shot | Resume at the same progress level, complete remaining work and withdraw all visible hands/body in the last working motion, landing on the person-free final instant without an empty hold. |
+Only already-installed or previously carried-in items may be used. Include material-specific
+footsteps and contact sounds. Reward is exempt from construction time-lapse wording and
+construction tool-contact checks, not from requested action coverage or object persistence.
 
-Retain stock and resting equipment required by the next anchor. Do not make a working machine blink away; its location and final operating/parked state must agree with the anchors. Erected plant follows its persistent lifecycle.
+## Physical entry
 
-## Shot Reference
+A complete unexpanded crossing uses **wide approach shot → threshold shot → interior wide
+shot**, with explicit clean cuts and a physically continuous opening/floor/light tether.
+Do not impose an opening/ending same-camera clause on a traversal.
 
-Four shots exist in the construction grammar. Every clip uses the main working shot and the
-returning wide shot; the extreme close-up insert appears only at eight and ten seconds.
+When the path is expanded into topology stages, each stage gets its own multi-shot structure,
+anchors and reveal budget from `omni-threshold-bridge.md`. Do not repeat the whole crossing
+inside every atomic stage or exempt expanded stages from cuts.
 
-### Wide Working Shot — every clip
+## Explicit user one-take coverage
 
-Purpose: orient the viewer *and* carry the entire visible advance of this beat. It is the
-first-frame anchor and the only shot that moves the work forward.
+Write the requested single-take camera/action sequence directly. Preserve first/last anchor
+binding, exact action scope, sources, causal contact, material balance, lighting and traces.
+Use the requested real-time or time-lapse pace without claiming multiple camera setups.
+Omit the cut/insert/return boilerplate and mark those audit rows `用户覆盖／不适用`.
+The override does not waive word ceilings or missing deliverables.
 
-Progress lock: opens exactly on IMAGE N with zero progress, then advances this beat's change
-from zero to roughly three quarters — the first occurrence (first board, first stroke, first
-fastener) shown in full from contact to placement, then repeated work cycles. Use progressive
-partial-state wording (`-ing`, `partially`, `growing`) throughout; finished-state wording is
-forbidden here.
+## Capture style and phrasing
 
-Include:
-- full environment, restoration carrier, and weather or ambient motion
-- first-frame anchor match, with no state jump at the opening instant
-- a person-free opening instant, then an adjacent-edge reach or short step directly into first effective tool contact
-- readable tool contact, a located material source and real physical weight; show only as much of the worker as the reachable operation needs
-- one dominant physical action, repeated in visible cycles
-- a ladder, scaffold, or standing surface if the task is above arm reach
-- physical resistance and rising dust or debris
-- phone-capture parameters such as a recent smartphone rear camera, slight off-centre
-  framing, mild wide-angle edge distortion, phone auto-exposure settling, and brief focus
-  breathing before the phone locks back onto the work area
-- a small human re-framing correction that preserves anchor landmarks
+UGC phone capture remains the default; a user's polished-cinema request overrides that style.
+Select plausible imperfections for the scene rather than repeating every artifact in every
+shot. Preserve landmark relationships and camera family while permitting minor handheld motion.
 
-Natural prose pattern:
+Repeat only genuine identity/anchor locks, worker identity and the necessary role clauses.
+Do not force all clips to share identical sentence order, cut wording, adjectives or arrival
+and departure choreography. Keep short anchor, no-text and audio clauses; spend the rest of
+the word budget on the physical operation.
 
-`The clip opens on a wide working shot captured like casual smartphone footage, slightly off-center with mild wide-angle edge distortion and phone auto-exposure settling, matching IMAGE N to show the full [location] and the [carrier] in its [current state] under [lighting], then immediately after that person-free opening instant [worker] reaches in from the adjacent frame edge at [reachable work zone] into first effective contact with [tool] and then repeatedly [verb] [object/surface] as the changed area grows steadily and fine dust settles nearby.`
-
-### Close-Up Insert — every clip
-
-Purpose: show material physics at the contact point.
-
-Progress lock: no measurable progress jump — the insert examines ongoing contact, not a new
-state, and the cut back returns at exactly the completion level the cut away left.
-
-Include:
-- tool contact
-- material deformation
-- debris, fluid, fiber, fastener, dust, paint, weld, adhesive, or friction behavior
-- audio sync opportunity
-- phone-camera imperfection such as minor motion blur, imperfect focus falloff, small blown
-  highlights, sensor noise, or compression
-- on 4s and 6s clips, where this is the only insert: at least two persistent traces as well
-
-Natural prose pattern:
-
-`A clean cut at the [entry mark in words] drops into a close-up insert on [tool/contact point] with minor handheld motion blur and imperfect focus falloff, capturing the raw material physics as [force] bends timber fibers, showers rust flakes, or sprays fine dust, leaving [visible trace].`
-
-### Extreme Close-Up Insert — 8s and 10s clips
-
-Purpose: prove causality.
-
-Progress lock: still no jump — every trace shown belongs to work already performed on screen.
-
-Include at least two persistent traces and tactile micro-textures. The traces must be
-characteristic products of the current operation (roller work leaves stipple, bolting leaves
-washer rings, prying leaves pry scars — not traces borrowed from another trade):
-- screw heads
-- washer rings
-- weld beads
-- adhesive squeeze-out
-- seam shadow
-- dust edge
-- drag scuff
-- clamp mark
-- brush overlap
-- roller stipple
-- drill dust
-- cable rub
-- pressure imprint
-- broken fiber ends
-- wood grain, steel texture, or brick porosity
-
-Natural prose pattern:
-
-`A second insert at the [entry mark in words] pushes to an extreme close-up insert on the evidence left behind: [trace one] and [trace two] are clearly engraved or embedded into the porous [surface] texture, with low-light noise, mild compression, natural scratches, and dust edges that prove the physical causality.`
-
-### Returning Wide Shot — every clip
-
-Purpose: return to the opening camera setup and land the anchor.
-
-Progress lock: the remaining repetitions finish through a stated same-way compression at the
-cut (`after the remaining boards come loose the same way`), landing exactly on IMAGE N+1 — no
-overshoot, no missing elements. Finished-state wording is allowed only here.
-
-Include:
-- an explicit statement that this is the same camera setup as the opening wide working shot
-- remaining work completed visibly, with all visible hands/body withdrawing in the last working motion
-- temporary tools, ladders, and scaffolds remaining only when supported by the resulting
-  state or the next beat
-- a final layout matching IMAGE N+1
-- permanent traces, including all changes inherited from earlier beats
-- no separate departure scene or empty hold; only the final anchor instant is person-free
-- phone-recorded exposure and tone matching the next anchor
-
-Natural prose pattern:
-
-`A final clean cut at the [entry mark in words] returns to the same camera setup as the opening wide working shot, matching the phone-recorded exposure and tone of IMAGE N+1, where — after the remaining [repetitions] are completed the same way — [worker] finishes [last concrete action] and withdraws the visible hands/body in that same motion, matching the person-free IMAGE N+1 with [persistent traces] and [retained stock/equipment] still in place.`
-
-## Progress Across Cuts
-
-Cuts are where models teleport. Enforce these rules at every cut:
-
-- Every shot opens at the completion level the previous shot ended with. A cut never silently advances the work.
-- A cut may compress repetitions of an action already shown once in full, and the prose must state it: `after several more panels go up the same way`.
-- A cut may never skip the first occurrence of a change type, introduce a new object, or finish a different sub-task.
-- Counts of major elements stay identical across a cut unless the change happened on screen or was stated as same-way repetition.
-- Cutting away to an insert and back must not move the work: the returning wide shot picks up at the completion level the main working shot cut away on, and only then applies its stated same-way compression.
-
-## Edit Rhythm
-
-Use clean cuts and match cuts. The sequence may feel dynamic, but it must not feel like random montage replacement.
-
-Allowed:
-- clean cut
-- match cut
-- hard cut only if it does not imply a state jump
-- rack focus or focus breathing inside an insert
-- cutting into an insert and back to the same camera setup
-- small phone re-framing correction
-
-Forbidden by default:
-- cross-dissolve
-- fade-in
-- fade-out
-- magical transition
-- instant transformation
-- sudden replacement
-- teleport
-- rapid montage that skips the physical path
-
-## Phrasing Variation
-
-The shot structure is a fixed skeleton — and a smaller one than it used to be — which makes
-template-loop prose the default failure mode of this skill: every beat opening the same way,
-using the same clause order, and reaching for the same verbs. With only two shot names in
-play, the burden falls entirely on the work description.
-
-Vary operation-specific opening actions, evidence and closing gestures using `omni-work-first-rhythm.md`; never make arrival-work-departure a repeated plot. Keep the existing shot structure, but do not turn its timing into fixed logistics phases.
-
-Before finalising each VIDEO, compare it against the immediately preceding VIDEO:
-
-- **Required and correct to repeat**: the anchor-binding opening sentence, the shot timeline
-  sentence, the four shot names, the same-camera-setup clause, the worker silhouette phrase,
-  the pacing declaration, the in-shot continuity sentence, the no-text sentence. These are
-  structural and must stay verbatim — the timeline in particular is identical in every beat
-  of a pack, because clip length and structure are constant across the pack.
-- **Failure if repeated**: the same subsequent sentence template, the same clause order
-  inside a shot, the same verb set, the same transition wording between shots, the same
-  adjective pairs.
-
-Deliberately vary sentence rhythm, subject phrasing, and verb selection every beat while
-keeping every required structural element intact. The same audit applies to adjacent IMAGE
-anchors.
-
-If varying the prose would cost a required element, keep the element — trim adjectives
-elsewhere instead.
-
-## Audio Sync
-
-If `<audio>` is supplied, align the shot rhythm and diegetic impacts to it.
-
-Examples:
-- crowbar pries hit the downbeat
-- hammer taps match the percussion
-- shovel impacts fall on low-frequency pulses
-- brush strokes follow the musical tempo
-- ambient wind or water motion follows the audio bed
-
-If no `<audio>` is supplied, provide SFX and ambient noise as ordinary natural prose.
+If `<audio>` is supplied, name it where the allowed contact/step rhythm follows it.
+Otherwise name operation-specific SFX over the scene's ambient sound; do not invent a score.

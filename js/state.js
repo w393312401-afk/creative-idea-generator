@@ -74,45 +74,70 @@ const DEFAULT_CONFIG = {
 };
 
 // LLM 主模型清单（激发/合成/审核/质检判定共用；网关路由由服务端 resolve_gateway 处理）。
-// 按供应商分三组，渲染成激发页脚的分组芯片单选器（见 config.js syncIdeationLlmPicker）：
-// - gpt: 模型名含 "gpt-5" 或 "gpt-6" 会被 resolve_gateway 自动转发到 codex 网关；只保留当前代
-//   gpt-5.5+（旧 gpt-4/gpt-3.5 系列、以及性能较弱的 gpt-5.4 系列都不放进来）。
-//   2026-07-13 已用真实请求逐个验证 gpt-5.5/5.6-sol/5.6-terra/5.6-luna 均原生
-//   支持联网搜索（{"type":"web_search"} 工具自动执行）。
+// 配置中心与项目再跑共用当前模型清单；旧配置由 config.js 迁移。
+// - gpt: GPT-6 系列经 resolve_gateway 转发到 codex 网关。
+//   2026-10-01 已通过本机网关 /models 确认下列四款模型可用。
 // - gemini: 走默认网关（config.baseUrl，即 8046）。
-// - claude: claude-sonnet-4-6 / claude-opus-4-6-thinking 也走跟 gemini 一样的默认
-//   网关（resolve_gateway 没有 claude 专属分支，落进默认分支）——2026-07-13 已用
-//   真实请求验证两者都能正常应答。
 const LLM_MODEL_GROUPS = {
     gpt: [
+        { value: 'gpt-6.1-sol', label: 'gpt-6.1-sol', recommended: true },
         { value: 'gpt-6-astra', label: 'gpt-6-astra' },
-        { value: 'gpt-5.5', label: 'gpt-5.5' },
-        { value: 'gpt-5.6-sol', label: 'gpt-5.6-sol' },
-        { value: 'gpt-5.6-terra', label: 'gpt-5.6-terra' },
-        { value: 'gpt-5.6-luna', label: 'gpt-5.6-luna' }
+        { value: 'gpt-6-sol', label: 'gpt-6-sol' },
+        { value: 'gpt-6-luna', label: 'gpt-6-luna' }
     ],
     gemini: [
-        { value: 'gemini-3.8-flash-high', label: 'gemini-3.8-flash-high', recommended: true },
-        { value: 'gemini-3.7-flash-high', label: 'gemini-3.7-flash-high' }
-    ],
-    claude: [
-        { value: 'claude-sonnet-4-6', label: 'claude-sonnet-4-6' },
-        { value: 'claude-opus-4-6-thinking', label: 'claude-opus-4-6-thinking' }
+        { value: 'gemini-3.8-flash-high', label: 'gemini-3.8-flash-high', recommended: true }
     ]
 };
 
 // 生图模型清单（与 LLM 模型解耦：resolve_gateway 会按模型名自动路由网关，
-// gemini LLM + gpt-image-2 生图这类混搭是合法组合）。
-// 注意：这里选 gpt-image-2 是「人明确要它」；系统不会再自己切过去——主模型配额
-// 耗尽时自动降级到 gpt-image-2 的机制已整体取消。配额耗尽时系统只会换传输通道、
+// gemini LLM + gpt-image-2.5 生图这类混搭是合法组合）。
+// 模型由用户明确选择，配额耗尽时系统只会换传输通道、
 // 绝不换模型：图生图撞上网关 /images/edits 的号池墙时，同一个模型改走
 // /chat/completions 续渲（见 frame_generator.CHAT_TRANSPORT），该帧在 manifest 里
 // 标 transport/actual_pixels 留痕（请求 2K/4K 时才另记 degraded_reason，chat 通道
 // 固定出 1K 档）；连这条通道也没额度才就地报错。
+function normalizeApiImageModel(value) {
+    const model = String(value || '').trim();
+    return /^gpt-image-2(?:-\d{4}-\d{2}-\d{2})?$/i.test(model)
+        ? 'gpt-image-2.5' : model;
+}
+
+let imageGatewayModelCatalog = { status: 'unknown', models: [] };
+
+function setImageGatewayModelCatalog(report) {
+    imageGatewayModelCatalog = report?.status === 'known' && Array.isArray(report.models)
+        ? { status: 'known', models: report.models.filter(model => typeof model === 'string') }
+        : { status: 'unknown', models: [] };
+}
+
+function isApiImageModelAvailable(value) {
+    const model = normalizeApiImageModel(value);
+    return !/^gpt-image-2\.5(?:-|$)/i.test(model)
+        || imageGatewayModelCatalog.status !== 'known'
+        || imageGatewayModelCatalog.models.includes(model);
+}
+
+function applyApiImageModelOptionAvailability(option) {
+    option.dataset ||= {};
+    if (!Object.prototype.hasOwnProperty.call(option.dataset, 'originalModelLabel')) {
+        option.dataset.originalModelLabel = option.textContent || option.value;
+    }
+    option.disabled = !isApiImageModelAvailable(option.value);
+    option.textContent = option.dataset.originalModelLabel
+        + (option.disabled ? '（当前网关不可用）' : '');
+}
+
+function unavailableApiImageModelMessage(model) {
+    return `${model} 当前网关不可用，${isApiImageModelAvailable('gpt-image-2.5')
+        ? '请改选 gpt-image-2.5 后重新生成' : '请改选当前可用的图片模型'}。`;
+}
+
 const IMAGE_MODELS = [
     { value: 'nano-banana-2', label: '🍌 Nano Banana 2 (Gemini)' },
-    { value: 'gpt-image-2.5', label: 'gpt-image-2.5 (GPT / codex 通道)' },
-    { value: 'gpt-image-2', label: 'gpt-image-2 (GPT / codex 通道)' }
+    { value: 'gpt-image-2.5-sunburst', label: 'gpt-image-2.5-sunburst（最强 / 高精度）' },
+    { value: 'gpt-image-2.5-flare', label: 'gpt-image-2.5-flare（快速）' },
+    { value: 'gpt-image-2.5', label: 'gpt-image-2.5 (GPT / codex 通道)' }
 ];
 
 // Google FX（AdsPower 浏览器 UI 自动化）后端的生图模型清单

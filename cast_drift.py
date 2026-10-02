@@ -189,7 +189,7 @@ def _ffmpeg_binary():
 def extract_frames(video_path, count=FRAMES_PER_SEGMENT, out_dir=None):
     """从一段视频里均匀抽 count 帧，返回帧文件路径列表。
 
-    ffmpeg 是本项目的既有硬依赖（replica_pipeline 的抽帧链路就靠它，缺它时那条链路
+    ffmpeg 是本项目视频处理的既有硬依赖（缺它时视频处理链路
     直接判失败），不是本模块新引入的。
 
     刻意跳过首尾各 10%：具名人物模式下进离场压缩在首尾各半秒内，那半秒里人物往往

@@ -165,6 +165,21 @@ class TestGalleryGrouping:
 
 
 class TestDeleteTakesCoverAlong:
+    def test_cover_symlink_cannot_delete_files_outside_outputs(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(sc, 'OUTPUT_ROOT', 'outputs')
+        (tmp_path / 'outputs').mkdir()
+        outside = tmp_path / 'originals'
+        outside.mkdir()
+        cover = outside / 'cover.webp'
+        cover.write_bytes(b'original')
+        (tmp_path / 'outputs' / 'linked').symlink_to(outside, target_is_directory=True)
+
+        deleted = delete_idea_output_files('', ['/outputs/linked/cover.webp'])
+
+        assert deleted['covers'] == []
+        assert cover.read_bytes() == b'original'
+
     def test_removing_the_project_dir_removes_its_cover(self, outputs, monkeypatch):
         monkeypatch.chdir(os.path.dirname(outputs))
         cover = _touch(os.path.join(outputs, '小屋', 'cover_100.webp'))

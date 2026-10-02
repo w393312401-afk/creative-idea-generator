@@ -7,6 +7,11 @@ import re
 import subprocess
 import tempfile
 import threading
+import contextlib
+import contextvars
+import uuid
+import math
+from datetime import datetime, timezone
 
 from server_common import (
     SERVER_CONFIG, resolve_gateway, effective_config,
@@ -14,7 +19,8 @@ from server_common import (
     ACTIVE_TASKS_LOCK, ACTIVE_TASKS, get_or_create_task,
     notify_listeners, save_tasks_to_disk,
     apply_google_fx_runtime_overrides, fx_cancel_context, fx_request_deadline,
-    read_manifest, write_manifest, manifest_lock, strict_gates_enabled, qa_gate_level, gate_setting,
+    read_manifest, write_manifest, write_json_atomic, manifest_lock, strict_gates_enabled, qa_gate_level, gate_setting,
+    reviews_disabled,
     _is_cover_filename, _cover_candidate_path,
     resolve_video_duration, resolve_video_resolution,
     FIXED_VIDEO_DURATION, OMNI_VIDEO_DURATIONS,
@@ -36,6 +42,215 @@ def _win_subprocess_flags():
         return {}
 
 
+_MEDIA_CONTEXT = contextvars.ContextVar('video_media_operation', default=None)
+_MERGE_LOCKS = {}
+_MERGE_LOCKS_GUARD = threading.Lock()
+
+
+def _check_media_cancel():
+    context = _MEDIA_CONTEXT.get() or {}
+    if context.get('cancel_check') and context['cancel_check']():
+        raise ConnectionError('视频合并已取消，已保留原成片')
+    if context.get('deadline') and time.monotonic() >= context['deadline']:
+        raise TimeoutError('视频合并超过时间上限，已保留原成片')
+
+
+def _merge_progress(phase, message, **details):
+    _check_media_cancel()
+    context = _MEDIA_CONTEXT.get() or {}
+    if context.get('on_progress'):
+        context['on_progress']('merge_progress', {
+            'phase': phase, 'message': message,
+            'elapsed_seconds': round(time.monotonic() - context.get('started', time.monotonic()), 1),
+            **details,
+        })
+
+
+def _run_media_command(cmd, **kwargs):
+    """Bound every media subprocess; active merges can terminate a running child."""
+    _check_media_cancel()
+    context = _MEDIA_CONTEXT.get() or {}
+    timeout = kwargs.pop('timeout', None) or (30 if 'ffprobe' in os.path.basename(cmd[0]) else 600)
+    if context.get('deadline'):
+        timeout = min(timeout, max(0.01, context['deadline'] - time.monotonic()))
+    if not context.get('cancel_check') and not context.get('on_progress'):
+        return subprocess.run(cmd, timeout=timeout, **kwargs)
+    check = kwargs.pop('check', False)
+    if kwargs.pop('capture_output', False):
+        kwargs['stdout'] = subprocess.PIPE
+        kwargs['stderr'] = subprocess.PIPE
+    deadline = time.monotonic() + timeout
+    proc = subprocess.Popen(cmd, **kwargs)
+    try:
+        last_report = 0.0
+        while True:
+            _check_media_cancel()
+            if time.monotonic() >= deadline:
+                raise subprocess.TimeoutExpired(cmd, timeout)
+            try:
+                stdout, stderr = proc.communicate(timeout=max(0.001, min(0.25, deadline - time.monotonic())))
+                result = subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
+                if check:
+                    result.check_returncode()
+                return result
+            except subprocess.TimeoutExpired:
+                if time.monotonic() - last_report >= 1:
+                    _merge_progress('processing', '正在处理视频，请稍候')
+                    last_report = time.monotonic()
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.communicate(timeout=2)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.communicate(timeout=2)
+
+
+@contextlib.contextmanager
+def _merge_operation(project_dir, on_progress=None, cancel_check=None, config=None):
+    parent = _MEDIA_CONTEXT.get()
+    if parent:
+        _check_media_cancel()
+        yield
+        return
+    started = time.monotonic()
+    timeout = max(1, min(float((config or {}).get('videoMergeTimeoutSeconds') or 1800), 7200))
+    context = {'started': started, 'deadline': started + timeout,
+               'on_progress': on_progress, 'cancel_check': cancel_check}
+    token = _MEDIA_CONTEXT.set(context)
+    key = os.path.realpath(project_dir)
+    with _MERGE_LOCKS_GUARD:
+        lock = _MERGE_LOCKS.setdefault(key, threading.RLock())
+    acquired = False
+    try:
+        while not acquired:
+            _check_media_cancel()
+            acquired = lock.acquire(timeout=0.2)
+            if not acquired:
+                _merge_progress('waiting', '等待本项目的上一项合并完成')
+        _merge_progress('preparing', '正在准备合并视频')
+        yield
+    finally:
+        if acquired:
+            lock.release()
+        _MEDIA_CONTEXT.reset(token)
+
+
+def _validate_merged_output(path, expected_duration=None):
+    _check_media_cancel()
+    if not os.path.isfile(path) or os.path.getsize(path) == 0:
+        raise RuntimeError('合并输出为空，已保留原成片')
+    result = _run_media_command(
+        ['ffprobe', '-v', 'error', '-show_entries',
+         'stream=codec_type,duration,avg_frame_rate:format=duration', '-of', 'json', path],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        encoding='utf-8', errors='replace', check=True, **_win_subprocess_flags())
+    info = json.loads(result.stdout)
+    streams = info.get('streams') or []
+    video = next((stream for stream in streams if stream.get('codec_type') == 'video'), None)
+    duration = float((info.get('format') or {}).get('duration') or 0)
+    video_duration = float((video or {}).get('duration') or 0)
+    if not (video and 0 < video_duration < 86400 and 0 < duration < 86400):
+        raise RuntimeError('合并输出时长无效，已保留原成片')
+    # A container can look successful while a broken audio timeline holds the last
+    # video frame for minutes. Check streams before replacing the previous export.
+    tolerance = 0.25
+    for stream in streams:
+        if stream.get('codec_type') == 'audio':
+            audio_duration = float(stream.get('duration') or 0)
+            if not math.isfinite(audio_duration) or abs(audio_duration - video_duration) > tolerance:
+                raise RuntimeError('合并输出音画时长不一致，已保留原成片')
+    if abs(duration - video_duration) > tolerance:
+        raise RuntimeError('合并输出存在异常拖尾，已保留原成片')
+    if expected_duration is not None and abs(video_duration - expected_duration) > tolerance:
+        raise RuntimeError('合并输出与片段总时长不一致，已保留原成片')
+    return duration
+
+
+def _merge_selected_files(project_dir, manifest_data, merge_slots, good, speed,
+                          cover_burn, cover_path, config, skipped_slots=None):
+    """Build in a same-filesystem staging directory; only publish valid output."""
+    project_dir = os.path.abspath(project_dir)
+    video_files = [good[slot] for slot in merge_slots]
+    if not video_files:
+        return None
+    partial = skipped_slots is not None
+    title = _project_display_name(manifest_data.get('title', ''))
+    filename = f'{title}_{"partial_" if partial else ""}{_merge_speed_slug(speed)}.mp4'
+    destination = os.path.join(project_dir, filename)
+    with tempfile.TemporaryDirectory(prefix='.merge-', dir=project_dir) as temp_dir:
+        output_path = os.path.join(temp_dir, filename)
+        _merge_progress('preparing', '正在准备片段', current=0, total=len(video_files))
+        if not reviews_disabled(config):
+            meta_by_slot = slot_meta_map(manifest_data)
+            try:
+                video_files, _notes = retime_clips_for_merge(
+                    video_files, temp_dir, metas=[meta_by_slot.get(slot, '') for slot in merge_slots])
+            except Exception as exc:
+                _check_media_cancel()
+                print(f'[WARN] 段内节奏重映射跳过：{exc}')
+        _check_media_cancel()
+        # Each input must be decoded with its own time base. Concatenating AAC
+        # packets from 44.1/48 kHz clips reinterprets their timestamps and can
+        # leave a long frozen/black tail even when FFmpeg reports success.
+        media = [_probe_merge_clip(path) for path in video_files]
+        has_audio = any(item['has_audio'] for item in media)
+        _check_media_cancel()
+        cover_info = None
+        try:
+            video_files, cover_info = prepend_cover_intro(
+                project_dir, manifest_data, video_files, temp_dir, speed=speed,
+                has_audio=has_audio, cover_burn=cover_burn, cover_path=cover_path)
+        except Exception as exc:
+            _check_media_cancel()
+            print(f'[WARN] 首帧封面烧录跳过：{exc}')
+        _check_media_cancel()
+        if cover_info:
+            media.insert(0, _probe_merge_clip(video_files[0]))
+        by_slot = {v.get('slot'): v for v in manifest_data.get('videos', []) if isinstance(v, dict)}
+        clip_speeds = []
+        for slot in merge_slots:
+            entry = by_slot.get(slot) or {}
+            value = entry.get('clip_speed')
+            clip_speeds.append(min(_CLIP_SPEED_MAX, max(_CLIP_SPEED_MIN, float(value)))
+                               if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0
+                               else _clip_speed_from_meta(entry.get('meta')))
+        if cover_info:
+            clip_speeds.insert(0, 1.0)
+        filters, expected_duration, fps = _normalized_merge_filter(media, clip_speeds, speed)
+        cmd = ['ffmpeg', '-y', '-filter_complex_threads', '1']
+        for path in video_files:
+            # Large projects may contain dozens of inputs; do not create a full
+            # decoder thread pool for every clip simultaneously.
+            cmd.extend(['-threads', '1', '-i', path])
+        cmd.extend(['-filter_complex', filters, '-map', '[v]'])
+        if has_audio:
+            cmd.extend(['-map', '[a]', '-c:a', 'aac', '-ar', '48000', '-ac', '2'])
+        cmd.extend(['-c:v', 'libx264', '-threads', '4', '-pix_fmt', 'yuv420p',
+                    '-r', f'{fps:.10g}', '-movflags', '+faststart', output_path])
+
+        _merge_progress('encoding', '正在编码合并视频', current=0, total=len(video_files))
+        result = _run_media_command(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                    text=True, encoding='utf-8', errors='replace', **_win_subprocess_flags())
+        if result.returncode:
+            raise RuntimeError(f'视频合并失败，已保留原成片：{(result.stderr or "")[-400:]}')
+        _merge_progress('validating', '正在检查合并结果')
+        duration = _validate_merged_output(output_path, expected_duration=expected_duration)
+        _check_media_cancel()
+        size = os.path.getsize(output_path)
+        os.replace(output_path, destination)
+        rel_path, url = _rel_url(destination)
+        merged = {'file': rel_path, 'url': url, 'size_bytes': size,
+                  'duration_seconds': round(duration, 2), 'speed': speed, 'status': 'success'}
+        if partial:
+            merged.update(partial=True, skipped_slots=sorted(skipped_slots))
+        if cover_info:
+            merged['cover_first_frame'] = cover_info
+        # After atomic publication cancellation can no longer roll back the completed file.
+        return merged
+
+
 def _get_google_fx_video_service():
     from integrations.google_fx.services import google_fx, google_fx_video
     from integrations.google_fx import models
@@ -48,22 +263,11 @@ def _get_credit_helpers():
 
 
 def plan_generation_legs(pending_items, ring, switch_interval):
-    """把待生成请求切成「腿」：每腿 switch_interval 个请求、绑定环里的下一个账号。
+    """整条序列共用一个滚动会话，余额耗尽才由服务切换账号。
 
-    所有腿都跑在同一个 IP 上（换 IP 已全局关停，见 server_common 的「换 IP 已全局关停」
-    注释）。可换的账号不足 2 个时退化成单腿（user_id=None 表示沿用调用方已经设好的
-    账号）。"""
-    items = list(pending_items)
-    if len(ring) <= 1:
-        return [{'items': items, 'user_id': None}]
-    legs = []
-    for i in range(0, len(items), max(1, switch_interval)):
-        idx = len(legs)
-        legs.append({
-            'items': items[i:i + max(1, switch_interval)],
-            'user_id': ring[idx % len(ring)],
-        })
-    return legs
+    旧 ring / switch_interval 参数保留兼容；生成并发上限仍由服务控制。
+    """
+    return [{'items': list(pending_items), 'user_id': None}]
 
 
 # ── 视频锚点帧校验 ──
@@ -167,7 +371,7 @@ def _extract_video_frame(video_path, out_png, position, sseof_offset=0.3):
         cmd = [ffmpeg_bin, "-y", "-v", "error", "-sseof", f"-{sseof_offset:.3f}",
                "-i", video_path, "-frames:v", "1", "-update", "1", ffmpeg_target]
     try:
-        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        res = _run_media_command(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                              text=True, encoding='utf-8', errors='replace', timeout=60,
                              **_win_subprocess_flags())
         if res.returncode != 0:
@@ -260,7 +464,7 @@ def _extract_video_mid_frames(video_path, out_dir, fractions=(0.25, 0.5, 0.75)):
         cmd = ["ffmpeg", "-y", "-v", "error", "-ss", f"{t:.3f}", "-i", video_path,
                "-frames:v", "1", out_png]
         try:
-            res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            res = _run_media_command(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                  text=True, encoding='utf-8', errors='replace', timeout=60,
                                  **_win_subprocess_flags())
             if res.returncode == 0 and os.path.exists(out_png) and os.path.getsize(out_png) > 0:
@@ -361,7 +565,7 @@ def clip_step_profile(video_path, tmp_dir, samples=_PACE_SAMPLES):
                 ok = _extract_video_frame(video_path, png, 'last', sseof_offset=tail_off)
             else:
                 t = duration * i / (samples - 1)
-                res = subprocess.run(
+                res = _run_media_command(
                     ["ffmpeg", "-y", "-v", "error", "-ss", f"{t:.3f}", "-i", video_path,
                      "-frames:v", "1", png],
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -950,7 +1154,7 @@ def _is_declared_editorial_cut(body, meta=''):
 
 def plan_video_slots(video_slots, slot_to_path, slot_to_quality, videos_dir, target_slots=None,
                       strict=False, verify_fn=None, gate_level='standard', stale_slots=None,
-                      override_flagged=False, existing_videos=None):
+                      override_flagged=False, existing_videos=None, config=None):
     """为每个视频槽位做生成决策。只读文件系统，不做任何写操作，可单测。
 
     video_slots: _parse_prompt_slots 的 videos 输出（{slot: str 或 {'body':...}}）
@@ -974,11 +1178,14 @@ def plan_video_slots(video_slots, slot_to_path, slot_to_quality, videos_dir, tar
               'generate' —— 需要提交生成
               'blocked'  —— 前置条件不满足（缺帧/降级帧），reason 说明原因
       start_frame / end_frame: 锚点帧绝对路径
-      delete_existing: 旧文件存在且即将被重新生成覆盖（显式重试，或断点续传时检测到
-        与当前锚点帧不符的过期片段），调用方需先删除
+      delete_existing: 兼容旧字段，表示需要替换旧版本；必须等新结果通过后原子替换，
+        不得预先删除旧文件
     """
     if verify_fn is None:
-        verify_fn = verify_video_anchors
+        def verify_fn(video_path, start_frame, end_frame, strict=False):
+            return verify_video_anchors(video_path, start_frame, end_frame,
+                                        strict=strict, config=config)
+    skip_reviews = reviews_disabled(config)
     slots = sorted(video_slots.keys())
     if target_slots is not None:
         wanted = {int(x) for x in target_slots}
@@ -1053,7 +1260,8 @@ def plan_video_slots(video_slots, slot_to_path, slot_to_quality, videos_dir, tar
                 continue
 
             # 5. 其余已有视频（如起止帧重渲过导致血统过期，或未登记在清单的残留文件）：核对首尾帧锚点
-            ok, verify_reason = verify_fn(dest_path, start_p, end_p, strict=strict)
+            ok, verify_reason = ((True, 'reviewsDisabled') if skip_reviews else
+                                 verify_fn(dest_path, start_p, end_p, strict=strict))
             if ok:
                 plan['action'] = 'reuse'
                 plans.append(plan)
@@ -1069,6 +1277,10 @@ def plan_video_slots(video_slots, slot_to_path, slot_to_quality, videos_dir, tar
         elif not is_hero and (end_slot is not None) and (not end_p or not os.path.exists(end_p)):
             plan['action'] = 'blocked'
             plan['reason'] = f"视频 {slot} 所需的结束帧 IMAGE {end_slot} 不存在。请重新生成该帧！"
+        elif skip_reviews:
+            # 总开关跳过历史审查标记和本地帧对探针；真实文件缺失仍由上面拦截。
+            plan['action'] = 'generate'
+            plan['reviews_skipped'] = True
         elif slot_to_quality.get(start_slot) == 'i2i_fallback_degraded' \
                 or (end_slot is not None and slot_to_quality.get(end_slot) == 'i2i_fallback_degraded'):
             plan['action'] = 'blocked'
@@ -1222,6 +1434,18 @@ def _video_info(plan, video_model, status, error=None):
     return info
 
 
+def _video_project_for_account(manifest, account_id):
+    """Prefer the account's known canvas; keep the frame-origin binding intact."""
+    projects = manifest.get('google_fx_projects') or {}
+    if account_id and projects.get(account_id):
+        return projects[account_id]
+    owner = manifest.get('google_fx_project_account_id')
+    if owner and owner != account_id:
+        return None
+    # Legacy projects have no recorded owner; retain their existing verified fallback.
+    return manifest.get('google_fx_project_url')
+
+
 class _ManifestWriter:
     """manifest.json 的 videos 段增量写入：同槽位后写覆盖先写，按槽位升序排列。
     每次 record() 立即落盘——浏览器批量任务动辄十几分钟，进度必须实时可恢复。"""
@@ -1231,9 +1455,70 @@ class _ManifestWriter:
         self.data = manifest_data
         self.all_slots = sorted(all_slots)
         self.results = []  # 本次运行产生的 video_info（含失败），按发生顺序
+        self.attempt_id = uuid.uuid4().hex
+        self.started_at = datetime.now(timezone.utc).isoformat()
+        self.attempt_outcomes = {}
+        self.data.setdefault('video_generation_stats', {})['last_run'] = {
+            'attempt_id': self.attempt_id, 'failed_slots': [], 'cancelled_slots': [],
+        }
 
     def record(self, video_info):
-        self.results.append(video_info)
+        previous_videos = list(self.data.get('videos', []))
+        old_attempt = self.attempt_outcomes.get(video_info['slot'])
+        info = dict(video_info)
+        status = info.get('status')
+        attempt = dict(old_attempt or {})
+        for key in ('account_id', 'project_url', 'tile_id', 'media_id', 'prompt_hash',
+                    'start_uuid', 'end_uuid', 'refs', 'submission_pending', 'confirmed'):
+            if key in (info.get('last_attempt') or {}):
+                attempt[key] = info['last_attempt'][key]
+        attempt.update(id=self.attempt_id, status=status, started_at=self.started_at)
+        if status == 'success':
+            attempt['submission_pending'] = False
+        if status in ('running', 'success'):
+            attempt.pop('error', None)
+        if status == 'running':
+            attempt.pop('finished_at', None)
+        if status != 'running':
+            attempt['finished_at'] = datetime.now(timezone.utc).isoformat()
+        if info.get('error'):
+            attempt['error'] = info['error']
+        self.attempt_outcomes[info['slot']] = attempt
+        previous = next((v for v in self.data.get('videos', [])
+                         if isinstance(v, dict) and v.get('slot') == info['slot']), None)
+        if status in ('running', 'failed', 'cancelled') and previous and previous.get('status') == 'success':
+            raw = previous.get('file') or ''
+            candidates = [raw, os.path.join(_BASE_DIR, raw.lstrip('/')),
+                          os.path.join(os.path.dirname(self.path), 'videos', os.path.basename(raw))]
+            if any(path and os.path.isfile(path) and os.path.getsize(path) > 0 for path in candidates):
+                info = dict(previous)
+                info['retained_previous'] = True
+        info['last_attempt'] = attempt
+        if status == 'success':
+            info.pop('retained_previous', None)
+        self.results.append(info)
+        try:
+            self.save()
+        except BaseException:
+            self.results.pop()
+            self.data['videos'] = previous_videos
+            if old_attempt is None:
+                self.attempt_outcomes.pop(info['slot'], None)
+            else:
+                self.attempt_outcomes[info['slot']] = old_attempt
+            raise
+        return info
+
+    def finish_unresolved(self, status='failed', error='本次尝试未交付视频'):
+        for slot, attempt in list(self.attempt_outcomes.items()):
+            if attempt.get('status') != 'running':
+                continue
+            self.record({'slot': slot, 'sequence': slot, 'status': status,
+                         'file': '', 'url': '', 'error': error})
+        stats = self.data.setdefault('video_generation_stats', {})
+        stats['last_run'] = {**(stats.get('last_run') or {}), 'attempt_id': self.attempt_id,
+                             'failed_slots': [s for s, a in self.attempt_outcomes.items() if a['status'] == 'failed'],
+                             'cancelled_slots': [s for s, a in self.attempt_outcomes.items() if a['status'] == 'cancelled']}
         self.save()
 
     def save(self):
@@ -1243,15 +1528,17 @@ class _ManifestWriter:
                 by_slot[v['slot']] = v
         all_known_slots = sorted(set(self.all_slots) | set(by_slot.keys()))
         self.data['videos'] = [by_slot[s] for s in all_known_slots if s in by_slot]
+        self.data['video_generation_stats']['last_run'].update(
+            attempt_id=self.attempt_id,
+            failed_slots=[s for s, a in self.attempt_outcomes.items() if a['status'] == 'failed'],
+            cancelled_slots=[s for s, a in self.attempt_outcomes.items() if a['status'] == 'cancelled'])
         # 视频阶段的能力印章：numpy/ffmpeg 缺失时防串片的首尾帧锚点校验、i2v 帧对
         # 契约、冻结检测全都静默跳过（返回 'skipped'/False，不拦截也不报错）。每次
         # 落盘都重盖一次，环境中途变化也能如实反映（stamp 内部按阶段覆盖，不累积）。
         stamp_manifest_capabilities(self.data, 'videos')
-        try:
-            # 项目级锁 + 原子替换（write_manifest 内部处理 Windows 句柄占用重试）
-            write_manifest(os.path.dirname(self.path), self.data)
-        except Exception as e:
-            print(f"Warning: could not write updated manifest.json ({e})")
+        with manifest_lock(os.path.dirname(self.path)):
+            write_json_atomic(self.path, self.data)
+
 
 
 def _adapt_prompt_after_anchor_rejection(prompt, reason):
@@ -1294,7 +1581,8 @@ class _BatchBridge:
 
     def __init__(self, pending, total, video_model, writer, on_progress, strict=False,
                  process_check_fn=None, account_pool=None, pool_account_id=None,
-                 allow_anchor_mismatch=False, config=None):
+                 allow_anchor_mismatch=False, config=None, cancel_check=None):
+        self.cancel_check = cancel_check
         self.pending = pending          # [{'plan':..., 'req':..., 'temp_out_dir':...}]
         self.total = total
         self.video_model = video_model
@@ -1318,6 +1606,9 @@ class _BatchBridge:
         # 本次批次是否观测到"登录失效等待人工处理超时"——generate_video_sequence
         # 据此判断要不要自动切换号池账号重试剩余失败槽位。
         self.saw_login_required_timeout = False
+        # Flow explicitly blocked this request/account. The runner drains its
+        # in-flight tiles; the sequence must not start a preplanned later leg.
+        self.flow_unusual_activity = False
         # 批量脚本在风控失败重试时自己换掉的号池账号（account_switched 事件）。
         # 批次跑完后并入 used_account_ids，免得补跑那一轮又挑回刚被判过的号。
         self.switched_accounts = []
@@ -1335,14 +1626,45 @@ class _BatchBridge:
             return self.on_progress(stage, payload)
         return None
 
-    def _fail(self, plan, message):
-        self.writer.record(_video_info(plan, self.video_model, status='failed', error=message))
+    def _fail(self, plan, message, details=None):
+        failed = _video_info(plan, self.video_model, status='failed', error=message)
+        if details:
+            failed['last_attempt'] = details
+        info = self.writer.record(failed) or {}
         self._emit('video_error', {
             'index': plan['slot'], 'current': plan['seq'],
             'total': self.total, 'message': message,
+            'last_attempt': info.get('last_attempt'),
+            'retained_previous': bool(info.get('retained_previous')),
         })
 
     def __call__(self, batch_idx, stage, details):
+        if stage == 'account_switching':
+            self._emit('video_warning', {
+                **(details or {}), 'total': self.total,
+                'message': '当前账号持续受限，正在核对备用账号积分并切号…',
+            })
+            return None
+        if stage == 'video_warning':
+            if (details or {}).get('code') == 'flow_unusual_activity':
+                self.flow_unusual_activity = True
+            self._emit(stage, {**(details or {}), 'total': self.total})
+            return None
+        if stage in ('ip_rotating', 'ip_rotated', 'ip_rotation_failed'):
+            # 出口切换属于整个生成任务，不依赖某个分段；保留结构化信息供事件回放。
+            payload = dict(details or {})
+            retry = payload.get('retry')
+            attempt = f'第 {retry} 次换 IP' if retry else '换 IP'
+            if stage == 'ip_rotating':
+                message = f'平台异常活动拦截，正在{attempt}，验证出口…'
+            elif stage == 'ip_rotated':
+                message = (f"{attempt}，已验证：{payload.get('old_ip') or '未知'} → "
+                           f"{payload.get('new_ip') or '未知'}，继续未完成视频")
+            else:
+                message = '换 IP 失败，已停止重试'
+            payload.setdefault('message', message)
+            self._emit(stage, {**payload, 'total': self.total})
+            return None
         if stage.startswith('manual_intervention_'):
             # 登录失效/验证码/安全拦截：连接/页面级状态，不属于某一个具体分段，
             # 原样转发给 SPARK 事件流以驱动前端常驻横幅，不落 manifest。
@@ -1358,7 +1680,6 @@ class _BatchBridge:
             self._emit(stage, {**(details or {}), 'index': slot, 'total': self.total})
             return None
         if stage == 'account_switched':
-            # 批量脚本被判异常活动后换号重试（原来是换 IP，2026-07-26 统一改成换号）。
             # 换号是连接/账号级动作，不属于某个具体分段：把后续的积分耗尽标记跟着
             # 指到新账号上，否则会把失败记到已经不在用的那个号头上。
             new_id = (details or {}).get('user_id')
@@ -1366,9 +1687,13 @@ class _BatchBridge:
                 self.switched_accounts.append(new_id)
                 if self.pool_account_id:
                     self.pool_account_id = new_id
+            reason = (details or {}).get('reason')
+            switch_message = ('当前账号额度不足，已周期停用 24 小时并换号继续'
+                              if reason == 'credit_exhausted'
+                              else '当前账号遇到异常，已换号重试')
             self._emit('video_warning', {
                 'total': self.total,
-                'message': (f"批量脚本被判异常活动，已换号重试："
+                'message': (f"{switch_message}："
                             f"{(details or {}).get('previous') or '当前账号'} → {new_id}"),
             })
             return None
@@ -1379,102 +1704,141 @@ class _BatchBridge:
             })
         elif stage == 'request_submitted':
             self.stats['submitted_requests'] += 1
+            # Journal the paid submission at the task layer even if the project
+            # checkpoint below fails (for example because its disk is full).
             self._emit('request_submitted', {
+                **(details or {}),
                 'index': plan['slot'], 'current': plan['seq'], 'total': self.total,
             })
+            submitted = _video_info(plan, self.video_model, status='running')
+            submitted['last_attempt'] = details or {}
+            self.writer.record(submitted)
         elif stage == 'video_done':
             self.stats['downloaded_results'] += 1
             generated_path = (details or {}).get('video_url')
-            if not (generated_path and os.path.exists(generated_path)):
+            if not (generated_path and os.path.isfile(generated_path) and os.path.getsize(generated_path) > 0):
                 self._fail(plan, '生成的视频文件不存在')
                 return None
-            shutil.move(generated_path, plan['dest_path'])
-            ok, reason = verify_video_anchors(plan['dest_path'], plan['start_frame'],
-                                              plan['end_frame'], strict=self.strict,
-                                              config=self.config)
-            if not ok:
-                if not self.allow_anchor_mismatch:
-                    self.stats['anchor_rejections'] += 1
-                    req = self.pending[batch_idx].get('req')
-                    if req is not None:
-                        adapted = _adapt_prompt_after_anchor_rejection(
-                            getattr(req, 'prompt', ''), reason)
-                        if adapted != getattr(req, 'prompt', ''):
-                            req.prompt = adapted
-                            plan['prompt'] = adapted
-                            self.stats['adaptive_retries'] += 1
-                            self._emit('video_retry_adapted', {
-                                'index': plan['slot'], 'current': plan['seq'],
-                                'total': self.total,
-                                'message': f"槽位 {plan['slot']} 已根据锚点偏差改写重试约束。",
-                            })
-                    try:
-                        os.remove(plan['dest_path'])
-                    except Exception:
-                        pass
-                    self._fail(plan, (
-                        f"下载的视频内容与槽位 {plan['slot']} 的首尾锚点帧不符 (MAD {reason})，"
-                        f"疑似画布串片/错误下载，已拦截并删除。请重试该片段。"
-                    ))
-                    return 'rejected'  # 通知批量脚本该片段实际失败，可参与失败重试
-                self._emit('video_warning', {
-                    'index': plan['slot'], 'current': plan['seq'], 'total': self.total,
-                    'message': (
-                        f"槽位 {plan['slot']} 锚点校验未通过 (MAD {reason})；"
-                        "已按显式风险覆盖保留该片段。"
-                    ),
+            fd, candidate = tempfile.mkstemp(prefix='.video-attempt-', suffix='.mp4',
+                                              dir=os.path.dirname(plan['dest_path']))
+            os.close(fd)
+            try:
+                shutil.move(generated_path, candidate)
+                ok, reason = verify_video_anchors(candidate, plan['start_frame'],
+                                                  plan['end_frame'], strict=self.strict,
+                                                  config=self.config)
+                if not ok:
+                    if not self.allow_anchor_mismatch:
+                        self.stats['anchor_rejections'] += 1
+                        req = self.pending[batch_idx].get('req')
+                        if req is not None:
+                            adapted = _adapt_prompt_after_anchor_rejection(
+                                getattr(req, 'prompt', ''), reason)
+                            if adapted != getattr(req, 'prompt', ''):
+                                req.prompt = adapted
+                                plan['prompt'] = adapted
+                                self.stats['adaptive_retries'] += 1
+                                self._emit('video_retry_adapted', {
+                                    'index': plan['slot'], 'current': plan['seq'],
+                                    'total': self.total,
+                                    'message': f"槽位 {plan['slot']} 已根据锚点偏差改写重试约束。",
+                                })
+                        try:
+                            os.remove(candidate)
+                        except Exception:
+                            pass
+                        self._fail(plan, (
+                            f"下载的视频内容与槽位 {plan['slot']} 的首尾锚点帧不符 (MAD {reason})，"
+                            f"疑似画布串片/错误下载，已拦截并删除。请重试该片段。"
+                        ))
+                        return 'rejected'  # 通知批量脚本该片段实际失败，可参与失败重试
+                    self._emit('video_warning', {
+                        'index': plan['slot'], 'current': plan['seq'], 'total': self.total,
+                        'message': (
+                            f"槽位 {plan['slot']} 锚点校验未通过 (MAD {reason})；"
+                            "已按显式风险覆盖保留该片段。"
+                        ),
+                    })
+                process_reason = None
+                if self.process_check_fn is not None:
+                    action, process_reason = self.process_check_fn({**plan, 'dest_path': candidate})
+                    if action == 'reject':
+                        self.stats['process_rejections'] += 1
+                        try:
+                            os.remove(candidate)
+                        except Exception:
+                            pass
+                        self._fail(plan, (
+                            f"槽位 {plan['slot']} 的视频段内过程检测未通过（{process_reason}），"
+                            f"疑似空心片段/无关内容，已拦截并删除。请重试该片段。"
+                        ))
+                        return 'rejected'  # 与锚点拒收同路径：批量脚本据此进入失败重试轮
+                if self.cancel_check and self.cancel_check():
+                    raise ConnectionError('视频生成已取消，已保留原视频')
+                info = _video_info(plan, self.video_model, status='success')
+                # Keep the upstream output identity with the local slot; DOM stamps
+                # are transient and cannot serve as a durable provenance record.
+                for key in ('flow_media_id', 'flow_project_url', 'account_id'):
+                    if (details or {}).get(key):
+                        info[key] = details[key]
+                # 校验结果留痕：skipped:* 表示该片段其实没经过锚点核验（环境异常被放行）
+                info['anchor_check'] = reason
+                if not ok:
+                    info['anchor_mismatch_overridden'] = True
+                if process_reason is not None:
+                    # 段内过程检测留痕：PASS / WARN:... / Skipped(...) / skipped:...
+                    info['process_check'] = process_reason
+                    if action == 'warn':
+                        # 结构化告警标记：终态质量风险汇总据此计数，不用猜留痕文本语义
+                        info['process_warned'] = True
+                account_id = (details or {}).get('account_id') or self.pool_account_id
+                project_url = (details or {}).get('project_url') or (details or {}).get('flow_project_url')
+                if account_id and project_url and hasattr(self.writer, 'data'):
+                    self.writer.data.setdefault('google_fx_projects', {})[account_id] = project_url
+                # Hold a same-filesystem backup until the manifest checkpoint commits.
+                backup = None
+                if os.path.exists(plan['dest_path']):
+                    fd, backup = tempfile.mkstemp(prefix='.video-backup-', suffix='.mp4',
+                                                  dir=os.path.dirname(plan['dest_path']))
+                    os.close(fd)
+                    shutil.copy2(plan['dest_path'], backup)
+                try:
+                    os.replace(candidate, plan['dest_path'])
+                    info = self.writer.record(info) or info
+                except BaseException:
+                    if backup:
+                        os.replace(backup, plan['dest_path'])
+                    else:
+                        with contextlib.suppress(OSError):
+                            os.remove(plan['dest_path'])
+                    raise
+                finally:
+                    if backup and os.path.exists(backup):
+                        os.remove(backup)
+                self.stats['accepted_results'] += 1
+                if self.process_check_fn is not None and process_reason and action == 'warn':
+                    self._emit('video_warning', {
+                        'index': plan['slot'], 'current': plan['seq'], 'total': self.total,
+                        'message': f"VID {plan['slot']:03d} 段内过程检测告警（宽松档放行）：{process_reason}",
+                    })
+                self._emit('video_done', {
+                    'index': plan['slot'], 'current': plan['seq'],
+                    'total': self.total, 'video': info,
                 })
-            process_reason = None
-            if self.process_check_fn is not None:
-                action, process_reason = self.process_check_fn(plan)
-                if action == 'reject':
-                    self.stats['process_rejections'] += 1
-                    try:
-                        os.remove(plan['dest_path'])
-                    except Exception:
-                        pass
-                    self._fail(plan, (
-                        f"槽位 {plan['slot']} 的视频段内过程检测未通过（{process_reason}），"
-                        f"疑似空心片段/无关内容，已拦截并删除。请重试该片段。"
-                    ))
-                    return 'rejected'  # 与锚点拒收同路径：批量脚本据此进入失败重试轮
-            info = _video_info(plan, self.video_model, status='success')
-            # Keep the upstream output identity with the local slot; DOM stamps
-            # are transient and cannot serve as a durable provenance record.
-            for key in ('flow_media_id', 'flow_project_url'):
-                if (details or {}).get(key):
-                    info[key] = details[key]
-            # 校验结果留痕：skipped:* 表示该片段其实没经过锚点核验（环境异常被放行）
-            info['anchor_check'] = reason
-            if not ok:
-                info['anchor_mismatch_overridden'] = True
-            if process_reason is not None:
-                # 段内过程检测留痕：PASS / WARN:... / Skipped(...) / skipped:...
-                info['process_check'] = process_reason
-                if action == 'warn':
-                    # 结构化告警标记：终态质量风险汇总据此计数，不用猜留痕文本语义
-                    info['process_warned'] = True
-            self.writer.record(info)
-            self.stats['accepted_results'] += 1
-            if self.process_check_fn is not None and process_reason and action == 'warn':
-                self._emit('video_warning', {
-                    'index': plan['slot'], 'current': plan['seq'], 'total': self.total,
-                    'message': f"VID {plan['slot']:03d} 段内过程检测告警（宽松档放行）：{process_reason}",
-                })
-            self._emit('video_done', {
-                'index': plan['slot'], 'current': plan['seq'],
-                'total': self.total, 'video': info,
-            })
+            finally:
+                if os.path.exists(candidate):
+                    os.remove(candidate)
         elif stage == 'video_error':
             # 单段失败隔离：记录失败状态，其余槽位继续
             message = (details or {}).get('message') or '生成失败'
-            if self.pool_account_id and self.account_pool is not None:
+            failed_account_id = (details or {}).get('account_id') or self.pool_account_id
+            if failed_account_id and self.account_pool is not None:
                 try:
                     if _get_credit_helpers().is_credit_exhausted_message(message):
-                        self.account_pool.mark_exhausted(self.pool_account_id)
+                        self.account_pool.mark_exhausted(failed_account_id)
                 except Exception as e:
                     print(f"Warning: 账号池积分耗尽标记失败 ({e})")
-            self._fail(plan, message)
+            self._fail(plan, message, details)
         return None
 
 
@@ -1511,7 +1875,7 @@ def generate_video_sequence(config, title, prompt_block, on_progress=None, targe
                               gate_level=qa_gate_level(config),
                               stale_slots=load_stale_slots(manifest_data),
                               override_flagged=override_flagged,
-                              existing_videos=existing_videos)
+                              existing_videos=existing_videos, config=config)
 
     if on_progress:
         on_progress('start', {
@@ -1604,11 +1968,8 @@ def generate_video_sequence(config, title, prompt_block, on_progress=None, targe
                     'index': plan['slot'], 'current': plan['seq'],
                     'total': len(plans), 'message': plan['warning'],
                 })
-        if plan['delete_existing']:
-            try:
-                os.remove(plan['dest_path'])
-            except Exception as e:
-                print(f"Warning: could not remove old video file {plan['dest_path']}: {e}")
+        # Keep the last accepted video until a validated replacement is ready.
+        writer.record(_video_info(plan, video_model, status='running'))
         temp_out_dir = tempfile.mkdtemp()
         req = models.VideoRequest(
             prompt=plan['prompt'],
@@ -1633,169 +1994,193 @@ def generate_video_sequence(config, title, prompt_block, on_progress=None, targe
     if canvas_project_url and known_canvas_frames:
         print(f"[VIDEO] 帧序列就在绑定的 Flow 画布上，{known_canvas_frames} 段任务的锚点帧免重复上传")
 
-    if pending_items:
-        account_pool = _get_account_pool_service()
-        pool_account_id = _select_pool_account(config, account_pool)
-        if pool_account_id:
-            apply_google_fx_runtime_overrides(config)
-
-        def _process_gate(plan):
-            return check_video_process(config, plan['dest_path'], plan['start_frame'],
-                                       plan['end_frame'], plan['prompt'],
-                                       meta=plan.get('meta', ''))
-
-        def cancel_check_cb():
-            if on_progress:
-                try:
-                    # 空探测调用：连接已死/用户已取消时返回 True
-                    return on_progress('cancel_check', None)
-                except Exception:
-                    return True
-            return False
-
-        def _run_leg(items, account_id):
-            """跑一条腿：绑定这一腿的号池账号，再交给批量脚本。返回 bridge。"""
-            actual_account_id = account_id or pool_account_id or config.get('googleFxUserId')
-            if actual_account_id:
-                config['googleFxUserId'] = actual_account_id
+    try:
+        if pending_items:
+            account_pool = _get_account_pool_service()
+            pool_account_id = _select_pool_account(config, account_pool)
+            if pool_account_id:
                 apply_google_fx_runtime_overrides(config)
-            leg_bridge = _BatchBridge(items, len(plans), video_model, writer, on_progress,
-                                      strict=strict_gates_enabled(config),
-                                      process_check_fn=_process_gate,
-                                      account_pool=account_pool,
-                                      pool_account_id=actual_account_id,
-                                      allow_anchor_mismatch=override_flagged,
-                                      config=config)
-            run_bridges.append(leg_bridge)
-            from integrations.google_fx.utils import account_binding
-            flow_project_url = writer.data.get('google_fx_project_url')
-            for item in items:
-                item['req'].project_url = flow_project_url
-            # fx_cancel_context 必须包住这次调用：cancel_check 只有 _ChunkRunner 自己的
-            # _check_cancel() 在读，而 L2 helpers 里那 10 处 _check_cancelled() 走的是
-            # per-request 的 CancelState contextvar。视频链此前从不建这个上下文，于是
-            # 那些检查在视频链上全是空转——最典型的是 _connect_fx_page 的 CDP 重连循环
-            # （3 轮 ×（45s 启动超时 + 10×2s 重试）），它只认 contextvar，传进去的
-            # cancel_check 只往下透给 find_or_create_page，重试循环本身读不到。
-            # 帧链一直是对的（frame_generator._fx_generate_batch），这里对齐它。
-            with account_binding.bound_task_account(actual_account_id), \
-                    fx_cancel_context(cancel_check_cb, deadline=fx_request_deadline()):
-                try:
-                    fx_results = google_fx_video.generate_videos_batch_google_fx(
-                        [it['req'] for it in items],
-                        on_progress=leg_bridge,
-                        cancel_check=cancel_check_cb
-                    )
-                    returned_url = next(
-                        (r.get('project_url') for r in (fx_results or [])
-                         if isinstance(r, dict) and r.get('project_url')),
-                        None,
-                    )
-                    if returned_url:
-                        writer.data['google_fx_project_url'] = returned_url
-                        writer.save()
-                finally:
-                    for it in items:
-                        shutil.rmtree(it['temp_out_dir'], ignore_errors=True)
-            return leg_bridge
 
-        # 换号（不换 IP）：号池自动选号且可用账号 ≥2 个时才切腿，否则退化为单批次
-        ring = _account_rotation_ring(config, account_pool, pool_account_id) if pool_account_id else []
-        legs = plan_generation_legs(pending_items, ring, _account_switch_interval(config))
-        used_account_ids = []
-        login_required_accounts = []
-        try:
-            for idx, leg in enumerate(legs):
-                # 腿与腿之间是唯一能干净停下来的位置：用户已取消就别再开下一个浏览器
-                if idx > 0 and (getattr(builtins, 'google_fx_cancelled', False) or cancel_check_cb()):
-                    break
-                # 切腿前复核积分：ring 是整条序列开始前按缓存值排定的，前面几条腿
-                # 烧掉多少积分号池并不记账，环里排在后面的号可能早就不够跑了。
-                if idx > 0 and pool_account_id:
-                    verified = revalidate_leg_account(
-                        config, account_pool, leg['user_id'], ring, used_account_ids)
-                    if verified is None:
-                        if on_progress:
-                            on_progress('video_warning', {
-                                'total': len(plans),
-                                'message': (f"号池里已经没有积分够用的账号，第 {idx + 1}/{len(legs)} 段"
-                                            f"仍按原计划用 {leg['user_id']} 试跑（生成中若确认积分不足会自动中止）"),
-                            })
-                    elif verified != leg['user_id']:
-                        if on_progress:
-                            on_progress('video_warning', {
-                                'total': len(plans),
-                                'message': (f"复核积分：原定账号 {leg['user_id']} 已不够用，"
-                                            f"第 {idx + 1}/{len(legs)} 段改用 {verified}"),
-                            })
-                        leg['user_id'] = verified
-                if idx > 0 and on_progress:
-                    on_progress('video_warning', {
-                        'total': len(plans),
-                        'message': (f"换号继续：第 {idx + 1}/{len(legs)} 段改用号池账号 {leg['user_id']} "
-                                    f"跑 {len(leg['items'])} 个片段（保持当前 IP，不换 IP）"),
-                    })
-                leg_bridge = _run_leg(leg['items'], leg['user_id'])
-                leg_account_id = leg['user_id'] or pool_account_id
-                if leg_account_id and leg_account_id not in used_account_ids:
-                    used_account_ids.append(leg_account_id)
-                # 批量脚本在这一腿内部换过的号也算"已用过"：补跑那一轮再挑回去
-                # 等于把刚被判异常活动的号又推上去。
-                for switched in leg_bridge.switched_accounts:
-                    if switched not in used_account_ids:
-                        used_account_ids.append(switched)
-                if leg_bridge.saw_login_required_timeout and leg_account_id \
-                        and leg_account_id not in login_required_accounts:
-                    login_required_accounts.append(leg_account_id)
-        finally:
-            # 兜底：被 break/异常跳过的腿，临时目录还没被 _run_leg 清掉
-            for it in pending_items:
-                shutil.rmtree(it['temp_out_dir'], ignore_errors=True)
+            def _process_gate(plan):
+                return check_video_process(config, plan['dest_path'], plan['start_frame'],
+                                           plan['end_frame'], plan['prompt'],
+                                           meta=plan.get('meta', ''))
 
-        # 🔁 2026-07-24: 号池自动选号的批次里，如果观测到"登录失效等待人工处理
-        # 超时"（人工没能在 20 分钟内处理完），换一个账号很可能就能跑通剩下的
-        # 失败槽位——不必等人工手动点"重试失败片段"。只在自动选号（非手动
-        # 指定账号）时触发，且只补一轮，避免账号池被跑穿也无限换号刷屏。
-        # 2026-07-25: 挑重试账号改走轮转环。原来这里二次调用 _select_pool_account 其实
-        # 永远返回 None——首次选号已经把 googleFxUserId 写回 config，二次调用会把它当成
-        # 手动指定而直接跳过，这条自动换号重试路径从未真正生效过。
-        if pool_account_id and login_required_accounts and not getattr(builtins, 'google_fx_cancelled', False):
-            for acct in login_required_accounts:
-                try:
-                    account_pool.mark_login_required(acct)
-                except Exception as e:
-                    print(f"Warning: 账号池登录失效标记失败 ({e})")
-            done_slots = {v['slot'] for v in writer.data.get('videos', []) if v.get('status') == 'success'}
-            retry_source = [it for it in pending_items if it['plan']['slot'] not in done_slots]
-            next_account_id = _next_unused_account(
-                config, account_pool, ring, set(used_account_ids) | set(login_required_accounts))
-            if retry_source and next_account_id:
+            def cancel_check_cb():
                 if on_progress:
-                    on_progress('video_warning', {
-                        'total': len(plans),
-                        'message': (f"检测到账号登录失效且等待人工处理超时，已自动切换号池账号 "
-                                    f"重试剩余 {len(retry_source)} 个片段"),
-                    })
-                retry_items = []
-                for it in retry_source:
-                    new_temp_dir = tempfile.mkdtemp()
-                    old_req = it['req']
-                    new_req = models.VideoRequest(
-                        prompt=old_req.prompt, image=old_req.image, end_image=old_req.end_image,
-                        image_uuid=old_req.image_uuid, end_image_uuid=old_req.end_image_uuid,
-                        model=old_req.model, ratio=old_req.ratio, duration=old_req.duration,
-                        resolution=getattr(old_req, 'resolution', None),
-                        output_path=new_temp_dir,
-                    )
-                    retry_items.append({'plan': it['plan'], 'req': new_req, 'temp_out_dir': new_temp_dir})
+                    try:
+                        # 空探测调用：连接已死/用户已取消时返回 True
+                        return on_progress('cancel_check', None)
+                    except Exception:
+                        return True
+                return False
 
-                _run_leg(retry_items, next_account_id)
+            def _run_leg(items, account_id):
+                """跑一条腿：绑定这一腿的号池账号，再交给批量脚本。返回 bridge。"""
+                actual_account_id = account_id or pool_account_id or config.get('googleFxUserId')
+                if actual_account_id:
+                    config['googleFxUserId'] = actual_account_id
+                    apply_google_fx_runtime_overrides(config)
+                leg_bridge = _BatchBridge(items, len(plans), video_model, writer, on_progress,
+                                          strict=strict_gates_enabled(config),
+                                          process_check_fn=_process_gate,
+                                          account_pool=account_pool,
+                                          pool_account_id=actual_account_id,
+                                          allow_anchor_mismatch=override_flagged,
+                                          config=config, cancel_check=cancel_check_cb)
+                run_bridges.append(leg_bridge)
+                from integrations.google_fx.utils import account_binding
+                flow_project_url = _video_project_for_account(writer.data, actual_account_id)
+                for item in items:
+                    item['req'].project_url = flow_project_url
+                # fx_cancel_context 必须包住这次调用：cancel_check 只有 _ChunkRunner 自己的
+                # _check_cancel() 在读，而 L2 helpers 里那 10 处 _check_cancelled() 走的是
+                # per-request 的 CancelState contextvar。视频链此前从不建这个上下文，于是
+                # 那些检查在视频链上全是空转——最典型的是 _connect_fx_page 的 CDP 重连循环
+                # （3 轮 ×（45s 启动超时 + 10×2s 重试）），它只认 contextvar，传进去的
+                # cancel_check 只往下透给 find_or_create_page，重试循环本身读不到。
+                # 帧链一直是对的（frame_generator._fx_generate_batch），这里对齐它。
+                with account_binding.bound_task_account(actual_account_id), \
+                        fx_cancel_context(cancel_check_cb, deadline=fx_request_deadline()):
+                    try:
+                        fx_results = google_fx_video.generate_videos_batch_google_fx(
+                            [it['req'] for it in items],
+                            on_progress=leg_bridge,
+                            cancel_check=cancel_check_cb
+                        )
+                        changed = False
+                        for result in fx_results or []:
+                            if not isinstance(result, dict):
+                                continue
+                            result_url = result.get('flow_project_url') or result.get('project_url')
+                            result_account = result.get('account_id') or actual_account_id
+                            if result_url and result_account:
+                                writer.data.setdefault('google_fx_projects', {})[result_account] = result_url
+                                changed = True
+                        if changed:
+                            writer.save()
+                    finally:
+                        for it in items:
+                            shutil.rmtree(it['temp_out_dir'], ignore_errors=True)
+                return leg_bridge
+
+            # 复用可用浏览器跑完整条序列，服务在余额耗尽后续跑剩余请求。
+            ring = _account_rotation_ring(config, account_pool, pool_account_id) if pool_account_id else []
+            legs = plan_generation_legs(pending_items, ring, _account_switch_interval(config))
+            used_account_ids = []
+            login_required_accounts = []
+            try:
+                for idx, leg in enumerate(legs):
+                    # 腿与腿之间是唯一能干净停下来的位置：用户已取消就别再开下一个浏览器
+                    if idx > 0 and (getattr(builtins, 'google_fx_cancelled', False) or cancel_check_cb()):
+                        raise ConnectionError('视频生成已取消，已保留原视频')
+                    # 切腿前复核积分：ring 是整条序列开始前按缓存值排定的，前面几条腿
+                    # 烧掉多少积分号池并不记账，环里排在后面的号可能早就不够跑了。
+                    if idx > 0 and pool_account_id:
+                        verified = revalidate_leg_account(
+                            config, account_pool, leg['user_id'], ring, used_account_ids)
+                        if verified is None:
+                            if on_progress:
+                                on_progress('video_warning', {
+                                    'total': len(plans),
+                                    'message': (f"号池里已经没有积分够用的账号，第 {idx + 1}/{len(legs)} 段"
+                                                f"仍按原计划用 {leg['user_id']} 试跑（生成中若确认积分不足会自动中止）"),
+                                })
+                        elif verified != leg['user_id']:
+                            if on_progress:
+                                on_progress('video_warning', {
+                                    'total': len(plans),
+                                    'message': (f"复核积分：原定账号 {leg['user_id']} 已不够用，"
+                                                f"第 {idx + 1}/{len(legs)} 段改用 {verified}"),
+                                })
+                            leg['user_id'] = verified
+                    if idx > 0 and on_progress:
+                        on_progress('video_warning', {
+                            'total': len(plans),
+                            'message': (f"换号继续：第 {idx + 1}/{len(legs)} 段改用号池账号 {leg['user_id']} "
+                                        f"跑 {len(leg['items'])} 个片段（保持当前 IP，不换 IP）"),
+                        })
+                    leg_bridge = _run_leg(leg['items'], leg['user_id'])
+                    if leg_bridge.flow_unusual_activity:
+                        # The blocked leg already saved every collected result.
+                        # Do not send this batch's remaining clips on another account.
+                        break
+                    leg_account_id = leg['user_id'] or pool_account_id
+                    if leg_account_id and leg_account_id not in used_account_ids:
+                        used_account_ids.append(leg_account_id)
+                    # 批量脚本在这一腿内部换过的号也算"已用过"：补跑那一轮再挑回去
+                    # 等于把刚被判异常活动的号又推上去。
+                    for switched in leg_bridge.switched_accounts:
+                        if switched not in used_account_ids:
+                            used_account_ids.append(switched)
+                    if leg_bridge.saw_login_required_timeout and leg_account_id \
+                            and leg_account_id not in login_required_accounts:
+                        login_required_accounts.append(leg_account_id)
+            finally:
+                # 兜底：被 break/异常跳过的腿，临时目录还没被 _run_leg 清掉
+                for it in pending_items:
+                    shutil.rmtree(it['temp_out_dir'], ignore_errors=True)
+
+            # 🔁 2026-07-24: 号池自动选号的批次里，如果观测到"登录失效等待人工处理
+            # 超时"（人工没能在 20 分钟内处理完），换一个账号很可能就能跑通剩下的
+            # 失败槽位——不必等人工手动点"重试失败片段"。只在自动选号（非手动
+            # 指定账号）时触发，且只补一轮，避免账号池被跑穿也无限换号刷屏。
+            # 2026-07-25: 挑重试账号改走轮转环。原来这里二次调用 _select_pool_account 其实
+            # 永远返回 None——首次选号已经把 googleFxUserId 写回 config，二次调用会把它当成
+            # 手动指定而直接跳过，这条自动换号重试路径从未真正生效过。
+            if pool_account_id and login_required_accounts and not getattr(builtins, 'google_fx_cancelled', False) and not cancel_check_cb():
+                for acct in login_required_accounts:
+                    try:
+                        account_pool.mark_login_required(acct)
+                    except Exception as e:
+                        print(f"Warning: 账号池登录失效标记失败 ({e})")
+                done_slots = {slot for slot, attempt in writer.attempt_outcomes.items() if attempt['status'] == 'success'}
+                retry_source = [it for it in pending_items if it['plan']['slot'] not in done_slots
+                                and not writer.attempt_outcomes.get(it['plan']['slot'], {}).get('submission_pending')]
+                next_account_id = _next_unused_account(
+                    config, account_pool, ring, set(used_account_ids) | set(login_required_accounts))
+                if retry_source and next_account_id:
+                    if on_progress:
+                        on_progress('video_warning', {
+                            'total': len(plans),
+                            'message': (f"检测到账号登录失效且等待人工处理超时，已自动切换号池账号 "
+                                        f"重试剩余 {len(retry_source)} 个片段"),
+                        })
+                    retry_items = []
+                    for it in retry_source:
+                        new_temp_dir = tempfile.mkdtemp()
+                        old_req = it['req']
+                        new_req = models.VideoRequest(
+                            prompt=old_req.prompt, image=old_req.image, end_image=old_req.end_image,
+                            image_uuid=old_req.image_uuid, end_image_uuid=old_req.end_image_uuid,
+                            model=old_req.model, ratio=old_req.ratio, duration=old_req.duration,
+                            resolution=getattr(old_req, 'resolution', None),
+                            output_path=new_temp_dir,
+                        )
+                        retry_items.append({'plan': it['plan'], 'req': new_req, 'temp_out_dir': new_temp_dir})
+
+                    _run_leg(retry_items, next_account_id)
+
+            if cancel_check_cb():
+                raise ConnectionError('视频生成已取消，已保留原视频')
+
+    except BaseException as exc:
+        status = 'cancelled' if isinstance(exc, ConnectionError) else 'failed'
+        writer.finish_unresolved(status, str(exc))
+        raise
+    finally:
+        for item in pending_items:
+            shutil.rmtree(item['temp_out_dir'], ignore_errors=True)
+    writer.finish_unresolved()
 
     stat_keys = (
         'submitted_requests', 'downloaded_results', 'accepted_results',
         'anchor_rejections', 'process_rejections', 'adaptive_retries',
     )
     run_stats = {key: sum(b.stats.get(key, 0) for b in run_bridges) for key in stat_keys}
+    run_stats['attempt_id'] = writer.attempt_id
+    run_stats['failed_slots'] = [slot for slot, a in writer.attempt_outcomes.items() if a['status'] == 'failed']
+    run_stats['cancelled_slots'] = [slot for slot, a in writer.attempt_outcomes.items() if a['status'] == 'cancelled']
     run_stats['planned_slots'] = len(plans)
     run_stats['generated_slots'] = sum(1 for p in plans if p.get('action') == 'generate')
     run_stats['skipped_cut_slots'] = [p['slot'] for p in plans if p.get('action') == 'skip_cut']
@@ -1850,7 +2235,7 @@ def generate_video_collage(project_dir, out_collage_path=None):
     filter_str += f'concat=n={n}:v=1:a=0,tile={cols}x{rows}'
 
     try:
-        subprocess.run(
+        _run_media_command(
             ['ffmpeg', '-y'] + input_args + ['-filter_complex', filter_str, out_collage_path],
             capture_output=True, timeout=60, **_win_subprocess_flags()
         )
@@ -1868,7 +2253,7 @@ def generate_video_collage(project_dir, out_collage_path=None):
 
 
 def generate_video_chain_sequence(config, title, prompt_block, on_progress=None, target_slots=None,
-                                  override_flagged=False):
+                                  override_flagged=False, auto_merge=True):
     """纯视频提示词链式生成通道 (T2V -> I2V Chain)：
     - 第 1 段视频（Slot 1）：纯文生视频 (T2V)，无输入参考图。
     - 第 2..N 段视频（Slot k >= 2）：单图生视频 (I2V)，以前一段视频生成的最后一帧作为参考帧输入。
@@ -1952,6 +2337,7 @@ def generate_video_chain_sequence(config, title, prompt_block, on_progress=None,
     from integrations.google_fx.utils import account_binding
 
     writer = _ManifestWriter(manifest_path, manifest_data, all_available_slots)
+    canvas_project_url = _video_project_for_account(manifest_data, actual_account_id)
 
     existing_videos = {
         v['slot']: v for v in manifest_data.get('videos', [])
@@ -1977,8 +2363,11 @@ def generate_video_chain_sequence(config, title, prompt_block, on_progress=None,
 
     for seq_idx, slot in enumerate(slots_to_run, start=1):
         if cancel_check_cb():
-            print(f"[VIDEO CHAIN] 任务已被用户取消，停止后续槽位生成")
-            break
+            for remaining in slots_to_run[seq_idx - 1:]:
+                writer.record({'slot': remaining, 'sequence': remaining, 'status': 'cancelled',
+                               'file': '', 'url': '', 'error': '视频生成已取消'})
+            writer.finish_unresolved('cancelled', '视频生成已取消')
+            raise ConnectionError('视频生成已取消，已保留原视频')
 
         item = videos[slot]
         raw_prompt = item['body'] if isinstance(item, dict) else item
@@ -1986,9 +2375,9 @@ def generate_video_chain_sequence(config, title, prompt_block, on_progress=None,
         dest_path = os.path.join(videos_dir, f'vid_{slot:03d}.mp4')
         start_frame_path = os.path.join(frames_dir, f'img_{slot:03d}.webp')
 
-        # 检查是否可以复用已生成的有效视频（非针对该单槽位的显式强制重试）
+        # 仅整单续跑复用；target_slots 是显式重试，选择多段也必须重新生成。
         can_reuse = (
-            target_slots is None or (len(target_slots) > 1 and slot in target_slots)
+            target_slots is None
         ) and os.path.exists(dest_path) and os.path.getsize(dest_path) > 0 and (slot in existing_videos)
 
         if can_reuse and not override_flagged:
@@ -2089,6 +2478,7 @@ def generate_video_chain_sequence(config, title, prompt_block, on_progress=None,
                                        p['end_frame'], p['prompt'],
                                        meta=p.get('meta', ''))
 
+        writer.record(_video_info(plan_item, video_model, status='running'))
         single_item = [{'plan': plan_item, 'req': req, 'temp_out_dir': temp_out_dir}]
         slot_bridge = _BatchBridge(
             single_item, len(slots_to_run), video_model, writer, on_progress,
@@ -2097,7 +2487,7 @@ def generate_video_chain_sequence(config, title, prompt_block, on_progress=None,
             account_pool=account_pool,
             pool_account_id=actual_account_id,
             allow_anchor_mismatch=override_flagged,
-            config=config
+            config=config, cancel_check=cancel_check_cb
         )
 
         with account_binding.bound_task_account(actual_account_id), \
@@ -2108,22 +2498,27 @@ def generate_video_chain_sequence(config, title, prompt_block, on_progress=None,
                     on_progress=slot_bridge,
                     cancel_check=cancel_check_cb
                 )
-                returned_url = next(
-                    (r.get('project_url') for r in (fx_results or [])
-                     if isinstance(r, dict) and r.get('project_url')),
-                    None,
-                )
-                if returned_url:
-                    canvas_project_url = returned_url
-                    writer.data['google_fx_project_url'] = returned_url
-                    writer.save()
-
-                if not (os.path.exists(dest_path) and os.path.getsize(dest_path) > 0) and os.path.exists(temp_out_dir):
-                    downloaded = [os.path.join(temp_out_dir, f) for f in os.listdir(temp_out_dir) if f.endswith('.mp4')]
+                for item_result in fx_results or []:
+                    if not isinstance(item_result, dict):
+                        continue
+                    result_url = item_result.get('flow_project_url') or item_result.get('project_url')
+                    result_account = item_result.get('account_id') or actual_account_id
+                    if result_url and result_account:
+                        writer.data.setdefault('google_fx_projects', {})[result_account] = result_url
+                canvas_project_url = _video_project_for_account(writer.data, actual_account_id)
+                writer.save()
+                if writer.attempt_outcomes.get(slot, {}).get('status') != 'success':
+                    downloaded = [os.path.join(temp_out_dir, name) for name in os.listdir(temp_out_dir)
+                                  if name.endswith('.mp4')]
                     if downloaded:
-                        shutil.move(downloaded[0], dest_path)
-                        writer.record(_video_info(plan_item, video_model, status='success'))
+                        slot_bridge(0, 'video_done', {'video_url': downloaded[0]})
+                if writer.attempt_outcomes.get(slot, {}).get('status') == 'running':
+                    slot_bridge._fail(plan_item, '本次尝试未交付视频')
             except Exception as e:
+                if isinstance(e, ConnectionError) or cancel_check_cb():
+                    writer.finish_unresolved('cancelled', str(e))
+                    raise ConnectionError(str(e)) from e
+                slot_bridge._fail(plan_item, str(e))
                 print(f"[VIDEO CHAIN] 槽位 {slot} 生成异常: {e}")
                 if on_progress:
                     on_progress('video_error', {
@@ -2135,7 +2530,7 @@ def generate_video_chain_sequence(config, title, prompt_block, on_progress=None,
                 shutil.rmtree(temp_out_dir, ignore_errors=True)
 
         # 如果生成成功并已落盘到 dest_path，则抽取当前视频的关键帧
-        if os.path.exists(dest_path) and os.path.getsize(dest_path) > 0:
+        if writer.attempt_outcomes.get(slot, {}).get('status') == 'success' and os.path.exists(dest_path):
             if is_t2v:
                 first_f = os.path.join(frames_dir, f'img_{slot:03d}.webp')
                 if _extract_video_frame(dest_path, first_f, 'first'):
@@ -2152,25 +2547,33 @@ def generate_video_chain_sequence(config, title, prompt_block, on_progress=None,
     except Exception as coll_err:
         print(f"[VIDEO CHAIN] 生成拼图失败（非致命）: {coll_err}")
 
-    has_chain_failures = any(
+    writer.finish_unresolved()
+    has_chain_failures = any(a['status'] in ('failed', 'cancelled') for a in writer.attempt_outcomes.values()) or any(
         v.get('status') not in ('success', 'skipped_cut', 'skipped_bridge_hold')
         for v in writer.data.get('videos', []) if isinstance(v, dict)
     )
-    if not has_chain_failures:
+    if auto_merge and not has_chain_failures:
         try:
-            merge_speed = config.get('_merge_speed', 2)
+            merge_speed = config.get('_merge_speed', 4)
             if on_progress:
                 on_progress('merge_start', {'message': f'正在自动以 {merge_speed}x 速率合并视频...'})
             merged_info = merge_project_videos(
                 project_dir, speed=merge_speed,
-                cover_burn=config.get('_cover_burn', COVER_BURN_DEFAULT)
+                cover_burn=config.get('_cover_burn', COVER_BURN_DEFAULT), config=config,
+                on_progress=on_progress, cancel_check=cancel_check_cb
             )
             if merged_info:
                 writer.data['merged_video'] = merged_info
                 writer.save()
         except Exception as merge_err:
+            if isinstance(merge_err, ConnectionError):
+                raise
+            writer.data['merge_error'] = str(merge_err)
+            writer.save()
+            if on_progress:
+                on_progress('merge_error', {'message': str(merge_err)})
             print(f"[VIDEO CHAIN] 自动合并视频异常: {merge_err}")
-    else:
+    elif auto_merge:
         if on_progress:
             on_progress('merge_skip', {'message': '由于存在失败或未生成片段，已跳过自动合并。'})
 
@@ -2200,9 +2603,9 @@ def _ffprobe_video_params(path):
     """探测视频的 width/height/fps/duration；失败返回 None。"""
     try:
         cmd = ["ffprobe", "-v", "error", "-select_streams", "v:0",
-               "-show_entries", "stream=width,height,r_frame_rate:format=duration",
+               "-show_entries", "stream=width,height,r_frame_rate,duration:format=duration",
                "-of", "json", path]
-        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        res = _run_media_command(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                              text=True, encoding='utf-8', errors='replace', check=True,
                              **_win_subprocess_flags())
         info = json.loads(res.stdout)
@@ -2211,11 +2614,14 @@ def _ffprobe_video_params(path):
         num, _, den = rate.partition('/')
         den = den or '1'
         fps = (float(num) / float(den)) if float(den) else 24.0
+        stream_duration = st.get('duration')
+        duration = float(stream_duration if stream_duration not in (None, '', 'N/A')
+                         else (info.get('format') or {}).get('duration') or 0)
         return {
             'width': int(st.get('width') or 0),
             'height': int(st.get('height') or 0),
             'fps': round(fps, 3),
-            'duration': float((info.get('format') or {}).get('duration') or 0) or 0.0,
+            'duration': duration,
         }
     except Exception as e:
         print(f"[WARN] _ffprobe_video_params failed for {path}: {e}")
@@ -2253,9 +2659,9 @@ def _normalize_merge_speed(speed):
     try:
         value = float(speed)
     except (TypeError, ValueError):
-        value = 2.0
-    if value not in (1.0, 1.5, 2.0):
-        raise ValueError("视频合并速率仅支持 1、1.5 或 2 倍")
+        value = 4.0
+    if value not in (1.0, 1.5, 2.0, 3.0, 4.0):
+        raise ValueError("视频合并速率仅支持 1、1.5、2、3 或 4 倍")
     return value
 
 
@@ -2267,7 +2673,7 @@ def _merge_filter(speed, has_audio):
     pts_factor = 1.0 / speed
     video_filter = f'[0:v]setpts={pts_factor:.10g}*PTS[v]'
     if has_audio:
-        return f'{video_filter};[0:a]atempo={speed:g}[a]'
+        return f'{video_filter};[0:a]{_atempo_chain(speed)}[a]'
     return video_filter
 
 
@@ -2341,7 +2747,7 @@ def _ffprobe_audio_params(path):
     try:
         cmd = ["ffprobe", "-v", "error", "-select_streams", "a:0",
                "-show_entries", "stream=sample_rate,channels", "-of", "json", path]
-        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        res = _run_media_command(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                              text=True, encoding='utf-8', errors='replace', check=True,
                              **_win_subprocess_flags())
         streams = json.loads(res.stdout).get('streams') or []
@@ -2396,7 +2802,7 @@ def build_cover_intro_clip(cover_path, ref_video, out_path, seconds=0.0, speed=1
     cmd += [out_path]
 
     try:
-        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        res = _run_media_command(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                              text=True, encoding='utf-8', errors='replace', timeout=120,
                              **_win_subprocess_flags())
     except Exception as e:
@@ -2671,7 +3077,7 @@ def retime_clip_even(src, dst, tmp_dir=None):
         # 截掉不损失任何内容。
         cmd.extend(["-c:v", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart",
                     "-t", f"{duration:.6f}", dst])
-        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        res = _run_media_command(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                              text=True, encoding='utf-8', errors='replace', timeout=300,
                              **_win_subprocess_flags())
         if res.returncode != 0 or not os.path.exists(dst) or os.path.getsize(dst) == 0:
@@ -2687,7 +3093,7 @@ def retime_clip_even(src, dst, tmp_dir=None):
 
 def _clip_has_audio(path):
     try:
-        res = subprocess.run(
+        res = _run_media_command(
             ["ffprobe", "-v", "error", "-select_streams", "a",
              "-show_entries", "stream=codec_type", "-of", "csv=p=0", path],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -2696,6 +3102,58 @@ def _clip_has_audio(path):
         return 'audio' in (res.stdout or '').lower()
     except Exception:
         return False
+
+
+def _probe_merge_clip(path):
+    _check_media_cancel()
+    params = _ffprobe_video_params(path)
+    _check_media_cancel()
+    if (not params or params['width'] <= 0 or params['height'] <= 0
+            or not math.isfinite(params['fps']) or not 0 < params['fps'] <= 240
+            or not math.isfinite(params['duration']) or not 0 < params['duration'] < 86400):
+        raise RuntimeError(f'无法读取视频片段的画面或时长：{os.path.basename(path)}，已保留原成片')
+    has_audio = _clip_has_audio(path)
+    _check_media_cancel()
+    return {**params, 'has_audio': has_audio}
+
+
+def _normalized_merge_filter(media, clip_speeds, speed):
+    """Normalize decoded streams before concat, preserving pacing and clip order."""
+    first = media[0]
+    width = (first['width'] + 1) // 2 * 2
+    height = (first['height'] + 1) // 2 * 2
+    fps = first['fps']
+    has_audio = any(item['has_audio'] for item in media)
+    parts, inputs = [], []
+    total_duration = 0.0
+    for index, (item, clip_speed) in enumerate(zip(media, clip_speeds)):
+        factor = float(clip_speed) / speed
+        # Snap every segment to whole output frames, including the cover's one
+        # frame. Audio must end at the same boundary so concat cannot add holds.
+        duration = max(1, round(item['duration'] * factor * fps)) / fps
+        total_duration += duration
+        parts.append(
+            f'[{index}:v:0]setpts=(PTS-STARTPTS)*{factor:.10g},'
+            f'scale={width}:{height}:force_original_aspect_ratio=decrease,'
+            f'pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,'
+            f'fps={fps:.10g},format=yuv420p,'
+            f'tpad=stop_mode=clone:stop_duration={duration:.10g},'
+            f'trim=duration={duration:.10g},setpts=PTS-STARTPTS[v{index}]')
+        inputs.append(f'[v{index}]')
+        if has_audio:
+            if item['has_audio']:
+                audio = (f'[{index}:a:0]asetpts=PTS-STARTPTS,aresample=48000,'
+                         'aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,'
+                         f'atrim=duration={item["duration"]:.10g},apad,'
+                         f'atrim=duration={item["duration"]:.10g},'
+                         f'{_atempo_chain(1.0 / factor)},apad,')
+            else:
+                audio = 'anullsrc=r=48000:cl=stereo,'
+            parts.append(f'{audio}atrim=duration={duration:.10g},asetpts=PTS-STARTPTS[a{index}]')
+            inputs.append(f'[a{index}]')
+    outputs = '[v][a]' if has_audio else '[v]'
+    parts.append(f'{"".join(inputs)}concat=n={len(media)}:v=1:a={int(has_audio)}{outputs}')
+    return ';'.join(parts), total_duration, fps
 
 
 def slot_meta_map(manifest_data):
@@ -2728,6 +3186,7 @@ def retime_clips_for_merge(video_files, tmp_dir, metas=None):
     任何一段失败都退回该段原文件——重映射是观感优化，不是正确性前提。"""
     paths, notes = [], []
     for idx, src in enumerate(video_files):
+        _merge_progress('preparing', '正在处理片段', current=idx + 1, total=len(video_files))
         meta = metas[idx] if metas and idx < len(metas) else ''
         if _is_camera_move_slot(meta):
             paths.append(src)
@@ -2767,8 +3226,16 @@ def _paced_merge_filter(clip_speeds, speed, has_audio):
     return ';'.join(video_parts + [concat])
 
 
-def merge_project_videos(project_dir, allow_partial=False, speed=2.0,
-                         cover_burn=COVER_BURN_DEFAULT, cover_path=None):
+def merge_project_videos(project_dir, allow_partial=False, speed=4.0,
+                         cover_burn=COVER_BURN_DEFAULT, cover_path=None, config=None,
+                         on_progress=None, cancel_check=None):
+    with _merge_operation(project_dir, on_progress, cancel_check, config):
+        return _merge_project_videos_unlocked(project_dir, allow_partial, speed,
+                                              cover_burn, cover_path, config)
+
+
+def _merge_project_videos_unlocked(project_dir, allow_partial=False, speed=4.0,
+                         cover_burn=COVER_BURN_DEFAULT, cover_path=None, config=None):
     """合并项目内全部视频片段。
 
     - 默认（allow_partial=False）：存在缺失/失败槽位时抛出 PartialMergeBlocked 拦截合并，
@@ -2851,6 +3318,7 @@ def merge_project_videos(project_dir, allow_partial=False, speed=2.0,
         expected_slots = sorted(good)
     else:
         for slot in expected_slots:
+            _check_media_cancel()
             v = by_slot.get(slot)
             is_hero_slot = bool(
                 v and (
@@ -2867,6 +3335,9 @@ def merge_project_videos(project_dir, allow_partial=False, speed=2.0,
                 if not is_hero_slot:
                     missing.append(slot)
                 continue
+            if reviews_disabled(config):
+                good[slot] = abs_path
+                continue
             # 手动上传、手动换位和显式风险覆盖在落盘前都已经得到用户确认。这里直接信任并加入 good
             if (v.get('source') in ('manual_upload', 'manual_swap')
                     or v.get('model') == 'manual_upload'
@@ -2880,7 +3351,7 @@ def merge_project_videos(project_dir, allow_partial=False, speed=2.0,
                 hero_anchor_slot = v.get('start_anchor_slot') or slot
                 hero_anchor_p = _resolve_frame(frame_by_slot.get(hero_anchor_slot))
                 ok, _reason = verify_video_anchors(abs_path, hero_anchor_p, None,
-                                                    strict=strict_gates_enabled())
+                                                    strict=strict_gates_enabled(config), config=config)
                 if not ok:
                     print(f"[WARN] 英雄展示视频（槽位 {slot}）锚点校验未通过，仍并入合并。")
                 good[slot] = abs_path
@@ -2893,8 +3364,8 @@ def merge_project_videos(project_dir, allow_partial=False, speed=2.0,
             end_slot = v.get('end_anchor_slot') or (slot + 1)
             start_p = _resolve_frame(frame_by_slot.get(start_slot))
             end_p = _resolve_frame(frame_by_slot.get(end_slot)) if end_slot else None
-            # 合并门禁没有请求级 config，strict 开关直接取服务端配置
-            ok, reason = verify_video_anchors(abs_path, start_p, end_p, strict=strict_gates_enabled())
+            ok, reason = verify_video_anchors(abs_path, start_p, end_p,
+                                               strict=strict_gates_enabled(config), config=config)
             if not ok:
                 # 锚点不符不再拦截，也不再剔除该槽位：片段存在就并入成片，只留日志。
                 print(f"[WARN] 槽位 {slot} 锚点校验未通过（{reason}），仍按用户要求并入合并。")
@@ -2909,324 +3380,18 @@ def merge_project_videos(project_dir, allow_partial=False, speed=2.0,
         print(f"[WARN] 跳过无文件的槽位后直接合并：missing={missing}")
         return _merge_skip_missing(
             project_dir, manifest_data, expected_slots, good, missing, mismatched, speed=speed,
-            cover_burn=cover_burn, cover_path=cover_path,
+            cover_burn=cover_burn, cover_path=cover_path, config=config,
         )
 
-    # 无缺口/无串片：走原有干净合并路径
-    merge_slots = sorted(good)
-    video_files = [good[s] for s in merge_slots]
-    if not video_files:
-        return None
-
-    # 段内时间重映射：把每段内部"停滞→突进"的速度曲线摊匀（总时长不变，故不影响
-    # 下面的 PACE 系数与音轨处理）。逐段 fail-open，失败的段原样进入合并。临时目录
-    # 必须活到 ffmpeg 跑完，所以显式管理而不是用 with。
-    retime_tmp = tempfile.TemporaryDirectory()
-    try:
-        meta_by_slot = slot_meta_map(manifest_data)
-        video_files, retime_notes = retime_clips_for_merge(
-            video_files, retime_tmp.name,
-            metas=[meta_by_slot.get(s, '') for s in merge_slots])
-        print(f"[INFO] 段内节奏重映射: {'; '.join(retime_notes)}")
-    except Exception as retime_err:
-        print(f"[WARN] 段内节奏重映射整体跳过（{retime_err}），按原片合并")
-
-    # Determine the Chinese theme name to use for the output filename
-    title = manifest_data.get('title', '')
-    chinese_name = ""
-    
-    # 1. Try to find the theme in library.json
-    library_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'library.json')
-    if os.path.exists(library_path):
-        try:
-            with open(library_path, 'r', encoding='utf-8') as lf:
-                lib_data = json.load(lf)
-            if isinstance(lib_data, list):
-                for item in lib_data:
-                    if item.get('title') == title:
-                        theme = item.get('theme', '')
-                        theme_chinese = "".join(re.findall(r'[\u4e00-\u9fa5]+', theme))
-                        if theme_chinese:
-                            chinese_name = theme_chinese
-                            break
-        except Exception as le:
-            print(f"Warning: could not read library.json for theme lookup ({le})")
-            
-    # 2. Fallback: extract Chinese characters from title
-    if not chinese_name and title:
-        title_chinese = "".join(re.findall(r'[\u4e00-\u9fa5]+', title))
-        if title_chinese:
-            chinese_name = title_chinese
-            
-    # 3. Fallback: use sanitized project folder name if no Chinese characters found
-    if not chinese_name:
-        chinese_name = _safe_project_name(title)
-        
-    output_filename = f"{chinese_name}_{_merge_speed_slug(speed)}.mp4"
-    output_path = os.path.join(project_dir, output_filename)
-
-    # Clean up any old merged files in the project root to prevent duplicate files
-    if os.path.exists(project_dir):
-        for fname in os.listdir(project_dir):
-            if fname.lower().endswith('.mp4') and os.path.isfile(os.path.join(project_dir, fname)):
-                try:
-                    os.remove(os.path.join(project_dir, fname))
-                except Exception as e:
-                    print(f"Warning: could not remove old merged file {fname} ({e})")
-    
-    # Check if the first video has audio
-    has_audio = False
-    if len(video_files) > 0:
-        first_video = video_files[0]
-        probe_cmd = [
-            "ffprobe", "-v", "error",
-            "-select_streams", "a",
-            "-show_entries", "stream=codec_type",
-            "-of", "csv=p=0",
-            first_video
-        ]
-        try:
-            import subprocess
-            res = subprocess.run(probe_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                                 encoding='utf-8', errors='replace', check=True,
-                                 **_win_subprocess_flags())
-            if "audio" in res.stdout.lower():
-                has_audio = True
-        except Exception as probe_err:
-            print(f"[DEBUG] ffprobe check failed: {probe_err}")
-
-    # 首帧封面：探完音轨布局（要按正片的布局配静音轨）之后、写 concat 清单之前插进队首。
-    # 用 retime 的临时目录存放，跟着 retime_tmp 一起清理。
-    cover_info = None
-    try:
-        video_files, cover_info = prepend_cover_intro(
-            project_dir, manifest_data, video_files, retime_tmp.name,
-            speed=speed, has_audio=has_audio, cover_burn=cover_burn, cover_path=cover_path)
-    except Exception as cover_err:
-        print(f"[WARN] 首帧封面烧录跳过（{cover_err}）")
-
-    # Write concat list to project directory
-    concat_list_path = os.path.join(project_dir, 'concat_list.txt')
-    with open(concat_list_path, 'w', encoding='utf-8') as f:
-        for vf in video_files:
-            safe_path = vf.replace('\\', '/')
-            f.write(f"file '{safe_path}'\n")
-
-    import subprocess
-
-    def _build_concat_demuxer_cmd():
-        """改造前的原路径：concat demuxer + 一个全局 setpts。所有片段等长通过。"""
-        base = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat_list_path]
-        if has_audio:
-            base.extend(["-filter_complex", _merge_filter(speed, True),
-                         "-map", "[v]", "-map", "[a]", "-c:a", "aac"])
-        else:
-            base.extend(["-filter_complex", _merge_filter(speed, False), "-map", "[v]"])
-        base.extend(["-c:v", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart", output_path])
-        return base
-
-    # 节奏时间分配：只要有任何一段带了 PACE 标签就走多输入路径；一段都没有时
-    # （老项目、手动上传、prompt_pipeline._RHYTHM_CLIP_TIMING=False）**原样走旧路径**，
-    # 行为与改造前逐字节一致。
-    def _slot_clip_speed(slot):
-        entry = by_slot.get(slot) or {}
-        declared = entry.get('clip_speed')
-        if isinstance(declared, (int, float)) and not isinstance(declared, bool) and declared > 0:
-            return min(_CLIP_SPEED_MAX, max(_CLIP_SPEED_MIN, float(declared)))
-        # 旧 manifest 没有 clip_speed 字段，但 meta 里可能已经有 PACE 标签
-        return _clip_speed_from_meta(entry.get('meta'))
-
-    # 封面静帧段固定 1.0：它在 build_cover_intro_clip 里已经按 speed 预放大过，
-    # 这里让它跟其它"没有 PACE 标签"的片段走同一条缩放（除以 speed），落地正好是目标时长。
-    clip_speeds = ([1.0] if cover_info else []) + [_slot_clip_speed(s) for s in sorted(good)]
-    paced = any(abs(k - 1.0) >= 0.01 for k in clip_speeds)
-
-    if paced:
-        cmd = ["ffmpeg", "-y"]
-        for vf in video_files:
-            cmd.extend(["-i", vf])
-        cmd.extend(["-filter_complex", _paced_merge_filter(clip_speeds, speed, has_audio),
-                    "-map", "[v]"])
-        if has_audio:
-            cmd.extend(["-map", "[a]", "-c:a", "aac"])
-        cmd.extend(["-c:v", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart", output_path])
-        print(f"[INFO] Merging {len(video_files)} videos to {output_path} "
-              f"(speed={speed:g}x, has_audio={has_audio}, pace={[round(k, 2) for k in clip_speeds]})...")
-    else:
-        cmd = _build_concat_demuxer_cmd()
-        print(f"[INFO] Merging {len(video_files)} videos to {output_path} (speed={speed:g}x, has_audio={has_audio})...")
-
-    # encoding must be explicit: ffmpeg emits UTF-8, but Windows text-mode default is GBK,
-    # which crashes the subprocess stderr reader thread mid-merge
-    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                         encoding='utf-8', errors='replace', **_win_subprocess_flags())
-
-    if paced and res.returncode != 0:
-        # 多输入 concat filter 要求所有输入的流布局一致；has_audio 只探了第一段，
-        # 若后面某段没有音轨，整次合并会失败。这种情况下退回等长的旧路径——
-        # 宁可丢掉节奏分配，也不能让用户拿不到成片。
-        print(f"[WARN] 按拍重变速的合并失败，回退等长拼接: {res.stderr[-400:]}")
-        res = subprocess.run(_build_concat_demuxer_cmd(), stdout=subprocess.PIPE,
-                             stderr=subprocess.PIPE, text=True,
-                             encoding='utf-8', errors='replace', **_win_subprocess_flags())
-
-    try:
-        os.remove(concat_list_path)
-    except:
-        pass
-    try:
-        retime_tmp.cleanup()
-    except Exception:
-        pass
-
-    if res.returncode == 0:
-        rel_path = os.path.relpath(output_path, os.path.dirname(os.path.abspath(__file__))).replace('\\', '/')
-        file_size = os.path.getsize(output_path)
-        
-        duration = 0.0
-        try:
-            dur_cmd = [
-                "ffprobe", "-v", "error",
-                "-show_entries", "format=duration",
-                "-of", "csv=p=0",
-                output_path
-            ]
-            dur_res = subprocess.run(dur_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                                     encoding='utf-8', errors='replace', check=True,
-                                     **_win_subprocess_flags())
-            duration = float(dur_res.stdout.strip())
-        except Exception as dur_err:
-            print(f"[DEBUG] ffprobe duration check failed: {dur_err}")
-            
-        merged = {
-            'file': rel_path,
-            'url': '/' + rel_path,
-            'size_bytes': file_size,
-            'duration_seconds': round(duration, 2),
-            'speed': speed,
-            'status': 'success'
-        }
-        if cover_info:
-            merged['cover_first_frame'] = cover_info
-        return merged
-    else:
-        print(f"[ERROR] ffmpeg merge failed with code {res.returncode}: {res.stderr}")
-        raise RuntimeError(f"FFmpeg merge failed: {res.stderr}")
+    return _merge_selected_files(project_dir, manifest_data, sorted(good), good, speed,
+                                 cover_burn, cover_path, config)
 
 
 def _merge_skip_missing(project_dir, manifest_data, expected_slots, good, missing, mismatched,
-                        speed=2.0, cover_burn=COVER_BURN_DEFAULT, cover_path=None):
-    """强制合并（allow_partial）：2026-07-22 改版——不再用起始锚点帧定格+「缺失」标注
-    填充缺口（占位预览这套 filter_complex/drawtext 太重，且冻结帧撑时长的观感也不好），
-    直接跳过缺失/串片的槽位，把仍然可用的片段按原顺序和所选速率拼接，跳过处是硬切。
-    不是背地里丢弃缺口——门禁提示里用户已经看到具体缺了哪些槽位，这里把 skipped_slots
-    带回给调用方展示，只是不再用假帧撑时长。"""
-    speed = _normalize_merge_speed(speed)
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    merge_slots = [s for s in expected_slots if s in good]
-    video_files = [good[s] for s in merge_slots]
-    if not video_files:
-        return None
-    skipped_slots = sorted(set(missing) | set(mismatched))
-
-    # 段内时间重映射：与干净合并路径同款处理（见 merge_project_videos）。缺口合并
-    # 本来就是降级产物，但每一段自己的推进节奏该匀还是要匀。
-    retime_tmp = tempfile.TemporaryDirectory()
-    try:
-        meta_by_slot = slot_meta_map(manifest_data)
-        video_files, retime_notes = retime_clips_for_merge(
-            video_files, retime_tmp.name,
-            metas=[meta_by_slot.get(s, '') for s in merge_slots])
-        print(f"[INFO] 段内节奏重映射: {'; '.join(retime_notes)}")
-    except Exception as retime_err:
-        print(f"[WARN] 段内节奏重映射整体跳过（{retime_err}），按原片合并")
-
-    title = manifest_data.get('title', '')
-    chinese_name = _project_display_name(title)
-    # 绝对路径：见 2026-07-22 的踩坑记录——project_dir 本身是相对路径（server_common.
-    # OUTPUT_ROOT='outputs'），若 output_path 沿用相对拼接，一旦后续改动又把 ffmpeg 子
-    # 进程的 cwd 切到 project_dir，就会被当成"project_dir 下再嵌一层 project_dir"解析。
-    output_path = os.path.abspath(os.path.join(
-        project_dir, f"{chinese_name}_partial_{_merge_speed_slug(speed)}.mp4"))
-
-    # 清理项目根下旧 mp4（保持单一成片）
-    for fname in os.listdir(project_dir):
-        if fname.lower().endswith('.mp4') and os.path.isfile(os.path.join(project_dir, fname)):
-            try:
-                os.remove(os.path.join(project_dir, fname))
-            except Exception as e:
-                print(f"Warning: could not remove old merged file {fname} ({e})")
-
-    has_audio = False
-    probe_cmd = ["ffprobe", "-v", "error", "-select_streams", "a",
-                 "-show_entries", "stream=codec_type", "-of", "csv=p=0", video_files[0]]
-    try:
-        res = subprocess.run(probe_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                             encoding='utf-8', errors='replace', check=True,
-                             **_win_subprocess_flags())
-        has_audio = "audio" in res.stdout.lower()
-    except Exception as probe_err:
-        print(f"[DEBUG] ffprobe check failed: {probe_err}")
-
-    # 首帧封面：缺口合并同样烧（成片再降级，缩略图也得是封面）
-    cover_info = None
-    try:
-        video_files, cover_info = prepend_cover_intro(
-            project_dir, manifest_data, video_files, retime_tmp.name,
-            speed=speed, has_audio=has_audio, cover_burn=cover_burn, cover_path=cover_path)
-    except Exception as cover_err:
-        print(f"[WARN] 首帧封面烧录跳过（{cover_err}）")
-
-    concat_list_path = os.path.join(project_dir, 'concat_list.txt')
-    with open(concat_list_path, 'w', encoding='utf-8') as f:
-        for vf in video_files:
-            f.write(f"file '{vf.replace(chr(92), '/')}'\n")
-
-    cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat_list_path]
-    if has_audio:
-        cmd += ["-filter_complex", _merge_filter(speed, True),
-                "-map", "[v]", "-map", "[a]", "-c:a", "aac"]
-    else:
-        cmd += ["-filter_complex", _merge_filter(speed, False), "-map", "[v]"]
-    cmd += ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart", output_path]
-
-    print(f"[INFO] Skip-merge: {len(video_files)} segments, skipped {skipped_slots}, speed={speed:g}x -> {output_path}")
-    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                         text=True, encoding='utf-8', errors='replace', **_win_subprocess_flags())
-    try:
-        os.remove(concat_list_path)
-    except Exception:
-        pass
-    try:
-        retime_tmp.cleanup()
-    except Exception:
-        pass
-
-    if res.returncode != 0:
-        print(f"[ERROR] skip-merge ffmpeg failed: {res.stderr}")
-        raise RuntimeError(f"跳过缺口合并失败（FFmpeg）：{res.stderr[-400:]}")
-
-    rel_path = os.path.relpath(output_path, base_dir).replace('\\', '/')
-    duration = 0.0
-    try:
-        dur_res = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", output_path],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-            encoding='utf-8', errors='replace', check=True, **_win_subprocess_flags())
-        duration = float(dur_res.stdout.strip())
-    except Exception:
-        pass
-
-    merged = {
-        'file': rel_path,
-        'url': '/' + rel_path,
-        'size_bytes': os.path.getsize(output_path),
-        'duration_seconds': round(duration, 2),
-        'speed': speed,
-        'status': 'success',
-        'partial': True,
-        'skipped_slots': skipped_slots,
-    }
-    if cover_info:
-        merged['cover_first_frame'] = cover_info
-    return merged
+                        speed=4.0, cover_burn=COVER_BURN_DEFAULT, cover_path=None, config=None,
+                        on_progress=None, cancel_check=None):
+    with _merge_operation(project_dir, on_progress, cancel_check, config):
+        return _merge_selected_files(
+            project_dir, manifest_data, [slot for slot in expected_slots if slot in good], good,
+            _normalize_merge_speed(speed), cover_burn, cover_path, config,
+            skipped_slots=sorted(set(missing) | set(mismatched)))

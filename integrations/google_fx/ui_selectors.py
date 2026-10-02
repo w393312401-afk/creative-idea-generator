@@ -55,19 +55,21 @@ UI_SELECTORS = {
         # google_fx_helpers._find_add2_btn 实际在用的那份，两边共用同一个源，
         # 所以选择器探针探的和生产代码点的是同一批选择器。
         "add_media_btn": [
-            "button[aria-haspopup='dialog']:has(span:text('Create'))",
+            # 画布上传优先使用顶部入口；提示词框 + 打开的是另一种素材选择器。
             "button[aria-label='Add media menu']",
             "button[mattooltip='Add media']",
-            "button:has(mat-icon:text('add'))",
             "button[aria-label*='Add media' i]",
             "button[aria-label*='添加媒体']",
+            # 某些布局隐藏顶部入口，保留素材选择器作为兼容路径。
+            "button[aria-label='Add ingredients to the prompt box']",
+            "button.add-menu-trigger[aria-haspopup]",
+            "button[aria-haspopup='dialog']:has(span:text('Create'))",
             "button[aria-haspopup='dialog']:has(i.google-symbols:text('add_2'))",
             "button[aria-haspopup='dialog']:has(i:text('add_2'))",
-            "button[aria-haspopup='dialog']",
             "button[aria-haspopup='menu']:has(span:text('Create'))",
             "button[aria-haspopup='menu']:has(span:text('添加媒体'))",
-            "button[aria-haspopup='menu']:has(mat-icon:text('add'))",
-            "button[aria-haspopup='menu']:has(i:text('add'))",
+            "button[aria-haspopup='menu']:has(mat-icon:text-is('add'))",
+            "button[aria-haspopup='menu']:has(i:text-is('add'))",
         ],
 
         # --- 配置面板: 比例/数量/模型 Tab 按钮 ---
@@ -162,7 +164,6 @@ UI_SELECTORS = {
             "[role='button']:has(flow-user-tier-chip)",
             "button:has(img[alt='用户头像'])",
             "button:has(img[alt*='头像'])",
-            "button:has(img[src*='googleusercontent.com'])",
             "button:has(img.user-avatar)",
             "button:has(img[class*='avatar'])",
             "button[aria-label*='Google Account']",
@@ -171,10 +172,7 @@ UI_SELECTORS = {
             "button[aria-label*='账号']",
             "button[aria-label*='account' i]",
             "button[aria-label*='profile' i]",
-            "button[aria-haspopup='menu']:has(img)",
             "[role='button']:has(img[alt*='profile' i])",
-            "header button:has(img)",
-            "button:has(img)",
         ],
         # 必须先确认账号菜单/弹层真实打开，再在这个局部范围内读积分。不能用
         # 全页 text=/N credits/，否则会把套餐宣传的 monthly credits 当成余额。

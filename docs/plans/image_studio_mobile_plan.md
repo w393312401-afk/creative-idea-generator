@@ -6,7 +6,7 @@
 > `base.css` / `panels-tabs.css` / `tokens.css`。
 >
 > 关联文档：`spark_result_minimal_layout_plan.md`（结果页移动端精简，本方案沿用它的
-> 断点与「首屏不被说明文字吃掉」的原则）、`replica_ui_layout_plan.md`。
+> 断点与「首屏不被说明文字吃掉」的原则）。
 
 ---
 

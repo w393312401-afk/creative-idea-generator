@@ -43,8 +43,8 @@
     align-items: center;
     gap: 8px;
     padding: 8px 14px;
-    border-radius: 20px;
-    font-size: 12px;
+    border-radius: var(--radius-2xl);
+    font-size: var(--fs-sm);
     font-weight: 500;
     background: rgba(var(--ink-rgb), 0.04);
     border: 1px solid var(--border-color);
@@ -97,12 +97,17 @@
     gap: 0;
 }
 
-.glass-panel {
+/* 只管 .app-main 的直接子面板（创作结果 / 图像工坊 / 项目 / 画廊）。.glass-panel 也被
+   弹窗（.modal-content）和 stepped 三联图复用，它们必须保持自己的 display，所以这里
+   不能再写全局的 .glass-panel { display:none }。 */
+.app-main > .glass-panel {
     display: none;
 }
 
-.glass-panel.mobile-active {
+.app-main > .glass-panel.mobile-active {
     display: flex;
+    flex: 1 1 auto; /* 内容再少也撑满外壳（欢迎态不再缩成一小块） */
+    min-height: 0;
 }
 
 .panel-body {
@@ -132,7 +137,7 @@
 }
 
 .group-title {
-    font-size: 13px;
+    font-size: var(--fs-md);
     font-weight: 600;
     color: var(--text-secondary);
     text-transform: uppercase;
@@ -153,13 +158,13 @@
 .anchor-node {
     background: var(--bg-card);
     border: 1px solid var(--border-color);
-    border-radius: 20px;
+    border-radius: var(--radius-2xl);
     padding: 10px 18px;
     cursor: pointer;
     display: flex;
     align-items: center;
     gap: 8px;
-    font-size: 12px;
+    font-size: var(--fs-sm);
     font-weight: 500;
     color: var(--text-secondary);
     transition: var(--transition-fast);
@@ -207,7 +212,7 @@
 .slider-labels {
     display: flex;
     justify-content: space-between;
-    font-size: 12px;
+    font-size: var(--fs-sm);
     font-weight: 500;
 }
 
@@ -241,7 +246,7 @@
     gap: 6px;
     background: rgba(var(--ink-rgb), 0.03);
     border: 1px solid var(--border-color);
-    border-radius: 12px;
+    border-radius: var(--radius-lg);
     padding: 4px;
 }
 
@@ -250,9 +255,9 @@
     min-width: 0;
     background: transparent;
     border: none;
-    border-radius: 9px;
+    border-radius: var(--radius-md);
     padding: 8px 6px;
-    font-size: 11.5px;
+    font-size: var(--fs-sm);
     font-weight: 500;
     font-family: inherit;
     line-height: 1.3;
@@ -300,7 +305,7 @@ html[data-theme="dark"] .segment-btn.active {
     border: 1px solid var(--border-color);
     background: var(--bg-card);
     color: var(--text-secondary);
-    font-size: 16px;
+    font-size: var(--fs-lg);
     font-weight: 600;
     font-family: inherit;
     line-height: 1;
@@ -326,7 +331,7 @@ html[data-theme="dark"] .segment-btn.active {
     appearance: none;
     width: 100%;
     height: 8px;
-    border-radius: 4px;
+    border-radius: var(--radius-xs);
     outline: none;
     cursor: pointer;
     transition: var(--transition-fast);
@@ -362,13 +367,13 @@ html[data-theme="dark"] .segment-btn.active {
 
 .neon-slider::-moz-range-track {
     height: 8px;
-    border-radius: 4px;
+    border-radius: var(--radius-xs);
     background: rgba(var(--ink-rgb), 0.06);
 }
 
 .neon-slider::-moz-range-progress {
     height: 8px;
-    border-radius: 4px;
+    border-radius: var(--radius-xs);
     background: var(--neon-cyan);
 }
 
@@ -392,7 +397,7 @@ html[data-theme="dark"] .segment-btn.active {
     position: relative;
     background: linear-gradient(135deg, var(--neon-cyan) 0%, var(--neon-purple) 100%);
     border: none;
-    border-radius: 14px;
+    border-radius: var(--radius-xl);
     padding: 18px;
     cursor: pointer;
     display: flex;
@@ -408,9 +413,9 @@ html[data-theme="dark"] .segment-btn.active {
 .btn-text {
     position: relative;
     z-index: 2;
-    color: #ffffff !important; /* Force white text */
+    color: inherit;
     font-family: 'Outfit', sans-serif;
-    font-size: 15px;
+    font-size: var(--fs-lg);
     font-weight: 700 !important; /* Force bold weight */
     letter-spacing: 1.5px;
 }
@@ -421,7 +426,7 @@ html[data-theme="dark"] .segment-btn.active {
     left: 0;
     width: 100%;
     height: 100%;
-    border-radius: 14px;
+    border-radius: var(--radius-xl);
     background: linear-gradient(135deg, var(--neon-cyan) 0%, var(--neon-purple) 100%);
     filter: blur(12px);
     opacity: 0.5;
@@ -469,13 +474,13 @@ html[data-theme="dark"] .segment-btn.active {
 
 .output-placeholder h3 {
     font-family: 'Outfit', sans-serif;
-    font-size: 20px;
+    font-size: var(--fs-2xl);
     font-weight: 600;
     margin-bottom: 12px;
 }
 
 .output-placeholder p {
-    font-size: 13px;
+    font-size: var(--fs-md);
     color: var(--text-secondary);
     line-height: 1.7;
     max-width: 440px;
@@ -527,7 +532,7 @@ html[data-theme="dark"] .segment-btn.active {
 
 .output-loading h3 {
     font-family: 'Outfit', sans-serif;
-    font-size: 18px;
+    font-size: var(--fs-xl);
     margin-bottom: 8px;
     letter-spacing: 0.5px;
 }
@@ -538,7 +543,7 @@ html[data-theme="dark"] .segment-btn.active {
     display: flex;
     flex-direction: column;
     gap: 12px;
-    font-size: 12.5px;
+    font-size: var(--fs-md);
 }
 
 .loading-steps li {
@@ -589,7 +594,7 @@ html[data-theme="dark"] .segment-btn.active {
     max-width: 550px;
     background: rgba(var(--ink-rgb), 0.06);
     border: 1px solid var(--neon-cyan-glow);
-    border-radius: 10px;
+    border-radius: var(--radius-md);
     margin-top: 16px;
     display: flex;
     flex-direction: column;
@@ -604,7 +609,7 @@ html[data-theme="dark"] .segment-btn.active {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    font-size: 12px;
+    font-size: var(--fs-sm);
     font-weight: 700;
     color: var(--text-secondary);
 }
@@ -621,7 +626,7 @@ html[data-theme="dark"] .segment-btn.active {
     max-height: 260px;
     overflow-y: auto;
     font-family: 'Consolas', 'Courier New', Courier, monospace;
-    font-size: 12px;
+    font-size: var(--fs-sm);
     line-height: 1.55;
     color: var(--text-primary);
     text-align: left;
@@ -652,7 +657,7 @@ html[data-theme="dark"] .segment-btn.active {
     max-width: 550px;
     background: rgba(var(--ink-rgb), 0.06);
     border: 1px solid var(--neon-cyan-glow);
-    border-radius: 10px;
+    border-radius: var(--radius-md);
     margin-top: 20px;
     display: flex;
     flex-direction: column;
@@ -687,7 +692,7 @@ html[data-theme="dark"] .segment-btn.active {
 
 .terminal-title {
     font-family: monospace;
-    font-size: 11px;
+    font-size: var(--fs-xs);
     font-weight: bold;
     color: var(--text-secondary);
     letter-spacing: 1px;
@@ -695,7 +700,7 @@ html[data-theme="dark"] .segment-btn.active {
 
 .terminal-status {
     font-family: monospace;
-    font-size: 10px;
+    font-size: var(--fs-2xs);
     color: var(--neon-green);
     text-shadow: 0 0 4px var(--neon-green-glow);
     animation: flash 1s infinite alternate;
@@ -706,7 +711,7 @@ html[data-theme="dark"] .segment-btn.active {
     height: 220px;
     overflow-y: auto;
     font-family: 'Consolas', 'Courier New', Courier, monospace;
-    font-size: 12px;
+    font-size: var(--fs-sm);
     line-height: 1.5;
     color: var(--text-primary);
     text-align: left;
@@ -788,7 +793,7 @@ html[data-theme="dark"] .segment-btn.active {
 
 #idea-title {
     font-family: 'Outfit', sans-serif;
-    font-size: 19px;
+    font-size: var(--fs-xl);
     line-height: 1.35;
     font-weight: 700;
     color: var(--text-primary);
@@ -798,7 +803,7 @@ html[data-theme="dark"] .segment-btn.active {
 
 .idea-title-cn {
     color: var(--text-secondary);
-    font-size: 13px;
+    font-size: var(--fs-md);
     font-weight: 600;
     line-height: 1.5;
     min-width: 0;
@@ -824,7 +829,7 @@ html[data-theme="dark"] .segment-btn.active {
     height: 30px;
     flex: 0 0 30px;
     align-self: start;
-    border-radius: 8px;
+    border-radius: var(--radius-md);
     color: var(--text-secondary);
 }
 
@@ -837,7 +842,7 @@ html[data-theme="dark"] .segment-btn.active {
     height: 34px;
     flex: 0 0 34px;
     align-self: start;
-    border-radius: 8px;
+    border-radius: var(--radius-md);
     color: var(--text-primary);
     border-color: rgba(176, 123, 82, 0.35);
     background: rgba(176, 123, 82, 0.10);
@@ -861,10 +866,10 @@ html[data-theme="dark"] .segment-btn.active {
     background: rgba(var(--ink-rgb), 0.04);
     border: 1px solid var(--border-color);
     color: var(--text-secondary);
-    font-size: 10.5px;
+    font-size: var(--fs-xs);
     font-weight: 600;
     padding: 4px 10px;
-    border-radius: 12px;
+    border-radius: var(--radius-lg);
     text-transform: uppercase;
 }
 
@@ -882,9 +887,9 @@ html[data-theme="dark"] .segment-btn.active {
 .text-btn {
     background: rgba(var(--ink-rgb), 0.04);
     border: 1px solid var(--border-color);
-    border-radius: 8px;
+    border-radius: var(--radius-md);
     padding: 7px 14px;
-    font-size: 12px;
+    font-size: var(--fs-sm);
     font-weight: 500;
     cursor: pointer;
     display: inline-flex;
@@ -962,17 +967,17 @@ html[data-theme="dark"] .segment-btn.active {
     display: flex;
     align-items: center;
     gap: 8px;
-    font-size: 13px;
+    font-size: var(--fs-md);
     font-weight: 600;
     color: var(--text-secondary);
 }
 
 .section-icon {
-    font-size: 16px;
+    font-size: var(--fs-lg);
 }
 
 .section-title h3 {
-    font-size: 13px;
+    font-size: var(--fs-md);
     font-weight: 700;
     letter-spacing: 0.5px;
     text-transform: uppercase;
@@ -981,9 +986,9 @@ html[data-theme="dark"] .segment-btn.active {
 .card-dark {
     background: var(--bg-card);
     border: 1px solid var(--border-color);
-    border-radius: 12px;
+    border-radius: var(--radius-lg);
     padding: 16px 20px;
-    font-size: 13.5px;
+    font-size: var(--fs-base);
     line-height: 1.7;
     color: var(--text-primary);
 }
@@ -998,7 +1003,7 @@ html[data-theme="dark"] .segment-btn.active {
 .spatial-card {
     background: var(--bg-card);
     border: 1px solid var(--border-color);
-    border-radius: 12px;
+    border-radius: var(--radius-lg);
     display: flex;
     flex-direction: column;
     overflow: hidden;
@@ -1006,7 +1011,7 @@ html[data-theme="dark"] .segment-btn.active {
 
 .spatial-card .card-header {
     padding: 10px 14px;
-    font-size: 11px;
+    font-size: var(--fs-xs);
     font-weight: 700;
     text-transform: uppercase;
     letter-spacing: 1px;
@@ -1032,7 +1037,7 @@ html[data-theme="dark"] .segment-btn.active {
 
 .spatial-card .card-body {
     padding: 14px;
-    font-size: 12.5px;
+    font-size: var(--fs-md);
     line-height: 1.6;
     color: var(--text-primary);
     flex-grow: 1;
@@ -1060,7 +1065,7 @@ html[data-theme="dark"] .segment-btn.active {
     display: flex;
     align-items: center;
     justify-content: center;
-    font-size: 12px;
+    font-size: var(--fs-sm);
     font-weight: 700;
     flex-shrink: 0;
     box-shadow: 0 0 10px rgba(176, 123, 82, 0.05);
@@ -1069,20 +1074,20 @@ html[data-theme="dark"] .segment-btn.active {
 .step-content {
     background: var(--bg-card);
     border: 1px solid var(--border-color);
-    border-radius: 12px;
+    border-radius: var(--radius-lg);
     padding: 14px 18px;
     flex-grow: 1;
 }
 
 .step-content h4 {
-    font-size: 13.5px;
+    font-size: var(--fs-base);
     font-weight: 600;
     margin-bottom: 6px;
     color: var(--text-main);
 }
 
 .step-content p {
-    font-size: 12.5px;
+    font-size: var(--fs-md);
     line-height: 1.6;
     color: var(--text-secondary);
 }
@@ -1097,12 +1102,12 @@ html[data-theme="dark"] .segment-btn.active {
 .causal-card {
     background: var(--bg-card);
     border: 1px solid var(--border-color);
-    border-radius: 12px;
+    border-radius: var(--radius-lg);
     padding: 16px;
 }
 
 .causal-card .card-label {
-    font-size: 11px;
+    font-size: var(--fs-xs);
     font-weight: 700;
     color: var(--neon-purple);
     text-transform: uppercase;
@@ -1111,7 +1116,7 @@ html[data-theme="dark"] .segment-btn.active {
 }
 
 .causal-card p {
-    font-size: 12.5px;
+    font-size: var(--fs-md);
     line-height: 1.6;
     color: var(--text-primary);
 }
@@ -1126,9 +1131,9 @@ html[data-theme="dark"] .segment-btn.active {
 .sfx-tag {
     background: rgba(var(--ink-rgb), 0.04);
     border: 1px solid var(--border-color);
-    border-radius: 8px;
+    border-radius: var(--radius-md);
     padding: 10px 14px;
-    font-size: 12.5px;
+    font-size: var(--fs-md);
     color: var(--text-secondary);
     display: flex;
     align-items: center;
@@ -1137,7 +1142,7 @@ html[data-theme="dark"] .segment-btn.active {
 
 .sfx-tag::before {
     content: "🔊";
-    font-size: 12px;
+    font-size: var(--fs-sm);
 }
 
 /* Prompt Box */
@@ -1153,14 +1158,14 @@ html[data-theme="dark"] .segment-btn.active {
     align-items: center;
     padding: 12px 18px;
     border-bottom: 1px solid var(--border-color);
-    font-size: 11.5px;
+    font-size: var(--fs-sm);
     font-weight: 600;
     color: var(--text-secondary);
 }
 
 .prompt-body {
     padding: 16px 18px;
-    font-size: 13px;
+    font-size: var(--fs-md);
     font-family: monospace;
     color: var(--neon-cyan);
     word-break: break-all;
@@ -1172,7 +1177,7 @@ html[data-theme="dark"] .segment-btn.active {
 
 .mini-btn {
     padding: 6px !important;
-    border-radius: 6px !important;
+    border-radius: var(--radius-sm) !important;
 }
 
 /* Saved Drawer */
@@ -1201,7 +1206,7 @@ html[data-theme="dark"] .segment-btn.active {
     background: rgba(var(--ink-rgb), 0.38);
     backdrop-filter: blur(8px);
     -webkit-backdrop-filter: blur(8px);
-    z-index: 1100; /* 高于日志 dock(900)：否则日志展开时设置弹窗被压在下面 */
+    z-index: var(--z-modal); /* 高于日志 dock(900)：否则日志展开时设置弹窗被压在下面 */
     display: flex;
     align-items: center;
     justify-content: center;
@@ -1242,10 +1247,6 @@ html[data-theme="dark"] .segment-btn.active {
     max-width: 760px;
 }
 
-.modal .modal-content.glass-panel {
-    display: flex !important;
-}
-
 .modal-header {
     padding: 20px 24px;
     border-bottom: 1px solid var(--border-color);
@@ -1257,7 +1258,7 @@ html[data-theme="dark"] .segment-btn.active {
 
 .modal-header h3 {
     font-family: 'Outfit', sans-serif;
-    font-size: 16px;
+    font-size: var(--fs-lg);
     font-weight: 700;
 }
 
@@ -1277,7 +1278,7 @@ html[data-theme="dark"] .segment-btn.active {
 }
 
 .form-group label {
-    font-size: 12px;
+    font-size: var(--fs-sm);
     font-weight: 600;
     color: var(--text-secondary);
 }
@@ -1287,9 +1288,9 @@ html[data-theme="dark"] .segment-btn.active {
     background: rgba(var(--ink-rgb), 0.04);
     border: 1px solid var(--border-color);
     color: var(--text-primary);
-    border-radius: 8px;
+    border-radius: var(--radius-md);
     padding: 10px 14px;
-    font-size: 13.5px;
+    font-size: var(--fs-base);
     font-family: inherit;
     outline: none;
     transition: var(--transition-fast);
@@ -1334,7 +1335,7 @@ html[data-theme="dark"] select optgroup {
     color: var(--text-muted);
     cursor: pointer;
     padding: 6px;
-    font-size: 14px;
+    font-size: var(--fs-base);
 }
 
 .view-btn:hover {
@@ -1342,12 +1343,12 @@ html[data-theme="dark"] select optgroup {
 }
 
 .modal-info {
-    font-size: 11.5px;
+    font-size: var(--fs-sm);
     color: var(--text-secondary);
     line-height: 1.6;
     background: rgba(var(--ink-rgb), 0.03);
     border: 1px solid var(--border-color);
-    border-radius: 8px;
+    border-radius: var(--radius-md);
     padding: 10px 14px;
 }
 
@@ -1369,7 +1370,7 @@ html[data-theme="dark"] select optgroup {
     flex-direction: column;
     gap: 10px;
     /* 必须盖过灯箱（2000）：之前在灯箱里复制图片时 toast 被完全挡住 */
-    z-index: 3000;
+    z-index: var(--z-toast);
 }
 
 .toast {
@@ -1379,8 +1380,8 @@ html[data-theme="dark"] select optgroup {
     border: 1px solid var(--border-color);
     color: var(--text-main);
     padding: 14px 20px;
-    border-radius: 10px;
-    font-size: 13px;
+    border-radius: var(--radius-md);
+    font-size: var(--fs-md);
     font-weight: 500;
     box-shadow: 0 10px 20px rgba(var(--ink-rgb), 0.10);
     display: flex;
@@ -1404,12 +1405,12 @@ html[data-theme="dark"] select optgroup {
     margin-left: auto;
     flex: 0 0 auto;
     padding: 4px 12px;
-    font-size: 12px;
+    font-size: var(--fs-sm);
     font-weight: 700;
     color: var(--text-main);
     background: rgba(var(--ink-rgb), 0.06);
     border: 1px solid var(--border-color);
-    border-radius: 6px;
+    border-radius: var(--radius-sm);
     cursor: pointer;
     transition: var(--transition-fast);
 }
@@ -1438,7 +1439,7 @@ html[data-theme="dark"] select optgroup {
     gap: 12px;
     padding: 10px 12px;
     border: 1px solid var(--border-color);
-    border-radius: 8px;
+    border-radius: var(--radius-md);
     background: rgba(var(--ink-rgb), 0.03);
 }
 
@@ -1448,7 +1449,7 @@ html[data-theme="dark"] select optgroup {
     gap: 3px;
     min-width: 0;
     flex: 1;
-    font-size: 12px;
+    font-size: var(--fs-sm);
     color: var(--text-secondary);
 }
 
@@ -1518,24 +1519,5 @@ html[data-theme="dark"] select optgroup {
 @keyframes slideIn {
     from { transform: translateX(-40px); opacity: 0; }
     to { transform: translateX(0); opacity: 1; }
-}
-
-/* Responsive Scaling */
-@media (max-width: 1024px) {
-    .app-main {
-        grid-template-columns: 1fr;
-        overflow-y: auto;
-    }
-    .panel-left, .panel-right {
-        height: auto;
-        max-height: none;
-    }
-    body {
-        overflow: auto;
-    }
-    .app-container {
-        height: auto;
-        overflow: visible;
-    }
 }
 

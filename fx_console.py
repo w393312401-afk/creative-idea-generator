@@ -28,14 +28,27 @@ FX_CONFIG_SPEC = {
     },
     'adsPowerSilentMode': {
         'type': 'bool', 'default': True, 'hot': True, 'env': 'ADSPOWER_SILENT_MODE',
-        'group': '连接', 'label': '后台静默运行（屏幕外运行，不弹窗抢焦点）',
+        'group': '连接', 'label': '后台静默运行（生成期间不主动切到前台）',
     },
     # macOS 上"屏幕外坐标"会被系统 clamp 回可见区域，静默模式挡不住抢焦点，得改用
-    # app 级隐藏。hide 需要「辅助功能」权限，没授权会自动降级成 focus。
+    # app 级隐藏。优先用 AppKit，失败时才回退需要「辅助功能」权限的 UI 脚本。
     'adsPowerMacWindowMode': {
         'type': 'enum', 'options': ['hide', 'focus', 'off'],
         'default': 'hide', 'hot': True, 'env': 'ADSPOWER_MACOS_WINDOW_MODE',
         'group': '连接', 'label': 'macOS 窗口处理（hide=隐藏窗口／focus=仅归还焦点／off=不干预）',
+    },
+    # ── 并发（见 docs/plans/multi_project_concurrency_plan.md）──────────
+    # 同时占用浏览器的任务数。1 = 串行（旧行为）；>1 时每个任务独占一个 AdsPower 环境。
+    # 每个环境都是完整的 Chromium，先从 2 起步并观察内存。
+    'fxMaxConcurrent': {
+        'type': 'integer', 'min': 1, 'max': 4, 'default': 1, 'hot': True,
+        'env': 'SPARK_FX_MAX_CONCURRENT',
+        'group': '并发', 'label': '浏览器并发数（1=串行；>1 时不同项目可同时出片，每个任务独占一个环境）',
+    },
+    'fxEgressPolicy': {
+        'type': 'enum', 'options': ['hard', 'warn'], 'default': 'hard', 'hot': True,
+        'env': 'SPARK_FX_EGRESS_POLICY',
+        'group': '并发', 'label': '同出口冲突（hard=拒绝同出口账号同时运行／warn=仅告警）',
     },
     'googleFxImageModel': {
         'type': 'enum', 'options': list(GOOGLE_FX_IMAGE_MODELS),
@@ -62,19 +75,21 @@ FX_CONFIG_SPEC = {
         'group': '模型', 'label': '视频参考模式（帧 / 素材）',
     },
 
-    # ── 号池与换号 ──────────────────────────────────────
+    # ── 号池与浏览器复用 ─────────────────────────────────
     'googleFxIpRotateRequests': {
         'type': 'integer', 'min': 1, 'max': 100, 'default': 5, 'hot': True,
-        'group': '号池', 'label': '换号节拍（每 N 个请求换一个号）',
+        'group': '号池', 'label': '旧版换号节拍（已停用，仅保留原值）',
+        'inactive': True,
+        'hint': '优先复用已打开且额度足够的浏览器；额度不足后周期停用 24 小时，关闭该浏览器并换号继续。',
     },
     'videoAccountPoolMinCredit': {
         'type': 'integer', 'min': 0, 'max': 100000, 'default': 15, 'hot': True,
-        'group': '号池', 'label': '选号最低积分（低于此值自动禁用）',
+        'group': '号池', 'label': '选号最低积分（低于此值周期停用 24 小时）',
     },
     'googleFxAccountStrategy': {
         'type': 'enum', 'options': ['credit_desc', 'expiration_asc', 'rotation'],
         'default': 'credit_desc', 'hot': True, 'group': '号池',
-        'label': '选号调度策略（积分最多 / 重置日期最早 / 均衡轮替）',
+        'label': '需要新开环境时的选号策略（积分最多 / 重置日期最早 / 均衡使用）',
     },
     'googleFxPriorityUserIds': {
         'type': 'account_list', 'default': [], 'hot': True, 'group': '号池',
@@ -84,11 +99,11 @@ FX_CONFIG_SPEC = {
     # 不写进 spec 的 options：号池是会变的运行时数据，固化进配置 schema 只会过期。
     'googleFxSequenceUserId': {
         'type': 'account', 'default': '', 'hot': True, 'group': '号池',
-        'label': '序列生成默认浏览器环境（留空=按号池自动选）',
+        'label': '序列首选浏览器环境（留空=自动复用/选号）',
     },
     'googleFxSequenceUserLock': {
         'type': 'bool', 'default': False, 'hot': True, 'group': '号池',
-        'label': '锁定默认环境：整条序列不按节拍换号',
+        'label': '优先指定默认环境（即使已有其他可用浏览器，额度不足仍换号）',
     },
 
     # ── 超时与预算 ──────────────────────────────────────
@@ -315,4 +330,3 @@ class FxConfigStore:
             apply_direct_env(self.current())
         self._audit(action, details={'before': before, 'after': clean}, actor=actor)
         return {'config': self.current(), 'changed': clean, 'version': None, 'versions': []}
-

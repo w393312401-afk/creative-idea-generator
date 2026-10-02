@@ -271,8 +271,9 @@ def test_projects_index_reads_through_the_split_store(store):
     _write_legacy(store, [_idea('1785458877351', '废弃越野救护车改造')])
     sc.read_library_index()
 
-    rows = sc.build_projects_index(tasks=[], ledger_rows=[], with_assets=False)
+    rows = sc.build_projects_index(tasks=[], ledger_rows=[], with_assets=False,
+                                  base_dir=os.path.dirname(store['db']))
 
     assert len(rows) == 1
     assert rows[0]['saved'] is True
-    assert rows[0]['state'] == 'saved'
+    assert rows[0]['state'] == 'ready'

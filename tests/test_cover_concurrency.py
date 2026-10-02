@@ -46,7 +46,8 @@ class TestCoverConcurrency(unittest.TestCase):
 
         generated_paths = []
 
-        def mock_generate_text_image(config, prompt, target_path):
+        def mock_generate_text_image(config, prompt, target_path, *, allow_text=False):
+            self.assertTrue(allow_text, 'cover generation must allow its English headline')
             generated_paths.append((prompt, target_path))
             with open(target_path, 'wb') as f:
                 f.write(b"FAKE_WEBP_IMAGE_CONTENT")
@@ -108,7 +109,8 @@ class TestCoverConcurrency(unittest.TestCase):
         task_id = "test_cover_standard_1"
         server.get_or_create_task(task_id, {"type": "cover", "theme": "Treehouse", "project_key": self.project_key})
 
-        def mock_generate_text_image(config, prompt, target_path):
+        def mock_generate_text_image(config, prompt, target_path, *, allow_text=False):
+            self.assertTrue(allow_text, 'cover generation must allow its English headline')
             with open(target_path, 'wb') as f:
                 f.write(b"FAKE_SINGLE_WEBP")
 
@@ -136,7 +138,8 @@ class TestCoverConcurrency(unittest.TestCase):
         task_id = "test_cover_partial_1"
         server.get_or_create_task(task_id, {"type": "cover", "theme": "Pool", "project_key": self.project_key})
 
-        def mock_generate_with_one_failure(config, prompt, target_path):
+        def mock_generate_with_one_failure(config, prompt, target_path, *, allow_text=False):
+            self.assertTrue(allow_text)
             if "_2.webp" in target_path:
                 raise RuntimeError("Gateway 502 error on variation 2")
             with open(target_path, 'wb') as f:
@@ -166,7 +169,8 @@ class TestCoverConcurrency(unittest.TestCase):
         task_id = "test_cover_fail_1"
         server.get_or_create_task(task_id, {"type": "cover", "theme": "Cave", "project_key": self.project_key})
 
-        def mock_fail_all(config, prompt, target_path):
+        def mock_fail_all(config, prompt, target_path, *, allow_text=False):
+            self.assertTrue(allow_text)
             raise RuntimeError("API quota exhausted")
 
         with patch('server._chat', return_value="EPIC CAVE!"), \

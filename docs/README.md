@@ -11,13 +11,13 @@
 - [对外开放部署指南（服务端托管模式）](guides/external_deploy_guide.md)
 - [Google FX 服务管理中心 · 使用说明书](guides/google_fx_console_manual.md)
 - [SPARK 图像生成与图生图接口说明书](guides/image_generation_guide.md)
+- [成片交给 Codex 精剪](guides/codex_video_editing.md)
 - [Antigravity Tools 公网访问与接口请求指南](guides/public_access_guide.md)
 
 ## 技术参考
 
 - [pipeline_flowchart.html](reference/pipeline_flowchart.html)
 - [pipeline_flowchart](reference/pipeline_flowchart.md)
-- [爆款复刻与正交受控发散架构技术方案规范书](reference/replica_baseline_and_orthogonal_mutation_spec.md)
 - [过门协议修订方案（TBCP v2 草案）](reference/threshold_protocol_revision.md)
 
 ## 设计与改造方案
@@ -32,10 +32,6 @@
 - [推进节奏均衡方案（全创意类型通用）](plans/pacing_rhythm_balance_plan.md)
 - [项目工作台重构方案（任务列表 + 点子库合并）](plans/project_workbench_refactor_plan.md)
 - [提示词推进骨架 ↔ 确定性审核 对齐方案](plans/prompt_skeleton_audit_alignment_plan.md)
-- [爆款延时视频「1:1 复刻 + 二创」实施方案](plans/replica_and_variant_pipeline_plan.md)
-- [灵活复刻改造方案（Flexible Replication）](plans/replica_flexible_mutation_plan.md)
-- [爆款复刻模块重构方案](plans/replica_module_refactor_plan.md)
-- [爆款复刻模块 UI 布局优化方案](plans/replica_ui_layout_plan.md)
 - [「激发维度」页极简布局方案](plans/spark_dimension_minimal_layout_plan.md)
 - [「本地服务工作日志」布局重构方案](plans/spark_log_panel_layout_plan.md)
 - [「激发结果」页极简布局方案](plans/spark_result_minimal_layout_plan.md)
@@ -47,8 +43,6 @@
 - [全项目瘦身结果（2026-09-12）](reports/project-slimming-2026-09-12.md)
 
 - [Google FX 服务管理优化清单](reports/google_fx_service_optimization_checklist.md)
-- [爆款复刻模块排查记录（2026-09-05）](reports/replica_bug_audit_2026-09-05.md)
-- [反推性能优化验证](reports/reverse_speed_optimization_2026-09-05.md)
 - [瘦身执行记录](reports/slimming-execution.md)
 - [视频成片识别与槽位恢复（2026-09-06）](reports/video_identity_recovery_2026-09-06.md)
 - [Flow 上传归属与成片识别修复（2026-09-09）](reports/video_identity_recovery_2026-09-09.md)

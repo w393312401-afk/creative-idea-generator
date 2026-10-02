@@ -41,6 +41,145 @@ let promptEditorOpen = false;
 // 不对账就会拿一份基于旧文本的整块覆盖，把那些改写静静抹掉。
 let promptEditorBaseId = null;
 let promptEditorBaseBlock = '';
+let promptBrowseOwner = null;
+let promptBrowseState = null;
+let promptEditSession = 0;
+const promptFoldMemory = new Map();
+
+function promptBrowseOwnerKey() {
+    if (typeof currentIdea === 'undefined' || !currentIdea) return null;
+    return currentIdea.id ? String(currentIdea.id) : currentIdea;
+}
+
+function promptBrowseElements() {
+    return { toolbar: document.getElementById('prompt-browse-tools'),
+        search: document.getElementById('prompt-search'), clear: document.getElementById('prompt-search-clear'),
+        type: document.getElementById('prompt-jump-type'), number: document.getElementById('prompt-jump-number'),
+        jump: document.getElementById('prompt-jump-btn'), status: document.getElementById('prompt-browse-status') };
+}
+
+function promptSetCollapsed(node, collapsed) {
+    if (collapsed) node.classList.add('is-collapsed');
+    else node.classList.remove('is-collapsed');
+    const badge = node.querySelector('.prompt-section-fold-badge');
+    if (badge) badge.hidden = !collapsed;
+    const header = node.querySelector(node.classList.contains('prompt-section') ? '.prompt-section-header' : '.prompt-item-header');
+    if (header) header.setAttribute('aria-expanded', String(!collapsed));
+}
+
+function promptCardMatches(card, query) {
+    const label = card.dataset.type === 'image' ? '图片 图像 画面 IMG IMAGE Frame 拍' : '视频 VIDEO VID Clip 段';
+    const body = card.querySelector('.prompt-item-body');
+    const meta = card.querySelector('.prompt-item-meta');
+    const text = `${label} ${card.dataset.index} ${meta?.textContent || ''} ${body?.textContent || ''}`.toLocaleLowerCase();
+    return String(query || '').trim().toLocaleLowerCase().split(/\s+/).filter(Boolean).every(word => text.includes(word));
+}
+
+function updatePromptFoldButtons(container) {
+    const cards = Array.from(container.querySelectorAll('.prompt-item-card'));
+    const sections = Array.from(container.querySelectorAll('.prompt-section'));
+    sections.forEach(section => {
+        const button = section.querySelector('.prompt-section-fold-items-btn span');
+        if (button) button.textContent = Array.from(section.querySelectorAll('.prompt-item-card'))
+            .some(card => !card.classList.contains('is-collapsed')) ? '折叠条目' : '展开条目';
+    });
+    const label = document.getElementById('toggle-fold-all-prompts-btn')?.querySelector('span');
+    if (label) label.textContent = [...cards, ...sections].some(node => !node.classList.contains('is-collapsed')) ? '全部折叠' : '全部展开';
+}
+
+function rememberPromptFolds(container, nodes) {
+    if (!promptBrowseState || container !== document.getElementById('idea-prompt-block')
+            || promptBrowseOwner !== promptBrowseOwnerKey()) return;
+    Array.from(nodes || []).forEach(node => {
+        if (node.dataset.foldKey) {
+            const collapsed = node.classList.contains('is-collapsed');
+            promptBrowseState.folds[node.dataset.foldKey] = collapsed;
+            promptSetCollapsed(node, collapsed);
+        }
+    });
+    promptFoldMemory.set(promptBrowseOwner, promptBrowseState.folds);
+    if (typeof promptBrowseOwner === 'string') {
+        try { localStorage.setItem('spark_prompt_folds:' + promptBrowseOwner, JSON.stringify(promptBrowseState.folds)); } catch (_) { /* Optional persistence. */ }
+    }
+    updatePromptFoldButtons(container);
+}
+
+function filterPromptBrowser() {
+    const container = document.getElementById('idea-prompt-block');
+    const controls = promptBrowseElements();
+    if (!container || !promptBrowseState) return;
+    const query = (controls.search?.value || '').trim();
+    const cards = Array.from(container.querySelectorAll('.prompt-item-card'));
+    let visible = 0;
+    cards.forEach(card => {
+        const match = promptCardMatches(card, query);
+        card.hidden = !match;
+        if (match) visible++;
+        promptSetCollapsed(card, query && match ? false : !!promptBrowseState.folds[card.dataset.foldKey]);
+    });
+    Array.from(container.querySelectorAll('.prompt-section')).forEach(section => {
+        const hasMatch = Array.from(section.querySelectorAll('.prompt-item-card')).some(card => !card.hidden);
+        section.hidden = !!query && !hasMatch;
+        promptSetCollapsed(section, query && hasMatch ? false : !!promptBrowseState.folds[section.dataset.foldKey]);
+    });
+    if (controls.clear) controls.clear.hidden = !query;
+    if (controls.status) controls.status.textContent = !cards.length ? '暂无可浏览的分段提示词'
+        : query ? (visible ? `找到 ${visible} / ${cards.length} 段` : '未找到匹配提示词，试试其他关键词或清除搜索')
+            : `共 ${cards.length} 段 · 修改此段只保存这一段；整份编辑可调整全文`;
+    updatePromptFoldButtons(container);
+}
+
+function syncPromptBrowser(container) {
+    if (container !== document.getElementById('idea-prompt-block')) return;
+    const controls = promptBrowseElements(), owner = promptBrowseOwnerKey();
+    if (promptBrowseOwner !== owner || !promptBrowseState) {
+        promptBrowseOwner = owner;
+        let folds = promptFoldMemory.get(owner) || {};
+        if (typeof owner === 'string' && !promptFoldMemory.has(owner)) {
+            try {
+                const stored = JSON.parse(localStorage.getItem('spark_prompt_folds:' + owner) || '{}');
+                if (stored && typeof stored === 'object' && !Array.isArray(stored)) {
+                    folds = Object.fromEntries(Object.entries(stored).filter(([key, value]) => typeof value === 'boolean'));
+                }
+            } catch (_) { /* Ignore invalid saved preferences. */ }
+        }
+        promptBrowseState = { folds };
+        if (controls.search) controls.search.value = '';
+        if (controls.type) controls.type.value = 'image';
+        if (controls.number) controls.number.value = '';
+    }
+    Array.from(container.querySelectorAll('.prompt-section')).forEach((section, i) => {
+        section.dataset.foldKey = `section:${i}`;
+    });
+    Array.from(container.querySelectorAll('.prompt-item-card')).forEach(card => {
+        card.dataset.foldKey = `card:${card.dataset.type}:${card.dataset.index}`;
+        card.tabIndex = -1;
+    });
+    filterPromptBrowser();
+}
+
+function jumpToPromptInBrowser(type, index) {
+    const container = document.getElementById('idea-prompt-block');
+    if (!container) return false;
+    const target = Array.from(container.querySelectorAll('.prompt-item-card')).find(card =>
+        card.dataset.type === type && Number(card.dataset.index) === Number(index));
+    if (!target) {
+        const status = promptBrowseElements().status;
+        if (status) status.textContent = `没有${type === 'image' ? '图片' : '视频'} ${index || ''}，请输入已有序号`;
+        return false;
+    }
+    const controls = promptBrowseElements();
+    if (controls.search) controls.search.value = '';
+    filterPromptBrowser();
+    const section = target.closest('.prompt-section');
+    if (section) promptSetCollapsed(section, false);
+    promptSetCollapsed(target, false);
+    updatePromptFoldButtons(container);
+    target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    target.focus({ preventScroll: true });
+    if (controls.status) controls.status.textContent = `已跳转到${type === 'image' ? '图片' : '视频'} ${index}`;
+    return true;
+}
 
 function promptEditorEls() {
     return {
@@ -63,6 +202,9 @@ function setPromptEditorMode(on) {
     const el = promptEditorEls();
     if (!el.textarea || !el.pre) return;
     promptEditorOpen = !!on;
+    promptEditSession++;
+    const browse = promptBrowseElements();
+    if (browse.toolbar) browse.toolbar.hidden = promptEditorOpen;
     el.pre.hidden = promptEditorOpen;
     el.textarea.hidden = !promptEditorOpen;
     if (el.hint) el.hint.hidden = !promptEditorOpen;
@@ -71,8 +213,8 @@ function setPromptEditorMode(on) {
     if (el.autoFixBtn) el.autoFixBtn.hidden = !promptEditorOpen;
     if (el.historyBtn) el.historyBtn.hidden = promptEditorOpen;
     if (el.addBtn) el.addBtn.hidden = !promptEditorOpen;
-    if (el.saveBtn) el.saveBtn.hidden = !promptEditorOpen;
-    if (el.cancelBtn) el.cancelBtn.hidden = !promptEditorOpen;
+    if (el.saveBtn) { el.saveBtn.hidden = !promptEditorOpen; el.saveBtn.disabled = false; }
+    if (el.cancelBtn) { el.cancelBtn.hidden = !promptEditorOpen; el.cancelBtn.disabled = false; }
     // 编辑态下复制按钮会复制 pre 里的旧文本，与眼前正在改的内容不一致，先收起来
     if (el.copyBtn) el.copyBtn.hidden = promptEditorOpen;
     if (!promptEditorOpen) {
@@ -171,6 +313,10 @@ function enterPromptEdit() {
         showToast('请先激发一个创意点子，或从创意库里打开一单', 'error');
         return;
     }
+    if (el.pre?.querySelector('.is-inline-editing')) {
+        showToast('请先保存或取消正在修改的单段提示词，再编辑整份。', 'info');
+        return;
+    }
     if (typeof isIdeaTaskActive === 'function'
             && (isIdeaTaskActive(currentIdea.id, 'frames') || isIdeaTaskActive(currentIdea.id, 'videos'))) {
         showToast('该创意的帧/视频序列正在生成中，等它结束后再改提示词', 'error');
@@ -188,6 +334,8 @@ function enterPromptEdit() {
 
 function cancelPromptEdit() {
     const el = promptEditorEls();
+    if (el.textarea?.disabled) return;
+    const session = promptEditSession;
     const dirty = currentIdea && el.textarea
         && el.textarea.value !== (currentIdea.prompt_block || '');
     if (!dirty) {
@@ -195,7 +343,7 @@ function cancelPromptEdit() {
         return;
     }
     customConfirm('放弃本次对提示词集的改动？').then(ok => {
-        if (!ok) return;
+        if (!ok || session !== promptEditSession) return;
         setPromptEditorMode(false);
         showToast('已放弃改动。', 'info');
     });
@@ -341,7 +489,11 @@ function addBeatInPromptEditor() {
 async function savePromptEdit() {
     const el = promptEditorEls();
     const ownerIdea = currentIdea;
-    if (!ownerIdea || !el.textarea) return false;
+    if (!ownerIdea || !el.textarea || el.textarea.disabled) return false;
+    const session = promptEditSession;
+    const stillEditing = () => promptEditorOpen && session === promptEditSession
+        && currentIdea && currentIdea.id === ownerIdea.id;
+    let expectedBlock = ownerIdea.prompt_block || '';
 
     // 编辑期间换了单：眼前这段文字属于另一条创意，存下去就是张冠李戴
     if (promptEditorBaseId && ownerIdea.id !== promptEditorBaseId) {
@@ -358,6 +510,8 @@ async function savePromptEdit() {
             showToast('已取消保存。可先取消编辑、看过最新提示词后再改。', 'info');
             return false;
         }
+        if (!stillEditing()) return false;
+        expectedBlock = ownerIdea.prompt_block || '';
     }
 
     let text = el.textarea.value;
@@ -402,37 +556,6 @@ async function savePromptEdit() {
         }
     }
 
-    // ── 前置提示词静态合规审查（Pre-flight Prompt Linter）──
-    if (typeof lintPromptBlock === 'function') {
-        const lintReport = lintPromptBlock(text);
-        if (!lintReport.passed) {
-            let linterProceed = false;
-            await new Promise(resolve => {
-                showPromptLinterModal({
-                    report: lintReport,
-                    actionTitle: '保存提示词',
-                    onProceed: () => {
-                        linterProceed = true;
-                        resolve();
-                    },
-                    onAutoFix: () => {
-                        text = autoFixLintIssues(text);
-                        el.textarea.value = text;
-                        autoFixed = true;
-                        linterProceed = true;
-                        showToast('✨ 已自动修复提示词格式瑕疵！', 'success');
-                        resolve();
-                    },
-                    onEdit: () => {
-                        linterProceed = false;
-                        resolve();
-                    }
-                });
-            });
-            if (!linterProceed) return false;
-        }
-    }
-
     const prevSlots = parsePromptBlock(ownerIdea.prompt_block || '');
     const prevCount = prevSlots.filter(s => s.type === 'image').length;
     const added = Math.max(0, check.imageCount - prevCount);
@@ -451,8 +574,15 @@ async function savePromptEdit() {
         showToast('已取消保存。', 'info');
         return false;
     }
+    if (!stillEditing()) return false;
+    if ((ownerIdea.prompt_block || '') !== expectedBlock) {
+        showToast('确认期间提示词已更新，请先核对最新内容再保存。', 'warning');
+        return false;
+    }
 
     el.textarea.disabled = true;
+    if (el.saveBtn) el.saveBtn.disabled = true;
+    if (el.cancelBtn) el.cancelBtn.disabled = true;
     const ok = await mutateSlot({
         what: '保存提示词改动',
         ownerIdea, scope: 'both', requirePrompt: true,
@@ -460,7 +590,7 @@ async function savePromptEdit() {
             title: getIdeaSaveTitle(ownerIdea),
             prompt_block: text,
             // 改动的判定基准：服务端拿它逐槽位比对，只标真正改过的那几帧
-            prev_prompt_block: ownerIdea.prompt_block || '',
+            prev_prompt_block: expectedBlock,
         }),
         // 提示词块是槽位总数的源头，必须先落到创意对象上再重渲两张网格。
         // deferSave：紧随其后的 reloadManifestIntoIdea 会带声明把库写掉。
@@ -493,12 +623,16 @@ async function savePromptEdit() {
         failure: (e) => `保存提示词失败: ${e.message}`,
     });
 
-    el.textarea.disabled = false;
+    if (stillEditing()) {
+        el.textarea.disabled = false;
+        if (el.saveBtn) el.saveBtn.disabled = false;
+        if (el.cancelBtn) el.cancelBtn.disabled = false;
+    }
     if (ok) {
         if (typeof recordPromptHistory === 'function') {
-            recordPromptHistory(ownerIdea.id, text, '手动全局编辑保存');
+            recordPromptHistory(ownerIdea.id, ownerIdea.prompt_block, '整份提示词编辑保存');
         }
-        setPromptEditorMode(false);
+        if (stillEditing()) setPromptEditorMode(false);
     }
     return ok;
 }
@@ -506,6 +640,23 @@ async function savePromptEdit() {
 function initPromptEditor() {
     const el = promptEditorEls();
     if (!el.textarea) return;
+    if (el.textarea.dataset.promptEditorBound) return;
+    el.textarea.dataset.promptEditorBound = 'true';
+    const browse = promptBrowseElements();
+    browse.search?.addEventListener('input', filterPromptBrowser);
+    browse.clear?.addEventListener('click', () => {
+        browse.search.value = ''; filterPromptBrowser(); browse.search.focus();
+    });
+    const jump = () => jumpToPromptInBrowser(browse.type.value, Number(browse.number.value));
+    browse.jump?.addEventListener('click', jump);
+    browse.number?.addEventListener('keydown', event => {
+        if (event.key === 'Enter') { event.preventDefault(); jump(); }
+    });
+    browse.search?.addEventListener('keydown', event => {
+        if (event.key === 'Escape' && browse.search.value) {
+            event.preventDefault(); event.stopPropagation(); browse.search.value = ''; filterPromptBrowser();
+        }
+    });
     if (el.foldAllBtn) {
         el.foldAllBtn.addEventListener('click', () => {
             if (typeof toggleFoldAllPrompts === 'function') {

@@ -802,7 +802,7 @@ def run_selftest(level=0, user_id=None, cancel_check=None):
     if level >= 1 and not any(r["status"] == "failed" for r in steps.rows):
         # 浏览器部分排 FX_CONTROL 队列：自检不能和真任务抢同一个 profile。
         with browser_slot('selftest', cancel_check=cancel_check, priority=30,
-                          task_id=f'selftest_l{level}_{int(time.time())}'):
+                          task_id=f'selftest_l{level}_{int(time.time())}', user_id=user_id):
             _selftest_browser(steps, level, user_id=user_id, cancel_check=cancel_check)
     elif level >= 1:
         steps.note("浏览器自检", "warn", "L0 已有失败步骤，跳过浏览器部分")
@@ -825,7 +825,7 @@ def probe_selectors_live(user_id=None, cancel_check=None, deep=False):
     from .google_fx_helpers import FLOW_HOST_HINTS
 
     with browser_slot('selector_probe', cancel_check=cancel_check, priority=35,
-                      task_id=f'selector_probe_{int(time.time())}'):
+                      task_id=f'selector_probe_{int(time.time())}', user_id=user_id):
         with sync_playwright() as pw:
             ws_url = get_ads_ws_url(user_id=user_id, auto_rotate_proxy=False)
             browser = pw.chromium.connect_over_cdp(ws_url, timeout=20000)
@@ -979,7 +979,7 @@ def capture_canvas_snapshot(user_id=None, cancel_check=None, bucket="canvas_snap
     from ..utils.browser import get_ads_ws_url, is_flow_url
 
     with browser_slot('canvas_snapshot', cancel_check=cancel_check, priority=35,
-                      task_id=f'canvas_snapshot_{int(time.time())}'):
+                      task_id=f'canvas_snapshot_{int(time.time())}', user_id=user_id):
         with sync_playwright() as pw:
             ws_url = get_ads_ws_url(user_id=user_id, auto_rotate_proxy=False)
             browser = pw.chromium.connect_over_cdp(ws_url, timeout=20000)

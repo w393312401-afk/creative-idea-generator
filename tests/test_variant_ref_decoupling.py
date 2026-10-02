@@ -27,7 +27,7 @@ class TestVariantRefDecoupling(unittest.TestCase):
         tb_path = os.path.join(self.tmp, 'timelapse_beats.json')
         with open(tb_path, 'w', encoding='utf-8') as f:
             json.dump({
-                'pipeline_id': 'replica_baseline_01',
+                'pipeline_id': 'reference_baseline_01',
                 'job_type': 'baseline',
                 'beats': [
                     {'id': 'B01', 'coverage_frames': [{'frame': 'review_001.png'}]}
@@ -54,7 +54,7 @@ class TestVariantRefDecoupling(unittest.TestCase):
 
         with open(os.path.join(parent_dir, 'timelapse_beats.json'), 'w', encoding='utf-8') as f:
             json.dump({
-                'pipeline_id': 'replica_parent123',
+                'pipeline_id': 'reference_parent123',
                 'job_type': 'baseline',
                 'beats': [
                     {'id': 'B01', 'coverage_frames': [{'frame': 'review_001.png'}]}
@@ -66,32 +66,29 @@ class TestVariantRefDecoupling(unittest.TestCase):
             f.write('fake_parent_collage')
 
         # 2. 建立变体目录
-        var_dir = os.path.join(self.tmp, 'run_replica_variant456_二创变体_高山避险')
+        var_dir = os.path.join(self.tmp, 'run_variant456_二创变体_高山避险')
         os.makedirs(var_dir, exist_ok=True)
         with open(os.path.join(var_dir, 'manifest.json'), 'w', encoding='utf-8') as f:
             json.dump({
                 'title': '高山避险小屋 · 二创变体',
-                'parent_baseline_id': 'replica_parent123',
+                'parent_baseline_id': 'reference_parent123',
                 'job_type': 'variant',
                 'is_variant': True,
                 'frames': []
             }, f)
 
-        # 模拟 replica_pipeline 的 job_dir 能索引到 parent
-        from unittest.mock import patch
-        with patch('replica_pipeline.job_dir', return_value=parent_dir), \
-             patch('replica_pipeline.validate_job_id', return_value=True):
-            self.assertTrue(pp.is_variant_project(var_dir))
-            refs, roles, collage = pp.find_reference_frames_with_roles(var_dir, total_beats=1)
-            # 变体必须清空逐拍 benchmark 挂帧！
-            self.assertEqual(refs, {})
-            self.assertEqual(roles, {})
-            # 变体仍然保留母本拼图用于宏观比对
-            self.assertEqual(collage, parent_col)
+        # Shared reference lookup follows an explicitly declared local source directory.
+        with open(os.path.join(var_dir, 'video_overview.json'), 'w', encoding='utf-8') as f:
+            json.dump({'source_video': os.path.join(parent_dir, 'source.mp4')}, f)
+        self.assertTrue(pp.is_variant_project(var_dir))
+        refs, roles, collage = pp.find_reference_frames_with_roles(var_dir, total_beats=1)
+        self.assertEqual(refs, {})
+        self.assertEqual(roles, {})
+        self.assertEqual(collage, parent_col)
 
     def test_guard_anchor_passes_no_ref_for_variant(self):
         from unittest.mock import patch
-        var_dir = os.path.join(self.tmp, 'run_replica_v789_二创变体_雪山')
+        var_dir = os.path.join(self.tmp, 'run_variant789_二创变体_雪山')
         os.makedirs(os.path.join(var_dir, 'frames'), exist_ok=True)
         img1 = os.path.join(var_dir, 'frames', 'img_001.webp')
         with open(img1, 'w') as f:
@@ -99,7 +96,7 @@ class TestVariantRefDecoupling(unittest.TestCase):
         with open(os.path.join(var_dir, 'manifest.json'), 'w', encoding='utf-8') as f:
             json.dump({
                 'title': '高山小屋 · 二创变体',
-                'parent_baseline_id': 'replica_parent123',
+                'parent_baseline_id': 'reference_parent123',
                 'job_type': 'variant',
                 'is_variant': True,
                 'frames': [{'sequence': 1, 'file': img1}]

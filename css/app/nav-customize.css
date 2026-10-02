@@ -17,10 +17,10 @@
     flex: 0 0 auto;
     background: transparent;
     border: none;
-    border-radius: 8px;
+    border-radius: var(--radius-md);
     color: var(--text-secondary);
     padding: 10px 10px;
-    font-size: 16px;
+    font-size: var(--fs-lg);
     line-height: 1;
     letter-spacing: 1px;
     cursor: pointer;
@@ -44,7 +44,7 @@
     max-width: calc(100vw - 24px);
     background: rgba(var(--panel-rgb), 0.98);
     border: 1px solid var(--border-color);
-    border-radius: 12px;
+    border-radius: var(--radius-lg);
     box-shadow: 0 12px 32px rgba(0, 0, 0, 0.28);
     padding: 10px;
     backdrop-filter: blur(8px);
@@ -58,12 +58,12 @@
 }
 
 .ncp-head strong {
-    font-size: 13px;
+    font-size: var(--fs-md);
     color: var(--text-primary);
 }
 
 .ncp-hint {
-    font-size: 11px;
+    font-size: var(--fs-xs);
     color: var(--text-secondary);
     opacity: 0.75;
 }
@@ -79,8 +79,8 @@
     align-items: center;
     gap: 6px;
     padding: 6px 4px;
-    border-radius: 8px;
-    font-size: 12px;
+    border-radius: var(--radius-md);
+    font-size: var(--fs-sm);
     color: var(--text-primary);
     cursor: grab;
     user-select: none;
@@ -105,11 +105,11 @@
 .ncp-grip {
     color: var(--text-secondary);
     opacity: 0.5;
-    font-size: 12px;
+    font-size: var(--fs-sm);
 }
 
 .ncp-icon {
-    font-size: 13px;
+    font-size: var(--fs-md);
 }
 
 .ncp-label {
@@ -132,8 +132,8 @@
     color: var(--text-secondary);
     cursor: pointer;
     padding: 2px 4px;
-    border-radius: 6px;
-    font-size: 11px;
+    border-radius: var(--radius-sm);
+    font-size: var(--fs-xs);
     line-height: 1;
 }
 
@@ -144,7 +144,7 @@
 }
 
 .ncp-eye {
-    font-size: 13px;
+    font-size: var(--fs-md);
 }
 
 .ncp-foot {
@@ -159,8 +159,8 @@
 .ncp-foot button {
     flex: 1;
     padding: 6px 8px;
-    border-radius: 8px;
-    font-size: 12px;
+    border-radius: var(--radius-md);
+    font-size: var(--fs-sm);
     cursor: pointer;
     border: 1px solid var(--border-color);
     background: transparent;
@@ -182,7 +182,7 @@
 @media (max-width: 768px) {
     .nav-customize-btn {
         padding: 8px 6px;
-        font-size: 14px;
+        font-size: var(--fs-base);
     }
 
     .nav-customize-panel {

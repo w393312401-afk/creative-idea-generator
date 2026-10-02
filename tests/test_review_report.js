@@ -14,7 +14,7 @@ const path = require('path');
 
 const {
     collectReviewIssues, summarizeReviewState, reviewSummaryText,
-    reviewIssueSeverity, reviewLayerLabel,
+    reviewIssueSeverity, reviewLayerLabel, reviewSeqRanges, reviewPanelCollapsed,
 } = require('../js/review_report.js');
 
 const frame = (seq, over) => Object.assign(
@@ -170,12 +170,12 @@ assert.strictEqual(state.rendered, 5, '未渲染的槽位不算进覆盖面');
 assert.strictEqual(state.passed, 1);
 assert.strictEqual(state.flagged, 1);
 assert.strictEqual(state.manual, 1);
-assert.deepStrictEqual(state.neverSeqs, [3], '从没审过');
+assert.deepStrictEqual(state.neverSeqs, [3, 5], '没有明确审查结论的图片都属于未审查');
 assert.deepStrictEqual(state.skippedSeqs, [4], '审查服务不可用被跳过');
 assert.strictEqual(state.lastReviewedAt, '2026-08-25T09:30:00', '取最近一次');
 
 // ── 抬头那一句 ──────────────────────────────────────────────────────
-assert.strictEqual(reviewSummaryText(state, 3), '3 处待处理问题 · 已审 2/5 帧 · 2 帧未审查');
+assert.strictEqual(reviewSummaryText(state, 3), '3 处待处理问题 · 已审 2/5 帧 · 3 帧未审查');
 const clean = summarizeReviewState({
     frames: [frame(1, { quality_gate: 'sequence_reviewed_pass' })],
 });
@@ -227,3 +227,19 @@ assert.ok(apiJs.includes("'review-beat'"),
 assert.ok(apiJs.includes('hadLines'), '有 lines 时不重复播报复用/完成');
 
 console.log('review report tests passed');
+
+// Zero and partial coverage must never claim that the entire project passed review.
+const unreviewed = summarizeReviewState({ frames: [frame(1, {}), frame(2, { quality_gate: 'auto_approved' })] });
+assert.strictEqual(unreviewed.reviewed, 0);
+assert.strictEqual(unreviewed.unreviewed, 2);
+assert.strictEqual(reviewSummaryText(unreviewed, 0), '尚未审查 · 已审 0/2 帧 · 2 帧未审查');
+const partial = summarizeReviewState({ frames: [frame(1, { quality_gate: 'sequence_reviewed_pass' }), frame(2, {})] });
+assert.strictEqual(reviewSummaryText(partial, 0), '已审部分未发现问题 · 已审 1/2 帧 · 1 帧未审查');
+
+assert.strictEqual(reviewSeqRanges(Array.from({ length: 44 }, (_, i) => i + 1)), 'IMG 001–044');
+assert.strictEqual(reviewSeqRanges([9, 2, 1, 2, 5, 7, 8]), 'IMG 001–002、IMG 005、IMG 007–009');
+assert.strictEqual(reviewSeqRanges([]), '');
+assert.strictEqual(reviewPanelCollapsed(0, undefined), true, 'no issues defaults to collapsed');
+assert.strictEqual(reviewPanelCollapsed(2, undefined), false, 'issues automatically expand without a preference');
+assert.strictEqual(reviewPanelCollapsed(2, '1'), true, 'manual collapsed preference wins');
+assert.strictEqual(reviewPanelCollapsed(0, '0'), false, 'manual expanded preference wins');

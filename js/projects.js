@@ -25,7 +25,8 @@
 let projectsRows = null;           // 当前页的项目行（服务端已筛选/排序）
 let projectsCounts = {};           // chips 角标（在完整表上统计，不受筛选影响）
 let projectsTotal = 0;
-let projectsFilter = 'all';        // all | running | completed | saved | failed
+let projectsSection = 'active';    // active | archived：制作中的项目和归档独立分区
+let projectsFilter = 'all';        // 活动项目的状态筛选：all | running | completed | saved | failed
 let projectsSearch = '';
 let projectsSort = 'newest';       // newest | oldest | title
 let projectsSelectedKey = null;    // 详情 pane 当前选中的 project_key
@@ -33,6 +34,9 @@ let projectsLoading = false;
 let projectsPollTimer = null;
 let projectsTabActive = false;
 let projectsSearchDebounce = null;
+let projectsArchiving = false;
+let projectsRefreshRevision = 0;   // 归档后拒绝此前发出的旧素材响应
+let projectsPendingArchivedKey = null;
 
 // 显示方式（列表 / 网格 / 紧凑）。三档只改 #projects-list 上的 view-* 类，行的
 // HTML 与数据完全不动——切视图不该重新拉一次 /api/projects，也不该丢掉勾选。
@@ -53,7 +57,7 @@ let projectsLastClickedKey = null;   // shift 连选的锚点
 
 const PROJECT_STATE_LABELS = {
     running: '运行中', completed: '已完成', saved: '已收藏',
-    failed: '已失败', cancelled: '已取消', unknown: '—',
+    failed: '已失败', cancelled: '已取消', ready: '待继续', partial: '部分完成', archived: '已归档', archive_pending: '归档待完成', unknown: '—',
 };
 const PROJECT_JOB_LABELS = {
     frames: '帧序列', staged_render: '分步渲染', videos: '视频', cover: '封面',
@@ -71,15 +75,10 @@ const PROJECT_STAGE_LABELS = {
     repair: '修复中', audit: '质量审计', compose: '合成提示词',
     frames: '生成帧序列', staged_render: '分步渲染', videos: '生成视频', cover: '生成封面',
     completed: '已完成', cancelled: '已取消',
-    // 复刻线的 stage 不在这里抄第三份——真源是 replica_pipeline.py 的 STAGE_LABELS，
-    // 由 js/replica_pipeline.js 的 REPLICA_STAGE_LABELS 兜底（它在本文件之前加载）。
-    // 抄一份的代价很具体：新增一个 stage 要记得改三处，漏掉这处就在工作台上露出
-    // `confirm_cost` 这种内部名。
 };
 function projectsStageLabel(stage) {
     if (!stage) return '准备中…';
-    const replica = (typeof REPLICA_STAGE_LABELS !== 'undefined' && REPLICA_STAGE_LABELS) || {};
-    return PROJECT_STAGE_LABELS[stage] || replica[stage] || stage;
+    return PROJECT_STAGE_LABELS[stage] || stage;
 }
 
 /* ── 显示方式 ──────────────────────────────────────────────────────────── */
@@ -104,6 +103,66 @@ function projectsSetView(view) {
     projectsApplyView();
 }
 
+/* ── 项目 / 项目归档分区 ───────────────────────────────────────────────── */
+
+function projectsIsArchived(p) {
+    return Boolean(p.archived || p.archive_pending || p.state === 'archived');
+}
+
+function projectsUpdateSectionUi() {
+    document.querySelectorAll('#projects-sections .projects-section-btn').forEach(btn => {
+        if (!btn.dataset.label) btn.dataset.label = btn.textContent.trim();
+        const count = btn.dataset.section === 'archived' ? projectsCounts.archived
+            : projectsCounts.active ?? (projectsCounts.all !== undefined && projectsCounts.archived !== undefined
+                ? Math.max(0, projectsCounts.all - projectsCounts.archived) : undefined);
+        btn.textContent = count !== undefined ? `${btn.dataset.label} (${count})` : btn.dataset.label;
+        const active = btn.dataset.section === projectsSection;
+        btn.classList.toggle('active', active);
+        btn.setAttribute('aria-pressed', active ? 'true' : 'false');
+    });
+    const archived = projectsSection === 'archived';
+    const filters = document.getElementById('projects-filters');
+    if (filters) filters.hidden = archived;
+    const hint = document.getElementById('projects-section-hint');
+    if (hint) hint.textContent = archived
+        ? '集中查看归档成片、节拍数据与提示词，继续完成待清理的归档'
+        : '查看生成进度，继续制作或下载成片';
+    const search = document.getElementById('projects-search');
+    if (search) {
+        search.placeholder = archived ? '搜索归档项目名称' : '搜索项目名称';
+        search.setAttribute('aria-label', archived ? '搜索归档项目' : '搜索项目');
+    }
+}
+
+function projectsApplySection(section, { clearSearch = false } = {}) {
+    const next = section === 'archived' ? 'archived' : 'active';
+    if (projectsSection !== next) {
+        projectsSection = next;
+        projectsFilter = 'all';
+        projectsSelectedKey = null;
+        projectsSelected.clear();
+        projectsLastClickedKey = null;
+        projectsPendingArchivedKey = null;
+        if (projectsRows) projectsRows = projectsRows.filter(p => projectsIsArchived(p) === (next === 'archived'));
+        projectsTotal = next === 'archived' ? projectsCounts.archived ?? 0
+            : projectsCounts.active ?? Math.max(0, (projectsCounts.all || 0) - (projectsCounts.archived || 0));
+        projectsRefreshRevision++;
+    }
+    if (clearSearch) {
+        projectsSearch = '';
+        const search = document.getElementById('projects-search');
+        if (search) search.value = '';
+    }
+    projectsUpdateSectionUi();
+}
+
+async function projectsSetSection(section) {
+    if (section === projectsSection) return;
+    projectsApplySection(section);
+    renderProjects();
+    await refreshProjects();
+}
+
 /* ── 数据 ──────────────────────────────────────────────────────────────── */
 
 function projectsTabEntered() {
@@ -125,7 +184,7 @@ function projectsTabLeft() {
 function projectsSchedulePoll() {
     if (projectsPollTimer) clearTimeout(projectsPollTimer);
     if (!projectsTabActive) return;
-    const hasRunning = (projectsRows || []).some(p => p.state === 'running');
+    const hasRunning = (projectsRows || []).some(projectsIsRunning);
     projectsPollTimer = setTimeout(() => {
         if (!projectsTabActive) return;
         refreshProjects({ assets: false, silent: true }).finally(projectsSchedulePoll);
@@ -136,6 +195,7 @@ async function refreshProjects(options = {}) {
     const { assets = true, silent = false } = options;
     if (projectsLoading) return;
     projectsLoading = true;
+    const revision = projectsRefreshRevision;
 
     const container = document.getElementById('projects-list');
     if (container && !projectsRows && !silent) {
@@ -143,7 +203,8 @@ async function refreshProjects(options = {}) {
     }
     try {
         const params = new URLSearchParams({
-            state: projectsFilter,
+            scope: projectsSection,
+            state: projectsSection === 'archived' ? 'archived' : projectsFilter,
             q: projectsSearch,
             sort: projectsSort,
             limit: '200',
@@ -153,6 +214,16 @@ async function refreshProjects(options = {}) {
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const data = await res.json();
         if (data && data.error) throw new Error(data.error);
+        if (revision !== projectsRefreshRevision) {
+            projectsLoading = false;
+            return refreshProjects();
+        }
+        // 执行响应丢失、或另一个窗口归档后，以服务端的归档状态清理本窗口旧媒体。
+        const previousRows = projectsRows || [];
+        const oldRows = new Map(previousRows.map(p => [p.project_key, p]));
+        const newlyArchived = (data.projects || []).filter(p => p.archived && oldRows.has(p.project_key)
+            && !oldRows.get(p.project_key).archived);
+        if (newlyArchived.length) projectsApplyArchiveResults(newlyArchived, previousRows, []);
 
         // assets=0 的轮询回来的行没有资产统计。直接覆盖会让"19 个文件"在两次
         // 轮询之间闪成 0，所以只在这次确实带了资产时才接受新值。
@@ -160,7 +231,7 @@ async function refreshProjects(options = {}) {
             const prev = new Map(projectsRows.map(p => [p.project_key, p]));
             (data.projects || []).forEach(p => {
                 const old = prev.get(p.project_key);
-                if (!old) return;
+                if (!old || p.archived || old.archived) return;
                 if (!p.assets) p.assets = old.assets;
                 // 轻量轮询（assets=0）不会扫描 outputs，因此未收藏项目的磁盘封面
                 // 不会出现在响应里。保留上一次完整刷新拿到的封面，避免每次轮询后
@@ -168,11 +239,19 @@ async function refreshProjects(options = {}) {
                 if (!p.cover && old.cover) p.cover = old.cover;
             });
         }
-        projectsRows = data.projects || [];
+        // 同时防御旧版服务端：所有活动状态筛选都不能混入归档项目。
+        projectsRows = (data.projects || []).filter(p => projectsIsArchived(p) === (projectsSection === 'archived'));
+        if (projectsPendingArchivedKey && projectsRows.some(p => p.project_key === projectsPendingArchivedKey && p.archived)) {
+            projectsSelectedKey = projectsPendingArchivedKey;
+            projectsPendingArchivedKey = null;
+        }
         projectsCounts = data.counts || {};
-        projectsTotal = data.total_count || 0;
+        projectsTotal = projectsSection === 'archived'
+            ? projectsCounts.archived ?? data.filtered_count ?? projectsRows.length
+            : projectsCounts.active ?? Math.max(0, (data.total_count || 0) - (projectsCounts.archived || 0));
     } catch (e) {
         projectsLoading = false;
+        if (revision !== projectsRefreshRevision) return refreshProjects();
         console.error('Failed to load projects', e);
         if (container && !silent) {
             container.innerHTML = `<div class="projects-status error">项目列表加载失败：${escapeHtml(e.message)}</div>`;
@@ -181,10 +260,21 @@ async function refreshProjects(options = {}) {
     }
     projectsLoading = false;
     renderProjects();
+    projectsSchedulePoll();
 }
 
 function projectsFindRow(key) {
     return (projectsRows || []).find(p => p.project_key === key) || null;
+}
+
+function projectsIsRunning(p) {
+    return p.state === 'running' || (p.task || {}).status === 'running'
+        || (p.sub_jobs || []).some(j => j.status === 'running')
+        || ['queued', 'running'].includes(p.video_edit?.status);
+}
+
+function projectsCanArchive(p) {
+    return Boolean(p.project_key && p.kind !== 'job' && (!p.archived || p.archive_pending) && !projectsIsRunning(p));
 }
 
 /* ── 渲染 ──────────────────────────────────────────────────────────────── */
@@ -230,149 +320,174 @@ function projectsHandleCoverError(img) {
         img.src = fallback;
         return;
     }
-    if (img) img.outerHTML = '<div class="project-thumb-icon">💡</div>';
+    if (img) img.outerHTML = `<div class="project-thumb-icon">${img.dataset?.placeholder === 'archive' ? '📦' : '💡'}</div>`;
+}
+
+function projectsArchiveCoverUrl(p) {
+    const archive = p.archive || {};
+    const files = Array.isArray(archive.retained_files) ? archive.retained_files : [];
+    return [archive.cover_url, ...files.filter(file => file && file.kind === 'cover').map(file => file.url)]
+        .find(projectsSafeArchiveUrl) || null;
 }
 
 function projectsCoverHtml(p) {
-    const candidates = [p.cover, p.assets && p.assets.cover]
+    const archived = projectsIsArchived(p);
+    const candidates = (archived ? [projectsArchiveCoverUrl(p)] : [p.cover, p.assets && p.assets.cover])
         .filter(projectsSafeCoverUrl)
         .filter((url, index, all) => all.indexOf(url) === index);
-    if (!candidates.length) return '<div class="project-thumb-icon">💡</div>';
+    if (!candidates.length) return `<div class="project-thumb-icon">${archived ? '📦' : '💡'}</div>`;
     const fallback = candidates[1]
         ? ` data-fallback="${escapeHtml(candidates[1])}"`
         : '';
-    return `<img src="${escapeHtml(candidates[0])}"${fallback} alt="" loading="lazy"
+    return `<img src="${escapeHtml(candidates[0])}"${fallback}${archived ? ' data-placeholder="archive"' : ''} alt="" loading="lazy"
                  onerror="projectsHandleCoverError(this)">`;
 }
 
+const PROJECT_EDIT_STAGE_LABELS = {
+    queued: '等待开始', preparing: '准备原片', reviewing_source: '审阅原片',
+    rendering: '导出精剪视频', reviewing_output: '复核剪切边界', verifying: '校验成片和音轨',
+    cancelling: '正在停止精剪',
+};
+
+function projectsEditElapsed(edit) {
+    const epoch = value => {
+        const number = Number(value);
+        return Number.isFinite(number) && number > 0 ? number < 1e12 ? number * 1000 : number : Date.parse(value) || 0;
+    };
+    const start = epoch(edit.created_at);
+    const active = ['queued', 'running'].includes(edit.status);
+    const end = active ? Date.now() : epoch(edit.finished_at || edit.updated_at);
+    if (!start || !end || end < start) return '';
+    const seconds = Math.floor((end - start) / 1000);
+    const duration = seconds >= 3600 ? `${Math.floor(seconds / 3600)} 小时 ${Math.floor(seconds % 3600 / 60)} 分`
+        : seconds >= 60 ? `${Math.floor(seconds / 60)} 分 ${seconds % 60} 秒` : `${seconds} 秒`;
+    return `${active ? edit.status === 'queued' ? '已等待' : '已运行' : '耗时'} ${duration}`;
+}
+
+function projectsCurrentStatus(p) {
+    if (p.archive_pending) return { label: '归档待完成', state: 'archive_pending',
+        next: '保留文件已保存，点击完成归档继续清理剩余内容', progress: '', running: false };
+    if (p.archived) return { label: '已归档', state: 'archived',
+        next: projectsArchiveVideos(p).length ? '查看成片、节拍数据和全套提示词' : '查看节拍数据和全套提示词', progress: '', running: false };
+    const task = p.task || {};
+    const progress = p.progress || {};
+    const imageReady = Number(progress.image_ready) || 0;
+    const videoReady = Number(progress.video_ready) || 0;
+    const imageTotal = Number(progress.image_total) || Number(p.image_count) || 0;
+    const videoTotal = Number(progress.video_total) || Number(p.video_count) || 0;
+    const jobs = p.sub_jobs || [];
+    const active = jobs.filter(j => j.status === 'running');
+    const parts = [];
+    if (imageTotal || imageReady) parts.push(`图片 ${imageReady}/${Math.max(imageTotal, imageReady)}`);
+    if (videoTotal || videoReady) parts.push(`视频 ${videoReady}/${Math.max(videoTotal, videoReady)}`);
+    const edit = p.video_edit;
+    if (edit && ['queued', 'running', 'completed', 'failed', 'cancelled', 'interrupted'].includes(edit.status)
+        && (['queued', 'running'].includes(edit.status) || (task.status !== 'running' && !active.length
+            && !progress.merged_partial && !progress.merged_stale))) {
+        const running = ['queued', 'running'].includes(edit.status);
+        const missing = edit.status === 'completed' && edit.output_missing;
+        const outdated = edit.status === 'completed' && edit.source_changed;
+        const labels = { queued: '精剪排队中', running: '正在精剪', completed: '精剪完成',
+            failed: '精剪失败', cancelled: '精剪已取消', interrupted: '精剪已中断' };
+        const label = edit.stage === 'cancelling' && running ? '正在停止精剪'
+            : missing ? '精剪文件不可用' : outdated ? '旧版精剪完成' : labels[edit.status];
+        const stage = running ? PROJECT_EDIT_STAGE_LABELS[edit.stage] || '正在精剪' : '';
+        if (stage) parts.push(stage);
+        const elapsed = projectsEditElapsed(edit);
+        if (elapsed) parts.push(elapsed);
+        const next = running ? edit.message || '打开项目查看精剪进度；原片和已完成版本会保留'
+            : missing ? '精剪结果文件不可用，打开项目重新精剪'
+            : outdated ? '当前原片已更新，打开项目查看旧版结果或重新精剪'
+            : edit.status === 'completed' ? '打开项目，查看或下载精剪成片'
+            : edit.message || '打开项目查看精剪记录，可重新开始精剪';
+        return { label, state: running ? 'running' : missing || ['failed', 'interrupted'].includes(edit.status)
+            ? 'failed' : edit.status === 'cancelled' ? 'cancelled' : 'completed',
+            next, progress: parts.join(' · '), running };
+    }
+    let label = '待生成', state = 'saved', next = '打开项目，开始生成图片';
+    if (task.status === 'running' || active.length) {
+        label = active.length
+            ? [...new Set(active.map(j => PROJECT_JOB_LABELS[j.type] || '媒体'))].join('、') + '生成中'
+            : projectsStageLabel(task.stage);
+        state = 'running';
+        next = active.length ? '打开项目查看当前进度' : '查看当前生成进度';
+    } else if (progress.merged_partial) {
+        label = '部分成片'; state = 'failed'; next = '打开项目，补齐缺失视频后重新合并';
+    } else if (progress.merged_stale) {
+        label = '成片待更新'; state = 'failed'; next = '旧成片仍可查看，完成当前生成后重新合并';
+    } else if (progress.merged) {
+        label = '已成片'; state = 'completed'; next = '打开项目，查看或下载成片';
+    } else if (p.has_failed_jobs || task.status === 'failed' || task.status === 'cancelled' || task.outcome === 'partial_failed') {
+        label = task.status === 'cancelled' ? '已取消' : '需要处理'; state = 'failed';
+        next = p.saved || task.status === 'completed' ? '打开项目，检查并重试未完成的生成' : '查看生成记录后重试';
+    } else if (videoTotal && videoReady >= videoTotal) {
+        label = '视频已齐'; state = 'completed'; next = '打开项目，合并成片';
+    } else if (imageTotal && imageReady >= imageTotal) {
+        label = '图片已齐'; state = 'completed'; next = '打开项目，继续生成视频';
+    } else if (imageReady || videoReady) {
+        label = '部分完成'; next = videoReady ? '打开项目，补齐未完成的视频' : '打开项目，补齐未完成的图片';
+    } else if (p.kind === 'job') {
+        label = p.state === 'completed' ? '生成已结束' : (PROJECT_STATE_LABELS[p.state] || '生成记录');
+        state = p.state || 'unknown'; next = '找回项目，或在画廊查看已生成文件';
+    }
+    return { label, state, next, progress: parts.join(' · '), running: state === 'running' };
+}
+
+function projectsCurrentStatusHtml(p, showLabel = true) {
+    const status = projectsCurrentStatus(p);
+    return `<div class="project-current-status" role="status">${status.running ? '<span class="project-spinner" aria-hidden="true"></span>' : ''}
+        ${showLabel ? `<strong>${escapeHtml(status.label)}</strong>` : ''}${status.progress ? `<span>${escapeHtml(status.progress)}</span>` : ''}</div>
+        ${showLabel ? `<div class="project-next-hint">${escapeHtml(status.next)}</div>` : ''}`;
+}
+
 function projectsBadgesHtml(p) {
-    const badges = [`<span class="project-badge state-${escapeHtml(p.state)}">${escapeHtml(PROJECT_STATE_LABELS[p.state] || p.state)}</span>`];
-    if (p.saved && p.state !== 'saved') badges.push('<span class="project-badge saved">已收藏</span>');
-    if (p.kind === 'job') {
-        badges.push('<span class="project-badge job" title="母项目的激发任务记录已被清理（任务记录只保留 7 天），只剩这些媒体作业">孤立作业</span>');
-    }
-    if (p.has_failed_jobs && p.state !== 'failed') {
-        badges.push('<span class="project-badge warn" title="有媒体子作业失败——这类失败在旧任务列表里完全不可见">子作业失败</span>');
-    }
+    const status = projectsCurrentStatus(p);
+    const badges = [`<span class="project-badge state-${escapeHtml(status.state)}">${escapeHtml(status.label)}</span>`];
+    if (p.kind === 'job') badges.push('<span class="project-badge job" title="未找到关联的项目，可按标题找回">生成记录</span>');
+    const fxBadge = projectsFxQueueBadge(p.fx_queue);
+    if (fxBadge) badges.push(fxBadge);
     return badges.join('');
 }
 
-function projectsAggregateJobs(p, maybeJobs) {
-    let project = {};
-    let subJobs = [];
-    if (Array.isArray(p)) {
-        subJobs = p;
-        project = maybeJobs || {};
-    } else if (p && typeof p === 'object') {
-        project = p;
-        subJobs = maybeJobs || p.sub_jobs || [];
-    } else {
-        return [];
+// 浏览器占用/排队徽标：来自 /api/projects 的 fx_queue（后端只读标注）。
+// 排队时让用户知道"没卡死，是在等浏览器名额"，并指出在等谁。
+function projectsFxQueueBadge(mark) {
+    if (!mark) return '';
+    if (mark.state === 'waiting') {
+        const waited = Number(mark.waited_seconds);
+        const waitedText = Number.isFinite(waited) && waited >= 5 ? `，已等 ${Math.round(waited)} 秒` : '';
+        const holder = mark.holder_task ? `正被 ${mark.holder_task} 占用` : '浏览器被占用';
+        return `<span class="project-badge fx-queue waiting" title="${escapeHtml(`${holder}${waitedText}`)}">⏳ 排队等浏览器</span>`;
     }
-    if (!Array.isArray(subJobs) || !subJobs.length) return [];
+    if (mark.state === 'active') {
+        return '<span class="project-badge fx-queue active" title="本项目当前占用着浏览器">🖥 占用浏览器</span>';
+    }
+    return '';
+}
 
-    const order = ['frames', 'staged_render', 'stepped', 'stepped_advance', 'videos', 'cover'];
+function projectsAggregateJobs(p, maybeJobs) {
+    const project = Array.isArray(p) ? (maybeJobs || {}) : (p || {});
+    const jobs = Array.isArray(p) ? p : (maybeJobs || project.sub_jobs || []);
     const groups = new Map();
-
-    subJobs.forEach(job => {
-        if (!job) return;
-        const type = job.type || 'unknown';
-        if (!groups.has(type)) {
-            groups.set(type, {
-                type,
-                total: 0,
-                completed: 0,
-                failed: 0,
-                running: 0,
-                cancelled: 0,
-                unknown: 0,
-            });
-        }
-        const g = groups.get(type);
-        g.total++;
-        const st = job.status || 'unknown';
-        if (st === 'completed') g.completed++;
-        else if (st === 'failed') g.failed++;
-        else if (st === 'running') g.running++;
-        else if (st === 'cancelled') g.cancelled++;
-        else g.unknown++;
+    [...jobs].sort((a, b) => (b.last_active || 0) - (a.last_active || 0)).forEach(job => {
+        if (!groups.has(job.type)) groups.set(job.type, { latest: job, running: 0 });
+        if (job.status === 'running') groups.get(job.type).running++;
     });
-
-    const result = Array.from(groups.values());
-    result.sort((a, b) => {
-        const ia = order.indexOf(a.type);
-        const ib = order.indexOf(b.type);
-        if (ia !== -1 && ib !== -1) return ia - ib;
-        if (ia !== -1) return -1;
-        if (ib !== -1) return 1;
-        return a.type.localeCompare(b.type);
-    });
-
-    const hasMediaFrames = (project.image_count > 0)
-        || (project.library && project.library.frame_count > 0)
-        || (project.assets && project.assets.file_count > 0 && (project.cover || project.assets.cover));
-    const hasMediaVideos = (project.video_count > 0);
-    const hasMediaCover = !!project.cover || (project.assets && !!project.assets.cover);
-
-    return result.map(g => {
-        const typeLabel = PROJECT_JOB_LABELS[g.type] || g.type;
-        let statusClass = 'completed';
-        let icon = '✓';
-        let label = '';
-        let title = '';
-
-        const typeHasMedia = (g.type === 'frames' || g.type === 'staged_render' || g.type === 'stepped' || g.type === 'stepped_advance') ? hasMediaFrames
-                           : (g.type === 'videos') ? hasMediaVideos
-                           : (g.type === 'cover') ? hasMediaCover
-                           : (project.saved || project.state === 'completed');
-
-        if (g.running > 0) {
-            statusClass = 'running';
-            icon = '⏳';
-            label = `${typeLabel}生成中`;
-            title = `${typeLabel}: ${g.running} 任务进行中${g.completed ? `, ${g.completed} 已完成` : ''}`;
-        } else if (g.completed > 0 || typeHasMedia) {
-            // 如果该类型有已完成任务，或者项目自身已有该媒体资产
-            statusClass = 'completed';
-            icon = '✓';
-            if ((g.type === 'frames' || g.type === 'staged_render') && (project.image_count || (project.library && project.library.frame_count))) {
-                const count = project.image_count || (project.library && project.library.frame_count);
-                label = `${count}帧序列`;
-            } else if (g.type === 'videos' && project.video_count) {
-                label = `${project.video_count}镜视频`;
-            } else {
-                label = typeLabel;
-            }
-            if (g.failed > 0) {
-                title = `${typeLabel}: 媒体已就绪（含 ${g.failed} 条历史重试/失败记录）`;
-            } else {
-                title = `${typeLabel}: 已就绪`;
-            }
-        } else if (g.failed > 0) {
-            statusClass = 'failed';
-            icon = '✕';
-            label = `${typeLabel}失败`;
-            title = `${typeLabel}: 生成失败（${g.failed} 次尝试未成功）`;
-        } else if (g.cancelled === g.total) {
-            statusClass = 'cancelled';
-            icon = '⚪';
-            label = `${typeLabel}已取消`;
-            title = `${typeLabel}: 全部已取消`;
-        } else {
-            statusClass = 'completed';
-            icon = '✓';
-            label = typeLabel;
-            title = `${typeLabel}: 已就绪`;
-        }
-
-        return {
-            type: g.type,
-            statusClass,
-            icon,
-            label,
-            title,
-            stats: g,
-        };
+    const progress = project.progress || {};
+    return Array.from(groups, ([type, group]) => {
+        const typeLabel = PROJECT_JOB_LABELS[type] || type;
+        const field = ['frames', 'staged_render'].includes(type) ? 'image'
+            : ['videos', 'video_chain'].includes(type) ? 'video' : '';
+        const ready = field ? Number(progress[field + '_ready']) || 0 : 0;
+        const total = field ? Number(progress[field + '_total']) || 0 : 0;
+        const mediaReady = total > 0 && ready >= total;
+        let statusClass = group.running ? 'running' : group.latest.outcome === 'partial_failed' ? 'failed' : group.latest.status || 'unknown';
+        if (!group.running && ((mediaReady && group.latest.outcome !== 'partial_failed') || progress.merged)) statusClass = 'completed';
+        const labels = { running: `${typeLabel}生成中`, failed: `${typeLabel}失败`,
+            cancelled: `${typeLabel}已取消`, completed: ready ? `${typeLabel} ${ready}${total ? '/' + total : ''}` : `${typeLabel}生成已结束` };
+        return { type, statusClass, icon: PROJECT_JOB_ICONS[statusClass] || '·',
+            label: labels[statusClass] || typeLabel,
+            title: '当前结果；过往尝试见生成记录', stats: group };
     });
 }
 
@@ -387,9 +502,6 @@ function projectsJobsHtml(p) {
 
 function projectsMetaHtml(p) {
     const bits = [];
-    if (p.video_count) bits.push(`${p.video_count} 镜`);
-    else if (p.image_count) bits.push(`${p.image_count} 帧`);
-    else if (p.library && p.library.frame_count) bits.push(`${p.library.frame_count} 帧`);
     if (p.assets && p.assets.file_count) {
         bits.push(`${p.assets.file_count} 个文件 · ${projectsFormatBytes(p.assets.bytes)}`);
     }
@@ -399,25 +511,21 @@ function projectsMetaHtml(p) {
 
 function projectsRowInnerHtml(p) {
     const task = p.task || {};
-    const running = p.state === 'running';
-    const progress = running
-        ? `<div class="project-progress"><span class="project-progress-stage" title="${escapeHtml(task.stage || '')}">${escapeHtml(projectsStageLabel(task.stage))}</span><span class="project-spinner"></span></div>`
-        : '';
-    const error = (p.state === 'failed' && task.error)
-        ? `<div class="project-error" title="${escapeHtml(task.error)}">❌ ${escapeHtml(task.error)}</div>` : '';
     const badgesHtml = projectsBadgesHtml(p);
 
     const actionBtns = [];
-    if (p.saved || task.status === 'completed') {
+    if (p.archived) {
+        actionBtns.push('<button type="button" class="project-card-btn primary" data-act="view-archive" title="查看归档文件">📦 查看归档</button>');
+    } else if (p.saved || task.status === 'completed') {
         actionBtns.push('<button type="button" class="project-card-btn primary" data-act="open" title="打开项目">🎬 打开</button>');
     }
-    if (task.status === 'running') {
+    if (!p.archived && task.status === 'running') {
         actionBtns.push('<button type="button" class="project-card-btn primary" data-act="follow" title="跟进实时输出">👁 跟进</button>');
     }
-    if (task.status === 'failed' || task.status === 'cancelled') {
+    if (!p.archived && (task.status === 'failed' || task.status === 'cancelled')) {
         actionBtns.push('<button type="button" class="project-card-btn" data-act="retry" title="重试">🔁 重试</button>');
     }
-    if (p.assets && p.assets.file_count) {
+    if ((!p.archived && p.assets && p.assets.file_count) || (p.archived && projectsArchiveVideos(p).length)) {
         actionBtns.push('<button type="button" class="project-card-btn" data-act="gallery" title="去画廊看资产">🖼️ 资产</button>');
     }
     const actionsOverlay = actionBtns.length
@@ -442,9 +550,7 @@ function projectsRowInnerHtml(p) {
                 <span class="project-badges-inline">${badgesHtml}</span>
             </div>
             ${projectsMetaHtml(p)}
-            ${progress}
-            ${error}
-            ${projectsJobsHtml(p)}
+            ${projectsCurrentStatusHtml(p, false)}
         </div>`;
 }
 
@@ -453,32 +559,40 @@ function projectsRowInnerHtml(p) {
 function projectsRowSignature(p) {
     const task = p.task || {};
     return JSON.stringify([
-        p.title, p.theme, p.state, p.saved, p.kind, p.cover, p.has_failed_jobs,
-        p.image_count, p.video_count, p.updated_at,
-        task.status, task.stage, task.error,
+        p.title, p.theme, p.state, p.saved, p.kind, p.cover, p.has_failed_jobs, p.archived, p.archive_pending, p.archive,
+        p.image_count, p.video_count, p.updated_at, p.progress, p.video_edit,
+        p.video_edit && ['queued', 'running'].includes(p.video_edit.status) ? projectsEditElapsed(p.video_edit) : '',
+        task.status, task.stage, task.error, task.outcome,
+        p.fx_queue ? [p.fx_queue.state, p.fx_queue.position, p.fx_queue.holder_task] : null,
         (p.assets || {}).file_count, (p.assets || {}).bytes,
-        (p.sub_jobs || []).map(j => `${j.type}:${j.status}`).join(','),
+        (p.sub_jobs || []).map(j => `${j.type}:${j.status}:${j.outcome || ''}:${j.last_active || 0}`).join(','),
     ]);
 }
 
 function renderProjects() {
     const container = document.getElementById('projects-list');
+    projectsUpdateSectionUi();
     if (!container || !projectsRows) return;
+    const visibleRows = projectsRows.filter(p => projectsIsArchived(p) === (projectsSection === 'archived'));
 
     // chips 角标
     document.querySelectorAll('#projects-filters .projects-filter-chip').forEach(chip => {
         if (!chip.dataset.label) chip.dataset.label = chip.textContent.trim();
-        const n = projectsCounts[chip.dataset.filter];
+        const n = chip.dataset.filter === 'all' ? projectsCounts.active ?? projectsTotal
+            : projectsCounts[chip.dataset.filter];
         chip.textContent = (n !== undefined) ? `${chip.dataset.label} (${n})` : chip.dataset.label;
         chip.classList.toggle('active', chip.dataset.filter === projectsFilter);
     });
     const statsEl = document.getElementById('projects-stats');
-    if (statsEl) statsEl.textContent = `共 ${projectsTotal} 个项目`;
+    if (statsEl) statsEl.textContent = `共 ${projectsTotal} 个${projectsSection === 'archived' ? '归档' : ''}项目`;
 
-    if (!projectsRows.length) {
-        container.innerHTML = projectsTotal
+    if (!visibleRows.length) {
+        container.innerHTML = projectsTotal || projectsSearch
             ? '<div class="projects-status">🗂️ 这个筛选下暂时没有匹配的项目</div>'
-            : '<div class="projects-status">📁 还没有项目——去「激发维度」跑一次创意激发，它会自动出现在这里</div>';
+            : projectsSection === 'archived'
+                ? '<div class="projects-status">📦 暂无归档项目<br>在项目详情或批量操作中归档后，会集中显示在这里。</div>'
+            : '<div class="projects-status">📁 还没有项目，导入图片和视频提示词即可开始。<br><button type="button" class="projects-btn primary" data-act="import-prompts">导入提示词</button></div>';
+        projectsSelectedKey = null;
         projectsSelected.clear();
         renderProjectsBulkBar();
         renderProjectDetail();
@@ -491,7 +605,7 @@ function renderProjects() {
     const seen = new Set();
     let anchor = null;   // 已就位的上一行，用于维持顺序
 
-    projectsRows.forEach(p => {
+    visibleRows.forEach(p => {
         const key = p.project_key;
         seen.add(key);
         let row = existing.get(key);
@@ -581,11 +695,15 @@ function renderProjectsBulkBar() {
     bar.hidden = false;
     document.getElementById('projects-list')?.classList.add('has-selection');
 
-    const running = rows.filter(p => (p.task || {}).status === 'running').length;
-    const withTask = rows.filter(p => (p.task || {}).id || (p.sub_jobs || []).length > 0).length;
+    const running = rows.filter(p => !p.archived && (p.task || {}).status === 'running').length;
+    const withTask = rows.filter(p => !p.archived && ((p.task || {}).id || (p.sub_jobs || []).length > 0)).length;
+    const archivable = rows.filter(p => !p.archive_pending && projectsCanArchive(p)).length;
+    const pendingArchives = rows.filter(p => p.archive_pending && projectsCanArchive(p)).length;
     const btns = [];
     if (running) btns.push(`<button type="button" class="projects-btn danger" data-bulk="cancel">✕ 取消运行中（${running}）</button>`);
     btns.push('<button type="button" class="projects-btn" data-bulk="copy-titles">📋 复制标题</button>');
+    if (archivable) btns.push(`<button type="button" class="projects-btn" data-bulk="archive"${projectsArchiving ? ' disabled' : ''} title="保留成片（如有）、节拍数据、全套提示词和封面缩略图，其余永久删除">📦 归档（${archivable}）</button>`);
+    if (pendingArchives) btns.push(`<button type="button" class="projects-btn" data-bulk="finish-archive"${projectsArchiving ? ' disabled' : ''} title="保留文件已保存，继续清理剩余内容">📦 完成归档（${pendingArchives}）</button>`);
     // 核心主操作：彻底删除所选项目（包含任务记录、点子库收藏及本地磁盘媒体）
     btns.push(`<button type="button" class="projects-btn danger" data-bulk="delete-projects" title="彻底删除所选项目：同步清除生成任务记录、点子库收藏及本地磁盘生成的图片/视频文件">🗑️ 彻底删除（${rows.length}）</button>`);
     if (withTask) btns.push(`<button type="button" class="projects-btn" data-bulk="delete-task" title="只删除生成任务记录与日志，已收藏的创意与磁盘素材不受影响">🧹 仅清除任务记录（${withTask}）</button>`);
@@ -735,7 +853,7 @@ async function projectsRunBulkAction(act) {
         }
 
         case 'cancel': {
-            const ids = rows.filter(p => (p.task || {}).status === 'running' && p.task.id).map(p => p.task.id);
+            const ids = rows.filter(p => !p.archived && (p.task || {}).status === 'running' && p.task.id).map(p => p.task.id);
             if (!ids.length) return;
             if (!await projectsConfirm(`确定取消这 ${ids.length} 个运行中的项目吗？`)) return;
             const ok = await projectsBulkJobRequest('/api/compose-cancel', ids);
@@ -757,8 +875,15 @@ async function projectsRunBulkAction(act) {
             break;
         }
 
+        case 'archive':
+            await projectsArchive(rows.filter(p => !p.archive_pending && projectsCanArchive(p)));
+            break;
+        case 'finish-archive':
+            await projectsArchive(rows.filter(p => p.archive_pending && projectsCanArchive(p)));
+            break;
+
         case 'delete-task': {
-            const ids = rows.filter(p => (p.task || {}).id).map(p => p.task.id);
+            const ids = rows.filter(p => !p.archived && (p.task || {}).id).map(p => p.task.id);
             if (!ids.length) return;
             if (!await projectsConfirm(
                 `确定清除这 ${ids.length} 条任务记录吗？（仅清理生成记录与日志，已收藏的创意与本地磁盘素材文件不受影响）`)) return;
@@ -773,7 +898,7 @@ async function projectsRunBulkAction(act) {
         }
 
         case 'unsave': {
-            const targets = rows.filter(p => p.saved && (p.library || {}).id);
+            const targets = rows.filter(p => !p.archived && p.saved && (p.library || {}).id);
             if (!targets.length) return;
             if (!await projectsConfirm(
                 `确定从点子库彻底删除这 ${targets.length} 个创意吗？\n⚠ 对应在 outputs/ 目录已生成的图片与成片文件会一并彻底清除，不可恢复。`)) return;
@@ -797,13 +922,14 @@ async function projectsRunBulkAction(act) {
 // 「换模型再跑」的下拉选项。原先长在任务抽屉的成功卡上，抽屉删除后搬到详情栏；
 // rerunCompletedTask 读的就是这个 select（见 app.js）。
 function projectsModelOptions(selectedModel) {
-    const selected = selectedModel || config.model || DEFAULT_CONFIG.model;
+    const requested = selectedModel || config.model || DEFAULT_CONFIG.model;
+    const selected = (typeof normalizeLlmModel === 'function') ? normalizeLlmModel(requested) : requested;
     const families = (typeof LLM_MODEL_PICKER_FAMILIES !== 'undefined') ? LLM_MODEL_PICKER_FAMILIES : [];
     const groups = (typeof LLM_MODEL_GROUPS !== 'undefined') ? LLM_MODEL_GROUPS : {};
     const known = Object.values(groups).flat();
     return families.map(family => {
         const models = (groups[family.key] || []).slice();
-        // 历史任务用过的模型可能已从选择器里下架，补一条免得选中项落空
+        // 保留自定义模型；已下架的文本模型在上面迁移到当前型号。
         if (!known.some(m => m.value === selected) && family.key === 'gpt') {
             models.push({ value: selected, label: `${selected}（历史模型）` });
         }
@@ -822,61 +948,101 @@ function projectsOrphanActionsHtml(p) {
     const jobs = (p.sub_jobs || []).filter(j => j && j.id);
     const running = jobs.filter(j => j.status === 'running');
     const settled = jobs.filter(j => j.status !== 'running');
-    const btns = [
-        '<button type="button" class="projects-btn primary" data-act="find-parent" title="按标题/主题去点子库和任务列表里反查母项目">🔍 找回母项目</button>',
-    ];
-    if (running.length) {
-        btns.push(`<button type="button" class="projects-btn danger" data-act="cancel-all-jobs">✕ 取消全部运行中（${running.length}）</button>`);
-    }
-    // 资产按钮由通用分支给（有 assets.dir 时能精确定位分组）；找不到目录的孤立行
-    // 只能退而求其次，把标题丢进画廊搜索框
-    if (!(p.assets && p.assets.file_count)) {
-        btns.push('<button type="button" class="projects-btn" data-act="gallery-search">🖼️ 在画廊里搜这个标题</button>');
-    }
-    btns.push('<button type="button" class="projects-btn" data-act="copy-title">📋 复制标题</button>');
-    if (settled.length) {
-        btns.push(`<button type="button" class="projects-btn danger" data-act="delete-all-jobs">🗑️ 清空全部作业记录（${settled.length}）</button>`);
-    }
+    const btns = [];
+    if (running.length) btns.push(`<button type="button" class="projects-btn danger" data-act="cancel-all-jobs">取消全部生成（${running.length}）</button>`);
+    btns.push('<button type="button" class="projects-btn" data-act="copy-title">复制标题</button>');
+    if (settled.length) btns.push(`<button type="button" class="projects-btn danger" data-act="delete-all-jobs">清除生成记录（${settled.length}）</button>`);
     return btns.join('');
 }
 
 function projectsDetailActionsHtml(p) {
+    if (p.archived) return (p.archive_pending && projectsCanArchive(p)
+        ? `<button type="button" class="projects-btn primary" data-act="archive"${projectsArchiving ? ' disabled' : ''}>📦 完成归档</button>` : '')
+        + (projectsArchiveVideos(p).length ? '<button type="button" class="projects-btn" data-act="gallery">在画廊查看成片</button>' : '')
+        + '<button type="button" class="projects-btn" data-act="copy-title">复制标题</button>';
     const task = p.task || {};
-    const btns = [];
-    if (p.kind === 'job') btns.push(projectsOrphanActionsHtml(p));
-    if (p.saved || task.status === 'completed') {
-        btns.push('<button type="button" class="projects-btn primary" data-act="open">🎬 打开项目</button>');
-    }
-    // 二创只对**复刻来的**项目露出：它去的是爆款复刻面板的「二创变体」栏，那一栏
-    // 是沿变异轴改写既有节拍阶梯，没有阶梯就没有可改的东西。激发出来的项目不在这
-    // 条线上，给它按钮等于给一个必然落空的入口。
-    if (projectReplicaJobId(p)) {
-        btns.push('<button type="button" class="projects-btn" data-act="remix" title="到爆款复刻的「二创变体」栏，沿变异轴从本项目的节拍阶梯派生衍生方案">♻️ 二创</button>');
+    const btns = [], more = [];
+    if (p.kind === 'job') {
+        btns.push('<button type="button" class="projects-btn primary" data-act="find-parent">找回项目</button>');
+        if (!(p.assets && p.assets.file_count)) btns.push('<button type="button" class="projects-btn" data-act="gallery-search">在画廊查找</button>');
+        more.push(projectsOrphanActionsHtml(p));
     }
     if (task.status === 'running') {
-        btns.push('<button type="button" class="projects-btn primary" data-act="follow">👁 跟进实时输出</button>');
-        btns.push('<button type="button" class="projects-btn danger" data-act="cancel">✕ 取消</button>');
+        btns.push('<button type="button" class="projects-btn primary" data-act="follow">查看进度</button>');
+        more.push('<button type="button" class="projects-btn danger" data-act="cancel">取消生成</button>');
+    } else if (p.saved || task.status === 'completed') {
+        btns.push('<button type="button" class="projects-btn primary" data-act="open">打开项目</button>');
     }
     if (task.status === 'completed') {
-        btns.push(`<label class="projects-rerun">
-            <select id="projects-rerun-model" class="projects-sort-select" aria-label="选择重新激发使用的模型">
-                ${projectsModelOptions(task.model)}
-            </select>
-            <button type="button" class="projects-btn" data-act="rerun">♻️ 换模型再跑</button>
+        more.push(`<label class="projects-rerun">
+            <select id="projects-rerun-model" class="projects-sort-select" aria-label="选择重新生成使用的模型">${projectsModelOptions(task.model)}</select>
+            <button type="button" class="projects-btn" data-act="rerun">换模型重新生成</button>
         </label>`);
     }
     if (task.status === 'failed' || task.status === 'cancelled') {
-        btns.push('<button type="button" class="projects-btn" data-act="retry">🔁 重试</button>');
+        (p.saved ? more : btns).push('<button type="button" class="projects-btn" data-act="retry">重试生成</button>');
     }
-    if (p.assets && p.assets.file_count) {
-        btns.push('<button type="button" class="projects-btn" data-act="gallery">🖼️ 去画廊看资产</button>');
-    }
-    // 核心主删除操作：彻底删除该项目（同时清理任务记录、点子库收藏及本地媒体文件）
-    btns.push('<button type="button" class="projects-btn danger" data-act="delete-project" title="彻底删除该项目：同步清除生成任务记录、点子库收藏及本地磁盘生成的图片/视频文件">🗑️ 彻底删除项目</button>');
-    if (task.id && p.saved) {
-        btns.push('<button type="button" class="projects-btn danger" data-act="delete-task" title="只删除生成任务记录与日志，已收藏的创意与本地磁盘素材文件不受影响">🧹 仅清除任务记录</button>');
-    }
-    return btns.join('');
+    if (p.assets && p.assets.file_count) btns.push('<button type="button" class="projects-btn" data-act="gallery">查看文件</button>');
+    if (projectsCanArchive(p)) btns.push(`<button type="button" class="projects-btn" data-act="archive"${projectsArchiving ? ' disabled' : ''} title="先查看保留文件和清理范围">📦 归档项目</button>`);
+    more.push('<button type="button" class="projects-btn danger" data-act="delete-project" title="删除项目、生成记录及本地生成的图片和视频">彻底删除项目</button>');
+    if (task.id && p.saved) more.push('<button type="button" class="projects-btn danger" data-act="delete-task" title="保留已收藏项目和本地生成文件">仅清除生成记录</button>');
+    return btns.join('') + `<details class="projects-more-actions" data-project-fold="actions"><summary>更多操作</summary><div class="projects-detail-actions">${more.join('')}</div></details>`;
+}
+
+function projectsSafeArchiveUrl(url) {
+    return typeof url === 'string' && ((url.startsWith('/') && !url.startsWith('//')) || url.startsWith('outputs/'));
+}
+
+function projectsArchiveVideos(p) {
+    const archive = p.archive || {};
+    const videos = Array.isArray(archive.final_videos) ? archive.final_videos : archive.refined_videos || [];
+    return videos.filter(file => file && projectsSafeArchiveUrl(file.url))
+        .map(file => ({ ...file, kind: file.kind === 'merged_video' ? 'merged_video' : 'refined_video' }));
+}
+
+function projectsArchiveFiles(p) {
+    const archive = p.archive || {};
+    const files = [...(Array.isArray(archive.retained_files) ? archive.retained_files : [])];
+    projectsArchiveVideos(p).forEach(file => files.push(file));
+    if (archive.beats_url) files.push({ url: archive.beats_url, name: '反推节拍数据.json', kind: 'beats' });
+    if (archive.prompts_url) files.push({ url: archive.prompts_url, name: '全套提示词.md', kind: 'prompts' });
+    const seen = new Set();
+    return files.filter(file => {
+        if (!file || !projectsSafeArchiveUrl(file.url) || seen.has(file.url)) return false;
+        seen.add(file.url);
+        return true;
+    });
+}
+
+function projectsFilesListHtml(files) {
+    const labels = { refined_video: '精剪成片', merged_video: '合成成片', beats: '节拍数据', prompts: '全套提示词', cover: '封面缩略图' };
+    return `<ul>${files.map(file => `<li><span><strong>${escapeHtml(labels[file.kind] || '保留文件')}</strong><small>${escapeHtml(file.name || file.url.split('/').pop())}</small></span>
+        <a class="projects-btn" href="${escapeHtml(file.url)}" target="_blank" rel="noopener">查看</a>
+        <a class="projects-btn" href="${escapeHtml(file.url)}" download="${escapeHtml(file.name || '')}">下载</a></li>`).join('')}</ul>`;
+}
+
+function projectsBeatFilesHtml(p) {
+    const seen = new Set();
+    const files = (Array.isArray(p.beat_files) ? p.beat_files : []).filter(file => {
+        if (!file || !projectsSafeArchiveUrl(file.url) || seen.has(file.url)) return false;
+        seen.add(file.url);
+        return true;
+    }).map(file => ({ ...file, kind: 'beats' }));
+    return files.length ? `<div class="projects-archive-files"><h4>节拍数据</h4>${projectsFilesListHtml(files)}</div>` : '';
+}
+
+function projectsArchiveFilesHtml(p) {
+    const files = projectsArchiveFiles(p);
+    const videos = projectsArchiveVideos(p);
+    const cover = projectsArchiveCoverUrl(p);
+    return `<div class="projects-archive-files"><h4>归档文件</h4>
+        <p class="projects-detail-hint">${p.archive_pending
+            ? '保留文件已保存，点击完成归档继续清理剩余内容。'
+            : videos.length ? `保留成片、节拍数据和全套提示词${cover ? '，以及封面缩略图' : ''}，其余项目文件已永久删除。`
+                : `未保留成片视频，只保留全套提示词和节拍数据（如有）${cover ? '，以及封面缩略图' : ''}，其余项目文件已永久删除。`}</p>
+        ${videos.map(file => `<figure class="projects-archive-video"><video controls preload="metadata" src="${escapeHtml(file.url)}"${cover ? ` poster="${escapeHtml(cover)}"` : ''}></video><figcaption>${escapeHtml(file.name || '成片')}</figcaption></figure>`).join('')}
+        ${projectsFilesListHtml(files)}
+        ${files.length ? '' : '<p class="projects-detail-hint">归档文件信息暂时不可用，请刷新项目列表。</p>'}</div>`;
 }
 
 function projectsJobActionsHtml(job) {
@@ -893,6 +1059,16 @@ function projectsJobActionsHtml(job) {
     return `<span class="projects-job-actions">${buttons.join('')}</span>`;
 }
 
+function projectsJobListHtml(jobs) {
+    return `<ul class="projects-job-list">${jobs.map(j => `
+        <li class="${escapeHtml(j.status || '')}">
+            <span class="projects-job-head"><span>${escapeHtml(PROJECT_JOB_ICONS[j.status] || '·')} ${escapeHtml(PROJECT_JOB_LABELS[j.type] || j.type)} · ${escapeHtml(j.outcome === 'partial_failed' ? '部分完成，需要处理' : PROJECT_STATE_LABELS[j.status] || j.status || '等待中')}</span>${projectsJobActionsHtml(j)}</span>
+            <span class="project-meta">${escapeHtml(projectsFormatTime(j.last_active))}</span>
+            ${j.error ? `<span class="projects-job-error">${escapeHtml(j.error)}</span>` : ''}
+            <details class="projects-technical" data-project-fold="job-${escapeHtml(j.id || '')}"><summary>技术详情</summary><span class="projects-job-id">${escapeHtml(j.id || '')}</span></details>
+        </li>`).join('')}</ul>`;
+}
+
 function renderProjectDetail() {
     const pane = document.getElementById('projects-detail');
     if (!pane) return;
@@ -900,62 +1076,247 @@ function renderProjectDetail() {
     if (!p) {
         pane.innerHTML = '<div class="projects-detail-empty">选中左侧任一项目查看详情</div>';
         pane.classList.remove('open');
+        delete pane.dataset.projectKey;
+        delete pane.dataset.renderSignature;
         return;
     }
+    // Polling should preserve the reader's expanded records and model selection.
+    const sameProject = pane.dataset.projectKey === p.project_key;
+    const signature = JSON.stringify([p, projectsArchiving]);
+    if (sameProject && pane.dataset.renderSignature === signature) return;
+    const focused = document.activeElement && pane.contains(document.activeElement) ? document.activeElement : null;
+    const focusedFold = focused?.tagName === 'SUMMARY'
+        ? focused.closest('details[data-project-fold]')?.dataset.projectFold : null;
+    const focusedId = focused?.id;
+    const openFolds = new Set(sameProject
+        ? Array.from(pane.querySelectorAll('details[data-project-fold][open]'), el => el.dataset.projectFold) : []);
+    const rerunModel = sameProject ? pane.querySelector('#projects-rerun-model')?.value : null;
+    pane.dataset.projectKey = p.project_key;
+    pane.dataset.renderSignature = signature;
     pane.classList.add('open');
 
     const task = p.task || {};
     const facts = [
-        ['状态', PROJECT_STATE_LABELS[p.state] || p.state],
         ['最近活动', projectsFormatTime(p.updated_at)],
-        ['镜头 / 图片', [p.video_count ? `${p.video_count} 镜` : null,
-                        p.image_count ? `${p.image_count} 图` : null].filter(Boolean).join(' · ') || '—'],
-        ['激发耗时', projectsFormatDuration(task.duration_seconds) || '—'],
-        ['使用模型', task.model || '—'],
-        ['磁盘资产', p.assets && p.assets.file_count
-            ? `${p.assets.file_count} 个文件 · ${projectsFormatBytes(p.assets.bytes)}`
-            : '—'],
-        ['收藏时间', (p.library && p.library.timestamp) || '未收藏'],
-        ['任务 ID', task.id || '—'],
-        ['project_key', p.project_key],
+        ['生成文件', p.assets && p.assets.file_count
+            ? `${p.assets.file_count} 个 · ${projectsFormatBytes(p.assets.bytes)}` : '暂无'],
+    ];
+    if (p.archived) {
+        facts.unshift(['归档时间', projectsFormatTime((p.archive || {}).archived_at)]);
+        facts.push(['已释放空间', projectsFormatBytes((p.archive || {}).deleted_bytes)]);
+    }
+    const technical = [
+        ['生成耗时', projectsFormatDuration(task.duration_seconds) || '—'],
+        ['使用模型', task.model || '—'], ['记录 ID', task.id || '—'], ['项目 ID', p.project_key],
     ];
     if (task.token_usage) {
         const u = task.token_usage;
-        facts.push(['Tokens', `${u.total_tokens} (I:${u.prompt_tokens} O:${u.completion_tokens}) · ${u.api_calls} 次调用`]);
+        technical.push(['Tokens', `${u.total_tokens} (I:${u.prompt_tokens} O:${u.completion_tokens}) · ${u.api_calls} 次调用`]);
     }
-
-    const jobs = (p.sub_jobs || []).length ? `
-        <div class="projects-detail-section">
-            <h4>媒体子作业</h4>
-            <ul class="projects-job-list">
-                ${p.sub_jobs.map(j => `
-                <li class="${escapeHtml(j.status || '')}">
-                    <span class="projects-job-head">
-                        <span>${escapeHtml(PROJECT_JOB_ICONS[j.status] || '·')} ${escapeHtml(PROJECT_JOB_LABELS[j.type] || j.type)}</span>
-                        ${projectsJobActionsHtml(j)}
-                    </span>
-                    <span class="projects-job-id">${escapeHtml(j.id || '')}</span>
-                    ${j.error ? `<span class="projects-job-error">${escapeHtml(j.error)}</span>` : ''}
-                </li>`).join('')}
-            </ul>
-        </div>` : '';
-
+    const factsHtml = entries => `<dl class="projects-facts">${entries.map(([k, v]) => `<dt>${escapeHtml(k)}</dt><dd>${escapeHtml(String(v))}</dd>`).join('')}</dl>`;
+    const active = p.archived ? [] : (p.sub_jobs || []).filter(j => j.status === 'running');
+    const history = p.archived ? [] : (p.sub_jobs || []).filter(j => j.status !== 'running');
+    const taskError = !p.archived && task.error ? `<p class="projects-job-error">${escapeHtml(task.error)}</p>` : '';
     pane.innerHTML = `
-        <div class="projects-detail-head">
-            <h3>${escapeHtml(p.title || '未命名项目')}</h3>
-            <button type="button" class="projects-detail-close" data-act="close-detail" title="收起详情">&times;</button>
-        </div>
-        ${p.theme ? `<p class="projects-detail-theme">${escapeHtml(p.theme)}</p>` : ''}
-        ${p.kind === 'job' ? `<p class="projects-detail-hint">🧩 孤立作业：母项目的激发任务记录已被清理（任务记录只保留 7 天），
-            这里只剩这批媒体作业本身。下面的动作围绕"找回它/收拾它"，不会碰 outputs/ 里的文件。</p>` : ''}
+        <div class="projects-detail-head"><h3>${escapeHtml(p.title || '未命名项目')}</h3>
+            <button type="button" class="projects-detail-close" data-act="close-detail" title="收起详情">&times;</button></div>
+        ${projectsCurrentStatusHtml(p)}
         <div class="projects-detail-actions">${projectsDetailActionsHtml(p)}</div>
-        <dl class="projects-facts">
-            ${facts.map(([k, v]) => `<dt>${escapeHtml(k)}</dt><dd>${escapeHtml(String(v))}</dd>`).join('')}
-        </dl>
-        ${jobs}`;
+        ${p.kind === 'job' ? '<p class="projects-detail-hint">未找到关联项目，生成记录和已生成文件仍可查看。</p>' : ''}
+        ${p.theme && p.theme !== p.title ? `<p class="projects-detail-theme">${escapeHtml(p.theme)}</p>` : ''}
+        ${factsHtml(facts)}
+        ${p.archived ? projectsArchiveFilesHtml(p) : projectsBeatFilesHtml(p)}
+        ${active.length ? `<div class="projects-detail-section"><h4>正在生成</h4>${projectsJobListHtml(active)}</div>` : ''}
+        ${history.length || taskError ? `<details class="projects-history" data-project-fold="history"><summary>生成记录${history.length ? `（${history.length}）` : ''}</summary>${taskError}${projectsJobListHtml(history)}</details>` : ''}
+        <details class="projects-technical" data-project-fold="technical"><summary>技术详情</summary>${factsHtml(technical)}</details>`;
+    pane.querySelectorAll('details[data-project-fold]').forEach(el => { el.open = openFolds.has(el.dataset.projectFold); });
+    if (rerunModel) {
+        const select = pane.querySelector('#projects-rerun-model');
+        if (select && Array.from(select.options).some(option => option.value === rerunModel)) select.value = rerunModel;
+    }
+    if (sameProject && focusedFold) {
+        Array.from(pane.querySelectorAll('details[data-project-fold]'))
+            .find(el => el.dataset.projectFold === focusedFold)?.querySelector('summary')?.focus({ preventScroll: true });
+    } else if (sameProject && focusedId) {
+        document.getElementById(focusedId)?.focus({ preventScroll: true });
+    }
 }
 
 /* ── 动作 ──────────────────────────────────────────────────────────────── */
+
+function projectsArchiveErrorText(errors) {
+    return (errors || []).map(error => `${error.title || error.project_key || '项目'}：${error.message || '归档失败'}`).join('；');
+}
+
+function projectsArchiveRetentionText(p) {
+    const files = p.retained_files || (p.archive || {}).retained_files || [];
+    const retention = p.video_retention || (files.some(file => file.kind === 'refined_video') ? 'refined'
+        : files.some(file => file.kind === 'merged_video') ? 'merged' : 'none');
+    if (retention === 'merged') return '未完成精剪，将保留当前合成成片。';
+    if (retention === 'none') return '没有可保留的成片视频，只保留全套提示词和节拍数据（如有）。';
+    return '保留精剪后的成片视频。';
+}
+
+function projectsArchivePreviewHtml(projects, errors, skipped, completing = false) {
+    const count = projects.reduce((sum, p) => sum + (Number(p.delete_count) || 0), 0);
+    const bytes = projects.reduce((sum, p) => sum + (Number(p.delete_bytes) || 0), 0);
+    return `<strong>${completing ? '完成归档' : '归档'} ${projects.length} 个项目</strong><br>保留成片视频（如有）、节拍数据文件和全套提示词，以及封面缩略图（如有）。<br>
+        <strong class="projects-archive-warning">其余文件、生成记录和旧素材将永久删除，无法恢复。</strong><br>
+        共清理 ${count} 个文件，释放约 ${projectsFormatBytes(bytes)}。
+        <span class="projects-archive-preview">${projects.map(p => `<span class="projects-archive-preview-project"><strong>${escapeHtml(p.title || p.project_key)}</strong>
+            <span>${escapeHtml(projectsArchiveRetentionText(p))}</span>
+            <span>保留：${(p.retained_files || []).map(file => escapeHtml(file.name || file.url || '文件')).join('、') || '暂无文件'}</span>
+            ${(p.retained_files || []).some(file => file.kind === 'beats') ? '' : '<span class="projects-archive-warning">未找到明确关联的节拍数据，此项目归档将不包含节拍文件。</span>'}
+            <span>删除 ${Number(p.delete_count) || 0} 个文件 · ${projectsFormatBytes(p.delete_bytes)}</span></span>`).join('')}</span>
+        ${errors.length ? `<span class="projects-archive-warning">以下项目无法归档，将跳过：${escapeHtml(projectsArchiveErrorText(errors))}</span><br>` : ''}
+        ${skipped ? `另跳过 ${skipped} 个运行中、已归档或未关联项目。<br>` : ''}
+        确定执行归档并永久删除上述其余内容吗？`;
+}
+
+function projectsApplyArchiveResults(results, sourceRows, deletedLibraryIds) {
+    const byKey = new Map(results.map(result => [result.project_key, result]));
+    const successfulRows = sourceRows.filter(p => byKey.has(p.project_key));
+    const ideaIds = new Set((deletedLibraryIds || []).map(String));
+    const taskIds = new Set();
+    successfulRows.forEach(p => {
+        if ((p.library || {}).id) ideaIds.add(String(p.library.id));
+        if (p.id) ideaIds.add(String(p.id));
+        if ((p.task || {}).id) { ideaIds.add(String(p.task.id)); taskIds.add(String(p.task.id)); }
+        (p.sub_jobs || []).forEach(job => { if (job.id) taskIds.add(String(job.id)); });
+    });
+    const matches = idea => Boolean(idea && (byKey.has(idea.project_key) || ideaIds.has(String(idea.id))));
+    if (typeof savedIdeas !== 'undefined' && Array.isArray(savedIdeas)) {
+        savedIdeas = savedIdeas.filter(idea => !matches(idea));
+        successfulRows.forEach(p => {
+            const result = byKey.get(p.project_key);
+            const id = (result.library || {}).id || result.library_id || (p.library || {}).id;
+            if (id) savedIdeas.push({ id, project_key: p.project_key, title: p.title, theme: p.theme,
+                archived: true, archive_pending: Boolean(result.archive_pending), archive: result.archive || result });
+        });
+        try { localStorage.setItem('spark_library', JSON.stringify(savedIdeas)); } catch (_) {}
+    }
+    try {
+        const snapshot = JSON.parse(localStorage.getItem('spark_current_idea') || 'null');
+        if (matches(snapshot) || ideaIds.has(localStorage.getItem('spark_current_idea_id'))) {
+            localStorage.removeItem('spark_current_idea');
+            localStorage.removeItem('spark_current_idea_id');
+        }
+        if (taskIds.has(localStorage.getItem('spark_active_task_id'))) {
+            localStorage.removeItem('spark_active_task_id');
+            localStorage.removeItem('spark_active_task_dimensions');
+        }
+        ideaIds.forEach(id => localStorage.removeItem(`spark_prompt_history_${id}`));
+        const background = JSON.parse(localStorage.getItem('spark_active_background_tasks') || 'null');
+        if (background && Array.isArray(background.tasks)) {
+            background.tasks = background.tasks.filter(task => !ideaIds.has(String(task.ideaId)) && !taskIds.has(String(task.taskId)));
+            localStorage.setItem('spark_active_background_tasks', JSON.stringify(background));
+        }
+    } catch (error) { console.warn('归档后的本地恢复状态清理失败', error); }
+    if (typeof currentIdea !== 'undefined' && matches(currentIdea)) {
+        currentIdea = null;
+        if (typeof resetPromptEditor === 'function') resetPromptEditor();
+        document.querySelectorAll('#output-content-view video, #output-content-view audio').forEach(media => {
+            media.pause();
+            media.removeAttribute('src');
+            media.load();
+        });
+        document.getElementById('output-content-view')?.classList.remove('active');
+        document.getElementById('output-placeholder-view')?.classList.add('active');
+        if (typeof switchMainTab === 'function') switchMainTab('projects');
+    }
+    if (typeof updateFavoriteButtonState === 'function') updateFavoriteButtonState();
+    projectsRows = (projectsRows || []).map(p => {
+        const result = byKey.get(p.project_key);
+        if (!result) return p;
+        const archive = result.archive || result;
+        const cover = projectsArchiveCoverUrl({ archive });
+        return { ...p, state: 'archived', archived: true, archive_pending: Boolean(result.archive_pending), archive, cover,
+            task: null, sub_jobs: [], progress: {}, image_count: 0, video_count: projectsArchiveVideos({ archive }).length,
+            assets: { dir: (p.assets || {}).dir || '', file_count: (archive.retained_files || []).length, bytes: 0, cover } };
+    });
+    results.forEach(result => projectsSelected.delete(result.project_key));
+    projectsRefreshRevision++;
+    if (typeof galleryData !== 'undefined') galleryData = null;
+    if (typeof gallerySelected !== 'undefined') gallerySelected.clear();
+    renderProjects();
+}
+
+async function projectsArchiveRequest(projectKeys, preview) {
+    const response = await fetch('/api/projects/archive', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ project_keys: projectKeys, preview }),
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok || data.status !== 'ok') throw new Error(data.error || data.message || `HTTP ${response.status}`);
+    return data;
+}
+
+async function projectsArchive(rows) {
+    if (projectsArchiving) return;
+    const targets = (rows || []).filter(projectsCanArchive);
+    if (!targets.length) return;
+    projectsArchiving = true;
+    renderProjectsBulkBar();
+    renderProjectDetail();
+    let submitted = false;
+    try {
+        const keys = [...new Set(targets.map(p => p.project_key))];
+        const preview = await projectsArchiveRequest(keys, true);
+        const requested = new Set(keys);
+        const errors = Array.isArray(preview.errors) ? preview.errors : [];
+        const executable = (preview.projects || []).filter(p => requested.has(p.project_key)
+            && !errors.some(error => error.project_key === p.project_key));
+        if (!executable.length) {
+            showToast(projectsArchiveErrorText(errors) || '没有可归档的项目，请刷新列表后重试', 'error');
+            return;
+        }
+        if (typeof customConfirm !== 'function') throw new Error('归档确认窗口不可用，请刷新后重试');
+        const completing = targets.every(p => p.archive_pending);
+        if (!await customConfirm(projectsArchivePreviewHtml(executable, errors, rows.length - targets.length, completing),
+            completing ? '完成归档并永久删除剩余内容' : '归档并永久删除其余内容', '取消')) return;
+        submitted = true;
+        const result = await projectsArchiveRequest(executable.map(p => p.project_key), false);
+        const completed = (result.projects || []).filter(p => requested.has(p.project_key));
+        if (completed.length) {
+            projectsApplyArchiveResults(completed, targets, result.deleted_library_ids);
+            projectsApplySection('archived', { clearSearch: true });
+            projectsSelectedKey = completed[0].project_key;
+            projectsPendingArchivedKey = completed[0].project_key;
+            renderProjects();
+        }
+        const executionErrors = Array.isArray(result.errors) ? result.errors : [];
+        const allErrors = [...errors, ...executionErrors];
+        const missing = executable.length - completed.length - executionErrors.length;
+        const summary = completed.length ? `已归档 ${completed.length} 个项目，释放 ${projectsFormatBytes(result.deleted_bytes)}` : '归档失败';
+        showToast(`${summary}${allErrors.length ? `；${projectsArchiveErrorText(allErrors)}` : ''}${missing > 0 ? `；${missing} 个项目未归档，请刷新后检查` : ''}`,
+            allErrors.length || missing > 0 || !completed.length ? 'error' : 'success');
+    } catch (error) {
+        console.error('Project archive failed', error);
+        showToast(`归档失败：${error.message}${submitted ? '，请刷新查看实际结果后再重试' : ''}`, 'error');
+    } finally {
+        projectsArchiving = false;
+        if (submitted) projectsRefreshRevision++;
+        renderProjectsBulkBar();
+        // 按钮的禁用状态不属于项目数据，强制更新详情。
+        const pane = document.getElementById('projects-detail');
+        if (pane) delete pane.dataset.renderSignature;
+        renderProjectDetail();
+        await refreshProjects();
+    }
+}
+
+async function openArchivedProject(projectKey) {
+    projectsApplySection('archived', { clearSearch: true });
+    projectsPendingArchivedKey = projectKey;
+    projectsRefreshRevision++;
+    switchMainTab('projects');
+    await refreshProjects();
+    if (projectsFindRow(projectKey)?.archived) {
+        projectsSelectedKey = projectKey;
+        projectsPendingArchivedKey = null;
+        renderProjects();
+    }
+}
 
 // 批量作业操作：优先使用批量端点，单次网络请求完成；失败时回落到逐条重试。
 async function projectsBulkJobRequest(url, ids) {
@@ -1002,8 +1363,17 @@ function projectsConfirm(message) {
 }
 
 async function projectsRunAction(act, p, event, jobId) {
+    if (p.archived && !(p.archive_pending && act === 'archive')
+        && !['view-archive', 'gallery', 'gallery-search', 'copy-title'].includes(act)) return;
     const task = p.task || {};
     switch (act) {
+        case 'archive':
+            await projectsArchive([p]);
+            break;
+        case 'view-archive':
+            projectsSelectedKey = p.project_key;
+            renderProjects();
+            break;
         case 'open':
             // project_key 现在是硬主键，openSparkProject 优先用它定位，标题/DNA
             // 只作为历史数据的回落（见 app.js findCompletedTaskForSpark）
@@ -1071,27 +1441,21 @@ async function projectsRunAction(act, p, event, jobId) {
             const ids = (p.sub_jobs || []).filter(j => j.id && j.status !== 'running').map(j => j.id);
             if (!ids.length) return;
             if (!await projectsConfirm(
-                `确定删除这 ${ids.length} 条作业记录吗？只删记录，outputs/ 里已生成的文件不受影响。`)) return;
+                `确定删除这 ${ids.length} 条生成记录吗？只删记录，本地已生成的文件不受影响。`)) return;
             const ok = await projectsBulkJobRequest('/api/tasks/delete', ids);
             showToast(ok === ids.length
-                ? `已删除 ${ok} 条作业记录`
+                ? `已删除 ${ok} 条生成记录`
                 : `${ids.length} 条记录中删除了 ${ok} 条，其余失败`,
                 ok === ids.length ? 'success' : 'error');
             refreshProjects();
             break;
         }
         case 'gallery-search': {
-            switchMainTab('gallery');
+            // 统一走画廊的 galleryFocus：等扫描完成、先清掉上次遗留的筛选再填词
             const title = p.title || '';
-            // 画廊是懒加载的，等它把搜索框和分组渲染出来再填词；搜索框自带
-            // 200ms 去抖，所以要派 input 事件而不是直接改 gallerySearch
-            setTimeout(() => {
-                const input = document.getElementById('gallery-search');
-                if (!input) return;
-                input.value = title;
-                input.dispatchEvent(new Event('input', { bubbles: true }));
-                showToast(`已在画廊里按「${title}」筛选`, 'info');
-            }, 600);
+            if (typeof galleryFocus !== 'function') { switchMainTab('gallery'); break; }
+            await galleryFocus({ search: title });
+            showToast(`已在画廊里按「${title}」筛选`, 'info');
             break;
         }
         case 'copy-title': {
@@ -1105,9 +1469,6 @@ async function projectsRunAction(act, p, event, jobId) {
             }
             break;
         }
-        case 'remix':
-            await startProjectRemix(p);
-            break;
         case 'delete-project': {
             const title = p.title || p.project_key || '未命名项目';
             if (!await projectsConfirm(
@@ -1125,20 +1486,11 @@ async function projectsRunAction(act, p, event, jobId) {
             refreshProjects();
             break;
         case 'gallery': {
-            switchMainTab('gallery');
-            const dir = (p.assets || {}).dir || '';
+            const archiveVideo = p.archived ? projectsArchiveVideos(p)[0] : null;
+            const dir = (p.assets || {}).dir || (archiveVideo ? archiveVideo.url.split('/').slice(0, -1).join('/') : '');
             const groupKey = dir.split('/').pop();
-            // 画廊是懒加载的，等它渲染完再定位
-            setTimeout(() => {
-                const el = document.querySelector(`#gallery-groups .gallery-group[data-group="${CSS.escape(groupKey)}"]`);
-                if (el) {
-                    el.scrollIntoView({ behavior: 'smooth', block: 'start' });
-                    el.classList.add('flash-highlight');
-                    setTimeout(() => el.classList.remove('flash-highlight'), 1600);
-                } else {
-                    showToast('画廊里没找到这个项目的资产目录（可能已被清理）', 'info');
-                }
-            }, 600);
+            if (typeof galleryFocus !== 'function') { switchMainTab('gallery'); break; }
+            await galleryFocus({ groupKey });
             break;
         }
         default:
@@ -1146,74 +1498,12 @@ async function projectsRunAction(act, p, event, jobId) {
     }
 }
 
-// 这个项目对应哪条爆款复刻作业。两个来源，都不用后端改字段：
-//   1. 复刻产出入库时 library item 的 id 直接写的就是 job_id（replica_pipeline.py
-//      _library_item：「job_id 本身就以 replica_ 开头，别再套一层」）；
-//   2. 复刻相关的任务在 dimensions 里带 replica_job_id（server_common._replica_job_of）。
-// 取不到就说明这个项目不是复刻线上的，二创无从谈起 —— 调用方据此决定露不露按钮。
-function projectReplicaJobId(p) {
-    if (!p) return '';
-    const libId = String((p.library || {}).id || '');
-    if (/^replica/.test(libId)) return libId;
-    const dims = ((p.task || {}).dimensions) || {};
-    return String(dims.replica_job_id || '').trim();
-}
-
-// 二创：把该项目对应的复刻作业在「爆款复刻」面板里打开，并定位到「二创变体」栏。
-//
-// 这里刻意**不**走 /api/ideate 的 remix_seed 那条路：那条路的落点是激发维度页的灵感
-// 卡网格，那一页已经下线，调用它只会静默返回、再配一个"正在激发…"的假提示。复刻面板
-// 的二创变体是现存唯一活着的二创机制（沿变异轴改写节拍阶梯，见 replicaMutateOrthogonal）。
-async function startProjectRemix(p) {
-    const jobId = projectReplicaJobId(p);
-    const toast = (msg, kind) => { if (typeof showToast === 'function') showToast(msg, kind); };
-
-    if (!jobId) {
-        toast('这个项目不是从爆款复刻来的，没有可改写的节拍阶梯', 'error');
-        return;
-    }
-    if (typeof switchMainTab !== 'function' || typeof replicaLoadJob !== 'function') {
-        toast('复刻工作台尚未加载完成，请稍后重试', 'error');
-        return;
-    }
-
-    let state;
-    try {
-        // 取数必须排在切页**之前**：switchMainTab 会触发 replicaTabEntered，它在
-        // replicaState 为空时会自作主张打开作业列表里的第一条。先把 state 落定，
-        // 那个兜底分支就不会跟我们抢；否则两个请求赛跑，用户可能落在别的作业上。
-        state = await replicaLoadJob(jobId);
-    } catch (e) {
-        toast(`打开复刻作业失败：${e.message}`, 'error');
-        return;
-    }
-
-    switchMainTab('replica');
-
-    // 节拍还没反推出来就没有「二创变体」栏可去（该栏与导航项都以 beats 非空为条件
-    // 渲染）。这时候滚到当前作业本身，并说清楚下一步该干什么。
-    const beats = ((state || {}).beats || {}).beats || [];
-    if (!beats.length) toast('该复刻作业还没有节拍阶梯，先跑完反推再做二创', 'info');
-
-    // 与上面「去画廊看资产」同一套：复刻面板由 replicaTabEntered 异步重渲一次，
-    // 立刻定位会被那次重渲把滚动位置顶回顶部。
-    setTimeout(() => {
-        if (typeof replicaFocusSection !== 'function') return;
-        // 逐个回落：每一栏都有自己的渲染条件（二创发散要 beats 非空），
-        // 条件不满足时那个锚点根本不存在，而 replicaFocusSection 找不到锚点是
-        // 彻底静默的——不滚动、不报错。所以按可能性从窄到宽试，别只赌一个。
-        const targets = beats.length
-            ? ['replica-sec-variant', 'replica-sec-current-job']
-            : ['replica-sec-current-job', 'replica-sec-jobs'];
-        targets.some(id => replicaFocusSection(id));
-    }, 600);
-}
-
 /* ── 初始化 ────────────────────────────────────────────────────────────── */
 
 function initProjects() {
     const container = document.getElementById('projects-list');
     if (!container) return;   // console.html 等页面没有工作台面板
+    projectsUpdateSectionUi();
 
     // Empty launches begin at the workbench; keep restored results and active
     // generation on their existing resume path. Respect hidden-tab preferences.
@@ -1222,21 +1512,29 @@ function initProjects() {
         switchMainTab('projects');
     }
 
+    document.getElementById('projects-sections')?.addEventListener('click', (e) => {
+        const btn = e.target.closest('.projects-section-btn');
+        if (btn) projectsSetSection(btn.dataset.section);
+    });
+
     document.getElementById('projects-filters')?.addEventListener('click', (e) => {
         const chip = e.target.closest('.projects-filter-chip');
-        if (!chip) return;
+        if (!chip || projectsSection !== 'active') return;
         projectsFilter = chip.dataset.filter || 'all';
+        projectsRefreshRevision++;
         refreshProjects({ assets: false });
     });
 
     document.getElementById('projects-search')?.addEventListener('input', (e) => {
         projectsSearch = e.target.value || '';
+        projectsRefreshRevision++;
         clearTimeout(projectsSearchDebounce);
         projectsSearchDebounce = setTimeout(() => refreshProjects({ assets: false }), 220);
     });
 
     document.getElementById('projects-sort')?.addEventListener('change', (e) => {
         projectsSort = e.target.value || 'newest';
+        projectsRefreshRevision++;
         refreshProjects({ assets: false });
     });
 
@@ -1260,6 +1558,10 @@ function initProjects() {
 
     // 行点击 = 快捷动作 / 勾选 / 选中并展开详情
     container.addEventListener('click', (e) => {
+        if (e.target.closest('[data-act="import-prompts"]')) {
+            document.getElementById('projects-import-prompt-btn')?.click();
+            return;
+        }
         const row = e.target.closest('.project-row');
         if (!row) return;
         const key = row.dataset.key;
@@ -1301,7 +1603,9 @@ function initProjects() {
         const key = row.dataset.key;
         const p = projectsFindRow(key);
         if (!p) return;
-        if (p.saved || (p.task && p.task.status === 'completed')) {
+        if (p.archived) {
+            projectsRunAction('view-archive', p, e);
+        } else if (p.saved || (p.task && p.task.status === 'completed')) {
             projectsRunAction('open', p, e);
         } else if (p.task && p.task.status === 'running') {
             projectsRunAction('follow', p, e);
@@ -1328,8 +1632,55 @@ function initProjects() {
 
 // header 的「⚡ 进行中」角标：跳到工作台并预选运行中。旧版是两个抽屉切换按钮
 // 各自一套开合状态 + 一路独立的 5s/30s 角标轮询，现在统一成一个入口。
+// 画廊分组的 key 是磁盘目录名，而 project_key 不一定与目录名相等（导入的项目 key 里
+// 是双下划线、目录名是单下划线），所以按「项目 key 或资产目录名」两种方式找行。
+function projectsFindRowByGalleryKey(key) {
+    if (!key) return null;
+    return projectsFindRow(key)
+        || (projectsRows || []).find(p => ((p.assets || {}).dir || '').split('/').pop() === key)
+        || null;
+}
+
+// 从画廊分组回到项目页定位：切到「进行中/全部」、清空搜索、等行出现后选中并滚到视野。
+// 找不到（已归档或标题被改）时退一步按标题搜索，让用户至少落在相关结果上。
+async function projectsLocate({ projectKey = '', title = '' } = {}) {
+    projectsApplySection('active', { clearSearch: true });
+    openProjectsWorkbench('all');
+    let row = null;
+    const t0 = Date.now();
+    while (Date.now() - t0 < 3000) {
+        row = projectsFindRowByGalleryKey(projectKey);
+        if (row) break;
+        await new Promise(r => setTimeout(r, 120));
+    }
+    if (row) {
+        projectsSelectedKey = row.project_key;
+        renderProjects();
+        const el = document.querySelector(`#projects-list .project-row[data-key="${CSS.escape(row.project_key)}"]`);
+        if (el) {
+            el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            el.classList.add('flash-highlight');
+            setTimeout(() => el.classList.remove('flash-highlight'), 1600);
+        }
+        return true;
+    }
+    if (title) {
+        const input = document.getElementById('projects-search');
+        if (input) {
+            input.value = title;
+            input.dispatchEvent(new Event('input', { bubbles: true }));
+        }
+        showToast(`项目页里没有精确匹配的项目，已按「${title}」搜索`, 'info');
+    } else {
+        showToast('项目页里没找到这个项目（可能已归档或被清理）', 'info');
+    }
+    return false;
+}
+
 function openProjectsWorkbench(filter) {
-    if (filter) projectsFilter = filter;
+    projectsApplySection(filter === 'archived' ? 'archived' : 'active');
+    if (filter && filter !== 'archived') projectsFilter = filter;
+    projectsRefreshRevision++;
     const chip = document.querySelector(`#projects-filters .projects-filter-chip[data-filter="${filter || 'all'}"]`);
     if (chip) {
         document.querySelectorAll('#projects-filters .projects-filter-chip')
@@ -1337,6 +1688,7 @@ function openProjectsWorkbench(filter) {
         chip.classList.add('active');
     }
     switchMainTab('projects');
+    refreshProjects({ assets: false });
 }
 
 // 兼容 defer 加载顺序：DOM 就绪后初始化一次

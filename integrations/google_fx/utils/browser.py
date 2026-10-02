@@ -14,6 +14,7 @@ import base64
 import requests
 import socket
 import glob
+import threading
 from urllib.parse import urlparse
 from pathlib import Path
 
@@ -31,12 +32,19 @@ from ..config import (
     get_runtime_adspower_headless,
     get_runtime_adspower_macos_window_mode,
 )
-from . import account_binding
+from . import account_binding, lease_registry
 from .logger import log
 
 
 class BrowserSessionClosedError(RuntimeError):
     """The Playwright page/CDP browser was closed while an operation was waiting."""
+
+
+class BrowserEnvironmentError(RuntimeError):
+    """Cannot safely establish the one-profile memory limit."""
+
+
+_ADS_BROWSER_LIFECYCLE_LOCK = threading.RLock()
 
 
 # ── Flow 站点地址（唯一事实来源） ────────────────────────────────────────────
@@ -285,6 +293,117 @@ def _find_running_browser_ws(user_id: str) -> str | None:
     return None
 
 
+def list_running_ads_browsers(port=None, *, strict=False) -> list[dict]:
+    """Read the local open-profile inventory without starting any browser."""
+    port = port or get_runtime_default_port() or DEFAULT_PORT
+    try:
+        response = requests.get(
+            f"http://127.0.0.1:{port}/api/v1/browser/local-active", timeout=2,
+        ).json()
+        if response.get("code") != 0:
+            raise BrowserEnvironmentError("无法读取 AdsPower 运行环境列表")
+        profiles = response.get("data", {}).get("list")
+        if not isinstance(profiles, list) or any(
+                not isinstance(profile, dict) or not profile.get("user_id")
+                for profile in profiles):
+            raise BrowserEnvironmentError("AdsPower 运行环境列表格式不完整")
+        return [dict(profile) for profile in profiles
+                if isinstance(profile, dict) and profile.get("user_id")]
+    except Exception as exc:
+        if strict:
+            raise BrowserEnvironmentError(
+                f"无法确认当前运行的浏览器环境（AdsPower 端口 {port}），已暂停打开新环境") from exc
+        return []
+
+
+def _check_browser_start_cancelled():
+    from . import cancel_flag
+    if cancel_flag.is_cancelled:
+        raise RuntimeError("任务已被取消")
+
+
+def ensure_profile_exclusive(user_id, port=None, timeout=20):
+    """Stop every other *unleased* local profile and verify exit before opening/reusing one.
+
+    Generation and account-selection probes share this boundary. A stop API
+    acknowledgement is not proof that Chromium has released its memory yet.
+
+    并发方案 R4：只关"无主"的浏览器，永不关别的任务租约内的环境（lease_registry）。
+    没装登记簿或没有他人租约时，行为与旧的"单环境模式"完全一致。
+    """
+    user_id = str(user_id or "").strip()
+    if not user_id:
+        raise BrowserEnvironmentError("未指定要保留的浏览器环境")
+    port = port or get_runtime_default_port() or DEFAULT_PORT
+    closed = []
+    with _ADS_BROWSER_LIFECYCLE_LOCK:
+        _check_browser_start_cancelled()
+        profiles = list_running_ads_browsers(port=port, strict=True)
+        leased = lease_registry.leased_by_others()
+        others = dict.fromkeys(str(row['user_id']) for row in profiles
+                               if str(row['user_id']) != user_id
+                               and str(row['user_id']) not in leased)
+        for skipped in sorted(leased & {str(row['user_id']) for row in profiles} - {user_id}):
+            log(f"🔒 环境 {skipped} 被其它任务租用，保留不关", "浏览器切换")
+        for previous in others:
+            _check_browser_start_cancelled()
+            log(f"🧹 单环境模式：先关闭 {previous}，再使用 {user_id}", "浏览器切换")
+            try:
+                requests.get(f"http://127.0.0.1:{port}/api/v1/browser/stop",
+                             params={"user_id": previous}, timeout=10).json()
+            except Exception:
+                # Stop can time out after taking effect; only active=Inactive
+                # confirms closure, never the stop response alone.
+                pass
+            deadline = time.monotonic() + max(0, timeout)
+            while True:
+                _check_browser_start_cancelled()
+                try:
+                    active = requests.get(
+                        f"http://127.0.0.1:{port}/api/v1/browser/active",
+                        params={"user_id": previous}, timeout=5).json()
+                    if (active.get("code") == 0 and
+                            str((active.get("data") or {}).get("status", "")).lower() == "inactive"):
+                        closed.append(previous)
+                        log(f"✅ 已确认环境 {previous} 关闭", "浏览器切换")
+                        break
+                except Exception:
+                    pass
+                if time.monotonic() >= deadline:
+                    raise BrowserEnvironmentError(
+                        f"环境 {previous} 未确认关闭，已暂停打开 {user_id}，避免同时占用内存")
+                time.sleep(min(0.5, max(0, deadline - time.monotonic())))
+        _check_browser_start_cancelled()
+    return closed
+
+
+# 旧名保留：外部脚本与历史代码仍按这个名字调用。
+ensure_single_ads_browser = ensure_profile_exclusive
+
+
+def get_running_ads_ws_url(user_id, port=None) -> str | None:
+    """Resolve a live profile before proxy rotation or a browser/start request."""
+    user_id = str(user_id or "").strip()
+    if not user_id:
+        return None
+    port = port or get_runtime_default_port() or DEFAULT_PORT
+    try:
+        response = requests.get(
+            f"http://127.0.0.1:{port}/api/v1/browser/active",
+            params={"user_id": user_id}, timeout=2,
+        ).json()
+        data = response.get("data") or {}
+        if response.get("code") == 0 and str(data.get("status", "")).lower() == "active":
+            ws_url = (data.get("ws") or {}).get("puppeteer")
+            if ws_url and _is_ws_port_open(ws_url, max_retries=1):
+                return ws_url
+        if response.get("code") == 0 and str(data.get("status", "")).lower() == "inactive":
+            return None
+    except Exception:
+        pass
+    return _find_running_browser_ws(user_id)
+
+
 def _try_revive_adspower(port: int | str = 50325, timeout: float = 8.0) -> bool:
     """当 AdsPower Local API 未响应时，尝试在 Windows 上自愈拉起客户端。"""
     if sys.platform != "win32":
@@ -352,6 +471,20 @@ def _macos_frontmost_app() -> str:
         return ""
 
 
+def bring_page_to_front_if_allowed(page, *, force: bool = False) -> bool:
+    """普通任务遵守静默模式；只有人工接管可以显式要求前置。
+
+    Playwright 的页面操作不需要激活桌面窗口。连接、生成和积分探测若直接
+    bring_to_front，会抵消启动时的隐藏。无头模式始终不执行窗口激活。
+    """
+    if get_runtime_adspower_headless():
+        return False
+    if not force and get_runtime_adspower_silent_mode():
+        return False
+    page.bring_to_front()
+    return True
+
+
 def suppress_browser_window(ws_url: str, previous_app: str = "", hide: bool = True) -> bool:
     """让刚启动的 AdsPower 浏览器别占着最前端（macOS 专用，其它平台 no-op）。
 
@@ -386,6 +519,20 @@ def reveal_browser_window(ws_url: str) -> bool:
         return False
 
 
+def reveal_current_task_window() -> int:
+    """只显示当前任务所用环境的浏览器窗口（macOS）；找不到运行中的环境返回 0。"""
+    if not IS_MAC:
+        return 0
+    try:
+        user_id = account_binding.resolve_account(
+            fallback=get_runtime_default_user_id() or DEFAULT_USER_ID)
+        ws_url = get_running_ads_ws_url(user_id) if user_id else None
+        return 1 if ws_url and reveal_browser_window(ws_url) else 0
+    except Exception as e:
+        log(f"⚠️ 恢复当前任务浏览器窗口时异常: {type(e).__name__}: {e}", "浏览器启动")
+        return 0
+
+
 def reveal_hidden_browser_windows() -> int:
     """把所有被静默隐藏的浏览器窗口翻到最前（macOS 专用，其它平台返回 0）。
 
@@ -394,6 +541,9 @@ def reveal_hidden_browser_windows() -> int:
     """
     if not IS_MAC:
         return 0
+    # 并发方案 R11：几个任务同时在跑时，只翻出"当前任务自己"的窗口，别把别人的静默窗口一起拉出来。
+    if lease_registry.concurrency() > 1:
+        return reveal_current_task_window()
     try:
         from .macos_window import reveal_hidden
         return reveal_hidden()
@@ -473,6 +623,30 @@ def get_ads_ws_url(user_id=None, port=None, auto_rotate_proxy=True,
     )
     if port is None:
         port = get_runtime_default_port() or DEFAULT_PORT
+
+    # Include the already-running fast path: leftover profiles must be closed
+    # even when the target itself needs no browser/start request.
+    with _ADS_BROWSER_LIFECYCLE_LOCK:
+        ensure_profile_exclusive(user_id, port=port)
+        return _start_or_reuse_ads_browser(
+            user_id, port, auto_rotate_proxy, max_start_attempts, start_timeout)
+
+
+def _start_or_reuse_ads_browser(user_id, port, auto_rotate_proxy,
+                                max_start_attempts, start_timeout):
+    from . import cancel_flag
+    if cancel_flag.is_cancelled:
+        raise RuntimeError("任务已被取消")
+    running_ws = get_running_ads_ws_url(user_id, port=port)
+    if running_ws:
+        log(f"⚡ 复用账号 {user_id} 已打开的浏览器", "浏览器启动")
+        if (IS_MAC and get_runtime_adspower_silent_mode()
+                and get_runtime_adspower_macos_window_mode() == "hide"
+                and not get_runtime_adspower_headless()):
+            # 复用没有启动新进程，不需要激活“之前的应用”。当前前台可能就是
+            # SunBrowser，先隐藏再恢复它反而会立即把窗口重新翻出来。
+            suppress_browser_window(running_ws, hide=True)
+        return running_ws
 
     # ── 代理轮换钩子 ──
     if auto_rotate_proxy:
@@ -761,7 +935,7 @@ def find_or_create_page(context, url_pattern, fallback_url=None, *, user_id=None
                 pass
 
     try:
-        target_page.bring_to_front()
+        bring_page_to_front_if_allowed(target_page)
     except Exception:
         pass
 

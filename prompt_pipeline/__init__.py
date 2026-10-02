@@ -29,7 +29,7 @@ from server_common import (
     _get_project_dir, _safe_project_name, read_ledger,
     IMG2IMG_CONTROL_PROMPT,
     PACKET_CACHE_LOCK, COMPOSE_CHECKPOINT_LOCK,
-    strict_gates_enabled, qa_gate_level, gate_setting, GenerationCancelled,
+    strict_gates_enabled, qa_gate_level, gate_setting, reviews_disabled, GenerationCancelled,
     skill_contract_strict, operator_blind_spot_block
 )
 from .frame_state import (
@@ -56,17 +56,7 @@ from .human_cast import (
     humanize_prompt_block,
     humanize_prompt_text,
 )
-from .mutate import (
-    generate_orthogonal_variant,
-    ai_diverge_orthogonal_ideas,
-    ORTHOGONAL_AXES,
-    MUTATION_PRESETS,
-    map_asmr_audio,
-)
-from .decision_framework import (
-    evaluate_variant_compatibility,
-    DIMENSION_METADATA,
-)
+
 
 
 
@@ -895,10 +885,12 @@ def refresh_trend_refs(config):
 def _chat(config, system, user, temperature=0.85, max_tokens=65536, timeout=240, on_chunk=None, model=None, enable_search=False):
     if not model:
         model = config.get('model') or 'gemini-3.8-flash-high'
+    # 先迁移历史模型，让网关路由与联网工具都依据实际发送的模型。
+    model = resolve_chat_model(model)
     base_url, api_key = resolve_gateway(model, config)
 
     payload = {
-        'model': resolve_chat_model(model),
+        'model': model,
         'messages': [
             {'role': 'system', 'content': system},
             {'role': 'user', 'content': user},
@@ -1063,6 +1055,7 @@ def _chat(config, system, user, temperature=0.85, max_tokens=65536, timeout=240,
 def _multimodal_chat(config, system, user_text, image_paths, model=None, max_tokens=1000, timeout=90):
     if not model:
         model = config.get('model') or 'gemini-3.8-flash-high'
+    model = resolve_chat_model(model)
     base_url, api_key = resolve_gateway(model, config)
 
     content_list = [{"type": "text", "text": user_text}]
@@ -1089,7 +1082,7 @@ def _multimodal_chat(config, system, user_text, image_paths, model=None, max_tok
         })
 
     payload = {
-        'model': resolve_chat_model(model),
+        'model': model,
         'messages': [
             {'role': 'system', 'content': system},
             {'role': 'user', 'content': content_list},
@@ -2268,7 +2261,7 @@ def _forbidden_layer_pair(indices):
                  if (a, b) in _FORBIDDEN_LAYER_PAIRS), None)
 
 
-def milestone_ladder_violations(beat_ladder, mode='Standard'):
+def milestone_ladder_violations(beat_ladder, mode='Standard', schema_only=False):
     """Deterministic P0 planning gate for the reference-case milestone skeleton.
 
     Ordinary construction beats must end in a named, visibly complete milestone rather
@@ -2276,6 +2269,7 @@ def milestone_ladder_violations(beat_ladder, mode='Standard'):
     only when all operations serve the same terminal state; obvious cross-phase bundles
     are rejected before prompt writing.  Threshold/reward beats retain their dedicated
     contracts and therefore do not need the ordinary construction fields.
+    schema_only preserves required output fields while skipping all quality judgments.
     """
     if not isinstance(beat_ladder, list):
         return ['Beat ladder is not a list.']
@@ -2310,6 +2304,8 @@ def milestone_ladder_violations(beat_ladder, mode='Standard'):
                 missing.append(field)
         if missing:
             errors.append(f'Beat {idx} is missing visible-milestone fields: {", ".join(missing)}.')
+            continue
+        if schema_only:
             continue
 
         name = str(beat.get('milestone_name')).strip().lower()
@@ -5165,11 +5161,9 @@ def micro_traces_channel_enabled(config=None):
     判据只认 active_skill_profile()——通道就是 profile，在这里按题材关键词再猜一遍
     就是给同一件事立第二个真相源（与 composers/__init__.get_composer 同一条纪律）。
 
-    三个注入点共用这一个判据：规划提示词（build_outline_plan_block 的 micro_traces）、
-    合成提示词（apply_observed_craft_fields / bind_outline_to_ladder 的 include_micro，
-    数据不落到 beat['observed_craft'] 上，observed_craft_directive 那条 bullet 自然不
-    渲染）、原片事实卡（observed_grounding.build_observed_digests 的 include_micro_traces）。
-    少接一处，那一处就静默恢复投喂。
+    规划提示词（build_outline_plan_block 的 micro_traces）和合成提示词
+    （apply_observed_craft_fields / bind_outline_to_ladder 的 include_micro）
+    共用这一判据。数据不落到 observed_craft 上时，正文也不渲染相应条目。
 
     反推侧一个字都不删：同一份节拍阶梯会被不同通道复用（换个 videoModel 重新合成一次
     就是另一条通道），在产出侧删掉等于要求换通道时重跑反推。
@@ -6152,6 +6146,31 @@ UGC_CAPTURE_CLAUSE = (
 )
 _UGC_CAPTURE_MARKERS = ('smartphone', 'phone footage', 'handheld tilt', 'compression artifact',
                         'blown highlight', 'sensor noise')
+
+
+def omni_user_shot_mode(dimensions=None, theme=''):
+    """Resolve an Omni shot override from user input, never from generated prose."""
+    dimensions = dimensions or {}
+    explicit = str(dimensions.get('video_shot_mode') or '').strip().lower().replace('-', '_')
+    if explicit in ('single_take', 'multishot'):
+        return explicit
+    if dimensions.get('user_single_take') is True:
+        return 'single_take'
+    # Clause-local negation keeps "不要一镜到底" and "no single take" at the default.
+    request = str(theme or dimensions.get('theme') or '')
+    single = re.compile(r'一镜到底|\b(?:oner|one[- ](?:continuous[- ])?(?:take|shot)|single[- ](?:continuous[- ])?take|unbroken take)\b', re.I)
+    for clause in re.split(r'[。；;!！?？\n,，]', request):
+        for match in single.finditer(clause):
+            before = clause[max(0, match.start() - 35):match.start()]
+            after = clause[match.end():match.end() + 18]
+            if re.search(r'(?:不要|禁止|避免|不使用|不用|不是|不得|不采用|无须|无需)\s*.*$', before):
+                continue
+            if re.search(r"\b(?:no|not|never|avoid|without|ban|banned|don['’]?t|do not)\b(?:\W+\w+){0,4}\W*$", before, re.I):
+                continue
+            if re.match(r'\s*(?:不行|不要|禁止|不需要|不是)', after):
+                continue
+            return 'single_take'
+    return 'multishot'
 
 
 def wants_cinematic_style(parsed_brief, theme=''):
@@ -10722,9 +10741,8 @@ def image_word_limit_for(family):
 
 def validate_beat_prompts(i, video_prompt, image_prompt, packet, mode, is_last, is_threshold_or_reveal, prev_video=None, prev_image=None, beat=None, family=None, is_pre_bridge=False, is_post_reveal_cleanup=False, video_word_limit=None):
     """video_word_limit：本 profile 的 VIDEO 硬顶。缺省 = base 的一镜到底档 380 词。
-    多镜头档（omni）的一条 VIDEO 按契约就是 5 个镜头 x 45~70 词 + 约 130 词结构句，
-    目标 450 / 硬顶 510——拿 380 去卡它，等于每一拍都必然报一条"超字数"，而那条报警
-    描述的是**契约本身**，不是这一拍写坏了。调用方（OmniComposer）传自己的硬顶。
+    OmniComposer 按实际拍型传自己的硬顶：三镜为400词、四镜为455词，
+    用户明确指定的一镜到底为400词；不用 base 的380词预算替代它。
 
     IMAGE 硬顶不走参数：它只由 family 决定（image_word_limit_for），所有 profile 同规则。"""
     errors = []
@@ -10960,6 +10978,8 @@ def compose_anchor_and_packet(config, dimensions, on_progress=None):
                 theme, ((_checkpoint.get('parsed_brief') or {}).get('destiny_zh', '')))
         checkpoint_total_beats = int(_checkpoint.get('total_beats'))
         _ck_brief = dict(_checkpoint.get('parsed_brief') or {})
+        if active_skill_profile(config) == 'omni':
+            _ck_brief['video_shot_mode'] = omni_user_shot_mode(dimensions, theme)
         normalize_threshold_topology(_ck_brief)
         ensure_spatial_contract(_ck_brief)
         _ck_ladder = normalize_beat_ladder(_checkpoint['beat_ladder'])
@@ -11065,8 +11085,8 @@ Required JSON keys:
         brief_user += f"- Initial Starting State: {dimensions['initial_state_before']}\n"
     if dimensions.get('scene_constants'):
         try:
-            from prompt_pipeline import reverse as _pp_rev
-            const_lines = _pp_rev.scene_constants_lines(dimensions['scene_constants'])
+            from .reference_context import scene_constants_lines
+            const_lines = scene_constants_lines(dimensions['scene_constants'])
             if const_lines:
                 brief_user += f"- Observed Scene Constants: {'; '.join(const_lines)}\n"
         except Exception:
@@ -11114,6 +11134,8 @@ Required JSON keys:
         parsed_brief = {}
     for k, v in _brief_fallback.items():
         parsed_brief.setdefault(k, v)
+    if active_skill_profile(config) == 'omni':
+        parsed_brief['video_shot_mode'] = omni_user_shot_mode(dimensions, theme)
 
     # 「内外双重完工」的第二幕依赖明确硬切：外部先交付一个可用门面，
     # 再把视觉状态归零到从未施工的室内。这不能由 brief LLM 自由改成 coaxial/pan，
@@ -11597,6 +11619,7 @@ Space Type: {space_type}
     # 就是这么来的），那几轮不能省。收手时交付的是**最好的那一版**，不是当前这版。
     _best_key = None
     _best_snapshot = None
+    _skip_planning_reviews = reviews_disabled(config)
     beat_ladder_max_attempts = max(2, int(config.get('beatLadderMaxAttempts', 4)))
     for attempt in range(beat_ladder_max_attempts):
         try:
@@ -11628,6 +11651,26 @@ Space Type: {space_type}
             if isinstance(beat_ladder, list) and count_ok:
                 idxs = [b.get('index') for b in beat_ladder]
                 if idxs == list(range(1, candidate_total + 1)):
+                    if _skip_planning_reviews:
+                        # 总开关关闭所有规划质量评判；仅保留可解析、齐段、连续索引
+                        # 和必填数据字段。施工顺序、转场叙事、最小段数都不再触发回炉。
+                        required_errors = milestone_ladder_violations(
+                            beat_ladder, mode=parsed_brief.get('mode', 'Standard'),
+                            schema_only=True)
+                        if not required_errors:
+                            total_beats = candidate_total
+                            beat_ladder_accepted = True
+                            bind_outline_to_ladder(config, _outline_plan, beat_ladder, [])
+                            if isinstance(config, dict):
+                                config['_planning_reviews_skipped'] = True
+                                if isinstance(config.get('_outline_contract'), dict):
+                                    config['_outline_contract']['review_skipped'] = True
+                            break
+                        if attempt < beat_ladder_max_attempts - 1:
+                            beat_user_current = (beat_user + '\n\n'
+                                'Required output structure is incomplete. Repair these fields:\n'
+                                + '\n'.join(f'- {error}' for error in required_errors))
+                        continue
                     # skill 直出模式：不再用 LLM 审查真实工序顺序（check_real_world_order_violation
                     # 已删）；仅保留免费的确定性结构校验——Threshold 桥接拍结构是下游
                     # _beat_contract/TBCP 的硬依赖，坏了整单都会崩，必须挡在这里。
@@ -11794,7 +11837,7 @@ Space Type: {space_type}
                     # On the last attempt, repair contradictory auxiliary package metadata
                     # before the strict milestone gate. The primary ``operation`` remains
                     # untouched and authoritative.
-                    if attempt >= 2:
+                    if attempt >= 2 and not _skip_planning_reviews:
                         _package_repairs = repair_incompatible_package_operations(beat_ladder)
                         if _package_repairs and sys.stdout:
                             print(f"[DEBUG] repaired final ladder package metadata: {_package_repairs}")
@@ -12138,16 +12181,14 @@ Space Type: {space_type}
     # downstream prompt writing can never receive a ladder different from the one that
     # was validated in the planning loop.
     frame_state_contract = build_frame_state_contract(beat_ladder)
-    frame_state_errors = validate_frame_state_contract(frame_state_contract)
+    frame_state_errors = ([] if _skip_planning_reviews else
+                          validate_frame_state_contract(frame_state_contract))
     scene_states = build_scene_states(beat_ladder)
-    # 反推复刻线（dimensions.reverse_engineered）豁免两条**施工纪律**类规则：进
-    # furnishing 前必须清场、持久结构件不得拆除。原因见 scene_state.validate_scene_states
-    # 的 docstring：这两条审的是"该不该这么施工"，而复刻单交付的是对原片的转录——原片里
-    # 那块防护布确实一直在，那块自铺的 OSB 底板也确实在第 17 拍被起掉了。在此之前这类闸
-    # 会把照实复刻判死，replica_pipeline 只能在外面写一段中文道歉去翻译它——翻译报错不是
-    # 修复，让闸知道题材来源才是。豁免掉的判据不丢：它们落进 _scene_state_advisories。
+    # Imported reference outlines may describe unconventional construction order.
+    # Preserve their existing compatibility marker: discipline findings remain
+    # visible as advisories, while physical continuity errors still block delivery.
     scene_state_advisories: list[str] = []
-    scene_state_errors = validate_scene_states(
+    scene_state_errors = [] if _skip_planning_reviews else validate_scene_states(
         scene_states,
         reverse_engineered=bool(dimensions.get('reverse_engineered')),
         advisories=scene_state_advisories)
@@ -13791,47 +13832,23 @@ TEMPLATE EXEMPLARS FOR THIS BEAT:
 """
 
 
-def _build_batch_user_message(beats, contracts, first_anchor_image, observed_digests=None):
+def _build_batch_user_message(beats, contracts, first_anchor_image):
     """Assembles the full user message for a batched beat-generation call: the fixed
     starting-point IMAGE (the only real cross-beat text anchor needed — everything
     after it, the model carries forward itself within its own single response), followed
     by each beat's own block in order.
 
-    `observed_digests`（复刻线专用，见 prompt_pipeline.observed_grounding）在每一拍的
-    合同后面追加一张「原片实拍事实卡」——那一拍 coverage 帧的逐帧读数压缩版。写手此前
-    从头到尾看不到任何一帧原片，机位/景别/三区布局/植被只能凭一句动作描述空想
-    （2026-08-30 复盘）。只发本拍那一张：整份按拍数乘一遍会撑爆上下文，还会让写手在写
-    第 3 拍时读到第 14 拍的画面。非复刻线不传这个参数，行为一字不变。"""
+    """
     parts = [f"""==================== STARTING POINT ====================
 Before the first beat below, the environment is already established in this state (do not restate it — just continue forward from it):
 {first_anchor_image}
 """]
     for i in beats:
         parts.append(_beat_block_text(i, contracts[i]))
-        observed = _observed_block_for_beat(observed_digests, i)
-        if observed:
-            parts.append(observed)
     parts.append(f"Generate all {len(beats)} beat(s) above, in order, now.")
     return "\n".join(parts)
 
 
-def _observed_block_for_beat(observed_digests, i):
-    """把第 i 拍的原片实拍事实卡渲成一段。没有事实卡时返回空串。
-
-    导入放在函数内：observed_grounding 反过来 `import prompt_pipeline as pp`，
-    模块顶层互引会在导入期成环。
-    """
-    if not observed_digests:
-        return ''
-    try:
-        from .observed_grounding import beat_digest_block
-    except Exception:
-        return ''
-    block = beat_digest_block(observed_digests, i)
-    if not block:
-        return ''
-    return ('==================== OBSERVED ORIGINAL FOOTAGE (BEAT %d) ====================\n%s\n'
-            % (i, block))
 
 
 # 英雄展示视频（[HERO]）的总开关。2026-07-31 关闭，理由见
@@ -14397,6 +14414,8 @@ def check_anchor_consistency(config, prompt_block, anchor_image_path, ref_frame_
     评估生成的 IMAGE 1 是否忠实还原了初始毛坯/待工状态、提示词空间维度与机位视角，
     并与爆款原片首帧关键帧（IMAGE REF）或封面（COVER）进行硬碰硬比对。
     返回中文违规描述 list（空 list = 判定为干净）；None = 审查未完成。"""
+    if reviews_disabled(config):
+        return None
     if not anchor_image_path or not os.path.exists(anchor_image_path):
         return None
 
@@ -14482,6 +14501,8 @@ def check_beat_consistency(config, prompt_block, beat_index, total_beats, image_
     与构图。role='establishing' 是反过来的一档：附件是同一个空间里最近的一张全景（本拍
     原片全程特写、或一张合规帧都挑不出来时的退档），机位/构图/尺度照判，**施工进度不判**
     ——那张帧不是本拍的时刻，照着它判进度会稳定报一条假的「工序超前/滞后」。"""
+    if reviews_disabled(config):
+        return None
     system_prompt = _local_beat_review_system_prompt()
     # 拍号只出现在 user turn：system prompt 因此在所有拍之间完全一致、可被 prompt
     # 缓存复用（见 _local_beat_review_system_prompt 的 2026-07-25 说明）。
@@ -14670,6 +14691,8 @@ def check_global_sequence_consistency(config, prompt_block, frame_image_paths, d
 
     only_beats: 只重跑「覆盖这些拍」的窗口（None = 全部窗口）。降级重试靠它只补跑上
     一轮没跑成的那几个窗口，而不是把已经审干净的窗口整批再烧一遍。"""
+    if reviews_disabled(config):
+        return None
     if not prompt_block or not frame_image_paths:
         return {}
     total_beats = len(frame_image_paths) - 1
@@ -14761,6 +14784,8 @@ def _verify_review_violation(config, violation_text, image_paths, timeout=30):
     返回 True=复核确认、False=复核明确否决（应丢弃）、None=复核调用本身没跑成
     （保守按"保留"处理——不能让基础设施抖动悄悄抹掉初审已经抓到的真问题，那样又会
     滑回"找不到问题"的老毛病）。"""
+    if reviews_disabled(config):
+        return None
     system_prompt = (
         "You are a skeptical second-opinion verifier for a construction-sequence visual "
         "audit. You will be shown one or more rendered frame images and a single claimed "
@@ -14789,6 +14814,8 @@ def check_collage_macro_alignment(config, source_collage_path, rendered_collage_
     """全局宏观拼图对齐审查：输入爆款 5 列拼图与新生成的 5 列拼图（full_collage.jpg），
     对比全剧节奏曲线、光影演变以及空间阶段演化。
     返回中文违规/偏差描述 list；空 list = 宏观对齐通过；None = 审查未完成。"""
+    if reviews_disabled(config):
+        return None
     if not source_collage_path or not rendered_collage_path:
         return []
     if not os.path.exists(source_collage_path) or not os.path.exists(rendered_collage_path):
@@ -15104,8 +15131,7 @@ def _storyboard_scene_fallback(rf_dir, source_ordinal):
 def _load_frame_facts_for_refs(cand_dirs):
     """{帧文件名: 逐帧读数}。读 reverse.py Pass A 落盘的 frame_facts.json。
 
-    与 observed_grounding.load_frame_facts 同一份形状，这里内联是为了避开
-    prompt_pipeline ← observed_grounding 的循环导入。读不到返回 {}：景别筛选随即失效，
+    读不到返回 {}：景别筛选随即失效，
     其余筛选照常——事实卡是增量信息，缺了不该把挂帧整个卡死。"""
     for cdir in cand_dirs or []:
         path = os.path.join(cdir, 'frame_facts.json')
@@ -15168,7 +15194,6 @@ def is_variant_project(project_dir, manifest=None, dims=None):
     变体特征：
       - manifest / dimensions 中有 job_type == 'variant', is_variant, variant_of, parent_baseline_id, mutation_axes
       - 目录名或标题中含有 '二创变体' / 'variant'
-      - 绑定的 replica_job 元数据表明其为 variant
     """
     if manifest is None and project_dir:
         mpath = os.path.join(project_dir, 'manifest.json')
@@ -15225,40 +15250,11 @@ def is_variant_project(project_dir, manifest=None, dims=None):
     if '二创变体' in title or re.search(r'(?:^|[_\W])variant(?:[_\W]|$)', title, re.I):
         return True
 
-    # 5. 绑定的 replica_job 元数据
-    job_id = str(dims.get('replica_job_id') or manifest.get('replica_job_id') or manifest.get('source_job_id') or '').strip()
-    if not job_id and project_dir:
-        m_job = re.search(r'replica_([a-f0-9]{12})', os.path.basename(project_dir))
-        if m_job:
-            job_id = f"replica_{m_job.group(1)}"
-    if job_id:
-        try:
-            from replica_pipeline import job_dir, validate_job_id
-            if validate_job_id(job_id):
-                j_dir = job_dir(job_id)
-                for meta_name in ('.summary.json', '.replica_pipeline.json', 'timelapse_beats.json'):
-                    meta_path = os.path.join(j_dir, meta_name)
-                    if os.path.exists(meta_path):
-                        try:
-                            with open(meta_path, 'r', encoding='utf-8') as f:
-                                data = json.load(f)
-                            if data.get('job_type') == 'baseline' and not (data.get('parent_baseline_id') or data.get('variant_of')):
-                                return False
-                            if (data.get('job_type') == 'variant'
-                                    or data.get('parent_baseline_id')
-                                    or data.get('variant_of')
-                                    or data.get('mutation_axes')):
-                                return True
-                        except Exception:
-                            pass
-        except Exception:
-            pass
-
     return False
 
 
 def find_reference_frames_with_roles(project_dir, total_beats=None):
-    """根据 project_dir（或其绑定的 replica_job_id）自动检索爆款原片抽出来的关键帧。
+    """读取项目本地参考帧及 video_overview.json 声明的来源目录。
 
     返回 (ref_frames_by_beat, ref_frame_roles, source_collage_path)：
       · ref_frames_by_beat: {帧号: 关键帧路径}。**缺号是声明，不是缺失**——挂不出空间层
@@ -15269,7 +15265,7 @@ def find_reference_frames_with_roles(project_dir, total_beats=None):
         对空间骨架与机位（见 check_beat_consistency 的 ref_frame_role）。
       · source_collage_path: 爆款原片 5 列多宫格拼图。
 
-    支持自动从目录名提取 job_id 并递归解析 video_overview.json 溯源上游抽帧目录。
+    支持沿 video_overview.json 溯源本地抽帧目录。
     纯只读探测，找不到返回 ({}, {}, None)。"""
     if not project_dir or not os.path.exists(project_dir):
         return {}, {}, None
@@ -15281,55 +15277,11 @@ def find_reference_frames_with_roles(project_dir, total_beats=None):
                 manifest = json.load(f)
         except Exception:
             manifest = {}
-    dims = manifest.get('dimensions') or {}
-    job_id = str(dims.get('replica_job_id') or manifest.get('replica_job_id') or manifest.get('source_job_id') or '').strip()
-
-    # 尝试从目录名中提取 replica_job_id (如 run_replica_293c50b9c953_...)
-    if not job_id:
-        m_job = re.search(r'replica_([a-f0-9]{12})', os.path.basename(project_dir))
-        if m_job:
-            job_id = f"replica_{m_job.group(1)}"
-
     cand_dirs = [os.path.abspath(project_dir)]
-    if job_id:
-        try:
-            from replica_pipeline import job_dir, validate_job_id
-            if validate_job_id(job_id):
-                j_dir = job_dir(job_id)
-                if os.path.isdir(j_dir) and j_dir not in cand_dirs:
-                    cand_dirs.insert(0, j_dir)
-        except Exception:
-            pass
-
-    # 递归查找 parent_baseline_id / variant_of / source_job_id 以及 video_overview.json 指向的溯源目录
-    try:
-        from replica_pipeline import job_dir as get_replica_job_dir, validate_job_id
-    except Exception:
-        get_replica_job_dir = None
-        validate_job_id = None
-
     seen_dirs = set(cand_dirs)
     queue = list(cand_dirs)
     while queue:
         cdir = queue.pop(0)
-        # 1. 检查 .summary.json / .replica_pipeline.json / manifest.json 中的 parent 关系
-        for meta_name in ('.summary.json', '.replica_pipeline.json', 'manifest.json'):
-            mpath = os.path.join(cdir, meta_name)
-            if os.path.exists(mpath):
-                try:
-                    with open(mpath, 'r', encoding='utf-8') as f:
-                        mdata = json.load(f)
-                    for k in ('parent_baseline_id', 'variant_of', 'source_job_id', 'parent_job_id', 'replica_job_id'):
-                        p_job = str(mdata.get(k) or '').strip()
-                        if p_job and validate_job_id and validate_job_id(p_job) and get_replica_job_dir:
-                            pj_dir = os.path.abspath(get_replica_job_dir(p_job))
-                            if os.path.isdir(pj_dir) and pj_dir not in seen_dirs:
-                                seen_dirs.add(pj_dir)
-                                cand_dirs.append(pj_dir)
-                                queue.append(pj_dir)
-                except Exception:
-                    pass
-
         # 2. 检查 video_overview.json
         vo_path = os.path.join(cdir, 'video_overview.json')
         if os.path.exists(vo_path):
@@ -15367,7 +15319,7 @@ def find_reference_frames_with_roles(project_dir, total_beats=None):
     # 严禁将母本的 review_frames 挂为逐像素/空间骨架 benchmark 对标帧（否则审查器会强行
     # 比对母本地貌，将新环境误判为"核心地貌完全缺失"并触发停链）。
     # 保留母本的 5 列拼图（source_collage_path），仅供双轨拼图横向快检与宏观节奏对齐。
-    if is_variant_project(project_dir, manifest=manifest, dims=dims):
+    if is_variant_project(project_dir, manifest=manifest):
         if sys.stdout:
             print(f"[REF] ℹ️ 当前任务为二创变体（Variant），已阻断挂载母本逐拍抽帧作为视觉对标基准，保留拼图供宏观比对。")
         return {}, {}, source_collage_path
@@ -15412,8 +15364,8 @@ def find_reference_frames_with_roles(project_dir, total_beats=None):
         # 1. 优先认第一拍已核准的证据帧 Triad 起始锚点（evidence_frames[0] 是模型/人工卡点确定的起步帧）。
         # 2. 原片开头可能是完工/半成品先导钩子闪帧，照直取就是拿成品画面当 IMG 001 的对标基准——
         #    链路守卫会照着它判「首帧不符」并触发 autofix 重写，4选1 也会照着它给最像成品的那张候选打高分。
-        #    判据与组稿期锚点对齐、组稿收尾对帧订正共用一份（reverse.select_opening_anchor）。
-        from prompt_pipeline import reverse as _reverse
+        #    判据与组稿期锚点对齐、组稿收尾对帧订正共用一份（reference_context.select_opening_anchor）。
+        from .reference_context import select_opening_anchor
         b1 = beats[0]
         evi1 = [str(x) for x in (b1.get('evidence_frames') or []) if x]
         cov1_raw = b1.get('coverage_frames') or []
@@ -15421,7 +15373,7 @@ def find_reference_frames_with_roles(project_dir, total_beats=None):
         if not cov1:
             cov1 = [str(c) for c in cov1_raw if isinstance(c, str) and c]
         head_names = (evi1 + [c for c in cov1 if c not in evi1]) if evi1 else cov1
-        start_f = (_reverse.select_opening_anchor(head_names, facts_by_name)
+        start_f = (select_opening_anchor(head_names, facts_by_name)
                    or (head_names[0] if head_names else 'review_001.png'))
         p1 = os.path.join(rf_dir, start_f)
         if not os.path.exists(p1):
@@ -15623,6 +15575,11 @@ def check_full_sequence_consistency(config, prompt_block, frame_image_paths, deg
     是同空间最近的一张全景，反过来只做机位/构图、不判施工进度（见 ref_frame_role）。
     source_collage_path / rendered_collage_path: 爆款原片与本单各自的 5 列拼图。两张
     都在时追加第 4 层 check_collage_macro_alignment（宏观节奏/光影演变对齐）。"""
+    if reviews_disabled(config):
+        return {
+            **_empty_review_result(), 'skipped': True, 'reason': 'reviewsDisabled',
+            'global_reviewed': False, 'global_attempted': False,
+        }
     if not prompt_block or not frame_image_paths:
         return _empty_review_result()
     total_beats = len(frame_image_paths) - 1
@@ -16230,19 +16187,30 @@ def _parse_prompt_slots(block):
     text = _strip_composer_marker_sections(_strip_markdown_fences_only(block or ''))
     text = re.sub(r'[\u200B-\u200D\u2060\uFEFF]', '', text)
 
-    # Matches: "图片 8:", "#### 图片 8:", "**图片 8:**", "图片 8（简介）[BRIDGE]:", "IMAGE 8:", etc.
-    image_matches = re.findall(
-        r'(?:^|\n)\s*(?:#{1,6}\s*|\*{1,2}\s*|[-*+]\s+)?(?:图片|图像|画面|IMAGE|IMG|Frame)\s*(?:第|#)?\s*(\d+)((?:\s*(?:[（\(].*?[）\)]|\[.*?\]))*)\s*[:：]\s*(.*?)(?=(?:\n\s*(?:#{1,6}\s*|\*{1,2}\s*|[-*+]\s+)?(?:图片|图像|画面|IMAGE|IMG|Frame)\s*(?:第|#)?\s*\d+|\n\s*(?:#{1,6}\s*)?(?:视频提示词|VIDEO\s*PROMPTS?)|\n\s*(?:#{1,6}\s*|\*{1,2}\s*|[-*+]\s+)?(?:视频|镜头|VIDEO|VID|Clip)\s*(?:第|#)?\s*\d+|\Z))',
-        text,
-        re.DOTALL | re.IGNORECASE
-    )
-    
-    video_matches = re.findall(
-        r'(?:^|\n)\s*(?:#{1,6}\s*|\*{1,2}\s*|[-*+]\s+)?(?:视频|镜头|VIDEO|VID|Clip)\s*(?:第|#)?\s*(\d+)((?:\s*(?:[（\(].*?[）\)]|\[.*?\]))*)\s*[:：]\s*(.*?)(?=(?:\n\s*(?:#{1,6}\s*|\*{1,2}\s*|[-*+]\s+)?(?:视频|镜头|VIDEO|VID|Clip)\s*(?:第|#)?\s*\d+|\n\s*(?:#{1,6}\s*)?(?:图片提示词|IMAGE\s*PROMPTS?)|\n\s*(?:#{1,6}\s*|\*{1,2}\s*|[-*+]\s+)?(?:图片|图像|画面|IMAGE|IMG|Frame)\s*(?:第|#)?\s*\d+|\Z))',
-        text,
-        re.DOTALL | re.IGNORECASE
-    )
-    
+    # A body reference such as "IMAGE 1 as the first frame" is not a boundary.
+    # Reuse the complete header grammar, including its colon, for both extraction
+    # and lookahead; the old lookahead stopped at any numbered IMAGE/VIDEO line.
+    decoration = r'[ \t]*(?:#{1,6}[ \t]*|\*{1,2}[ \t]*|[-*+][ \t]+)?'
+    image_label = r'(?:图片|图像|画面|IMAGE|IMG|Frame)'
+    video_label = r'(?:视频|镜头|VIDEO|VID|Clip)'
+    number = r'[ \t]*(?:第|#)?[ \t]*(\d+)'
+    tags = r'((?:[ \t]*(?:[（\(][^\n]*?[）\)]|\[[^\n]*?\]))*)'
+    suffix = r'[ \t]*[:：][ \t]*'
+    image_header = decoration + image_label + number + tags + suffix
+    video_header = decoration + video_label + number + tags + suffix
+    boundary_header = (decoration + r'(?:' + image_label + '|' + video_label + ')'
+                       + number + tags + suffix)
+    section_header = (decoration
+                      + r'(?:图片提示词|视频提示词|IMAGE[ \t]*PROMPTS?|VIDEO[ \t]*PROMPTS?)'
+                      + r'[ \t]*[:：]?[ \t]*(?:\*{1,2})?[ \t]*(?=\n|\Z)')
+    boundary = r'(?=^' + boundary_header + r'|^' + section_header + r'|\Z)'
+    flags = re.DOTALL | re.IGNORECASE | re.MULTILINE
+    # finditer avoids returning the lookahead's capture groups as slot fields.
+    image_matches = (m.group(1, 2, 3) for m in re.finditer(
+        '^' + image_header + r'(.*?)' + boundary, text, flags))
+    video_matches = (m.group(1, 2, 3) for m in re.finditer(
+        '^' + video_header + r'(.*?)' + boundary, text, flags))
+
     images = {}
     for n, tags, body in image_matches:
         if body.strip():

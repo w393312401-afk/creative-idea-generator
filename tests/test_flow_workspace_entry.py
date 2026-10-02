@@ -221,8 +221,13 @@ def test_onboarding_is_completed_in_chinese_english_and_current_indonesian(langu
     assert page.scrolled is True
 
 
-def test_find_or_create_page_reuses_tab_and_closes_extras(monkeypatch):
+@pytest.mark.parametrize("silent", [True, False])
+def test_find_or_create_page_reuses_tab_and_closes_extras(monkeypatch, silent):
     from integrations.google_fx.utils.browser import find_or_create_page
+    monkeypatch.setattr(
+        "integrations.google_fx.utils.browser.get_runtime_adspower_silent_mode", lambda: silent)
+    monkeypatch.setattr(
+        "integrations.google_fx.utils.browser.get_runtime_adspower_headless", lambda: False)
 
     class DummyPage:
         def __init__(self, url):
@@ -261,7 +266,7 @@ def test_find_or_create_page_reuses_tab_and_closes_extras(monkeypatch):
     assert p_flow.closed is False
     assert p_blank.closed is True
     assert p_extra.closed is True
-    assert p_flow.brought_to_front is True
+    assert p_flow.brought_to_front is (not silent)
 
     # 2. 只有空白页时，应该直接复用空白页进行跳转，而不额外新建标签页，且闭合多余标签
     p_blank2 = DummyPage("about:blank")

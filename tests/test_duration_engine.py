@@ -137,40 +137,6 @@ class TestDurationEngine(unittest.TestCase):
         self.assertTrue(hasattr(pp, 'allocate_beat_durations'))
         self.assertTrue(hasattr(pp, 'validate_beat_duration_budget'))
         self.assertTrue(hasattr(pp, 'convert_time_axes'))
-    def test_autobalance_beats_splits_and_merges(self):
-        """测试对真实用户案例（包含 7.3s, 9.967s 超长拍与 1.2s 微拍）的自动平衡与拆拍。"""
-        from prompt_pipeline import reverse
-        beats_doc = {
-            'video_duration_sec': 38.0,
-            'speed_multiplier': 2.0,
-            'beats': [
-                {'id': 'B01', 'start': 0.0, 'end': 3.6, 'stage': 'demolition', 'operation': 'clearing', 'package_operations': ['clear']},
-                {'id': 'B02', 'start': 3.6, 'end': 10.9, 'stage': 'structural', 'operation': 'framing', 'package_operations': ['frame', 'fasten']}, # 7.3s > 6.0s (拆拍)
-                {'id': 'B03', 'start': 10.9, 'end': 14.5, 'stage': 'enclosure', 'operation': 'boarding', 'package_operations': ['sheath']},
-                {'id': 'B04', 'start': 14.5, 'end': 19.3, 'stage': 'surface', 'operation': 'plastering', 'package_operations': ['plaster']},
-                {'id': 'B05', 'start': 19.3, 'end': 24.8, 'stage': 'floor', 'operation': 'flooring', 'package_operations': ['lay']},
-                {'id': 'B06', 'start': 24.8, 'end': 26.0, 'stage': 'furnishing', 'operation': 'furnishing', 'package_operations': ['place']}, # 1.2s < 2.0s (合并)
-                {'id': 'B07', 'start': 26.0, 'end': 35.967, 'stage': 'reveal', 'operation': 'reveal', 'package_operations': ['light', 'admire']}, # ~10.0s > 6.0s (拆拍)
-            ]
-        }
-        balanced, count = reverse.autobalance_beats(beats_doc)
-        self.assertGreater(count, 0)
-        
-        # 拆拍后所有拍的时长都在 1.5s ~ 6.0s 之间
-        beats = balanced['beats']
-        for b in beats:
-            span = b['end'] - b['start']
-            self.assertLessEqual(span, 6.0)
-            self.assertGreaterEqual(span, 1.8)
-            # 确认 2x 倍速与旁白字段已注入
-            self.assertIn('screen_duration_sec', b)
-            self.assertIn('action_duration_sec', b)
-            self.assertIn('voiceover_quota', b)
-            self.assertEqual(b['action_duration_sec'], round(b['screen_duration_sec'] * 2.0, 1))
-
-        # 序号重新排序 B01 ~ B0N
-        expected_ids = [f'B{i:02d}' for i in range(1, len(beats) + 1)]
-        self.assertEqual([b['id'] for b in beats], expected_ids)
 
 
 if __name__ == '__main__':

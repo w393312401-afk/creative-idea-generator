@@ -12,7 +12,7 @@ const appJs = fs.readFileSync(appJsPath, 'utf8');
 // 1. Verify index.html contains generate-cover-concurrent-btn
 assert.ok(html.includes('id="generate-cover-concurrent-btn"'), 'index.html should have generate-cover-concurrent-btn');
 assert.ok(html.includes('🎯 并发生成封面'), 'index.html should have 🎯 并发生成封面 button text');
-assert.ok(html.includes('封面图并发生成数量'), 'api-candidate-concurrency-group should mention cover concurrency');
+assert.ok(html.includes('候选图与封面生成'), 'api-candidate-concurrency-group should mention cover concurrency');
 
 // 2. Verify app.js binds generate-cover-concurrent-btn
 assert.ok(appJs.includes("getElementById('generate-cover-concurrent-btn')"), 'app.js should bind generate-cover-concurrent-btn');

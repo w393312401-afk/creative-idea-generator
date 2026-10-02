@@ -13,12 +13,22 @@
        理由与实测数据见 css/tokens.css 的 .glass-panel。 */
     background: var(--bg-panel);
     border: 1px solid var(--border-color);
-    border-radius: 20px;
+    border-radius: var(--radius-2xl);
     overflow: hidden;
 }
 
 #panel-gallery .panel-header {
-    padding: 1.5rem 1.5rem 0.75rem 1.5rem;
+    padding: 1rem 1.5rem 0.625rem 1.5rem;
+    flex-shrink: 0;
+    border-bottom: none; /* 分隔线由下面的工具栏自己带，避免上下两条线夹一个空条 */
+}
+
+#panel-gallery .gallery-header-title { min-width: 0; }
+
+#panel-gallery .gallery-header-meta {
+    display: flex;
+    align-items: center;
+    gap: 10px;
     flex-shrink: 0;
 }
 
@@ -26,7 +36,7 @@
     font-size: 1.25rem;
     font-weight: 600;
     letter-spacing: -0.3px;
-    margin-bottom: 0.25rem;
+    margin-bottom: 0.125rem;
     color: var(--text-main);
 }
 
@@ -52,14 +62,16 @@
     display: flex;
     gap: 6px;
     flex-wrap: wrap;
+    flex: 1 1 auto;
+    min-width: 0;
 }
 
 #panel-gallery .gallery-filter-chip {
     background: transparent;
     border: 1px solid var(--border-color);
-    border-radius: 20px;
+    border-radius: var(--radius-2xl);
     color: var(--text-secondary);
-    font-size: 12px;
+    font-size: var(--fs-sm);
     font-weight: 600;
     padding: 5px 14px;
     cursor: pointer;
@@ -92,9 +104,8 @@
     display: flex;
     align-items: center;
     gap: 8px;
-    flex: 1;
-    min-width: 200px;
-    max-width: 380px;
+    flex: 0 1 280px;
+    min-width: 180px;
 }
 
 #panel-gallery .gallery-search-input {
@@ -102,9 +113,9 @@
     min-width: 120px;
     background: rgba(var(--ink-rgb), 0.04);
     border: 1px solid var(--border-color);
-    border-radius: 8px;
+    border-radius: var(--radius-md);
     color: var(--text-main);
-    font-size: 12px;
+    font-size: var(--fs-sm);
     padding: 6px 12px;
     outline: none;
     transition: var(--transition-fast);
@@ -122,9 +133,9 @@
 #panel-gallery .gallery-sort-select {
     background: rgba(var(--ink-rgb), 0.04);
     border: 1px solid var(--border-color);
-    border-radius: 8px;
+    border-radius: var(--radius-md);
     color: var(--text-secondary);
-    font-size: 12px;
+    font-size: var(--fs-sm);
     font-weight: 600;
     padding: 6px 8px;
     cursor: pointer;
@@ -144,7 +155,7 @@
     gap: 2px;
     padding: 2px;
     border: 1px solid var(--border-color);
-    border-radius: 8px;
+    border-radius: var(--radius-md);
     background: rgba(var(--ink-rgb), 0.04);
     flex-shrink: 0;
 }
@@ -152,9 +163,9 @@
 #panel-gallery .gallery-view-btn {
     background: transparent;
     border: none;
-    border-radius: 6px;
+    border-radius: var(--radius-sm);
     color: var(--text-muted);
-    font-size: 13px;
+    font-size: var(--fs-md);
     line-height: 1;
     padding: 5px 9px;
     cursor: pointer;
@@ -172,22 +183,21 @@
     display: flex;
     align-items: center;
     gap: 8px;
-    flex-wrap: wrap;
+    flex-shrink: 0;
 }
 
 #panel-gallery .gallery-stats {
-    font-size: 12px;
+    font-size: var(--fs-sm);
     color: var(--text-muted);
-    margin-right: 4px;
     white-space: nowrap;
 }
 
 #panel-gallery .gallery-tool-btn {
     background: rgba(var(--ink-rgb), 0.04);
     border: 1px solid var(--border-color);
-    border-radius: 8px;
+    border-radius: var(--radius-md);
     color: var(--text-secondary);
-    font-size: 12px;
+    font-size: var(--fs-sm);
     font-weight: 600;
     padding: 6px 12px;
     cursor: pointer;
@@ -213,22 +223,27 @@
 
 #panel-gallery .gallery-tool-btn.small {
     padding: 4px 10px;
-    font-size: 11px;
+    font-size: var(--fs-xs);
 }
 
 /* ── 滚动区与分组 ─────────────────────────────────────────────────── */
 #panel-gallery .gallery-scroll {
-    gap: 22px;
+    gap: 10px;
+    /* 覆盖全局 .panel-body 的 28px 内边距：画廊要尽量多给内容。上内边距为 0，分组标题
+       吸顶时才能真正贴顶；手机上全局规则用 !important 固定成 16px，见下方媒体查询里的
+       --gallery-pad，吸顶 top 要减去它。 */
+    padding: 0 16px 12px;
+    --gallery-pad: 0px;
 }
 
 #panel-gallery .gallery-status {
     text-align: center;
     padding: 40px 16px;
-    font-size: 13px;
+    font-size: var(--fs-md);
     color: var(--text-secondary);
     background: rgba(var(--ink-rgb), 0.03);
     border: 1px dashed rgba(var(--ink-rgb), 0.08);
-    border-radius: 10px;
+    border-radius: var(--radius-md);
 }
 
 #panel-gallery .gallery-status.error {
@@ -236,30 +251,48 @@
     border-color: rgba(239, 68, 68, 0.25);
 }
 
+/* 分组标题吸顶：长分组（几十~上百项）往下滚时仍看得到分组名和操作按钮。
+   必须有实色背景，否则下面滚动的卡片会透出来；吸顶范围天然限定在各自的
+   .gallery-group 内，滚到下一组时由下一组的标题顶替。 */
 #panel-gallery .gallery-group-head {
+    position: sticky;
+    top: calc(-1px - var(--gallery-pad, 28px)); /* 抵消滚动区上内边距，真正贴顶；多出的 1px 防止顶上漏线 */
+    z-index: 4;
     display: flex;
     align-items: center;
     justify-content: space-between;
     gap: 10px;
-    margin-bottom: 10px;
-    flex-wrap: wrap;
+    margin-bottom: 2px;
+    padding: 6px 0;
+    flex-wrap: nowrap;          /* 单行：标题让位（省略号），按钮不折行 */
+    background: var(--bg-panel-solid);
+    border-bottom: 1px solid transparent;
 }
 
 #panel-gallery .gallery-group-head h3 {
-    font-size: 14px;
+    font-size: var(--fs-base);
     font-weight: 600;
     color: var(--text-main);
     display: flex;
     align-items: center;
     gap: 8px;
+    flex: 1 1 auto;
     min-width: 0;
-    overflow-wrap: anywhere;
     cursor: pointer;
     user-select: none;
 }
 
+#panel-gallery .g-group-name {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+#panel-gallery .g-group-title > * { flex-shrink: 0; }
+#panel-gallery .g-group-title > .g-group-name { flex-shrink: 1; }
+
 #panel-gallery .g-collapse-caret {
-    font-size: 11px;
+    font-size: var(--fs-xs);
     color: var(--text-muted);
     width: 12px;
     flex-shrink: 0;
@@ -271,34 +304,93 @@
 }
 
 #panel-gallery .g-orphan-badge {
-    font-size: 10px;
+    font-size: var(--fs-2xs);
     font-weight: 700;
     color: #f87171;
     background: rgba(239, 68, 68, 0.1);
     border: 1px solid rgba(239, 68, 68, 0.3);
-    border-radius: 6px;
+    border-radius: var(--radius-sm);
     padding: 1px 7px;
     white-space: nowrap;
     flex-shrink: 0;
 }
 
-/* 组标题上的磁盘目录名：只在它与项目名不一致时出现（改过名的项目）。
-   删除本组删的就是这个文件夹，所以它必须看得见，但不该跟项目名抢主位。 */
-#panel-gallery .g-group-dir {
-    font-size: 11px;
-    font-weight: 500;
-    font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
-    color: var(--text-muted);
-    background: rgba(var(--ink-rgb), 0.04);
-    border: 1px solid var(--border-color);
-    border-radius: 6px;
-    padding: 1px 7px;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    max-width: 42%;
-    flex-shrink: 1;
+/* 选择操作条：停靠在面板底部，只在有选中项时出现（[hidden] 由 JS 控制）。
+   放底部而不是顶部，出现/消失时不会把上方内容顶得跳动。 */
+#panel-gallery .gallery-selection-bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 8px 12px;
+    padding: 10px 1.5rem;
+    flex-shrink: 0;
+    border-top: 1px solid var(--border-color);
+    background: var(--bg-panel-solid);
+    box-shadow: 0 -6px 16px rgba(var(--ink-rgb), 0.06);
+}
+
+#panel-gallery .gallery-selection-bar[hidden] { display: none; }
+
+#panel-gallery .gallery-selection-note {
     min-width: 0;
+    color: var(--text-secondary);
+    font-size: var(--fs-sm);
+    font-weight: 600;
+}
+
+#panel-gallery .gallery-selection-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+
+#panel-gallery .gallery-group-details {
+    margin: -4px 0 12px 20px;
+    color: var(--text-muted);
+    font-size: var(--fs-xs);
+}
+
+#panel-gallery .gallery-group-details summary,
+#panel-gallery .gallery-file-details summary {
+    cursor: pointer;
+    width: fit-content;
+    color: var(--text-secondary);
+}
+
+#panel-gallery .gallery-group-details summary:hover,
+#panel-gallery .gallery-file-details summary:hover {
+    color: var(--neon-cyan);
+}
+
+#panel-gallery .gallery-group-details code,
+#panel-gallery .gallery-file-details code {
+    overflow-wrap: anywhere;
+    white-space: normal;
+    user-select: text;
+}
+
+#panel-gallery .gallery-group-details[open] > div {
+    margin-top: 6px;
+}
+
+#panel-gallery .gallery-file-details {
+    min-width: 0;
+    margin-top: 3px;
+    font-size: var(--fs-2xs);
+    color: var(--text-muted);
+}
+
+#panel-gallery .gallery-file-details dl {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr);
+    gap: 5px 8px;
+    margin: 8px 0 0;
+}
+
+#panel-gallery .gallery-file-details dd {
+    margin: 0;
+    overflow-wrap: anywhere;
 }
 
 #panel-gallery .gallery-expand-btn {
@@ -307,9 +399,9 @@
     margin-top: 8px;
     background: rgba(var(--ink-rgb), 0.03);
     border: 1px dashed var(--border-color);
-    border-radius: 8px;
+    border-radius: var(--radius-md);
     color: var(--text-secondary);
-    font-size: 12px;
+    font-size: var(--fs-sm);
     font-weight: 600;
     padding: 7px;
     cursor: pointer;
@@ -322,11 +414,11 @@
 }
 
 #panel-gallery .g-group-icon {
-    font-size: 15px;
+    font-size: var(--fs-lg);
 }
 
 #panel-gallery .g-count {
-    font-size: 11px;
+    font-size: var(--fs-xs);
     font-weight: 500;
     color: var(--text-muted);
     white-space: nowrap;
@@ -334,20 +426,27 @@
 
 #panel-gallery .gallery-group-actions {
     display: flex;
-    gap: 6px;
-    flex-shrink: 0;
+    flex-wrap: nowrap;
+    gap: 4px;
+    flex: 0 0 auto;
 }
+
+#panel-gallery .gallery-group-actions .gallery-tool-btn { padding: 3px 8px; }
+#panel-gallery .g-btn-ico { margin-right: 3px; }
+
+/* 路径与时间改放进悬停提示（标题 / 卡片的 title），这条折叠条占一整行，去掉 */
+#panel-gallery .gallery-group-details { display: none; }
 
 /* ── 缩略图网格与卡片 ─────────────────────────────────────────────── */
 #panel-gallery .gallery-grid {
     display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
-    gap: 12px;
+    grid-template-columns: repeat(auto-fill, minmax(128px, 1fr));
+    gap: 8px;
 }
 
 #panel-gallery .gallery-card {
     border: 1px solid var(--border-color);
-    border-radius: 12px;
+    border-radius: var(--radius-md);
     overflow: hidden;
     background: rgba(var(--panel-rgb), 0.4);
     transition: var(--transition-fast);
@@ -356,10 +455,12 @@
        子树 1685 个节点），而可视区一次只放得下十几张；img 上的 loading="lazy"
        只推迟了下载，布局/绘制该做的一样不少 —— 切到画廊页时 TaskDuration 实测
        802ms，是修完毛玻璃之后剩下的最大一处卡顿。
-       contain-intrinsic-size 给未渲染的卡片一个占位尺寸（列宽下限 150px + 卡片
-       正文一行），没有它滚动条会随着卡片进出视口来回跳。 */
+       contain-intrinsic-block-size 给未渲染的卡片一个占位高度，没有它滚动条会随着
+       卡片进出视口来回跳。故意不用 `auto`（记住上次渲染尺寸）：画廊有三种视图，
+       记住的是上一个视图的高度，切换后未渲染的卡片会按旧高度占位、布局错位。
+       每个视图各写一个固定估值（见下方各视图块）。 */
     content-visibility: auto;
-    contain-intrinsic-size: auto 186px;
+    contain-intrinsic-block-size: 138px;
 }
 
 #panel-gallery .gallery-card:hover {
@@ -399,7 +500,7 @@
     border-radius: 50%;
     background: rgba(0, 0, 0, 0.5);
     color: #fff;
-    font-size: 13px;
+    font-size: var(--fs-md);
     display: flex;
     align-items: center;
     justify-content: center;
@@ -410,11 +511,11 @@
     position: absolute;
     right: 6px;
     top: 6px;
-    font-size: 10px;
+    font-size: var(--fs-2xs);
     font-weight: 600;
     color: #fff;
     background: rgba(0, 0, 0, 0.55);
-    border-radius: 6px;
+    border-radius: var(--radius-sm);
     padding: 2px 7px;
     pointer-events: none;
 }
@@ -423,11 +524,11 @@
     position: absolute;
     right: 6px;
     top: 28px;
-    font-size: 10px;
+    font-size: var(--fs-2xs);
     font-weight: 600;
     color: #fff;
     background: rgba(176, 123, 82, 0.85);
-    border-radius: 6px;
+    border-radius: var(--radius-sm);
     padding: 2px 7px;
     pointer-events: none;
 }
@@ -443,7 +544,7 @@
     align-items: center;
     justify-content: center;
     background: rgba(0, 0, 0, 0.45);
-    border-radius: 6px;
+    border-radius: var(--radius-sm);
     cursor: pointer;
     opacity: 0;
     transition: var(--transition-fast);
@@ -482,9 +583,9 @@
 #panel-gallery .g-act {
     background: rgba(0, 0, 0, 0.45);
     border: none;
-    border-radius: 6px;
+    border-radius: var(--radius-sm);
     color: #fff;
-    font-size: 12px;
+    font-size: var(--fs-sm);
     width: 26px;
     height: 26px;
     display: flex;
@@ -502,15 +603,23 @@
     background: rgba(239, 68, 68, 0.8);
 }
 
+/* 正文一行：文件名（省略号）+ 大小。类型/时间只在列表视图显示（表格列）。 */
 #panel-gallery .gallery-card-meta {
     display: flex;
-    flex-direction: column;
-    gap: 2px;
-    padding: 7px 9px 8px 9px;
+    align-items: baseline;
+    gap: 6px;
+    padding: 5px 8px 6px 8px;
 }
 
+#panel-gallery .g-name { flex: 1 1 auto; min-width: 0; }
+#panel-gallery .g-kind,
+#panel-gallery .g-time { display: none; }
+
+/* 「详情」折叠条（时间/路径）：网格与列表里太占地方，改看悬停提示；仅大图视图保留 */
+#panel-gallery .gallery-file-details { display: none; }
+
 #panel-gallery .g-name {
-    font-size: 11px;
+    font-size: var(--fs-xs);
     font-weight: 600;
     color: var(--text-main);
     white-space: nowrap;
@@ -519,75 +628,84 @@
 }
 
 #panel-gallery .g-sub {
-    font-size: 10px;
+    flex: 0 0 auto;
+    font-size: var(--fs-2xs);
     color: var(--text-muted);
     white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
 }
 
 /* ── 显示方式：大图 ───────────────────────────────────────────────── */
 /* 只放大列宽下限。占位高度必须跟着一起改，否则未渲染卡片按 186px 占位、
    进入视口后撑到 260px，滚动条会随滚动来回跳（见 .gallery-card 的注释）。 */
 #panel-gallery .gallery-scroll.view-large .gallery-grid {
-    grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
-    gap: 16px;
+    grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+    gap: 12px;
 }
 
 #panel-gallery .gallery-scroll.view-large .gallery-card {
-    contain-intrinsic-size: auto 296px;
+    contain-intrinsic-block-size: 270px;
 }
 
+/* 大图视图正文可以宽松一点，并保留「详情」 */
+#panel-gallery .gallery-scroll.view-large .gallery-card-meta { flex-wrap: wrap; padding: 7px 10px 8px; }
+#panel-gallery .gallery-scroll.view-large .g-name { font-size: var(--fs-sm); }
+#panel-gallery .gallery-scroll.view-large .gallery-file-details { display: block; flex-basis: 100%; }
+
 /* ── 显示方式：列表 ───────────────────────────────────────────────── */
+/* 做成真正的表格行：缩略图 | 文件名 | 类型 | 大小 | 时间 | 操作，一行约 48px。
+   .gallery-card-meta 与 .g-sub 用 display:contents 摊平，让名字/类型/大小/时间
+   直接成为卡片这个 grid 的列。 */
 #panel-gallery .gallery-scroll.view-list .gallery-grid {
     display: flex;
     flex-direction: column;
-    gap: 6px;
+    gap: 3px;
 }
 
 #panel-gallery .gallery-scroll.view-list .gallery-card {
-    display: flex;
+    display: grid;
+    grid-template-columns: 56px minmax(0, 1fr) 44px 64px 118px auto;
     align-items: center;
-    gap: 12px;
-    padding: 6px 10px;
-    border-radius: 10px;
-    contain-intrinsic-size: auto 96px;   /* 缩略图 110×82 + 上下 padding */
+    column-gap: 10px;
+    padding: 3px 8px 3px 3px;
+    border-radius: var(--radius-md);
+    contain-intrinsic-block-size: 50px;
 }
 
 #panel-gallery .gallery-scroll.view-list .gallery-thumb {
-    width: 110px;
-    flex: 0 0 auto;
-    border-radius: 8px;
+    width: 56px;
+    border-radius: var(--radius-sm);
     overflow: hidden;
 }
 
-#panel-gallery .gallery-scroll.view-list .gallery-card-meta {
-    order: 2;
-    flex: 1;
-    min-width: 0;
-    flex-direction: row;
-    align-items: baseline;
-    gap: 12px;
-    padding: 0;
-}
+#panel-gallery .gallery-scroll.view-list .gallery-card-meta,
+#panel-gallery .gallery-scroll.view-list .g-sub { display: contents; }
 
-#panel-gallery .gallery-scroll.view-list .g-name {
-    flex: 1;
-    min-width: 0;
-    font-size: 12px;
-}
+#panel-gallery .gallery-scroll.view-list .g-name { font-size: var(--fs-sm); }
 
-#panel-gallery .gallery-scroll.view-list .g-sub {
-    flex: 0 0 auto;
-    font-size: 11px;
+/* DOM 顺序是「缩略图 → 操作条 → 正文」，而表格列顺序是「缩略图 | 名字 | 类型 | 大小 |
+   时间 | 操作」，所以每一列都必须显式指定位置，不能靠自动排列（否则操作条会占到第二列）。 */
+#panel-gallery .gallery-scroll.view-list .gallery-thumb        { grid-column: 1; grid-row: 1; }
+#panel-gallery .gallery-scroll.view-list .g-name               { grid-column: 2; grid-row: 1; }
+#panel-gallery .gallery-scroll.view-list .g-kind               { grid-column: 3; grid-row: 1; }
+#panel-gallery .gallery-scroll.view-list .g-size               { grid-column: 4; grid-row: 1; }
+#panel-gallery .gallery-scroll.view-list .g-time               { grid-column: 5; grid-row: 1; }
+#panel-gallery .gallery-scroll.view-list .gallery-card-actions { grid-column: 6; grid-row: 1; }
+
+#panel-gallery .gallery-scroll.view-list .g-kind,
+#panel-gallery .gallery-scroll.view-list .g-size,
+#panel-gallery .gallery-scroll.view-list .g-time {
+    display: block;
+    font-size: var(--fs-xs);
+    color: var(--text-muted);
+    white-space: nowrap;
 }
+#panel-gallery .gallery-scroll.view-list .g-size { text-align: right; }
 
 /* 行尾常显按钮条：去掉网格视图那套负 margin + 渐变遮罩 + 悬停淡入 */
 #panel-gallery .gallery-scroll.view-list .gallery-card-actions {
-    order: 3;
     margin-top: 0;
-    flex: 0 0 auto;
     padding: 0;
+    gap: 3px;
     background: none;
     opacity: 1;
 }
@@ -604,48 +722,115 @@
     color: #fff;
 }
 
-/* 徽章按比例缩小而不是隐藏：「片段/封面」是这行是什么、「🔗 使用中」是删了会破图，
-   两条都是列表视图下唯一的来源（缩略图小到看不出类型）。 */
-#panel-gallery .gallery-scroll.view-list .gallery-kind-badge,
+/* 类型已经是单独一列了，缩略图上的角标只留「🔗 使用中」（删了会破图，必须看得见），
+   收成左下角小标记；播放标记缩小。 */
+#panel-gallery .gallery-scroll.view-list .gallery-kind-badge { display: none; }
 #panel-gallery .gallery-scroll.view-list .gallery-inuse-badge {
-    right: 3px;
-    font-size: 9px;
-    padding: 1px 4px;
-    border-radius: 4px;
+    top: auto;
+    bottom: 2px;
+    right: auto;
+    left: 2px;
+    padding: 0 3px;
+    border-radius: var(--radius-xs);
 }
 
-#panel-gallery .gallery-scroll.view-list .gallery-kind-badge { top: 3px; }
-#panel-gallery .gallery-scroll.view-list .gallery-inuse-badge { top: 20px; }
-
 #panel-gallery .gallery-scroll.view-list .gallery-play-badge {
-    width: 22px;
-    height: 22px;
-    font-size: 10px;
+    width: 20px;
+    height: 20px;
+    font-size: var(--fs-2xs);
 }
 
 #panel-gallery .gallery-scroll.view-list .gallery-check {
     opacity: 1;
-    left: 3px;
-    top: 3px;
-    width: 18px;
-    height: 18px;
-    border-radius: 5px;
+    left: 2px;
+    top: 2px;
+    width: 16px;
+    height: 16px;
+    border-radius: var(--radius-xs);
 }
 
 /* ── 移动端微调 ───────────────────────────────────────────────────── */
 @media (max-width: 768px) {
+    /* 页头：收掉说明文案，标题 + 统计 + 刷新同一行 */
+    #panel-gallery .panel-header { padding: 10px 12px 6px; }
+    #panel-gallery .panel-header p { display: none; }
+    #panel-gallery .gallery-header-title { flex-shrink: 0; }
+    #panel-gallery .panel-header h2 { white-space: nowrap; }
+    #panel-gallery .gallery-header-meta { gap: 8px; min-width: 0; flex: 1 1 auto; }
+
+    /* 手机上分组头本身就有两三行（标题 + 按钮换行），吸顶会吃掉近三成面板高度，所以不吸顶 */
+    #panel-gallery .gallery-group-head { position: static; padding: 4px 0; background: none; }
+    #panel-gallery .gallery-stats { flex: 1 1 0; min-width: 0; font-size: var(--fs-xs); white-space: normal; text-align: right; }
+    #panel-gallery .gallery-header-meta .gallery-tool-btn { flex-shrink: 0; }
+
+    /* 工具栏：三行压成两行半。筛选 chip 单行横滑，不再折成 3 行；
+       搜索 + 排序 + 视图并一行；收起/全选放最后一行。 */
     #panel-gallery .gallery-toolbar {
         padding: 8px 12px;
-    }
-
-    #panel-gallery .gallery-grid {
-        grid-template-columns: repeat(auto-fill, minmax(110px, 1fr));
         gap: 8px;
     }
 
-    /* 触屏没有 hover：操作条与勾选框常显 */
-    #panel-gallery .gallery-card-actions,
-    #panel-gallery .gallery-check {
-        opacity: 1;
+    #panel-gallery .gallery-filters {
+        flex: 1 1 100%;
+        flex-wrap: nowrap;
+        overflow-x: auto;
+        scrollbar-width: none;
+        -webkit-overflow-scrolling: touch;
+        /* 右缘渐隐，提示还能横滑 */
+        -webkit-mask-image: linear-gradient(90deg, #000 calc(100% - 24px), transparent);
+        mask-image: linear-gradient(90deg, #000 calc(100% - 24px), transparent);
     }
+    #panel-gallery .gallery-filters::-webkit-scrollbar { display: none; }
+    #panel-gallery .gallery-filter-chip { flex-shrink: 0; padding: 4px 12px; }
+
+    #panel-gallery .gallery-search-sort { flex: 1 1 0; min-width: 0; }
+    #panel-gallery .gallery-search-input { min-width: 0; }
+    #panel-gallery .gallery-toolbar-right { flex: 1 1 100%; }
+    #panel-gallery .gallery-toolbar-right .gallery-tool-btn { flex: 1; }
+
+    #panel-gallery .gallery-scroll { --gallery-pad: 16px; gap: 8px; }
+    #panel-gallery .gallery-selection-bar { padding: 8px 12px; padding-bottom: calc(8px + env(safe-area-inset-bottom, 0px)); }
+    /* 右下角有全局的「日志」悬浮胶囊（约 90px 宽），按钮行右侧让出这块，免得「取消选择」被盖住 */
+    #panel-gallery .gallery-selection-actions { width: 100%; padding-right: 92px; gap: 6px; }
+    #panel-gallery .gallery-selection-actions .gallery-tool-btn { flex: 1 1 auto; padding: 6px 8px; font-size: var(--fs-xs); }
+
+    /* 网格：手机上 3 列（列宽下限 92px；原来 110px 在 299px 宽里只放得下 2 列） */
+    #panel-gallery .gallery-grid {
+        grid-template-columns: repeat(auto-fill, minmax(92px, 1fr));
+        gap: 6px;
+    }
+    #panel-gallery .gallery-card { contain-intrinsic-block-size: 118px; }
+    #panel-gallery .gallery-card-meta { padding: 4px 6px 5px; gap: 4px; }
+
+    /* 触屏没有 hover：勾选框常显。网格里缩略图只有 ~95px 宽，放不下 4 个操作按钮，
+       网格视图不显示操作条（点缩略图预览；要下载/删除用「选择」或切到列表/大图） */
+    #panel-gallery .gallery-check { opacity: 1; }
+    #panel-gallery .gallery-scroll.view-grid .gallery-card-actions { display: none; }
+    #panel-gallery .gallery-scroll.view-large .gallery-card-actions { opacity: 1; }
+
+    /* 分组头：按钮收成纯图标，标题省略号 */
+    #panel-gallery .gallery-group-actions .g-btn-label { display: none; }
+    #panel-gallery .gallery-group-actions .g-btn-ico { margin: 0; }
+    #panel-gallery .gallery-group-actions .gallery-tool-btn { padding: 4px 8px; font-size: var(--fs-sm); }
+    #panel-gallery .g-count { display: none; }
+
+    /* 大图：手机上单列，占位高度跟着变 */
+    #panel-gallery .gallery-scroll.view-large .gallery-grid { grid-template-columns: 1fr; }
+    #panel-gallery .gallery-scroll.view-large .gallery-card { contain-intrinsic-block-size: 300px; }
+
+    /* 列表：两行布局。左边缩略图跨两行；第一行文件名，第二行「类型 · 大小」+ 操作按钮。
+       之前 4 个按钮和名字挤在同一行，名字被截成「edit…」。 */
+    #panel-gallery .gallery-scroll.view-list .gallery-card {
+        grid-template-columns: 52px minmax(0, 1fr) auto;
+        grid-template-rows: auto auto;
+        row-gap: 2px;
+        contain-intrinsic-block-size: 58px;
+    }
+    #panel-gallery .gallery-scroll.view-list .gallery-thumb { grid-row: 1 / span 2; width: 52px; }
+    #panel-gallery .gallery-scroll.view-list .g-name { grid-column: 2 / span 2; grid-row: 1; }
+    #panel-gallery .gallery-scroll.view-list .g-kind { grid-column: 2; grid-row: 2; justify-self: start; }
+    #panel-gallery .gallery-scroll.view-list .g-size { grid-column: 2; grid-row: 2; justify-self: end; margin-right: 8px; }
+    #panel-gallery .gallery-scroll.view-list .g-time { display: none; }
+    #panel-gallery .gallery-scroll.view-list .gallery-card-actions { grid-column: 3; grid-row: 2; }
+    #panel-gallery .gallery-scroll.view-list .g-act-reveal { display: none; } /* 手机上"在本机文件管理器中显示"没有意义 */
 }

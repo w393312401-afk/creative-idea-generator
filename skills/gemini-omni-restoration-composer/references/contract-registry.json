@@ -15,7 +15,7 @@
       "id": "omni-multishot-ladder",
       "level": "P0",
       "scope": "video",
-      "summary": "每条 VIDEO 必须是「主工作镜 + 一到两个特写插入 + 切回同机位」的组接，按片长对应的结构依次出现且不得乱序；旧的五景别轮换名（establishing long / full / medium / wide outro）一律按梯外景别报错",
+      "summary": "默认施工按片长三或四镜；完整过门、兑现与展开阶段用各自三镜。门禁检查镜头名顺序、每个边界的实际cut、可拍描述及施工/硬件返回同机位声明，拒绝明确不同相机位置、焦段或构图。用户明确单镜覆盖豁免默认梯；文字门禁不证明实际画面连续性。",
       "source": "references/omni-multishot-language.md",
       "enforcer": "prompt_pipeline.composers.omni:omni_video_violations"
     },
@@ -23,16 +23,24 @@
       "id": "omni-one-take-ban",
       "level": "P0",
       "scope": "video",
-      "summary": "禁止一镜到底措辞，过门拍与最终兑现拍同样没有例外",
+      "summary": "默认多镜模式禁止一镜到底措辞，过门与兑现同样适用；原始用户明确指定single_take时只覆盖镜头语法，字数、锚点与物理因果要求继续适用。",
       "source": "SKILL.md#Three Standing Conflict Resolutions",
       "enforcer": "prompt_pipeline.composers.omni:omni_video_violations"
     },
     {
       "id": "omni-timeline-cutmarks",
+      "level": "P2",
+      "scope": "video",
+      "summary": "兼容旧ID：当前采用自然分镜，不要求数字秒点表。归一阶段删除旧Cut this...seconds时间线；实际cut边界由omni-multishot-ladder检查。",
+      "source": "references/omni-multishot-language.md",
+      "enforcer": "prompt_pipeline.composers.omni:_inject_timeline"
+    },
+    {
+      "id": "omni-video-word-ceiling",
       "level": "P0",
       "scope": "video",
-      "summary": "必须原样带上把切点钉在秒上的时间线句，且与片长/镜头结构一致",
-      "source": "references/omni-multishot-language.md",
+      "summary": "交付VIDEO全文按空白分词实际计数：三镜和用户单镜硬顶400词，四镜硬顶455词；压缩后仍须复验结构，不能凭审核套话或trim声明通过。",
+      "source": "references/omni-output-templates.md",
       "enforcer": "prompt_pipeline.composers.omni:omni_video_violations"
     },
     {
@@ -55,16 +63,16 @@
       "id": "omni-notation-ban-video",
       "level": "P2",
       "scope": "video",
-      "summary": "记号禁用：VIDEO 正文除时间线秒数外不得出现阿拉伯数字，计数写成英文单词",
-      "source": "references/omni-output-templates.md#Notation Ban",
+      "summary": "VIDEO正文计数写英文单词；IMAGE编号与紧贴单位的数字依运行期兼容规则豁免，旧机械时间线归一时删除。",
+      "source": "references/omni-output-templates.md",
       "enforcer": "prompt_pipeline.composers.omni:omni_video_violations"
     },
     {
       "id": "omni-notation-ban-image",
       "level": "P2",
       "scope": "image",
-      "summary": "记号禁用同样适用于 IMAGE 正文：计数与画高比例一律写成英文单词",
-      "source": "references/omni-output-templates.md#Notation Ban",
+      "summary": "IMAGE正文计数与画高比例写英文单词；IMAGE编号、兼容紧贴单位数字和运行期Grid单元格依注册例外处理，不能声称所有数字记号均已消失。",
+      "source": "references/omni-output-templates.md",
       "enforcer": "prompt_pipeline.composers.omni:omni_image_violations"
     },
     {
@@ -72,7 +80,7 @@
       "level": "P2",
       "scope": "image",
       "summary": "记号禁用把 Grid/坐标记法也列为违规（`Grid B2`、`x-axis 0.35`）",
-      "source": "references/omni-output-templates.md#Notation Ban",
+      "source": "references/omni-output-templates.md",
       "enforcer": null,
       "gap": "与 base 的 primary-landmark-restatement / anchor-scale-lock 直接冲突：那两条要求 IMAGE 按 `<地标> at Grid A2 holding forty-five percent of frame height` 的形态逐字重述 packet，Grid 单元格是 SCUP 漂移门禁的解析锚点。omni 若剥掉 Grid，base 的两个 P0 会同时失去可校验的输入。数字部分已可安全消解（词形数字仍能被 _PERCENT_NEAR_PATTERN 解析，见 omni-notation-ban-image），Grid 部分不能——保留为登记在案的冲突，等 SCUP 支持词形坐标后再消。"
     },

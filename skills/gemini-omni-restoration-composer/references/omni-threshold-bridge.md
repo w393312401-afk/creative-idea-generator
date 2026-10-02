@@ -5,6 +5,23 @@ additional IMAGE/VIDEO slots; it never steals, merges, or compresses constructio
 Every VIDEO still uses the Omni multi-shot grammar, but each transition slot performs only its
 declared stage.
 
+## Shot structure within each stage
+
+Every stage uses three shots with two explicit clean cuts, at every clip length (400-word
+VIDEO ceiling). Bind its own adjacent anchors; a stage does not inherit the whole crossing's
+camera path or construction work cycle.
+
+| Stage role | Three-shot coverage | Camera / progress rule |
+|---|---|---|
+| `door_hardware_open`, `hatch_hardware_open` | wide working shot → close-up insert → returning wide shot | Opening and return share the same position, framing and focal length. Show only opening the original hardware and its unavoidable local dust/debris. The insert inspects existing contact/hinge/latch evidence without additional opening progress; finish opening in the return. No room cleanup, repair or fit-out. |
+| `threshold_partial`, `shaft_descent`, `landing_turn`, `orientation_turn`, `partial_first_look`, `interior_establish` and secondary travel/establish stages | transition working shot → detail insert → landing shot | First and last match that stage's distinct anchors. The working and landing shots perform its actual movement/reveal. The insert retains the same spatial position and reveals no further depth; it cannot skip a rung, sill crossing, landing or turn. No same-camera-return demand for this traversal. |
+| Complete, unexpanded crossing | wide approach shot → threshold shot → interior wide shot | Traverse the actual entrance using shared sill/floor/light evidence; opening and arrival viewpoints legitimately differ. |
+
+For `divider_open`, apply the hardware-opening structure in the finished primary space;
+the following secondary traversal stages use the travel structure. The user's explicit
+one-take request overrides these cut structures directly while keeping the actual topology,
+reveal budget and state continuity. Mark the cut checks `用户覆盖／不适用`.
+
 ## Frozen ledgers before entry
 
 Carry four records through every prompt and manifest:
@@ -77,13 +94,28 @@ and colour across the threshold.
 Partial stages retain orientation evidence and hide the far wall. The full room overview is a
 later establish stage. In 9:16 vertical long-axis spaces, **default to a three-quarter oblique establish (wide 3/4 diagonal corner perspective)**; strictly forbid centered one-point perspective corridor overviews that trigger extreme tunnel/bowling-alley stretching.
 
-Every interior establish prompt (`interior_establish` / IMAGE T+1) must follow the **Depth-Layered Spatial Protocol (DLSP)**:
-1. **Camera Geometry**: `24mm wide-angle interior shot at 1.3m eye-level, wide 3/4 diagonal oblique perspective from near corner`.
-2. **Layer 1 - Immediate Foreground (<1m)**: Entrance hardware (ladder, hatch ring, door jamb) is explicitly locked as a **near-foreground object 0.5m from the lens at the frame margin (Grid A3-C3)** to prevent it from drifting to the back wall.
-3. **Layer 2 - Midground Staging Floor (1~4m)**: Broad, open floor expanse with raw seams and water/light caustics, completely unobstructed for future staging.
-4. **Layer 3 - Lateral Boundary Topology**: Explicitly define every wall plane (e.g. `Left wall: two consecutive widescreen windows; Right wall: solid corrugated steel wall`).
-5. **Layer 4 - Background Wall & Metric Envelope (>4m)**: State metric proportions (e.g. `3.8m wide, 5.5m deep, 2.6m ceiling`) and close out with a solid far background wall.
-6. **Negative Anti-Distortion Restraints**: Always inject `(cramped room, square box room, tiny cubicle, elevator shaft, three-sided glass box, endless narrow tunnel, bowling alley effect, train carriage, ladder placed in background:1.6)`.
+Every interior establish prompt (`interior_establish` / its settled IMAGE) carries a compact
+**Depth-Layered Spatial Protocol (DLSP)** in natural prose:
+
+1. **Camera geometry**: eye-level wide-angle, three-quarter diagonal oblique perspective
+   from the near corner, with a lens/height appropriate to the actual carrier. Spell any
+   measurements in English words; do not force one numerical room template on every shell.
+2. **Immediate foreground**: the named entrance hardware stays near the entry margin while
+   the crossing camera can see it. At the settled interior viewpoint, it may remain near a
+   frame edge or lie physically behind the camera; state which. Never relocate it to another
+   physical wall. A later visibly reached reverse viewpoint may see the same original entry
+   in its background; name its original boundary and distinguish it from the opposite solid
+   wall. Keep an original near floor seam/rung as an orientation tether when hardware leaves view.
+3. **Midground**: the real unobstructed raw floor/staging area, with inherited seams and
+   material state. A shallow carrier stays shallow; do not invent several metres of floor.
+4. **Lateral boundaries**: describe every wall and its complete aperture inventory, for
+   example two original windows only on the left and solid material on the right and rear.
+5. **Background and envelope**: close the real far wall at the declared door-width,
+   door-height and countable-bay proportions. Repeat the short envelope/roof lock.
+6. **Distortion restraint**: one concise sentence forbids stretched depth, invented rear
+   glass/openings and entrance hardware moved to another physical boundary. No numeric weights,
+   parenthesized negative lists or invented Grid cells; the output reference owns the
+   runtime-supplied IMAGE Grid exception.
 
 ## Scale and camera families
 
@@ -94,11 +126,26 @@ consecutive construction milestones. At least once per new space, a transition V
 shows an anonymous worker silhouette together with a standard door, rung/tread or known-size
 device; IMAGE anchors remain worker-free.
 
+The `camera_reframe` / `operation: reframe` slot is a no-work change within the same space,
+not a new entrance or construction milestone. Use transition working shot → detail insert →
+landing shot with two explicit cuts and the 400-word ceiling. Visibly perform the camera move
+between its distinct start and end anchors; the insert holds the current position and work
+state. Do not replay entry, require a return to the opening camera, add labor cycles or advance
+the room's construction state.
+
+A declared far-wall reverse looks back toward the same original entry. Its apparent distance
+or screen side may change with the actual camera movement, but its physical wall, hinge side,
+aperture inventory and relationship to the original floor seams cannot change. State the new
+orientation explicitly; a port wall can appear on the opposite screen side without becoming
+the starboard wall. Do not mistake that justified perspective change for a relocated opening.
+
 The first settled IMAGE of every new family is a render stop when rendering is active. Inspect it
 before composing dependent frames. For an interior family, confirm the exterior roof form and
 pitch remain credible, every opening matches the ledger, the denylist is clean, clear width and
 height read correctly in door units, at least one primary landmark is a fixed carrier feature,
-the door frame is fully behind the camera, and the interior remains in untouched trauma state.
+the entrance remains on its original registered boundary (near the entry viewpoint's frame
+edge, behind it, or visible from a declared reverse viewpoint), and the interior remains in
+untouched trauma state.
 Nothing checks these pixels automatically. Delete a rejected frame and re-render the same slot
 with `--force_regenerate`; a retry is not a new transition or construction beat.
 

@@ -51,3 +51,38 @@ def test_restart_endpoint_enforces_access_code(monkeypatch):
     assert len(sent) == 1
     assert sent[0][1] == 401
     assert '访问码' in sent[0][0].get('error', '')
+
+
+def test_auto_reload_reads_current_config_and_restarts_for_stale_code(monkeypatch, tmp_path):
+    config_path = tmp_path / 'server_config.json'
+    config_path.write_text('{"autoReload": false}', encoding='utf-8')
+    monkeypatch.setattr(sc, 'SERVER_CONFIG_FILE', str(config_path))
+    monkeypatch.setattr(server, '_AUTO_RELOAD_TRIGGERED', False)
+    monkeypatch.setattr(server, 'ACTIVE_TASKS', {})
+    monkeypatch.setattr(server, 'code_staleness_report',
+                        lambda: {'stale': True, 'stale_files': ['integrations/google_fx/ui_selectors.py']})
+
+    sleep_calls = []
+    def fake_sleep(seconds):
+        sleep_calls.append(seconds)
+        # The first poll sees autoReload=false; change the file before the next.
+        if sleep_calls.count(1.5) == 2:
+            config_path.write_text('{"autoReload": true}', encoding='utf-8')
+
+    monkeypatch.setattr(server.time, 'sleep', fake_sleep)
+    restarted = []
+    monkeypatch.setattr(server, 'restart_server_process', lambda: restarted.append(True))
+
+    class InlineThread:
+        def __init__(self, *, target, **kwargs):
+            self.target = target
+
+        def start(self):
+            self.target()
+
+    monkeypatch.setattr(server.threading, 'Thread', InlineThread)
+    server._start_auto_reload_watcher()
+
+    assert sleep_calls[:3] == [3.0, 1.5, 1.5]
+    assert restarted == [True]
+    assert server._AUTO_RELOAD_TRIGGERED is True

@@ -287,6 +287,11 @@ def test_tasks_clear_all_and_purge(monkeypatch, tmp_path):
     (out_dir / 'proj_extra').mkdir()
     (out_dir / 'extra_file.png').write_text('dummy')
     (out_dir / '.gitkeep').write_text('')
+    outside_dir = tmp_path / 'outside'
+    outside_dir.mkdir()
+    outside_file = outside_dir / 'source.mp4'
+    outside_file.write_text('user source')
+    (out_dir / 'outside_link').symlink_to(outside_dir, target_is_directory=True)
 
     monkeypatch.setattr(server, 'ACTIVE_TASKS', tasks)
     monkeypatch.setattr(server, 'read_library', lambda *a, **k: lib_items)
@@ -315,5 +320,5 @@ def test_tasks_clear_all_and_purge(monkeypatch, tmp_path):
     assert not (out_dir / 'proj_extra').exists()
     assert not (out_dir / 'extra_file.png').exists()
     assert (out_dir / '.gitkeep').exists()
-
+    assert outside_file.read_text() == 'user source'
 

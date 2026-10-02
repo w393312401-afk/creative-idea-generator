@@ -12,15 +12,16 @@ import glob
 from server_common import (
     SERVER_CONFIG, resolve_gateway, effective_config,
     OUTPUT_ROOT, _get_project_dir, _safe_project_name,
-    IMG2IMG_CONTROL_PROMPT, IMG2IMG_CROSSING_REVEAL_CONTROL_PROMPT,
+    IMG2IMG_CONTROL_PROMPT, IMG2IMG_CAMERA_CUT_CONTROL_PROMPT,
+    IMG2IMG_CROSSING_REVEAL_CONTROL_PROMPT,
     resolve_cover_reference, project_cover_path,
     apply_google_fx_runtime_overrides, fx_cancel_context, fx_request_deadline,
     read_manifest, write_manifest, GenerationCancelled, log,
-    gate_setting, chain_guard_mode, _get_account_pool_service, _select_pool_account,
+    gate_setting, chain_guard_mode, reviews_disabled, _get_account_pool_service, _select_pool_account,
 )
 from frame_continuity import (
     analyze_frame, changed_grid_cells, continuity_max_retries, continuity_mode,
-    family_map, is_transition_frame,
+    family_map, is_camera_cut_frame, is_transition_frame,
 )
 from frame_generator import (
     _image_edit_model, _image_generation_model, _generate_text_image,
@@ -590,7 +591,7 @@ def sync_frame_candidates_pool(frames_dir, seq, current_frame=None, target_path=
     return manifest_cands, chosen_idx, meta_payload
 
 
-def generate_frame_candidates(config, title, item, reference_path, seq, candidate_count=4, on_progress=None, is_bridge=False, is_cut_head=False, is_turn=False, project_url=None, frames_dir=None, canvas_state=None):
+def generate_frame_candidates(config, title, item, reference_path, seq, candidate_count=4, on_progress=None, is_bridge=False, is_cut_head=False, is_turn=False, is_camera_cut=False, project_url=None, frames_dir=None, canvas_state=None):
     """
     Generate `candidate_count` candidate images for a given sequence step.
     Saves candidates to `outputs/<title>/frames/candidates/frame_{seq:03d}/candidate_{1..N}.webp`.
@@ -659,6 +660,8 @@ def generate_frame_candidates(config, title, item, reference_path, seq, candidat
         ctrl_prompt = ''
     elif is_turn or is_bridge or is_cut_head:
         ctrl_prompt = IMG2IMG_CROSSING_REVEAL_CONTROL_PROMPT
+    elif is_camera_cut:
+        ctrl_prompt = IMG2IMG_CAMERA_CUT_CONTROL_PROMPT
     else:
         ctrl_prompt = IMG2IMG_CONTROL_PROMPT
         _region_cells = changed_grid_cells(item.get('prompt', ''))
@@ -668,6 +671,10 @@ def generate_frame_candidates(config, title, item, reference_path, seq, candidat
     prompt_text = item.get('prompt', '')
 
     backend = (config.get('imageBackend') or 'api').strip().lower()
+    if backend == 'google_fx' and is_camera_cut and ctrl_prompt not in prompt_text:
+        # Flow has no separate edit-control channel; preserve the same declared
+        # camera change used by the API candidate path in the submitted text.
+        prompt_text = f'{ctrl_prompt}\n\n{prompt_text}'.strip()
     canvas_state = canvas_state if isinstance(canvas_state, dict) else {}
     project_url = project_url or canvas_state.get('project_url')
     canvas_opened = bool(canvas_state.get('opened') or project_url)
@@ -984,6 +991,14 @@ def evaluate_and_select_best_candidate(config, prompt_text, reference_path, cand
         "selection_reason": str
     }
     """
+    if reviews_disabled(config):
+        return {
+            'candidates': [{'index': i, 'score': None, 'score_source': 'review_skipped',
+                            'strengths': '', 'defects': ''}
+                           for i in range(1, len(candidate_paths) + 1)],
+            'best_index': 1, 'review_skipped': True,
+            'selection_reason': '全部审查已关闭，默认使用首个候选；其他候选保留供手动选择。',
+        }
     if not candidate_paths:
         return {
             "candidates": [{"index": 1, "score": 90, "strengths": "无生成候选图", "defects": ""}],
@@ -1340,6 +1355,7 @@ def run_candidate_selection_frame_sequence(config, title, prompt_block, on_progr
         is_bridge = ('BRIDGE' in item.get('meta', '').upper() or 'BRIDGE' in incoming_meta)
         is_turn = 'TURN' in incoming_meta
         is_cut_head = ('CUT' in incoming_meta) and ('BRIDGE' not in incoming_meta)
+        is_camera_cut = is_camera_cut_frame(item.get('meta', ''))
         is_continuity_transition = is_transition_frame(
             seq, item.get('meta', ''), incoming_meta, _continuity_beat(manifest, seq)
         )
@@ -1379,6 +1395,7 @@ def run_candidate_selection_frame_sequence(config, title, prompt_block, on_progr
             is_bridge=is_bridge,
             is_cut_head=is_cut_head,
             is_turn=is_turn,
+            is_camera_cut=is_camera_cut,
             project_url=project_url,
             frames_dir=frames_dir,
             canvas_state=canvas_state,
@@ -1564,8 +1581,10 @@ def run_candidate_selection_frame_sequence(config, title, prompt_block, on_progr
             'fx_project_url': project_url,
             'prompt': item.get('prompt', ''),
             'reference': os.path.relpath(reference, workspace_root).replace('\\', '/') if reference else None,
-            'quality_gate': 'auto_approved',
-            'vlm_qa_reason': f"AI 4选1 鉴别优选 (候选 #{best_actual_idx}): {selection_reason}",
+            'quality_gate': ('pending_manual_review' if eval_result.get('review_skipped')
+                             else 'auto_approved'),
+            'vlm_qa_reason': (selection_reason if eval_result.get('review_skipped') else
+                              f"AI 4选1 鉴别优选 (候选 #{best_actual_idx}): {selection_reason}"),
             'selection_mode': 'candidate_selection',
             'chosen_candidate_index': best_actual_idx,
             'ai_evaluation': eval_result,
@@ -1598,7 +1617,10 @@ def run_candidate_selection_frame_sequence(config, title, prompt_block, on_progr
                 'best_index': best_actual_idx,
                 'selection_reason': selection_reason,
                 'scores': [c.get('score') for c in full_candidates],
-                'message': f"IMG {seq:03d} AI 鉴别选中候选 #{best_actual_idx}：{selection_reason}",
+                'review_skipped': bool(eval_result.get('review_skipped')),
+                'message': (f"IMG {seq:03d} 审查已跳过，使用候选 #{best_actual_idx}"
+                            if eval_result.get('review_skipped') else
+                            f"IMG {seq:03d} AI 鉴别选中候选 #{best_actual_idx}：{selection_reason}"),
             })
             # guard_pending：这一帧落盘后还有一道链上守卫要审（见下面的守卫分支）。
             # frame_data 里的 quality_gate 恒为 'auto_approved'（4选1 优选的结论），

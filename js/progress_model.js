@@ -234,7 +234,9 @@
             const done = terminalSlotCount(state);
             const denom = state.total || total || done || 1;
             percent = 5 + clamp(done / denom, 0, 1) * 83;
-            label = `视频段落完成 ${done}/${denom}`;
+            const successful = Object.values(state.slotStatus).filter(v => v === 'done').length;
+            const failed = Object.values(state.slotStatus).filter(v => v === 'failed').length;
+            label = `已生成 ${successful}/${denom} 段视频` + (failed ? ` · ${failed} 段待重试` : '');
             status = 'done';
         } else if (stage === 'video_error') {
             current = Number(details && details.current) || null;
@@ -246,6 +248,15 @@
             label = slot ? `VID ${String(slot).padStart(3, '0')} 生成失败` : '视频生成失败';
             if (details && details.message) label += `：${details.message}`;
             status = 'failed-slot';
+        } else if (stage === 'video_warning') {
+            label = messageFrom(details, '正在处理视频生成状态');
+            status = 'active';
+            slot = null;
+        } else if (stage === 'ip_rotating' || stage === 'ip_rotated' || stage === 'ip_rotation_failed') {
+            label = messageFrom(details, stage === 'ip_rotating' ? '正在更换并验证出口 IP…'
+                : stage === 'ip_rotated' ? '出口 IP 已更换，继续未完成视频' : '换 IP 失败，已停止重试');
+            status = stage === 'ip_rotation_failed' ? 'failed' : 'retrying';
+            slot = null;
         } else if (stage === 'merge_start') {
             percent = 90;
             label = messageFrom(details, '正在合并并加速视频...');
@@ -267,7 +278,8 @@
             status = 'skipped';
         } else if (stage === 'result') {
             percent = 100;
-            label = '视频序列生成完成';
+            const failed = Object.values(state.slotStatus).filter(v => v === 'failed').length;
+            label = failed ? `本次生成已结束 · ${failed} 段待重试` : '视频序列生成完成';
             status = 'completed';
         } else if (stage === 'error') {
             label = messageFrom(details, '视频生成失败');

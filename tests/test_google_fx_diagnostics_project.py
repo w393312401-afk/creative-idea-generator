@@ -102,7 +102,7 @@ class _ProbePage:
 # 每条都是对应族的第 0 层，凑齐 _REQUIRED_WORKSPACE_FAMILIES 的主选择器命中。
 _WORKSPACE_HITS = {
     "textarea",                                                    # prompt_input
-    "button[aria-haspopup='dialog']:has(span:text('Create'))",     # add_media_btn
+    "button[aria-label='Add media menu']",                          # add_media_btn
     "button:has(img[alt='User profile image'])",                   # account_menu_trigger
 }
 

@@ -20,13 +20,15 @@ from ..utils.logger import log
 from ..utils.browser import (
     random_sleep, clean_path, get_ads_ws_url, find_or_create_page, ensure_flow_workspace,
     _page_is_alive, FLOW_HOST_HINTS, FLOW_HOME_URL, is_flow_url,
-    is_flow_project_url, flow_project_id,
+    is_flow_project_url, flow_project_id, BrowserEnvironmentError,
+    bring_page_to_front_if_allowed,
 )
 from ..ui_selectors import UI_SELECTORS, RATIO_MAP, ORIENT_ICON_MAP
 from ..model_catalog import DEFAULT_GOOGLE_FX_IMAGE_MODEL, GOOGLE_FX_IMAGE_MODELS
 from ..utils import selector_stats
 from ..utils import cancel_flag
 from .google_fx_dom import _click_first_visible, _find_first_visible, _safe_press_escape
+from .flow_tile_observer import FLOW_FAILURE_OBSERVER_JS
 from .google_fx_credit import (
     detect_page_credit_exhaustion, is_credit_exhausted_message, last_credit_reading,
 )
@@ -298,23 +300,35 @@ def _click_new_project_button(page, confirm_timeout=45.0):
         return (not is_flow_project_url(before_url)
                 or flow_project_id(current_url) != flow_project_id(before_url))
 
+    def _pump_navigation_events(seconds):
+        # page.url is cached by sync Playwright. time.sleep alone cannot deliver
+        # the CDP navigation event, so an already-open project looked unchanged
+        # for the entire 45 s confirmation window. This wait pumps those events.
+        _check_cancelled()
+        if hasattr(page, "wait_for_timeout"):
+            page.wait_for_timeout(seconds * 1000)
+        else:
+            time.sleep(seconds)
+        _check_cancelled()
+
     for sel in UI_SELECTORS["google_fx"].get("new_project_btn", []):
+        _check_cancelled()
         try:
             btn = page.locator(sel).first
             if btn.is_visible(timeout=1500):
                 btn.click(timeout=5000)
                 deadline = time.monotonic() + max(0.0, float(confirm_timeout))
                 while True:
+                    _check_cancelled()
                     if _project_navigation_confirmed():
-                        random_sleep(2, 4)
                         log(f"🆕 新建项目成功，已确认进入项目页 (sel={sel!r}, url={page.url})", "GoogleFX")
                         return True
                     if time.monotonic() >= deadline:
                         break
-                    time.sleep(0.2)
+                    _pump_navigation_events(0.2)
                 # 到期前再宽限一拍：navigation 常常就卡在窗口边缘落地（见上面的
                 # 实测说明），差 0.2 秒就把一次成功的新建判成失败太亏。
-                time.sleep(1.5)
+                _pump_navigation_events(1.5)
                 if _project_navigation_confirmed():
                     log(f"🆕 新建项目成功（宽限期内确认，sel={sel!r}, url={page.url}）", "GoogleFX")
                     return True
@@ -346,6 +360,7 @@ def _click_new_project_button(page, confirm_timeout=45.0):
                 except Exception:
                     pass
         except Exception as e:
+            _check_cancelled()
             log(f"  ⚠️ 新建项目候选点击失败 (sel={sel!r}): {type(e).__name__}", "GoogleFX")
     return False
 
@@ -360,11 +375,295 @@ def _find_add2_btn(page):
     探针报绿不代表生产路径能点得到。统一成一个源后，探针命中层级和运行期统计
     才对得上。
     """
-    return _find_first_visible(
-        page,
-        UI_SELECTORS["google_fx"]["add_media_btn"],
-        family="add_media_btn",
-    )
+    selectors = UI_SELECTORS["google_fx"]["add_media_btn"]
+    for index, selector in enumerate(selectors):
+        try:
+            matches = page.locator(selector)
+            # Flow can leave a hidden copy of the toolbar mounted while a new
+            # visible copy is rendered. `.first` would miss the usable button.
+            for match_index in range(min(matches.count(), 8)):
+                button = matches.nth(match_index)
+                if button.is_visible(timeout=500):
+                    selector_stats.record_hit(
+                        "add_media_btn", index, selector=selector,
+                        total=len(selectors),
+                    )
+                    return button
+        except Exception:
+            pass
+    selector_stats.record_hit("add_media_btn", -1, total=len(selectors))
+    return None
+
+
+_CANVAS_UPLOAD_MENU_SELECTOR = (
+    "[role='menu'], .mat-mdc-menu-panel, .mat-menu-panel, "
+    "[data-radix-menu-content], [role='dialog'], "
+    "flow-add-menu-popover-content, "
+    ".cdk-overlay-pane:has(button[aria-label='Upload media'])"
+)
+_CANVAS_UPLOAD_ACTION_SELECTOR = (
+    # Desktop Flow uses a role-less popover with Upload media in its sidebar;
+    # the narrow layout uses an icon button carrying the accessible label.
+    "button[aria-label='Upload media'], button[aria-label='Upload'], "
+    "button[mattooltip='Upload media'], "
+    "button[aria-label*='上传'], "
+    "button:has-text('Upload'), button:has-text('上传'), "
+    "[role='menuitem']:has-text('Upload'), [role='menuitem']:has-text('上传'), "
+    "[role='button']:has-text('Upload'), [role='button']:has-text('上传'), "
+    "flow-menu-item:has-text('Upload'), flow-menu-item:has-text('上传'), "
+    "label:has-text('Upload'), label:has-text('上传')"
+)
+
+
+def _canvas_upload_menu_selector(trigger):
+    """Selector for the menu owned by `trigger` (exact portal id when exposed)."""
+    controls = ""
+    try:
+        controls = (trigger.get_attribute("aria-controls", timeout=500) or "").strip()
+    except Exception:
+        pass
+    # Material exposes an exact portal id. Never let another open menu satisfy
+    # that contract. Legacy Create dialogs do not expose aria-controls.
+    return ", ".join(f"[id={json.dumps(item)}]" for item in controls.split()) \
+        if controls else _CANVAS_UPLOAD_MENU_SELECTOR
+
+
+def _find_canvas_upload_file_input(page, trigger):
+    """Hidden <input type=file> inside this Create/Add media menu, or None.
+
+    Last-resort handoff when clicking Upload never opens a native chooser.
+    Scoped to the trigger's own menu so Start/End frame dialogs or any other
+    uploader on the page can never receive the file.
+    """
+    if trigger is None:
+        return None
+    try:
+        menus = page.locator(_canvas_upload_menu_selector(trigger))
+        for index in range(min(menus.count(), 8)):
+            menu = menus.nth(index)
+            if not menu.is_visible():
+                continue
+            inputs = menu.locator("input[type='file']")
+            if inputs.count() == 1:
+                return inputs.first
+    except Exception:
+        pass
+    return None
+
+
+def _describe_canvas_upload_state(page, action):
+    """One-line DOM snapshot for a chooser that never opened (diagnostics only)."""
+    try:
+        return page.evaluate("""el => {
+            const box = el && el.getBoundingClientRect ? el.getBoundingClientRect() : null;
+            const hit = box ? document.elementFromPoint(
+                box.x + box.width / 2, box.y + box.height / 2) : null;
+            const tag = n => n ? (n.tagName.toLowerCase()
+                + (n.getAttribute('aria-label') ? `[${n.getAttribute('aria-label')}]` : '')
+                + (n.className && typeof n.className === 'string'
+                    ? '.' + n.className.trim().split(/\\s+/).slice(0, 2).join('.') : '')) : 'none';
+            return JSON.stringify({
+                action: tag(el),
+                covered_by: hit && el && !el.contains(hit) ? tag(hit) : null,
+                disabled: !!(el && (el.disabled || el.getAttribute('aria-disabled') === 'true')),
+                file_inputs: document.querySelectorAll('input[type=file]').length,
+                overlays: document.querySelectorAll('.cdk-overlay-pane, [role=dialog], [role=menu]').length,
+                visibility: document.visibilityState,
+                focused: document.hasFocus(),
+            });
+        }""", action.element_handle(timeout=500))
+    except Exception as error:
+        return f"snapshot unavailable ({type(error).__name__})"
+
+
+def _find_canvas_upload_action(page, trigger):
+    """Return the visible Upload action owned by this Create/Add media menu."""
+    if trigger is None:
+        return None
+    selector = _canvas_upload_menu_selector(trigger)
+    try:
+        menus = page.locator(selector)
+        for index in range(min(menus.count(), 8)):
+            menu = menus.nth(index)
+            if not menu.is_visible():
+                continue
+            actions = menu.locator(_CANVAS_UPLOAD_ACTION_SELECTOR)
+            for action_index in range(min(actions.count(), 8)):
+                action = actions.nth(action_index)
+                if action.is_visible():
+                    return action
+    except Exception:
+        pass
+    return None
+
+
+def _canvas_upload_menu_is_ready(page, trigger):
+    """Only accept a visible upload action in the media trigger's open menu."""
+    return _find_canvas_upload_action(page, trigger) is not None
+
+
+def _wait_for_canvas_upload_trigger(page, seconds):
+    """Wait through a canvas toolbar re-render without clicking anything."""
+    deadline = time.monotonic() + seconds
+    while True:
+        _check_cancelled()
+        trigger = _find_add2_btn(page)
+        if trigger is not None:
+            return trigger
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        time.sleep(min(0.5, remaining))
+
+
+def _canvas_upload_reload_safe(page, project_id):
+    """Only reload a quiet project with an empty composer.
+
+    The batch runner may have other videos generating on this canvas. A reload
+    would replace their stamped tile nodes and make the in-flight bookkeeping
+    harder to reconcile, so it is not a recovery option while any are pending.
+    """
+    if not project_id:
+        return False
+    try:
+        if flow_project_id(str(page.url or "")) != project_id:
+            return False
+        if page.locator("flow-pending-tile").count():
+            return False
+        editor = _find_fx_prompt_input(page)
+        if editor is None:
+            return False
+        draft = (editor.inner_text(timeout=500) or "").strip()
+        try:
+            draft = draft or (editor.input_value(timeout=500) or "").strip()
+        except Exception:
+            pass  # contenteditable editors do not have an input value
+        if draft:
+            return False
+        reference_state = read_prompt_reference_state(page)
+        return bool(reference_state["scope"] == "bar" and not reference_state["uuids"])
+    except Exception:
+        # Unknown composer state is not evidence that it is safe to discard.
+        return False
+
+
+def _reload_canvas_for_upload_trigger(page, project_id):
+    """Refresh the same quiet project once, then wait for its editor and Add media."""
+    _check_cancelled()
+    log("  🔄 Canvas 上传入口持续隐藏；原项目无在途卡片及输入草稿，刷新页面恢复编辑器", "GoogleFX")
+    try:
+        page.reload(timeout=30000, wait_until="domcontentloaded")
+    except Exception as error:
+        _check_cancelled()
+        log(f"  ⚠️ Canvas 上传入口刷新失败 ({type(error).__name__})", "GoogleFX")
+        return None
+    deadline = time.monotonic() + 20.0
+    while True:
+        _check_cancelled()
+        if flow_project_id(str(page.url or "")) != project_id:
+            log("  ⚠️ Canvas 上传入口刷新后离开原项目，停止本次上传", "GoogleFX")
+            return None
+        trigger = _find_add2_btn(page)
+        if trigger is not None and _find_fx_prompt_input(page) is not None:
+            return trigger
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            log("  ⚠️ Canvas 上传入口刷新后编辑器仍未就绪", "GoogleFX")
+            return None
+        time.sleep(min(0.25, remaining))
+
+
+def _open_canvas_upload_menu(page):
+    """Idempotently open Create/Add media; never upload files or submit generation.
+
+    True means a relevant, visible Upload action is ready. An already-open menu
+    is reused, including when its transparent CDK backdrop covers the trigger.
+    A hidden toolbar gets a bounded wait and, only when no generation or draft
+    is in flight, one same-project reload. Cancellation propagates; no force
+    click bypasses overlays.
+    """
+    try:
+        project_id = flow_project_id(str(page.url or ""))
+    except Exception:
+        project_id = None
+    hidden_recovery_done = False
+    for attempt in range(2):
+        _check_cancelled()
+        if project_id and flow_project_id(str(page.url or "")) != project_id:
+            log("  ⚠️ Canvas 上传入口已离开原项目，停止本次上传", "GoogleFX")
+            return False
+        trigger = _find_add2_btn(page)
+        if trigger is not None and _canvas_upload_menu_is_ready(page, trigger):
+            return True
+
+        # Escape only transient menus/backdrops. Do not dismiss unrelated task,
+        # login, or verification dialogs while trying to reach an upload button.
+        overlay_open = False
+        try:
+            overlay_open = page.locator(
+                "[role='menu']:visible, .mat-mdc-menu-panel:visible, "
+                ".mat-menu-panel:visible, [data-radix-menu-content]:visible, "
+                "flow-add-menu-popover-content:visible, "
+                ".cdk-overlay-transparent-backdrop.cdk-overlay-backdrop-showing:visible"
+            ).count() > 0
+        except Exception:
+            pass
+        if overlay_open:
+            _check_cancelled()
+            _safe_press_escape(page, "上传菜单清理临时遮挡")
+            trigger = _find_add2_btn(page)
+            if trigger is not None and _canvas_upload_menu_is_ready(page, trigger):
+                return True
+        if trigger is None and not hidden_recovery_done:
+            hidden_recovery_done = True
+            # A busy Flow canvas can hide its mounted toolbar for much longer
+            # than the old 4 s wait. Wait without touching the upload action.
+            trigger = _wait_for_canvas_upload_trigger(page, 20.0)
+            if trigger is None:
+                if _canvas_upload_reload_safe(page, project_id):
+                    trigger = _reload_canvas_for_upload_trigger(page, project_id)
+                else:
+                    # Preserve pending generations and draft references. The
+                    # outer caller can retry this pre-upload step once more.
+                    trigger = _wait_for_canvas_upload_trigger(page, 60.0)
+        if trigger is None:
+            log("  ⚠️ Canvas 上传: 未找到 Create/Add media 按钮", "GoogleFX")
+            continue
+
+        _check_cancelled()
+        try:
+            trigger.click(timeout=2500)
+        except Exception as error:
+            _check_cancelled()
+            log(f"  ⚠️ Canvas 上传: 打开菜单第 {attempt + 1}/2 次失败 "
+                f"({type(error).__name__})", "GoogleFX")
+            continue
+
+        # A new canvas can open the asset picker before its upload control has
+        # finished rendering. Keep this bounded, but allow its initial load.
+        deadline = time.monotonic() + 4.0
+        while True:
+            _check_cancelled()
+            if _canvas_upload_menu_is_ready(page, trigger):
+                return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(0.1, remaining))
+
+    try:
+        page_url = str(page.url or "")
+        header_add = page.locator("button[aria-label='Add media menu']")
+        header_count = header_add.count()
+        header_visible = bool(header_count and header_add.first.is_visible())
+        log(
+            "  ❌ Canvas 上传: Create/Add media 菜单未就绪，未开始上传 "
+            f"(url={page_url}, header_add={header_count}, visible={header_visible})",
+            "GoogleFX",
+        )
+    except Exception:
+        log("  ❌ Canvas 上传: Create/Add media 菜单未就绪，未开始上传", "GoogleFX")
+    return False
 
 
 # ── _wait_for_fx_toolbar ──
@@ -784,13 +1083,14 @@ def wake_flow_tile_video(page, tile_id, uuid="", allow_click=False, log_tag="Goo
 
 
 # ── _click_flow_more_menu ──
-def _click_flow_more_menu(page, uuid: str = "", tile_id: str = "") -> str:
+def _click_flow_more_menu(page, uuid: str = "", tile_id: str = "", hovered_info=None) -> str:
     """点击目标卡片右上角 more_vert 菜单，成功时返回 aria-controls 指向的菜单 id。"""
     attempts = 4
     last_tile_id = tile_id or ""
 
     for attempt in range(1, attempts + 1):
-        info = _hover_flow_tile_for_toolbar(page, uuid=uuid, tile_id=last_tile_id)
+        info = hovered_info if attempt == 1 and hovered_info else \
+            _hover_flow_tile_for_toolbar(page, uuid=uuid, tile_id=last_tile_id)
         if not info:
             return ""
 
@@ -1277,13 +1577,19 @@ def _mount_flow_images_to_prompt(page, image_refs, context_label="参考图"):
         if not _add_flow_image_to_prompt(page, uuid, tile_id=tile_id):
             log(f"  ❌ {context_label}: Add to Prompt 失败 ({uuid[:16]}...)", "GoogleFX")
             continue
-        ready, ready_sel = _wait_for_flow_reference_ready(
-            page,
-            timeout_seconds=15,
-            settle_range=(0.5, 1.0),
-        )
         current_refs = _get_prompt_reference_uuids(page, limit=2)
-        if ready or (uuid and uuid in current_refs) or len(current_refs) > 0:
+        # Add to Prompt already waits for this exact UUID. Do not start another
+        # generic readiness wait: the new Flow chip can expose its UUID while
+        # none of the legacy ingredient selectors match.
+        ready = bool(uuid and uuid.lower() in [ref.lower() for ref in current_refs])
+        ready_sel = "prompt_refs" if ready else ""
+        if not uuid:
+            ready, ready_sel = _wait_for_flow_reference_ready(
+                page,
+                timeout_seconds=15,
+                settle_range=(0.5, 1.0),
+            )
+        if ready:
             log(f"  ✅ {context_label}: 已挂入提示词框 (sel={ready_sel or 'prompt_refs'!r})", "GoogleFX")
             mounted.append(uuid)
         else:
@@ -1294,26 +1600,23 @@ def _mount_flow_images_to_prompt(page, image_refs, context_label="参考图"):
 
 # ── _wait_for_prompt_reference_change ──
 def _wait_for_prompt_reference_change(page, previous_refs=None, expected_uuid: str = "", timeout_seconds: int = 12):
-    """等待 Prompt 参考图列表发生真实变化，而不是只依赖菜单点击成功。"""
+    """有目标 UUID 时等待精确命中；不能用别的参考图数量增加代替。"""
     before = [item for item in (previous_refs or []) if item]
     expected = (expected_uuid or "").strip().lower()
-    before_norm = [item.lower() for item in before]
-    deadline = time.time() + max(timeout_seconds, 1)
+    deadline = time.monotonic() + max(timeout_seconds, 1)
 
-    while time.time() < deadline:
+    while True:
+        _check_cancelled()
         current = _get_prompt_reference_uuids(page, limit=max(len(before) + 3, 4))
         current_norm = [item.lower() for item in current]
-        if expected and expected in current_norm and current != before:
-            return True, current
-        if expected and expected in current_norm and expected in before_norm:
-            return True, current
-        if len(current) > len(before):
+        if expected and expected in current_norm:
             return True, current
         if not expected and current != before:
             return True, current
-        time.sleep(0.5)
-
-    return False, _get_prompt_reference_uuids(page, limit=max(len(before) + 3, 4))
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False, current
+        time.sleep(min(0.25, remaining))
 
 
 # ── _clear_prompt_reference_chips_video ──
@@ -1402,7 +1705,6 @@ def _upload_to_slot_directly(page, label: str, file_path: str, refs_before=None,
                 fc.set_files(abs_path)
                 file_uploaded = True
                 log(f"  ✅ {label} 槽位 file_chooser set_files: {os.path.basename(file_path)}", "GoogleFX")
-                random_sleep(3.0, 5.0)
             except Exception:
                 upload_menu_item.click(force=True)
                 random_sleep(0.8, 1.2)
@@ -1418,21 +1720,26 @@ def _upload_to_slot_directly(page, label: str, file_path: str, refs_before=None,
             abs_path = os.path.abspath(file_path)
             file_input.set_input_files(abs_path)
             log(f"  ✅ {label} 槽位已设置输入文件: {os.path.basename(file_path)}", "GoogleFX")
-            random_sleep(4.0, 6.0)  # 等待上传并就绪
         except Exception as e:
             log(f"  ❌ {label} 槽位上传文件异常: {e}", "GoogleFX")
             return False
 
     before_count = len([u for u in (refs_before or []) if u])
-    deadline = time.time() + max(verify_timeout, 1)
-    while time.time() < deadline:
+    # Upload completion is asynchronous. Inspect the existing readiness signals
+    # immediately instead of sleeping 3–6 seconds before even checking them.
+    deadline = time.monotonic() + max(verify_timeout, 1)
+    while True:
+        _check_cancelled()
         if _slot_container_has_thumbnail(target_container):
             log(f"  ✅ {label} 槽位已确认出现缩略图", "GoogleFX")
             return True
         if len(_get_prompt_reference_uuids(page, limit=max(before_count + 2, 2))) > before_count:
             log(f"  ✅ {label} 槽位上传后提示词区参考图数量已增加，判定挂载成功", "GoogleFX")
             return True
-        time.sleep(1)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(0.25, remaining))
 
     log(
         f"  ❌ {label} 槽位上传后 {verify_timeout}s 内未见缩略图/参考图变化，"
@@ -1440,6 +1747,41 @@ def _upload_to_slot_directly(page, label: str, file_path: str, refs_before=None,
         "GoogleFX",
     )
     return False
+
+
+def _repair_reversed_video_frame_slots(page, expected_uuids, actual_uuids, timeout=3.0):
+    """Swap only a confirmed, complete reversed pair, then verify the UI update."""
+    if (len(expected_uuids) != 2 or len(set(expected_uuids)) != 2
+            or actual_uuids != list(reversed(expected_uuids))):
+        return False
+    _check_cancelled()
+    try:
+        swap = _find_first_visible(page, [
+            "flow-ingredient-bar button[aria-label='Swap first and last frames']",
+            "flow-ingredient-bar button:has(mat-icon:text-is('swap_horiz'))",
+        ])
+        if swap is None:
+            return False
+        swap.click(timeout=2500)
+    except Exception as error:
+        _check_cancelled()
+        log(f"  ⚠️ 首尾帧交换未确认: {type(error).__name__}", "GoogleFX")
+        return False
+
+    # Angular updates the slot images asynchronously after the click returns.
+    # Re-reading once immediately can still show the old pair (verified live).
+    deadline = time.monotonic() + max(0.0, timeout)
+    while True:
+        _check_cancelled()
+        state = read_prompt_reference_state(page, limit=3)
+        actual = state.get("frame_slots", state["uuids"])
+        if state["ok"] and actual == expected_uuids:
+            log("  ✅ 已通过 Swap 校正首尾帧，并确认 Start/End 顺序", "GoogleFX")
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(0.1, remaining))
 
 
 # ── _mount_video_prompt_refs ──
@@ -1489,6 +1831,11 @@ def _mount_video_prompt_refs(page, start_ref: str = "", end_ref: str = "", start
             context_label=f"视频参考卡片[{strategy_name}]",
         )
         actual_order = _get_prompt_reference_uuids(page, limit=len(expected_uuids) or 1)
+        slot_state = read_prompt_reference_state(page, limit=3)
+        if "frame_slots" in slot_state:
+            # Keep the empty Start position: an End-only image cannot satisfy a
+            # request for one Start frame merely by being the first nonempty UUID.
+            actual_order = slot_state["frame_slots"]
         last_actual = actual_order
         last_mounted = mounted
 
@@ -1504,6 +1851,13 @@ def _mount_video_prompt_refs(page, start_ref: str = "", end_ref: str = "", start
         elif actual_order[:len(expected_uuids)] == expected_uuids:
             meta.update({"strategy": "prompt_chips", "refs": list(actual_order)})
             return mounted
+
+        # A complete pair already in the two semantic slots needs only Flow's
+        # Swap action. Re-uploading through a frame picker does not auto-attach
+        # the file in current Flow and would lose both working references.
+        if _repair_reversed_video_frame_slots(page, expected_uuids, actual_order):
+            meta.update({"strategy": "prompt_chips", "refs": list(expected_uuids)})
+            return list(expected_uuids)
 
     log(
         f"⚠️ 视频参考图顺序校验失败，尝试通过直接上传到 Start/End 槽位进行挂载... | expected={expected_uuids} | actual={last_actual} | mounted={last_mounted}",
@@ -1566,72 +1920,28 @@ def _upload_image_to_canvas_and_mount(page, local_path: str, timeout: int = 60):
 
     known_uuids = _get_panel_uuids(page)
 
-    add2_btn = _find_add2_btn(page)
-    if not add2_btn:
-        log("  ❌ 上传回退: 未找到 Create (add_2) 按钮", "GoogleFX")
+    if not _open_canvas_upload_menu(page):
+        log("  ❌ 上传回退: Create/Add media 菜单未就绪", "GoogleFX")
+        return False
+    upload_action = _find_canvas_upload_action(page, _find_add2_btn(page))
+    if upload_action is None:
+        log("  ❌ 上传回退: 未找到当前菜单的 Upload 操作", "GoogleFX")
+        _safe_press_escape(page, "上传回退 Upload 操作未找到")
         return False
 
+    abs_path = os.path.abspath(local_path)
     try:
-        add2_btn.click()
-        random_sleep(1.0, 1.5)
-        log("  ✅ 已点击 Create 按钮", "GoogleFX")
+        # Current Flow opens a native chooser from the menu action and need not
+        # leave an input[type=file] in the DOM. Catch that chooser during the
+        # ordinary click; never force-click a broad page-wide Upload button.
+        with page.expect_file_chooser(timeout=3000) as chooser_info:
+            upload_action.click(timeout=2500)
+        _check_cancelled()
+        chooser_info.value.set_files(abs_path)
+        log(f"  ✅ 上传回退 file_chooser set_files: {os.path.basename(abs_path)}", "GoogleFX")
     except Exception as e:
-        log(f"  ❌ 上传回退: 点击 Create 失败: {e}", "GoogleFX")
-        return False
-
-    uploaded = False
-    try:
-        upload_sels = [
-            "button:has-text('Upload')", "button:has-text('上传')",
-            "[role='button']:has-text('Upload')", "[role='button']:has-text('上传')",
-            "div[class*='upload']", "label:has-text('Upload')",
-            "button[aria-label*='Upload']", "button[aria-label*='上传']",
-            "button[role='menuitem']:has-text('上传')",
-            "button[role='menuitem']:has-text('Upload')",
-        ]
-        for _up_sel in upload_sels:
-            try:
-                _matches = page.locator(_up_sel)
-                for _idx in range(_matches.count()):
-                    _el = _matches.nth(_idx)
-                    if _el.is_visible(timeout=2000):
-                        _el.click(force=True)
-                        log(f"  ✅ 已点击 Upload 触发区域 ({_up_sel!r})", "GoogleFX")
-                        random_sleep(0.8, 1.5)
-                        break
-                else:
-                    continue
-                break
-            except Exception:
-                continue
-
-        file_input = None
-        for _fi_sel in ["input[type='file']", "input[accept*='image']"]:
-            try:
-                _fi = page.locator(_fi_sel).first
-                if _fi.count() > 0:
-                    file_input = _fi
-                    break
-            except Exception:
-                pass
-
-        if file_input:
-            abs_path = os.path.abspath(local_path)
-            file_input.set_input_files(abs_path)
-            log(f"  ✅ set_input_files: {os.path.basename(abs_path)}", "GoogleFX")
-            uploaded = True
-        else:
-            log("  ❌ 上传回退: 未找到 file input", "GoogleFX")
-            _safe_press_escape(page, "上传回退 file input 未找到")
-            return False
-
-    except Exception as e:
-        log(f"  ❌ 上传回退: 上传操作失败: {e}", "GoogleFX")
+        log(f"  ❌ 上传回退: 当前菜单未触发可用文件选择器: {type(e).__name__}: {e}", "GoogleFX")
         _safe_press_escape(page, "上传回退异常")
-        return False
-
-    if not uploaded:
-        _safe_press_escape(page, "上传回退未完成")
         return False
 
     log("  ⏳ 等待上传图片出现在画布...", "GoogleFX")
@@ -1703,7 +2013,9 @@ def _inspect_all_pending_tiles(page, tile_ids, prompts_map=None, slices_map=None
     if slices_map is None:
         slices_map = _distinct_slices(prompts_map or {})
     refs_map = refs_map or {}
-    return page.evaluate("([tileIds, slicesMap, refsMap]) => {" + _FLOW_TILE_JS + """
+    return page.evaluate("([tileIds, slicesMap, refsMap]) => {" + _FLOW_TILE_JS
+                         + FLOW_FAILURE_OBSERVER_JS + """
+        sparkObserveFailures(tileIds);
         const results = {};
         const claimed = new Set();
 
@@ -1739,6 +2051,16 @@ def _inspect_all_pending_tiles(page, tile_ids, prompts_map=None, slices_map=None
 
         for (const tid of tileIds) {
             let tile = sparkFindTile(tid);
+            // Preserve an error observed on this exact submitted tile before a
+            // later upload/grid redraw erased its stamp. Never infer ownership
+            // from another failed card's position or repeated error text.
+            if (!tile) {
+                const remembered = sparkRememberedFailure(tid);
+                if (remembered) {
+                    results[tid] = remembered;
+                    continue;
+                }
+            }
             // resolvedBy：卡片是靠哪条路径找到的。'stamp'=我们盖的戳还在；
             // 'refs'/'slice'=戳丢了、靠兜底重新认回来的；null=压根没找到。
             // 光看 status 分不清"找错了卡"和"没找到卡"，而这两者的修法完全不同。
@@ -2217,7 +2539,7 @@ def _video_refs_still_attached(page, mount_meta):
     expected = [u for u in (meta.get("expected") or []) if u]
     if meta.get("strategy") == "prompt_chips" and expected:
         state = _read_prompt_refs_settled(page, limit=max(len(expected), 2))
-        actual = state["uuids"]
+        actual = state.get("frame_slots", state["uuids"])
         if actual[:len(expected)] == expected:
             return True
         if not state["ok"]:
@@ -2248,7 +2570,7 @@ def _video_refs_still_attached(page, mount_meta):
 
 
 # ── _submit_video_to_canvas ──
-def _submit_video_to_canvas(page, req, before_tile_ids, expect_slice=None):
+def _submit_video_to_canvas(page, req, before_tile_ids, expect_slice=None, on_idle=None):
     """
     在画布上提交一个视频生成任务（不等待完成）。
     流程: 清理旧 chips → 挂载首尾帧 → 写提示词 → Generate → 等新 tile 出现
@@ -2273,6 +2595,11 @@ def _submit_video_to_canvas(page, req, before_tile_ids, expect_slice=None):
         )
 
     log(f"📤 提交任务: {req.prompt[:40]}... | 首帧={has_start} | 尾帧={has_end}", "GoogleFX")
+
+    # Check existing requests before changing the canvas/editor. Uploading or
+    # mounting another reference may redraw failed tiles and erase their stamps.
+    if on_idle is not None:
+        on_idle()
 
     try:
         page.wait_for_timeout(500)
@@ -2346,6 +2673,8 @@ def _submit_video_to_canvas(page, req, before_tile_ids, expect_slice=None):
             raise RuntimeError(f"CANVAS_MOUNT_FAILED:画布卡片挂载失败 ({len(mounted)}/{expected})")
         log(f"✅ 参考卡片挂载完成 ({len(mounted)}/{expected})", "GoogleFX")
 
+    if on_idle is not None:
+        on_idle()
     input_el = _find_fx_prompt_input(page, announce=False)
     if not input_el:
         raise RuntimeError("无法找到视频提示词输入框")
@@ -2367,15 +2696,39 @@ def _submit_video_to_canvas(page, req, before_tile_ids, expect_slice=None):
     # 提交节奏闸门（2026-07-26 补齐）：两条链都会 note_fx_submit()，但此前只有图片链
     # 调 fx_pacing_wait()，视频批量的连续提交完全没有最小间隔约束。风控看的是**两次
     # 提交之间**隔了多久，所以闸门必须贴在提交动作前面，两条链共用同一个时间戳。
-    fx_pacing_wait(*fx_pacing_bounds())
+    if on_idle is None:
+        fx_pacing_wait(*fx_pacing_bounds())
+    else:
+        fx_pacing_wait(*fx_pacing_bounds(), on_idle=on_idle)
 
+    _check_cancelled()
+    # Pacing can return immediately when the gap has already elapsed. Always
+    # check once more before Generate, including failures arriving during the
+    # final pacing sleep; a callback error must propagate before any paid click.
+    if on_idle is not None:
+        on_idle()
+    if prompt_has_refs and not _video_refs_still_attached(page, mount_meta):
+        raise RuntimeError("CANVAS_MOUNT_FAILED:等待提交期间首尾帧已脱落，拒绝提交")
     _verify_video_prompt_before_send(input_el, req.prompt)
     click_time = time.time()
-    click_fx_send_button(page, input_el)
+    try:
+        sent = click_fx_send_button(page, input_el, strict_submission=True)
+    except Exception as exc:
+        if getattr(exc, "submission_started", False):
+            exc.click_time = click_time
+            note_fx_submit()
+        raise
+    if sent is False:
+        raise RuntimeError("未找到可用的视频提交按钮，未发起生成")
     note_fx_submit()   # 与图片链共用提交节奏闸门的参照点
     log("✅ 已点击 Generate", "GoogleFX")
 
-    new_tile_id = _wait_for_new_tile_id(page, before_tile_ids, timeout=20, expect_slice=expect_slice)
+    try:
+        new_tile_id = _wait_for_new_tile_id(page, before_tile_ids, timeout=20, expect_slice=expect_slice)
+    except Exception as exc:
+        exc.submission_started = True
+        exc.click_time = click_time
+        raise
     if not new_tile_id:
         # 拿不到新卡片时，先记下"上一次实读余额"是多少。下面的 deep 探测会再读
         # 一次真实余额并覆盖它，两个读数一比就知道这段时间积分有没有在掉。
@@ -2385,7 +2738,10 @@ def _submit_video_to_canvas(page, req, before_tile_ids, expect_slice=None):
         page_credit_err = detect_page_credit_exhaustion(page, deep=True)
         if page_credit_err:
             raise RuntimeError(f"INSUFFICIENT_CREDITS: {page_credit_err}")
-        raise RuntimeError(_no_tile_error_message(page, credit_before))
+        exc = RuntimeError(_no_tile_error_message(page, credit_before))
+        exc.submission_started = True
+        exc.click_time = click_time
+        raise exc
     log(f"🎯 新 tile: {new_tile_id[:16]}...", "GoogleFX")
 
     # 立即为新 tile 设置 data-original-tile-id，防止后续生成过程中 React/UI 更新其 ID 后丢失匹配
@@ -2423,63 +2779,93 @@ _ARIA_CONTROLS_RATIO_MAP = {
     "landscape_4_3": "LANDSCAPE_4_3",
 }
 
+_VIDEO_DURATION_UNIT_PATTERN = r"(?:s(?:ec(?:ond)?s?)?|秒(?:钟|鐘)?)"
+
+
 def _normalize_video_duration_label(duration):
-    """Return Google FX duration labels like 6s from values such as 6, "6", or "6s"."""
+    """Normalize a duration value (6, 6s, 6 seconds, 6 秒) to the internal 6s label."""
     if duration is None:
         return ""
     text = str(duration).strip().lower()
-    match = re.search(r"(\d+(?:\.\d+)?)\s*s?", text)
+    match = re.fullmatch(rf"(\d+(?:\.\d+)?)\s*(?:{_VIDEO_DURATION_UNIT_PATTERN})?", text)
     if not match:
         return ""
     number = match.group(1)
-    if number.endswith(".0"):
-        number = number[:-2]
+    if "." in number:
+        number = number.rstrip("0").rstrip(".")
     return f"{number}s"
 
-def _click_video_duration_tab(page, panel_scope, duration_label):
-    """Click a video duration tab such as 4s, 6s, 8s, or 10s."""
-    root = panel_scope or page
-    duration_label = _normalize_video_duration_label(duration_label) or str(duration_label)
 
-    # 0. 优先在 flow-toggles[aria-label='Video duration'] 容器中定位
+def _video_duration_text_pattern(duration, exact=False):
+    """Share localized units and numeric boundaries between summaries and controls."""
+    label = _normalize_video_duration_label(duration)
+    if not label:
+        return None
+    number = re.escape(label[:-1])
+    number += r"0*" if "." in label else r"(?:\.0+)?"
+    value = rf"{number}\s*{_VIDEO_DURATION_UNIT_PATTERN}"
+    # A bare substring would accept 18s/8.5s when the requested duration is 8s.
+    pattern = rf"^\s*{value}\s*$" if exact else rf"(?<![\w.]){value}(?![\w.])"
+    return re.compile(pattern, re.I)
+
+
+def _click_video_duration_tab(page, panel_scope, duration_label):
+    """Click the exact duration in English or Chinese within the config panel."""
+    root = panel_scope or page
+    duration_label = _normalize_video_duration_label(duration_label)
+    pattern = _video_duration_text_pattern(duration_label, exact=True)
+    if pattern is None:
+        return ""
+
+    controls = "button, [role='tab'], [role='radio'], mat-button-toggle, .mat-button-toggle-button"
+
+    def click_matching(scope, selector):
+        buttons = scope.locator(selector)
+        for i in range(buttons.count()):
+            try:
+                button = buttons.nth(i)
+                if not button.is_visible() or not button.is_enabled():
+                    continue
+                # Material labels can be preceded by icon ligatures; read the
+                # dedicated label instead of accepting arbitrary surrounding text.
+                labels = button.locator(".toggle-text")
+                text = labels.first.inner_text() if labels.count() else button.inner_text()
+                if not pattern.fullmatch(text):
+                    continue
+                button.click(timeout=3000)
+                random_sleep(0.4, 0.8)
+                return True
+            except Exception:
+                continue
+        return False
+
+    # Prefer a duration group, including translated aria-labels. Iterate visible
+    # groups so a hidden stale panel cannot mask the live controls.
     for container_sel in [
-        "flow-toggles[aria-label='Video duration']",
-        "flow-toggles[aria-label*='duration' i]",
-        "[aria-label*='duration' i]",
+        "flow-toggles[aria-label*='duration' i], flow-toggles[aria-label*='时长'], flow-toggles[aria-label*='時長']",
+        "[aria-label*='duration' i], [aria-label*='时长'], [aria-label*='時長']",
     ]:
         try:
-            container = root.locator(container_sel).first
-            if container.is_visible(timeout=1000):
-                btn = container.locator("button, mat-button-toggle, .mat-button-toggle-button").filter(
-                    has_text=re.compile(rf"^\s*{re.escape(duration_label)}\s*$", re.I)
-                ).first
-                if btn.is_visible(timeout=1000):
-                    btn.click(force=True)
-                    random_sleep(0.4, 0.8)
+            containers = root.locator(container_sel)
+            for i in range(containers.count()):
+                container = containers.nth(i)
+                if container.is_visible() and click_matching(container, controls):
                     return f"{container_sel} + 点击成功 ({duration_label})"
         except Exception:
             pass
 
-    selectors = [
-        "button[role='tab']",
-        "button[aria-controls*='DURATION']",
-        "button[aria-controls*='duration']",
-        "button",
-    ]
-    for sel in selectors:
-        try:
-            _dur_btn = root.locator(sel).filter(
-                has_text=re.compile(f"^{re.escape(duration_label)}$", re.I)
-            ).first
-            if _dur_btn.is_visible(timeout=1500):
-                _dur_btn.click(force=True)
-                random_sleep(0.4, 0.8)
-                return f"{sel} + 精确匹配 ({duration_label})"
-        except Exception:
-            pass
-
-    if _click_fx_tab(page, duration_label, scope=panel_scope):
-        return "tab fallback"
+    # Unknown translated group labels and legacy Radix tabs still work. Without
+    # a scoped panel, require toggle semantics rather than scanning every button
+    # on the canvas. Never use the generic substring/global-JS tab fallback here.
+    fallback = controls if panel_scope is not None and panel_scope is not page else (
+        "[role='tab'], [role='radio'], mat-button-toggle, .mat-button-toggle-button, "
+        "button[aria-controls*='duration' i]"
+    )
+    try:
+        if click_matching(root, fallback):
+            return f"{fallback} + 精确匹配 ({duration_label})"
+    except Exception:
+        pass
     return ""
 
 def _click_video_resolution_tab(page, panel_scope, resolution_label):
@@ -2808,7 +3194,9 @@ def _matches_model_status(text, model):
     if not target:
         return True
     if "omni" in model.lower():
-        return "omni" in clean or (("video" in clean or "视频" in clean) and "veo" not in clean)
+        # The toolbar only says "Video" for every video model. A generic
+        # summary cannot confirm that Flow selected the requested Omni family.
+        return "omni" in clean
     if model.lower().startswith("veo"):
         aliases = {target}
         if "lite" in target:
@@ -2902,8 +3290,56 @@ def _click_fx_tab(page, label, scope=None):
     selector_stats.record_hit("fx_tab", -1, total=len(patterns))
     return False
 
+def _is_fx_config_panel(panel):
+    """Distinguish Flow's settings overlay from other visible CDK/Radix menus."""
+    try:
+        if not panel.is_visible(timeout=500):
+            return False
+        # The settings shell can mount before its model control. Requiring that
+        # button for panel identity made an already-open panel look absent and
+        # a second click on the toolbar summary then closed it.
+        shell = panel.locator("flow-prompt-box-settings.settings-content-overlay")
+        for index in range(min(shell.count(), 4)):
+            if shell.nth(index).is_visible(timeout=500):
+                return True
+        try:
+            panel_tag = panel.evaluate("element => element.tagName.toLowerCase()")
+            panel_class = panel.get_attribute("class") or ""
+            if panel_tag == "flow-prompt-box-settings" and "settings-content-overlay" in panel_class:
+                return True
+            if "settings-content" in panel_class and panel.locator("flow-toggles[aria-label='Mode']").count():
+                return True
+        except Exception:
+            pass
+        # Legacy Radix settings did not have the shell; keep their model and
+        # settings-control signature so unrelated menus never qualify.
+        named = panel.locator("button[aria-label='Select model family']")
+        for index in range(min(named.count(), 4)):
+            if named.nth(index).is_visible(timeout=500):
+                return True
+        # Legacy Radix settings do not have that label. Require both a model
+        # dropdown and a settings control so an unrelated menu cannot qualify.
+        controls = panel.locator(
+            "flow-toggles, [role='tablist'], [role='radiogroup'], "
+            "button[role='tab'], button[role='radio']"
+        )
+        if not controls.count():
+            return False
+        triggers = panel.locator("button[aria-haspopup='menu']")
+        for index in range(min(triggers.count(), 8)):
+            button = triggers.nth(index)
+            if not button.is_visible(timeout=500):
+                continue
+            label = _normalize_fx_status_text(button.inner_text() or "")
+            if any(token in label for token in ("omni", "veo", "banana", "imagen")):
+                return True
+    except Exception:
+        pass
+    return False
+
+
 def _get_open_fx_config_panel(page, trigger_btn=None):
-    """锁定当前打开的配置面板，优先使用 aria-labelledby 关联到底部摘要按钮。"""
+    """锁定当前打开的配置面板；忽略上传/账号等其他可见菜单。"""
     button_id = ""
     aria_controls = ""
     try:
@@ -2921,7 +3357,7 @@ def _get_open_fx_config_panel(page, trigger_btn=None):
             panel = page.locator(
                 f"[role='menu'][data-state='open'][aria-labelledby='{button_id}']"
             ).first
-            if panel.is_visible(timeout=1500):
+            if _is_fx_config_panel(panel):
                 selector_stats.record_hit("fx_config_panel", 0, selector="aria-labelledby", total=total_layers)
                 return panel
         except Exception:
@@ -2930,7 +3366,7 @@ def _get_open_fx_config_panel(page, trigger_btn=None):
     if aria_controls:
         try:
             panel = page.locator(f"[id=\"{aria_controls}\"]").first
-            if panel.is_visible(timeout=1500):
+            if _is_fx_config_panel(panel):
                 selector_stats.record_hit("fx_config_panel", 1, selector="aria-controls", total=total_layers)
                 return panel
         except Exception:
@@ -2938,14 +3374,87 @@ def _get_open_fx_config_panel(page, trigger_btn=None):
 
     for layer_idx, sel in enumerate(fallback_selectors):
         try:
-            panel = page.locator(sel).first
-            if panel.is_visible(timeout=1500):
-                selector_stats.record_hit("fx_config_panel", 2 + layer_idx, selector=sel, total=total_layers)
-                return panel
+            candidates = page.locator(sel)
+            for index in range(min(candidates.count(), 8)):
+                panel = candidates.nth(index)
+                if _is_fx_config_panel(panel):
+                    selector_stats.record_hit("fx_config_panel", 2 + layer_idx, selector=sel, total=total_layers)
+                    return panel
         except Exception:
             pass
 
     selector_stats.record_hit("fx_config_panel", -1, total=total_layers)
+    return None
+
+
+def _wait_for_open_fx_config_panel(page, trigger_btn, seconds=3.0):
+    """Wait for Flow to mount the actual settings overlay after its trigger is clicked."""
+    deadline = time.monotonic() + seconds
+    while True:
+        _check_cancelled()
+        panel = _get_open_fx_config_panel(page, trigger_btn)
+        if panel is not None:
+            return panel
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        page.wait_for_timeout(min(200, max(1, int(remaining * 1000))))
+
+
+def _visible_fx_settings_shell(page):
+    """An open Flow settings shell can exist briefly before its model button."""
+    try:
+        shells = page.locator("flow-prompt-box-settings, .settings-content")
+        return any(shells.nth(i).is_visible(timeout=500)
+                   for i in range(min(shells.count(), 8)))
+    except Exception:
+        return False
+
+
+def _wait_for_fx_model_dropdown(page, trigger_btn, target_model, seconds=4.0):
+    """Wait for the model control within the live settings shell."""
+    deadline = time.monotonic() + seconds
+    while True:
+        _check_cancelled()
+        panel = _get_open_fx_config_panel(page, trigger_btn)
+        if panel is not None:
+            model = _find_fx_model_dropdown(page, scope=panel, target_model=target_model)
+            if model is not None:
+                return panel, model
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return panel, None
+        page.wait_for_timeout(min(200, max(1, int(remaining * 1000))))
+
+
+def _ensure_open_fx_config_panel(page, trigger_btn):
+    """Open settings and verify its model control, retrying one lost trigger click."""
+    panel = _get_open_fx_config_panel(page, trigger_btn)
+    if panel is not None:
+        return panel
+    if _visible_fx_settings_shell(page):
+        return _wait_for_open_fx_config_panel(page, trigger_btn, seconds=4.0)
+
+    # The upload/account popover can still cover the settings trigger after an
+    # image upload. Dismiss that unrelated overlay before trying the trigger.
+    try:
+        overlays = page.locator("[role='menu'][data-state='open'], .cdk-overlay-pane")
+        if any(overlays.nth(i).is_visible() for i in range(min(overlays.count(), 8))):
+            _safe_press_escape(page, "打开 Flow 配置面板前关闭其他菜单")
+    except Exception:
+        pass
+
+    for attempt in range(2):
+        _check_cancelled()
+        trigger_btn.click(timeout=5000)
+        panel = _wait_for_open_fx_config_panel(page, trigger_btn)
+        if panel is not None:
+            return panel
+        # Do not toggle a partially mounted settings panel closed. Give its
+        # model control another bounded hydration window, then fail closed.
+        if _visible_fx_settings_shell(page):
+            return _wait_for_open_fx_config_panel(page, trigger_btn, seconds=4.0)
+        log(f"  ⚠️ 点击配置按钮后设置面板未打开（第 {attempt + 1}/2 次）", "GoogleFX")
     return None
 
 def _find_fx_model_dropdown(page, scope=None, target_model=None):
@@ -3243,13 +3752,15 @@ def check_fx_config(status_text, model="Nano Banana 2", orientation="Portrait", 
 
     checks = {}
     # 视频模式下，状态栏常只显示 "Video"，不能再把它当成模型验证通过。
-    model_source = resolved_model_text if (want_video and resolved_model_text) else status_text
+    # Flow's video toolbar summary is model agnostic ("Video · 360p · ...").
+    # Require a reading from the actual model dropdown before generation.
+    model_source = resolved_model_text if want_video else status_text
     checks["model"] = _matches_model_status(model_source, model)
     checks["orientation"] = _matches_orientation_text(clean, orientation) if orientation else True
     checks["count"] = _matches_generation_count(clean, count)
     if want_video and duration:
-        duration_label = _normalize_video_duration_label(duration)
-        checks["duration"] = (duration_label in clean) if duration_label else True
+        duration_pattern = _video_duration_text_pattern(duration)
+        checks["duration"] = bool(duration_pattern and duration_pattern.search(clean))
     if want_video and resolution:
         res_label = "360p" if "360" in str(resolution).lower() else ("720p" if "720" in str(resolution).lower() else str(resolution).lower())
         checks["resolution"] = (res_label in clean) if res_label else True
@@ -3262,13 +3773,6 @@ def check_fx_config(status_text, model="Nano Banana 2", orientation="Portrait", 
 def fix_fx_config(page, cfg_btn, checks, model="Nano Banana 2", orientation="Portrait", count="1x", duration=None, want_video=False, mode_label="", video_submode=None, resolution=None):
     """打开配置面板并修正不正确的配置项。"""
     log("⚙️ 需要修改配置，打开面板...", "GoogleFX")
-    panel_scope = _get_open_fx_config_panel(page, cfg_btn)
-    if not panel_scope or not panel_scope.is_visible():
-        cfg_btn.click()
-        random_sleep(1.5, 2.5)
-        panel_scope = _get_open_fx_config_panel(page, cfg_btn) or page
-    else:
-        panel_scope = panel_scope or page
     fix_info = {
         "resolved_model_text": "",
         "duration_clicked": False,
@@ -3276,6 +3780,12 @@ def fix_fx_config(page, cfg_btn, checks, model="Nano Banana 2", orientation="Por
         "clicked_keys": [],
         "resolved_keys": [],
     }
+    panel_scope = _ensure_open_fx_config_panel(page, cfg_btn)
+    if panel_scope is None:
+        # Never accept an Omni/Veo entry from an unrelated upload or account
+        # menu as proof of the selected model.
+        log("  ❌ 设置面板未打开，无法验证或切换模型", "GoogleFX")
+        return fix_info
 
     if not checks.get("mode", True):
         target_mode_name = "Video" if want_video else "Image"
@@ -3374,7 +3884,13 @@ def fix_fx_config(page, cfg_btn, checks, model="Nano Banana 2", orientation="Por
     if not checks.get("model", True):
         log(f"  → 切换到 {model}", "GoogleFX")
         try:
-            model_dd = _find_fx_model_dropdown(page, scope=panel_scope, target_model=model)
+            panel_scope, model_dd = _wait_for_fx_model_dropdown(page, cfg_btn, model)
+            if panel_scope is None and not _visible_fx_settings_shell(page):
+                # Flow can close the overlay while a previous upload popover
+                # settles. Reopen only after verifying the shell is truly gone.
+                panel_scope = _ensure_open_fx_config_panel(page, cfg_btn)
+                if panel_scope is not None:
+                    panel_scope, model_dd = _wait_for_fx_model_dropdown(page, cfg_btn, model)
 
             if model_dd and model_dd.is_visible():
                 curr = _get_fx_model_dropdown_text(page, scope=panel_scope, target_model=model)
@@ -3421,8 +3937,10 @@ def fix_fx_config(page, cfg_btn, checks, model="Nano Banana 2", orientation="Por
                     log(f"  模型下拉复检: '{current_after or '<空>'}'", "GoogleFX")
             else:
                 log(f"  ❌ 模型下拉按钮未找到", "GoogleFX")
+                return fix_info
         except Exception as e:
             log(f"  ❌ 模型异常: {e}", "GoogleFX")
+            return fix_info
     elif want_video:
         fix_info["resolved_model_text"] = _get_fx_model_dropdown_text(page, scope=panel_scope, target_model=model)
 
@@ -3992,6 +4510,7 @@ def wait_out_manual_intervention(page, context_label="Google FX", cancel_check=N
     # 注意隐藏是 app 级的，不是重启浏览器，所以 page 对象在整个过程中始终有效。
     _mac_prev_app = ""
     _mac_revealed = 0
+    _page_fronted = False
     try:
         from ..utils.browser import reveal_hidden_browser_windows
         from ..utils.macos_window import frontmost_app
@@ -3999,61 +4518,62 @@ def wait_out_manual_intervention(page, context_label="Google FX", cancel_check=N
         _mac_revealed = reveal_hidden_browser_windows()
         if _mac_revealed:
             log(f"👁 已将 {_mac_revealed} 个静默浏览器窗口切到最前，请在窗口内处理", "GoogleFX")
+        else:
+            # 没有隐藏记录（或非 macOS）时，人工处理仍要能看见目标页面。
+            _page_fronted = bring_page_to_front_if_allowed(page, force=True)
     except Exception as e:
         log(f"⚠️ 恢复浏览器窗口显示失败（请手动切到 AdsPower 窗口）: "
             f"{type(e).__name__}: {e}", "GoogleFX")
 
     def _rehide():
         """人工环节结束后藏回去，别让窗口继续占着屏幕。"""
-        if not _mac_revealed:
-            return
         try:
-            from ..utils.browser import rehide_browser_windows
-            rehide_browser_windows(_mac_prev_app)
+            if _mac_revealed:
+                from ..utils.browser import rehide_browser_windows
+                rehide_browser_windows(_mac_prev_app)
+            elif _page_fronted and _mac_prev_app:
+                from ..utils.macos_window import restore_focus
+                restore_focus(_mac_prev_app)
         except Exception:
             pass
 
-    deadline = time.time() + max_wait_secs
-    while time.time() < deadline:
-        if cancel_check and cancel_check():
-            _rehide()
-            raise ConnectionError("用户已取消（等待人工处理期间）")
-        # 没有 cancel_check 的调用方（图片批量链路就是）也必须能被取消：不然人工拦截
-        # 一旦命中，取消要等满 max_wait_secs（默认 20 分钟）才生效。
-        _check_cancelled()
-        time.sleep(_MANUAL_INTERVENTION_POLL_SECONDS)
-        # 页面/浏览器被关掉：人工已经不可能在这个 page 上把拦截处理好了，
-        # 再等下去只是把整批任务多压 20 分钟，直接按超时处置。
-        if _page_is_gone(page):
-            log(f"⛔ {context_label}等待人工处理期间浏览器/标签页已关闭，停止等待", "Error")
-            _rehide()
-            _emit("timeout")
-            return False
-        try:
-            still_blocked = _probe_manual_intervention(page, context_label)
-        except Exception as e:
-            # 页面/浏览器在人工处理期间被关掉等：当作没恢复继续等，等满超时由
-            # 调用方统一处置，避免在这里抛出一个更难解释的错误。
-            log(f"⚠️ 人工接管状态复检失败: {type(e).__name__}: {e}", "GoogleFX")
-            continue
-        if not still_blocked:
-            log(f"✅ {context_label}人工处理已完成，继续执行", "GoogleFX")
-            _rehide()
-            _emit("cleared")
-            return True
-        code, reason = still_blocked
-
-    log(f"⛔ {context_label}等待人工处理超时 ({max_wait_secs}s)，放弃", "Error")
-    _rehide()
     try:
-        from ..utils.forensics import capture
-        capture(page, "manual_intervention_timeout",
-                f"{context_label} 等待人工处理超时（{code}: {reason}）",
-                extra={"code": code, "max_wait_secs": max_wait_secs})
-    except Exception:
-        pass
-    _emit("timeout")
-    return False
+        deadline = time.time() + max_wait_secs
+        while time.time() < deadline:
+            if cancel_check and cancel_check():
+                raise ConnectionError("用户已取消（等待人工处理期间）")
+            # 没有 cancel_check 的调用方也要响应全局取消，并经过 finally 隐藏窗口。
+            _check_cancelled()
+            time.sleep(_MANUAL_INTERVENTION_POLL_SECONDS)
+            # 页面已关闭时，人工无法在原页面恢复，立即停止等待。
+            if _page_is_gone(page):
+                log(f"⛔ {context_label}等待人工处理期间浏览器/标签页已关闭，停止等待", "Error")
+                _emit("timeout")
+                return False
+            try:
+                still_blocked = _probe_manual_intervention(page, context_label)
+            except Exception as e:
+                log(f"⚠️ 人工接管状态复检失败: {type(e).__name__}: {e}", "GoogleFX")
+                continue
+            if not still_blocked:
+                log(f"✅ {context_label}人工处理已完成，继续执行", "GoogleFX")
+                _emit("cleared")
+                return True
+            code, reason = still_blocked
+
+        log(f"⛔ {context_label}等待人工处理超时 ({max_wait_secs}s)，放弃", "Error")
+        try:
+            from ..utils.forensics import capture
+            capture(page, "manual_intervention_timeout",
+                    f"{context_label} 等待人工处理超时（{code}: {reason}）",
+                    extra={"code": code, "max_wait_secs": max_wait_secs})
+        except Exception:
+            pass
+        _emit("timeout")
+        return False
+    finally:
+        # 完成、超时、全局取消或回调异常都必须归还窗口。
+        _rehide()
 
 
 # ── 页面卡在意外状态时的两个自愈动作 ──────────────────────────────────────
@@ -4405,6 +4925,22 @@ def read_prompt_reference_state(page, limit=4):
             // 定位不到输入条时退回全文档，但只认 chip 签名：画布卡片不是
             // button[data-card-open]，不会混进来冒充参考图。
             const scope = bar || document;
+            // Current Flow binds its two frame-trigger containers to firstFrame
+            // and lastFrame. Read that semantic order before sorting thumbnail
+            // coordinates: crop transforms and in-flight animations can move
+            // an image above/left of the other without changing slot ownership.
+            const frameSlots = Array.from(scope.querySelectorAll(
+                'flow-ingredient-bar .frame-trigger'
+            )).filter((slot) => slot.offsetParent !== null);
+            if (frameSlots.length === 2) {
+                const slotUuids = frameSlots.map((slot) => {
+                    const img = slot.querySelector('button.chip-container img, img.chip-image');
+                    const match = img && (img.currentSrc || img.src || '').match(uuidRegex);
+                    return match ? match[1] : '';
+                });
+                return {uuids: slotUuids.filter(Boolean), frame_slots: slotUuids,
+                    scope: bar ? 'bar' : 'document'};
+            }
             const selector = bar
                 ? "button[data-card-open] img, [data-slate-editor='true'] img, button.chip-container img, img.chip-image, .chip-image-wrapper img"
                 : ("button[data-card-open] img" + ", button.chip-container img, img.chip-image, .chip-image-wrapper img");
@@ -4436,11 +4972,14 @@ def read_prompt_reference_state(page, limit=4):
         return {"uuids": [], "scope": "", "ok": False}
     state = state or {}
     uuids = list(state.get("uuids") or [])
-    return {
+    result = {
         "uuids": uuids[:max(limit, 1)],
         "scope": state.get("scope") or "",
         "ok": bool(state.get("scope")),
     }
+    if "frame_slots" in state:
+        result["frame_slots"] = list(state["frame_slots"])
+    return result
 
 
 def _get_prompt_reference_uuids(page, limit=4):
@@ -4451,7 +4990,7 @@ def _get_prompt_reference_uuids(page, limit=4):
     """
     return read_prompt_reference_state(page, limit=limit)["uuids"]
 
-def click_fx_send_button(page, input_el=None):
+def click_fx_send_button(page, input_el=None, strict_submission=False):
     """点击发送按钮 (新版 UI: arrow icon / aria-label / Create / Enter)
 
     FX_DRY_RUN=1 时不真的提交（见 services/google_fx_diagnostics 的 Dry-run 说明）：
@@ -4467,6 +5006,32 @@ def click_fx_send_button(page, input_el=None):
     except Exception:
         pass
 
+    def ensure_credit_available():
+        reason = detect_page_credit_exhaustion(page)
+        if reason:
+            exc = RuntimeError(f"INSUFFICIENT_CREDITS: {reason}")
+            exc.credit_insufficient = True
+            raise exc
+
+    # Flow replaces Generate with an icon-only credit warning when the balance
+    # is too low. Do not turn that rejected request into an Enter submission.
+    ensure_credit_available()
+
+    def send_once(action):
+        if strict_submission:
+            _check_cancelled()
+        # The warning can arrive while locating/hovering the send button.
+        # Keep this outside the click exception handler: no request was sent.
+        ensure_credit_available()
+        try:
+            action()
+        except Exception as exc:
+            if strict_submission:
+                # A click can reach Flow even if its browser acknowledgement is
+                # lost. Trying another selector could then buy a second video.
+                exc.submission_started = True
+            raise
+
     sent = False
     # 方法0: Generate 按钮（新版 Flow UI 首选，aria-controls 稳定 Radix UI）
     # ✅ Patch: scroll_into_view + hover + 随机停顿，避免直接 click 触发反自动化检测
@@ -4478,10 +5043,12 @@ def click_fx_send_button(page, input_el=None):
             gen_btn.scroll_into_view_if_needed()
             gen_btn.hover()
             random_sleep(0.3, 0.7)   # 鼠标停在按钮上的自然停顿
-            gen_btn.click()
+            send_once(gen_btn.click)
             sent = True
             log("✅ 已点击 Generate 按钮", "GoogleFX")
     except Exception as e:
+        if getattr(e, "credit_insufficient", False) or (strict_submission and (isinstance(e, ConnectionError) or getattr(e, "submission_started", False))):
+            raise
         log(f"  ⚠️ click_fx_send Generate: {type(e).__name__}", "GoogleFX")
     # 方法1: 找包含 arrow icon 的按钮
     if not sent:
@@ -4493,13 +5060,17 @@ def click_fx_send_button(page, input_el=None):
                     b = all_btns.nth(bi)
                     t = b.inner_text().strip()
                     if 'arrow_forward' in t or 'send' in t or 'arrow_upward' in t:
-                        b.click()
+                        send_once(b.click)
                         sent = True
                         log("✅ 已点击发送 (arrow icon)", "GoogleFX")
                         break
                 except Exception as e:
+                    if getattr(e, "credit_insufficient", False) or (strict_submission and (isinstance(e, ConnectionError) or getattr(e, "submission_started", False))):
+                        raise
                     log(f"  ⚠️ click_fx_send 方法1 内层: {type(e).__name__}", "GoogleFX")
         except Exception as e:
+            if getattr(e, "credit_insufficient", False) or (strict_submission and (isinstance(e, ConnectionError) or getattr(e, "submission_started", False))):
+                raise
             log(f"  ⚠️ click_fx_send 方法1 外层: {type(e).__name__}: {e}", "GoogleFX")
     # 方法2: aria-label
     if not sent:
@@ -4507,11 +5078,13 @@ def click_fx_send_button(page, input_el=None):
             try:
                 sb = page.locator(f"button[aria-label*='{label}']").last
                 if sb.is_visible():
-                    sb.click()
+                    send_once(sb.click)
                     sent = True
                     log(f"✅ 已点击发送 (aria-label: {label})", "GoogleFX")
                     break
             except Exception as e:
+                if getattr(e, "credit_insufficient", False) or (strict_submission and (isinstance(e, ConnectionError) or getattr(e, "submission_started", False))):
+                    raise
                 log(f"  ⚠️ click_fx_send 方法2 label={label!r}: {type(e).__name__}", "GoogleFX")
     # 方法3: Create / Generate 按钮（文字包含匹配兜底）
     if not sent:
@@ -4519,15 +5092,17 @@ def click_fx_send_button(page, input_el=None):
             try:
                 fallback_btn = page.locator("button").filter(has_text=_btn_text).last
                 if fallback_btn.is_visible():
-                    fallback_btn.click()
+                    send_once(fallback_btn.click)
                     sent = True
                     log(f"✅ 已点击 {_btn_text} 按钮", "GoogleFX")
                     break
             except Exception as e:
+                if getattr(e, "credit_insufficient", False) or (strict_submission and (isinstance(e, ConnectionError) or getattr(e, "submission_started", False))):
+                    raise
                 log(f"  ⚠️ click_fx_send 方法3 {_btn_text}: {type(e).__name__}: {e}", "GoogleFX")
     # 方法4: Enter
     if not sent and input_el:
-        input_el.press("Enter")
+        send_once(lambda: input_el.press("Enter"))
         log("⚠️ 按 Enter 提交", "GoogleFX")
         sent = True
 
@@ -4590,7 +5165,7 @@ def _add_flow_image_to_prompt(page, image_ref: str, tile_id: str = "") -> bool:
 
             # 2. 进入 hover 态并尝试直接点击 toolbar 中的 "Add to prompt" 按钮
             before_refs = _get_prompt_reference_uuids(page, limit=6)
-            _hover_flow_tile_for_toolbar(page, uuid=uuid or "", tile_id=tile_id)
+            hovered_info = _hover_flow_tile_for_toolbar(page, uuid=uuid or "", tile_id=tile_id)
 
             clicked_direct = False
             if tile_id:
@@ -4623,7 +5198,8 @@ def _add_flow_image_to_prompt(page, image_ref: str, tile_id: str = "") -> bool:
             menu_id_hint = ""
             if not clicked_direct:
                 # 3. 备选: 点击 more_vert 弹出菜单再选择
-                menu_id_hint = _click_flow_more_menu(page, uuid=uuid or "", tile_id=tile_id)
+                menu_id_hint = _click_flow_more_menu(page, uuid=uuid or "", tile_id=tile_id,
+                                                    hovered_info=hovered_info)
                 menu_open = False
                 for menu_sel in [
                     "[role='menu'][data-state='open']",
@@ -4657,17 +5233,27 @@ def _add_flow_image_to_prompt(page, image_ref: str, tile_id: str = "") -> bool:
                         continue
                     return False
 
-            ready, ready_sel = _wait_for_flow_reference_ready(
-                page,
-                timeout_seconds=10 + (mount_attempt - 1) * 4,
-                settle_range=(0.3, 0.6) if mount_attempt == 1 else (0.8, 1.2),
-            )
-            changed, after_refs = _wait_for_prompt_reference_change(
-                page,
-                previous_refs=before_refs,
-                expected_uuid=uuid or "",
-                timeout_seconds=8 + (mount_attempt - 1) * 4,
-            )
+            ready, ready_sel = False, ""
+            if uuid:
+                # One bounded wait for the actual reference instead of waiting
+                # 10/14 s for legacy chip selectors, then another 8/12 s for UUIDs.
+                changed, after_refs = _wait_for_prompt_reference_change(
+                    page,
+                    previous_refs=before_refs,
+                    expected_uuid=uuid,
+                    timeout_seconds=10 + (mount_attempt - 1) * 4,
+                )
+                ready_sel = "prompt_refs" if changed else ""
+            else:
+                # Legacy tile-only callers cannot identify a UUID. Keep their
+                # visual readiness fallback without applying it to known UUIDs.
+                ready, ready_sel = _wait_for_flow_reference_ready(
+                    page,
+                    timeout_seconds=10 + (mount_attempt - 1) * 4,
+                    settle_range=(0.3, 0.6) if mount_attempt == 1 else (0.8, 1.2),
+                )
+                changed = False
+                after_refs = _get_prompt_reference_uuids(page, limit=6)
             if ready or changed:
                 log(
                     f"✅ 参考图 {uuid[:16]}... 已加入 Prompt | ready={ready} | "
@@ -4708,7 +5294,8 @@ def _add_flow_image_to_prompt(page, image_ref: str, tile_id: str = "") -> bool:
 def _connect_over_cdp_with_retry(playwright_ctx, ws_url, max_attempts=10, delay_secs=2.0):
     """CDP 连接包装器：如果遇到 Web Socket 连接被拒绝 (ECONNREFUSED) 则重试，最多重试 10 次。"""
     last_err = None
-    time.sleep(1.0)  # 首次连接前先等待 1 秒，给 Chromium 端口绑定留出缓冲时间
+    # Existing browser sessions are ready immediately. Startup races already
+    # have the retry below, so do not delay every successful reconnection.
     for attempt in range(1, max_attempts + 1):
         try:
             return playwright_ctx.chromium.connect_over_cdp(ws_url, timeout=30000)
@@ -4727,7 +5314,7 @@ def _connect_fx_page(playwright_ctx, cancel_check=None, on_event=None,
     1. 如果连接 CDP 失败 (比如 profile 卡死导致调试端口未开启)，重启当前 profile
        后重试，最多重试 3 次；本地连接故障不触发账号切换。
     2. 检测到 Google 安全拦截 (unusual activity / security check) 时，
-       自动关闭浏览器 → 换号 → 重启浏览器 → 重试导航，最多重试 1 次。
+       将换号请求交给外层重试；外层退出当前 Playwright 会话后再探测候选账号。
     3. 检测到登录失效 / 验证码 / 二次验证（换号/换 IP 都解决不了、只能人工在 AdsPower
        窗口里处理的那几类）时，若调用方给了 on_event 能把状态透出给人看，
        就暂停等人工处理完再继续；等不到则抛 _ManualInterventionTimeoutError。
@@ -4736,7 +5323,6 @@ def _connect_fx_page(playwright_ctx, cancel_check=None, on_event=None,
     """
     max_conn_attempts = 3
     browser = None
-    tried_accounts = set()   # Google 安全拦截后换号时，避免换回已失败的账号
 
     for attempt in range(1, max_conn_attempts + 1):
         # 连接阶段（含 profile 卡死 → stop → 重开浏览器）一轮就要几十秒，
@@ -4746,6 +5332,10 @@ def _connect_fx_page(playwright_ctx, cancel_check=None, on_event=None,
             ws_url = get_ads_ws_url()
             browser = _connect_over_cdp_with_retry(playwright_ctx, ws_url)
             break
+        except BrowserEnvironmentError:
+            # A previous profile may still be alive. Restarting the target or
+            # cycling accounts cannot resolve the one-environment constraint.
+            raise
         except Exception as e:
             if cancel_flag.is_cancelled:
                 log("🛑 任务已取消，放弃连接重试", "GoogleFX")
@@ -4789,12 +5379,11 @@ def _connect_fx_page(playwright_ctx, cancel_check=None, on_event=None,
         try:
             page = context.new_page()
             page.goto(FLOW_HOME_URL, timeout=60000, wait_until="domcontentloaded")
-            random_sleep(1, 2)
         except Exception as new_page_err:
             log(f"⚠️ 新建页面也失败: {type(new_page_err).__name__}: {new_page_err}", "GoogleFX")
             raise
 
-    page.bring_to_front()
+    bring_page_to_front_if_allowed(page)
     # 2026-09-05: 判"是不是已经在 Flow 上"必须走 is_flow_url。Flow 搬到
     # flow.google.com 之后，这里对一个好端端的项目画布也会判否，然后一脚把页面
     # 导回首页——画布上刚传好的参考图连同项目一起丢掉。
@@ -4808,7 +5397,6 @@ def _connect_fx_page(playwright_ctx, cancel_check=None, on_event=None,
         # ——整个 chunk（最多 5 段视频）连一次重试机会都没有就全部判失败。
         try:
             page.goto(FLOW_HOME_URL, timeout=60000, wait_until="domcontentloaded")
-            random_sleep(1, 2)
         except Exception as nav_err:
             log(f"⚠️ 导航到 Flow 首页超时/失败: {type(nav_err).__name__}: {nav_err}，继续尝试后续步骤...", "GoogleFX")
 
@@ -4835,42 +5423,13 @@ def _connect_fx_page(playwright_ctx, cancel_check=None, on_event=None,
                     "PINNED_CANVAS_ACCOUNT_UNAVAILABLE: 原画布所属账号触发安全验证，"
                     "为避免迭代落入其他账号的新画布，已停止自动换号"
                 ) from e
-            log("⚠️ 检测到 Google 安全拦截，尝试换号后重试...", "GoogleFX")
-            # 关闭当前浏览器
-            try:
-                browser.close()
-            except Exception:
-                pass
-            # 换号：安全拦截是账号侧的风控评分，换出口 IP 救不回来
-            switched = _switch_account_on_failure(force_switch=True, exclude=tried_accounts)
-            if switched:
-                tried_accounts.add(switched)
-            # 重新启动浏览器（换号后连的是新 profile；IP 轮换交回正常节奏，
-            # 这里不额外触发一次，跟原来"刚换过就不重复换"的意图一致）
-            ws_url = get_ads_ws_url(auto_rotate_proxy=False)
-            browser = _connect_over_cdp_with_retry(playwright_ctx, ws_url)
-            context = browser.contexts[0]
-            page = find_or_create_page(
-                context, FLOW_HOST_HINTS, cancel_check=cancel_check,
-                context_label="Google FX 换号后浏览器启动")
-            page.bring_to_front()
-            try:
-                page.goto(FLOW_HOME_URL, timeout=60000, wait_until="domcontentloaded")
-                random_sleep(2, 4)
-            except Exception as nav_err:
-                log(f"⚠️ 换 IP 后导航到 Flow 首页超时/失败: {type(nav_err).__name__}: {nav_err}，继续尝试后续步骤...", "GoogleFX")
-            ensure_flow_workspace(page)
-            # 再次检测，如果仍然被拦截：能透出状态就等人工处理，否则直接抛
-            if on_event:
-                if not wait_out_manual_intervention(
-                    page, context_label="Google FX 换 IP 后重试",
-                    cancel_check=cancel_check, on_event=on_event,
-                ):
-                    raise _ManualInterventionTimeoutError(
-                        "Google FX 换 IP 后仍被拦截，等待人工处理超时"
-                    )
-            else:
-                _raise_if_manual_intervention_required(page, context_label="Google FX 换 IP 后重试")
+            # pick_account() 可能需要打开其它账号浏览器真实探测积分。此处仍在调用方
+            # 的 with sync_playwright() 内，嵌套探测会触发 Playwright 的 asyncio-loop
+            # 禁止规则，并把整排健康账号误记成探测失败。交给图片/视频外层在会话退出后换号。
+            raise RuntimeError(
+                "SECURITY_CHECK_ACCOUNT_SWITCH_REQUIRED: 当前账号触发安全验证；"
+                "退出当前 Playwright 会话后再探测其他账号"
+            ) from e
         else:
             raise
 
@@ -4886,6 +5445,12 @@ def _prepare_fx_canvas(page, has_refs, require_fresh_canvas=False):
 
     # 如果当前没有打开任何项目（即输入框/工具栏不存在），优先尝试打开最新历史项目，找不到再新建项目
     toolbar_exists = _find_fx_prompt_input(page, announce=False) is not None
+    toolbar_waited = False
+    if not toolbar_exists and is_flow_project_url(str(getattr(page, "url", "") or "")):
+        # Project creation confirms navigation, not React hydration. Wait on the
+        # actual editor before deciding a just-created canvas needs replacing.
+        toolbar_exists = bool(_wait_for_fx_toolbar(page, timeout=get_runtime_max_wait_seconds()))
+        toolbar_waited = toolbar_exists
     if not toolbar_exists and require_fresh_canvas:
         log("📍 输入框未就绪；本次任务要求全新画布，直接新建项目（不回历史项目）", "GoogleFX")
         try:
@@ -4953,7 +5518,8 @@ def _prepare_fx_canvas(page, has_refs, require_fresh_canvas=False):
     # 现读而不是用 import 时冻结的 MAX_WAIT_SECONDS：控制台改「单张/单条最长等待」
     # 后本轮就该跟着变（理由见 config.get_runtime_max_wait_seconds 的 docstring）。
     # 这是 config 里点名"一律走 get_runtime_*"之后唯一漏掉的等待点。
-    _wait_for_fx_toolbar(page, timeout=get_runtime_max_wait_seconds())
+    if not toolbar_waited:
+        _wait_for_fx_toolbar(page, timeout=get_runtime_max_wait_seconds())
 
 def _count_error_cards(page):
     """用 JS 数唯一 Failed 卡片 DOM 元素，避免多选择器重复计数。
@@ -5371,6 +5937,7 @@ def _cancellable_sleep(seconds, step=0.5):
 #     （沿用这个环境变量名，避免已有 .env 失效）。
 
 _RISK_CONTROL_ERROR_TOKENS = (
+    "security_check_account_switch_required",
     "异常活动", "unusual activity", "suspicious", "风控",
     "所有 prompt 均未捕获到图片", "生成失败", "something went wrong",
     "quota", "配额", "rate limit", "too many requests", "429", "403",
@@ -5499,7 +6066,7 @@ def fx_pacing_bounds():
     return (low, max(low, high))
 
 
-def fx_pacing_wait(min_gap=15.0, max_gap=25.0, log_tag="GoogleFX"):
+def fx_pacing_wait(min_gap=15.0, max_gap=25.0, log_tag="GoogleFX", on_idle=None):
     """确保距上一次真实提交至少隔 min_gap~max_gap 秒，返回实际睡眠秒数。"""
     if _LAST_FX_SUBMIT_TS <= 0:
         log("🕐 本进程尚无提交记录，跳过节奏等待", log_tag)
@@ -5510,7 +6077,14 @@ def fx_pacing_wait(min_gap=15.0, max_gap=25.0, log_tag="GoogleFX"):
         log(f"🕐 距上次提交已隔 {time.time() - _LAST_FX_SUBMIT_TS:.0f}s ≥ {target:.1f}s，无需节奏等待", log_tag)
         return 0.0
     log(f"🕐 Pacing: 距上次提交仅 {time.time() - _LAST_FX_SUBMIT_TS:.0f}s，补足 {remain:.1f}s 后开始", log_tag)
-    _cancellable_sleep(remain)
+    if on_idle is None:
+        _cancellable_sleep(remain)
+    else:
+        deadline = time.time() + remain
+        while time.time() < deadline:
+            _check_cancelled()
+            on_idle()  # Must not hover/click or mutate the prepared prompt bar.
+            _cancellable_sleep(min(0.5, max(0.0, deadline - time.time())))
     return remain
 
 

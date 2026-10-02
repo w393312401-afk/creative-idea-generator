@@ -116,6 +116,37 @@ def test_partial_image_batch_returns_durable_prefix_instead_of_discarding_it():
         shutil.rmtree(temp_dir, ignore_errors=True)
 
 
+def test_next_image_chunk_keeps_account_selected_after_exhaustion():
+    config = {'googleFxUserId': 'exhausted'}
+    session = {}
+    seen = []
+
+    class Models:
+        ImageBatchRequest = staticmethod(lambda **kwargs: SimpleNamespace(**kwargs))
+
+    class Fx:
+        @staticmethod
+        def _generate_images_batch_google_fx(req):
+            seen.append((account_binding.current_task_account(), req.project_url))
+            if len(seen) == 1:
+                account_binding.set_task_account('replacement')
+            path = os.path.join(req.output_path, 'result.jpg')
+            with open(path, 'wb') as handle:
+                handle.write(b'image')
+            return {'status': 'success', 'image_urls': [path],
+                    'project_url': 'https://flow.google.com/project/replacement'}
+
+    for prompt in ('first', 'second'):
+        with account_binding.bound_task_account(config['googleFxUserId']):
+            _, out = frames._fx_generate_batch(
+                Fx(), Models(), config, [prompt], None, canvas_session=session)
+        shutil.rmtree(out, ignore_errors=True)
+
+    assert config['googleFxUserId'] == 'replacement'
+    assert seen == [('exhausted', None),
+                    ('replacement', 'https://flow.google.com/project/replacement')]
+
+
 def test_targeted_iteration_splits_adjacent_frames_owned_by_different_canvases():
     manifest = {
         "google_fx_project_url": "https://labs.google/fx/tools/flow/project/legacy",

@@ -10,10 +10,11 @@
 
 let galleryLoading = false;
 let galleryData = null;             // /api/gallery 的原始返回
-let galleryFilter = 'all';          // all | cover | frame | video | studio | orphan
+let galleryFilter = 'all';          // all | cover | frame | video (片段) | merged (成片) | studio | orphan
 let gallerySearch = '';             // 文件名/项目名子串（不区分大小写）
 let gallerySort = 'newest';         // newest | oldest | size | name
-const gallerySelected = new Set();  // 已勾选 item.path 集合（跨筛选保留）
+const gallerySelected = new Set();  // 已勾选 item.path，仅保留在当前筛选范围内的选择
+let galleryDownloading = false;
 const galleryExpanded = new Set();  // 本次会话内点过"展开全部"的组 key
 const GALLERY_TRUNCATE = 12;        // 每组默认最多显示的卡片数
 
@@ -101,8 +102,17 @@ function galleryVersionedUrl(it) {
     return galleryEncodeUrl(it.url) + '?v=' + (it.mtime || 0);
 }
 
-async function refreshGallery() {
-    if (galleryLoading) return;
+// 扫描进行中的 Promise：其它模块（项目工作台、图像工坊）跳进画廊时要等它跑完再定位，
+// 之前靠 setTimeout(600) 猜扫描耗时，扫描慢一点就定位落空。
+let galleryRefreshPromise = null;
+
+function refreshGallery() {
+    if (galleryLoading) return galleryRefreshPromise;
+    galleryRefreshPromise = galleryDoRefresh().finally(() => { galleryRefreshPromise = null; });
+    return galleryRefreshPromise;
+}
+
+async function galleryDoRefresh() {
     galleryLoading = true;
     const container = document.getElementById('gallery-groups');
     if (container && !galleryData) {
@@ -129,6 +139,64 @@ async function refreshGallery() {
     renderGallery();
 }
 
+function gallerySetFilter(filter) {
+    galleryFilter = filter || 'all';
+    document.querySelectorAll('#gallery-filters .gallery-filter-chip').forEach(c => {
+        c.classList.toggle('active', (c.dataset.filter || 'all') === galleryFilter);
+    });
+}
+
+// 直接写状态并同步输入框，绕开输入框 200ms 去抖——程序化跳转要立刻生效。
+function gallerySetSearch(q) {
+    gallerySearch = q || '';
+    const input = document.getElementById('gallery-search');
+    if (input) input.value = gallerySearch;
+}
+
+/**
+ * 其它模块跳进画廊的统一入口（项目工作台「查看文件/在画廊查找」、图像工坊「在画廊查看」）。
+ *   groupKey  定位到某个分组（目录名）：展开它、滚到视野、闪一下高亮
+ *   search    预填搜索词
+ *   filter    预设筛选档（all | cover | frame | video | merged | studio | orphan）
+ * 先重置上次遗留的筛选/搜索再跳转——否则目标分组可能正好被旧筛选藏起来；
+ * 并且等扫描真的完成才定位，而不是猜一个超时。返回是否定位成功。
+ */
+async function galleryFocus({ groupKey = '', search = '', filter = 'all' } = {}) {
+    gallerySetFilter(filter);
+    gallerySetSearch(search);
+    switchMainTab('gallery');            // 进入画廊会触发一次重新扫描
+    await (galleryRefreshPromise || refreshGallery());
+    if (!galleryData) return false;      // 扫描失败，面板里已有错误提示
+    if (groupKey) {
+        galleryCollapsed.delete(groupKey);
+        galleryPersistCollapsed();
+    }
+    renderGallery();
+    if (!groupKey) return true;
+    const el = document.querySelector(`#gallery-groups .gallery-group[data-group="${CSS.escape(groupKey)}"]`);
+    if (!el) {
+        showToast('画廊里没找到这个项目的资产目录（可能已被清理）', 'info');
+        return false;
+    }
+    galleryScrollToGroup(el);
+    el.classList.add('flash-highlight');
+    setTimeout(() => el.classList.remove('flash-highlight'), 1600);
+    return true;
+}
+
+// 卡片里的 <video preload="metadata"> 与懒加载图片会在滚动之后才撑开高度，把平滑滚动的
+// 目标挤出视野。所以先瞬时跳到位，再在布局稳定的前 1.5 秒内几次校正。
+function galleryScrollToGroup(el) {
+    const scroller = document.getElementById('gallery-groups');
+    const align = () => {
+        if (!el.isConnected || !scroller) return;
+        const drift = el.getBoundingClientRect().top - scroller.getBoundingClientRect().top;
+        if (Math.abs(drift) > 24) scroller.scrollTop += drift;
+    };
+    align();
+    [150, 400, 800, 1500].forEach(ms => setTimeout(align, ms));
+}
+
 // 孤儿 = 无引用的历史遗留：孤儿项目组的全部文件，或封面池里没被任何点子/任务引用的封面。
 // in_use 缺失（服务端引用收集失败的降级态）时不算孤儿——宁可漏标不可误标。
 function galleryItemIsOrphan(group, item) {
@@ -140,7 +208,8 @@ function galleryItemIsOrphan(group, item) {
 function galleryItemMatchesFilter(group, item) {
     switch (galleryFilter) {
         case 'all': return true;
-        case 'video': return item.type === 'video'; // 片段 + 合成成片
+        case 'video': return item.kind === 'video'; // 视频片段与成片分开
+        case 'merged': return item.kind === 'merged';
         case 'orphan': return galleryItemIsOrphan(group, item);
         default: return item.kind === galleryFilter; // cover / frame / studio
     }
@@ -197,11 +266,12 @@ function galleryVisibleGroups() {
 
 // 各筛选档的条目数（不含搜索词，让 chip 计数保持稳定的"分类体量"含义）
 function galleryFilterCounts() {
-    const counts = { all: 0, cover: 0, frame: 0, video: 0, studio: 0, orphan: 0 };
+    const counts = { all: 0, cover: 0, frame: 0, video: 0, merged: 0, studio: 0, orphan: 0 };
     for (const g of (galleryData && galleryData.groups) || []) {
         for (const it of g.items || []) {
             counts.all++;
-            if (it.type === 'video') counts.video++;
+            if (it.kind === 'video') counts.video++;
+            if (it.kind === 'merged') counts.merged++;
             if (it.kind === 'cover') counts.cover++;
             if (it.kind === 'frame') counts.frame++;
             if (it.kind === 'studio') counts.studio++;
@@ -211,11 +281,23 @@ function galleryFilterCounts() {
     return counts;
 }
 
+function gallerySelectedPaths() {
+    const allowed = new Set(galleryVisibleGroups().flatMap(group => group.items.map(item => item.path)));
+    return [...gallerySelected].filter(path => allowed.has(path));
+}
+
+function galleryPruneSelection() {
+    const selected = new Set(gallerySelectedPaths());
+    [...gallerySelected].forEach(path => { if (!selected.has(path)) gallerySelected.delete(path); });
+}
+
+
 function renderGallery() {
     const container = document.getElementById('gallery-groups');
     if (!container || !galleryData) return;
 
     const groups = galleryVisibleGroups();
+    galleryPruneSelection();
     const totals = galleryData.totals || {};
     const statsEl = document.getElementById('gallery-stats');
     if (statsEl) {
@@ -249,7 +331,10 @@ function renderGallery() {
         // idea_id 是服务端按目录命名反查到的点子库归属（见 gallery_collect_references）；
         // 没反查到也照样给按钮，前端还能按目录名里的 run_<task_id> 落到任务记录上。
         const openProjectBtn = g.kind === 'project'
-            ? `<button type="button" class="gallery-tool-btn small g-group-open-project" title="打开这批素材所属的激发项目（提示词/封面/帧与视频）">🎬 打开项目</button>`
+            ? `<button type="button" class="gallery-tool-btn small g-group-open-project" title="打开这批素材所属的激发项目（提示词/封面/帧与视频）"><span class="g-btn-ico">🎬</span><span class="g-btn-label">打开项目</span></button>`
+            : '';
+        const locateProjectBtn = g.kind === 'project'
+            ? `<button type="button" class="gallery-tool-btn small g-group-locate-project" title="在项目页里定位这个项目（状态、归档、任务记录）"><span class="g-btn-ico">📁</span><span class="g-btn-label">项目页</span></button>`
             : '';
 
         let gridHtml = '';
@@ -264,30 +349,33 @@ function renderGallery() {
             gridHtml = `<div class="gallery-grid">${cards}</div>${moreBtn}`;
         }
 
-        // 标题显示归属创意的**项目名**，目录名退到后面的小字。
-        // 只显示目录名的话，改过名的项目在这里对不上号：磁盘目录未必跟着标题走
-        //（改名时有作业在跑就不搬目录，早期改的名压根没搬过），于是画廊上挂着的是
-        // 「run_import_xxx_粘贴的文本」这种导入时的临时名，用户认不出那是哪一单。
-        // 反过来目录名也不能丢——这一屏管的是磁盘，删除一组删的就是那个文件夹。
+        // 项目名称作为标题；磁盘路径收进可展开详情。
+        // 改过名的项目可能仍沿用旧目录，路径可在详情里核对。
         const groupName = g.idea_title || g.title;
-        const dirNote = (g.kind === 'project' && g.idea_title && g.idea_title !== g.title)
-            ? `<span class="g-group-dir" title="磁盘目录名（删除本组删的就是它）">outputs/${escapeHtml(g.title)}</span>`
+        const totalCount = ((galleryData.groups || []).find(raw => raw.key === g.key)?.items || []).length;
+        const filtered = totalCount !== g.items.length;
+        const groupDetails = g.kind === 'project'
+            ? `<details class="gallery-group-details"><summary>项目详情</summary><div>本地目录 <code>outputs/${escapeHtml(g.title)}</code></div></details>`
             : '';
+        const deleteLabel = filtered ? '删除筛选结果' : '删除本组媒体';
+
 
         return `
         <section class="gallery-group${collapsed ? ' collapsed' : ''}${g.orphan === true ? ' orphan' : ''}" data-group="${escapeHtml(g.key)}">
             <div class="gallery-group-head">
-                <h3 class="g-group-title" title="点击折叠/展开">
+                <h3 class="g-group-title" title="点击折叠/展开${g.kind === 'project' ? `\n本地目录 outputs/${escapeHtml(g.title)}` : ''}">
                     <span class="g-collapse-caret">${collapsed ? '▸' : '▾'}</span>
-                    <span class="g-group-icon">${icon}</span>${escapeHtml(groupName)}${orphanBadge}${dirNote}
-                    <span class="g-count">${g.items.length} 项 · ${galleryFmtSize(gBytes)}</span>
+                    <span class="g-group-icon">${icon}</span><span class="g-group-name">${escapeHtml(groupName)}</span>${orphanBadge}
+                    <span class="g-count">${filtered ? `筛选 ${g.items.length} / ${totalCount}` : g.items.length} 项 · ${galleryFmtSize(gBytes)}</span>
                 </h3>
                 <div class="gallery-group-actions">
                     ${openProjectBtn}
-                    <button type="button" class="gallery-tool-btn small g-group-select">全选本组</button>
-                    <button type="button" class="gallery-tool-btn small danger g-group-delete">删除本组</button>
+                    ${locateProjectBtn}
+                    <button type="button" class="gallery-tool-btn small g-group-select" title="${filtered ? '选择本组当前筛选结果' : '选择本组全部媒体'}"><span class="g-btn-ico">☑</span><span class="g-btn-label">选择${filtered ? '筛选结果' : '本组媒体'}</span></button>
+                    <button type="button" class="gallery-tool-btn small danger g-group-delete" title="仅删除本组当前筛选中的 ${g.items.length} 个媒体文件"><span class="g-btn-ico">🗑️</span><span class="g-btn-label">${deleteLabel}</span></button>
                 </div>
             </div>
+            ${groupDetails}
             ${gridHtml}
         </section>`;
     }).join('');
@@ -298,7 +386,7 @@ function renderGallery() {
 function galleryCardHtml(it) {
     const sel = gallerySelected.has(it.path);
     const url = galleryVersionedUrl(it);
-    const badge = GALLERY_KIND_LABELS[it.kind] || '';
+    const badge = it.is_edited ? '精剪成片' : (GALLERY_KIND_LABELS[it.kind] || '');
     const inUseBadge = (it.kind === 'cover' && it.in_use === true)
         ? '<span class="gallery-inuse-badge" title="正被点子库或任务引用，删除会导致卡片破图">🔗 使用中</span>' : '';
     const thumb = it.type === 'video'
@@ -318,21 +406,41 @@ function galleryCardHtml(it) {
              一排常显小按钮 —— 挂在缩略图里面就只能跟着缩略图一起被压成一列。 -->
         <div class="gallery-card-actions">
             <button type="button" class="g-act g-act-preview" title="放大预览">🔍</button>
+            ${it.type === 'video' ? '' : '<button type="button" class="g-act g-act-i2i" title="送去图像工坊·图生图，作为参考图">🎨</button>'}
             <button type="button" class="g-act g-act-download" title="下载文件">📥</button>
             <button type="button" class="g-act g-act-reveal" title="在本机文件管理器中显示">📂</button>
             <button type="button" class="g-act g-act-delete" title="删除本地文件">🗑️</button>
         </div>
-        <div class="gallery-card-meta">
-            <span class="g-name" title="${escapeHtml(it.path)}">${escapeHtml(it.name)}</span>
-            <span class="g-sub">${galleryFmtSize(it.size)} · ${galleryFmtTime(it.mtime)}</span>
+        <!-- 正文：网格视图是「文件名 | 大小」一行；列表视图把 g-sub 的三个 span 拆成表格列；
+             完整信息（时间/路径）在 title 悬停提示里，大图视图才展开「详情」。 -->
+        <div class="gallery-card-meta" title="${escapeHtml(`${it.name}\n${galleryFmtSize(it.size)} · ${galleryFmtTime(it.mtime)}\n${it.path}`)}">
+            <span class="g-name" title="${escapeHtml(it.name)}">${escapeHtml(it.name)}</span>
+            <span class="g-sub"><span class="g-kind">${escapeHtml(badge || '图片')}</span><span class="g-size">${galleryFmtSize(it.size)}</span><span class="g-time">${galleryFmtTime(it.mtime)}</span></span>
+            <details class="gallery-file-details"><summary>详情</summary><dl>
+                <dt>更新时间</dt><dd>${galleryFmtTime(it.mtime)}</dd>
+                <dt>本地路径</dt><dd><code>${escapeHtml(it.path)}</code></dd>
+            </dl></details>
         </div>
     </div>`;
 }
 
 function galleryUpdateToolbar() {
+    const selected = gallerySelectedPaths();
+    const downloadBtn = document.getElementById('gallery-download-selected-btn');
+    if (downloadBtn) {
+        downloadBtn.disabled = !selected.length || galleryDownloading;
+        downloadBtn.textContent = galleryDownloading ? '正在打包…' : `下载所选${selected.length ? ` (${selected.length})` : ''}`;
+    }
+    // 选择操作条只在有选中项时出现（没选东西时不占位、不摆一排灰按钮）
+    const selectionBar = document.getElementById('gallery-selection-bar');
+    if (selectionBar) selectionBar.hidden = selected.length === 0;
+    const selectionNote = document.getElementById('gallery-selection-note');
+    if (selectionNote) selectionNote.textContent = selected.length
+        ? `已选 ${selected.length} 项 · 下载和删除仅作用于当前筛选中的所选媒体`
+        : '选择仅在当前筛选内保留';
     const delBtn = document.getElementById('gallery-delete-selected-btn');
     if (delBtn) {
-        const n = gallerySelected.size;
+        const n = selected.length;
         delBtn.disabled = n === 0;
         delBtn.textContent = n > 0 ? `🗑️ 删除所选 (${n})` : '🗑️ 删除所选';
     }
@@ -340,7 +448,8 @@ function galleryUpdateToolbar() {
     if (selAllBtn) {
         const visible = galleryVisibleGroups().flatMap(g => g.items.map(it => it.path));
         const allSelected = visible.length > 0 && visible.every(p => gallerySelected.has(p));
-        selAllBtn.textContent = allSelected ? '⬜ 取消全选' : '☑️ 全选';
+        selAllBtn.textContent = allSelected ? '取消本筛选全选' : '全选筛选结果';
+        selAllBtn.disabled = visible.length === 0;
     }
     const collapseAllBtn = document.getElementById('gallery-collapse-all-btn');
     if (collapseAllBtn) {
@@ -432,6 +541,26 @@ async function galleryOpenSparkProject(group) {
     });
 }
 
+// 「🎨」：把画廊里的图送进图像工坊·图生图当参考图（与渲染室的「送去图生图」同一条通路）。
+// 会替换图生图里已有的参考图——和渲染室那个按钮行为一致。
+function galleryUseAsReference(it) {
+    if (typeof imgStudioSendToImageToImage !== 'function') {
+        showToast('图像工坊尚未加载完成，请稍后重试', 'error');
+        return;
+    }
+    switchMainTab('image');
+    imgStudioSendToImageToImage(galleryVersionedUrl(it), `ref_${it.name || 'gallery.png'}`);
+}
+
+// 「📁 项目页」：从项目组回到项目工作台，选中并展开对应项目。
+function galleryLocateInProjects(group) {
+    if (typeof projectsLocate !== 'function') {
+        showToast('项目工作台尚未加载完成，请稍后重试', 'error');
+        return;
+    }
+    projectsLocate({ projectKey: group.key || '', title: group.idea_title || group.title || '' });
+}
+
 function galleryDownload(it) {
     const a = document.createElement('a');
     a.href = galleryEncodeUrl(it.url);
@@ -441,13 +570,45 @@ function galleryDownload(it) {
     a.remove();
 }
 
+async function galleryDownloadSelected() {
+    if (galleryDownloading) return;
+    const paths = gallerySelectedPaths();
+    if (!paths.length) return;
+    if (paths.length === 1) { galleryDownload(galleryFindItem(paths[0])); return; }
+    galleryDownloading = true;
+    galleryUpdateToolbar();
+    try {
+        const response = await fetch('/api/gallery/download-zip', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ paths }),
+        });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok || typeof data.url !== 'string' || !data.url.startsWith('/api/gallery/download-zip/')) {
+            throw new Error(data.message || (response.ok ? '下载链接无效，请重试' : `HTTP ${response.status}`));
+        }
+        const link = document.createElement('a');
+        link.href = data.url;
+        link.download = data.filename || '画廊所选素材.zip';
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+        showToast(`已准备 ${data.count || paths.length} 个文件的打包下载`, 'success');
+
+    } catch (error) {
+        showToast(`下载失败：${error.message}`, 'error');
+    } finally {
+        galleryDownloading = false;
+        galleryUpdateToolbar();
+    }
+}
+
+
 async function galleryDeletePaths(paths, label) {
     if (!paths.length) return;
     const inUseCount = paths.filter(p => {
         const it = galleryFindItem(p);
         return it && it.in_use === true;
     }).length;
-    let msg = `确定要删除${label}吗？\n共 ${paths.length} 个文件，将从本地磁盘永久删除，不可恢复。`;
+    let msg = `确定删除${label}吗？\n删除范围：${paths.length} 个媒体文件，将从本地磁盘永久删除。项目记录与此范围以外的文件保留。`;
     if (inUseCount > 0) {
         msg = `⚠️ 注意：其中 ${inUseCount} 个封面正被点子库或任务引用，删除后对应卡片会破图！\n\n${msg}`;
     }
@@ -457,7 +618,7 @@ async function galleryDeletePaths(paths, label) {
         const res = await fetch('/api/gallery/delete', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ paths }),
+            body: JSON.stringify({ paths, remove_empty_projects: false }),
         });
         const data = await res.json().catch(() => ({}));
         if (!res.ok || data.status !== 'ok') {
@@ -484,6 +645,10 @@ function initGallery() {
     if (!container) return; // console.html 等页面没有画廊
 
     galleryApplyView();
+    // 图像工坊渲染室页头的「在画廊查看」：直达「图像工坊」筛选档
+    document.getElementById('imgstudio-open-gallery-btn')?.addEventListener('click', () => {
+        galleryFocus({ filter: 'studio' });
+    });
     document.getElementById('gallery-view-switch')?.addEventListener('click', (e) => {
         const btn = e.target.closest('.gallery-view-btn');
         if (btn) gallerySetView(btn.dataset.view);
@@ -494,8 +659,7 @@ function initGallery() {
     filters?.addEventListener('click', (e) => {
         const chip = e.target.closest('.gallery-filter-chip');
         if (!chip) return;
-        galleryFilter = chip.dataset.filter || 'all';
-        filters.querySelectorAll('.gallery-filter-chip').forEach(c => c.classList.toggle('active', c === chip));
+        gallerySetFilter(chip.dataset.filter);
         renderGallery();
     });
 
@@ -530,8 +694,14 @@ function initGallery() {
         renderGallery();
     });
 
+    document.getElementById('gallery-clear-selection-btn')?.addEventListener('click', () => {
+        gallerySelected.clear();
+        renderGallery();
+    });
+    document.getElementById('gallery-download-selected-btn')?.addEventListener('click', galleryDownloadSelected);
     document.getElementById('gallery-delete-selected-btn')?.addEventListener('click', () => {
-        galleryDeletePaths([...gallerySelected], `所选的 ${gallerySelected.size} 个文件`);
+        const paths = gallerySelectedPaths();
+        galleryDeletePaths(paths, `当前筛选中选中的 ${paths.length} 个文件`);
     });
 
     // 卡片与分组操作：单一事件委托，重渲染后无需重绑
@@ -542,6 +712,12 @@ function initGallery() {
             const key = groupEl?.dataset.group;
             const group = galleryVisibleGroups().find(g => g.key === key);
             if (group) galleryOpenSparkProject(group);
+            return;
+        }
+        if (e.target.closest('.g-group-locate-project')) {
+            const key = groupEl?.dataset.group;
+            const group = galleryVisibleGroups().find(g => g.key === key);
+            if (group) galleryLocateInProjects(group);
             return;
         }
         if (e.target.closest('.g-group-select')) {
@@ -558,18 +734,8 @@ function initGallery() {
             const key = groupEl?.dataset.group;
             const group = galleryVisibleGroups().find(g => g.key === key);
             if (!group) return;
-            // 无筛选遮挡时删整组 = 项目文件夹连同隐藏残留一起消失（后端按
-            // "画廊可见媒体清零"自动 rmtree），确认文案要说清楚
-            const raw = (galleryData.groups || []).find(g => g.key === key);
-            const isFullProject = group.kind === 'project' && raw && group.items.length === (raw.items || []).length;
-            // 删除要删的是目录，所以确认文案里项目名与目录名都得报出来——改过名的
-            // 项目两者不一样，只报一个都可能让人删错东西
-            const named = group.idea_title && group.idea_title !== group.title
-                ? `${group.idea_title}（目录 outputs/${group.title}）` : group.title;
-            const label = isFullProject
-                ? `「${named}」全部 ${group.items.length} 个文件（整个项目文件夹连同 manifest、插帧中间产物将一并移除）`
-                : `「${named}」当前显示的 ${group.items.length} 个文件`;
-            galleryDeletePaths(group.items.map(it => it.path), label);
+            const named = group.idea_title || group.title;
+            galleryDeletePaths(group.items.map(it => it.path), `「${named}」当前筛选中的 ${group.items.length} 个媒体文件`);
             return;
         }
         // 组标题（含 caret）点击 → 折叠/展开
@@ -602,6 +768,7 @@ function initGallery() {
             return;
         }
         if (e.target.closest('.g-act-preview')) { galleryOpenPreview(path); return; }
+        if (e.target.closest('.g-act-i2i')) { galleryUseAsReference(item); return; }
         if (e.target.closest('.g-act-download')) { galleryDownload(item); return; }
         // 定位到本机文件：item.path 就是 outputs/ 下的相对路径（服务端扫描出来的真值）
         if (e.target.closest('.g-act-reveal')) { revealLocalFile(item.path, item.name); return; }

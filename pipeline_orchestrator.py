@@ -41,7 +41,7 @@ from datetime import datetime
 
 from server_common import (
     _get_project_dir, read_manifest, write_manifest, manifest_lock,
-    IMG2IMG_CONTROL_PROMPT, log,
+    IMG2IMG_CONTROL_PROMPT, log, reviews_disabled,
     frame_content_hash, drop_stale_review_verdicts, REAL_REVIEW_VERDICTS,
 )
 from prompt_pipeline import (
@@ -579,6 +579,13 @@ def _sequence_consistency_review(config, title, prompt_block, project_dir, on_pr
     full=True：强制全量重审，不复用任何既有结论。跨帧层是按窗口切的（global_review_windows），
     增量只重跑覆盖失效拍的那几个窗口——某一帧的改动理论上可能影响别的窗口里的判断，
     这条出口就是留给"想让整链重新互相比一遍"的时候用的。"""
+    if reviews_disabled(config):
+        if on_progress:
+            on_progress('sequence_review_result', {
+                'passed': False, 'skipped': True, 'reviewed_sequences': [],
+                'message': '已开启「一键关闭所有审查」，一致性审查已跳过。',
+            })
+        return prompt_block
     images, videos = _parse_prompt_slots(prompt_block)
     total_beats = len(images) - 1
     if total_beats <= 0:

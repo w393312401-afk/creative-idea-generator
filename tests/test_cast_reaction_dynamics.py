@@ -1,38 +1,12 @@
 """Unit tests for Living Cast Dynamic Reflex and Action-Reaction Causal Interlock rules."""
 
 import pytest
-from prompt_pipeline.reverse import _scan_beat_craft, _validate_beat_craft
 from prompt_pipeline import build_outline_plan_block, _beat_block_text
 from prompt_pipeline.composers.miniature import MiniatureComposer
 
 
-def test_scan_beat_craft_detects_static_cast_action():
-    """Static wording like 'remain standing' should be flagged as static_cast_action."""
-    beats = [{
-        'id': 'B01',
-        'workers_present': True,
-        'cast_action': 'the two figurines remain standing at the lower left as before',
-        'operation': 'demolish shack',
-        'state_before': '100% intact',
-        'state_after': '100% cleared',
-    }]
-    buckets, missing = _scan_beat_craft(beats)
-    assert 'B01' in buckets['static_cast_action']
 
 
-def test_scan_beat_craft_passes_dynamic_trigger_reaction_chain():
-    """A dynamic causal chain should pass without static_cast_action warning."""
-    beats = [{
-        'id': 'B01',
-        'workers_present': True,
-        'cast_action': 'As the giant hand descends -> the two figurines tilt heads back looking up -> as shack is gripped -> swiftly stand up -> turn to face the cleared blueprint',
-        'operation': 'demolish shack',
-        'state_before': '100% intact',
-        'state_after': '100% cleared',
-    }]
-    buckets, missing = _scan_beat_craft(beats)
-    assert 'B01' not in buckets['static_cast_action']
-    assert 'B01' not in buckets['missing_cast_action']
 
 
 def test_outline_plan_block_injects_action_reaction_causal_chain():

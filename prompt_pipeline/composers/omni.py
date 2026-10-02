@@ -30,10 +30,8 @@ setup as the opening wide working shot"），所以首帧锚与尾帧锚天然�
 medium shot / wide outro shot——一律按硬伤报（_extra_shot_rungs），否则模型会照着
 旧习惯把景别轮换梯悄悄写回来。
 
-  2. **切点用时间线句显式钉在秒上**。这是本次唯一被允许出现阿拉伯数字的地方
-     （omni-output-templates.md §Notation Ban 的 Timecode exemption），正文其余部分
-     的数字一律折成英文单词。时间线句由 _inject_timeline 确定性注入并覆写——模型
-     自己编的时间线不作数。
+  2. **切点用自然分镜叙事表达**。每个镜头边界实际写出 clean cut / match cut，
+     不输出数字切点表。旧时间线函数只保留兼容入口，归一时删除机械时间线句。
 
   3. **过门桥拍与最终兑现拍走各自的梯**。此前它们被同一套施工梯审计，等于要求
      一段穿门镜头也写出"工具接触点"和"重复作业循环"。
@@ -77,6 +75,7 @@ from .base import BaseComposer
 OMNI_ALWAYS_LOAD_REFERENCES = (
     'omni-scene-skeleton.md',
     'omni-multishot-language.md',
+    'omni-work-first-rhythm.md',
     'omni-restoration-continuity.md',
     'omni-beat-skeleton.md',
     'omni-damage-vocabulary.md',
@@ -84,7 +83,7 @@ OMNI_ALWAYS_LOAD_REFERENCES = (
     'omni-output-templates.md',
 )
 
-# 条件加载：故事真的要从室外穿过一个开口进到室内时才读（SKILL.md 的 Load conditionally）。
+# 条件加载：真实过门，或同空间无施工换机位（SKILL.md 的 Load conditionally）。
 OMNI_THRESHOLD_REFERENCE = 'omni-threshold-bridge.md'
 
 
@@ -292,6 +291,33 @@ def apply_observed_scale(ladder, shot_scale, shot_scales=None):
 _TRAVERSAL_LADDER = (_R_APPROACH, _R_THRESHOLD, _R_ARRIVAL)
 _REWARD_LADDER = (_R_DETAIL, _R_PULLBACK, _R_FINAL_WIDE)
 
+# 展开后的过门子拍只完成自己的阶段，不能每拍重新走完整的逼近/门槛/落定。
+# 硬件拍首尾相同机位，空间移动拍的首尾则分别来自两张不同位置的锚点。
+_TRANSITION_HARDWARE_LADDER = (
+    _R_MAIN._replace(role='从本拍起始 IMAGE 的入口机位开场，只开合原有硬件或移开已存在的入口杂物；不安装新件、不推进施工'),
+    _R_CLOSE._replace(role='clean cut 到同一入口部件的接触细节；部件状态与切走时相同，插入不新增开合或空间推进'),
+    _R_RETURN._replace(role='clean cut 返回与第一镜相同的机位、构图与焦段，完成本拍入口动作，精确匹配本拍结果 IMAGE；不跨过入口、不执行后续阶段'),
+)
+_R_TRANSITION_WORK = Rung(
+    'transition_work', ('transition working shot', 'transition work shot'),
+    '阶段主镜 transition working shot', 'a transition working shot', 1.4,
+    '精确从本拍起始 IMAGE 的相机位置与朝向开场，连续显示本 transition_stage 的下降、转向、无施工换机位或局部揭示；只完成本阶段，不提前完成下一阶段')
+_R_TRANSITION_DETAIL = Rung(
+    'transition_detail', ('detail insert', 'transition detail insert'),
+    '方向证据 detail insert', 'a detail insert', 1.0,
+    'clean cut 到已经可见的门槛、梯档、舱肋或接缝方向证据；相机的空间位置与移动完成度不在插入期间推进，不增加新地标或施工')
+_R_TRANSITION_LAND = Rung(
+    'transition_land', ('landing shot', 'transition landing shot'),
+    '阶段落点 landing shot', 'a landing shot', 1.3,
+    'clean cut 继续刚才的空间移动或揭示，在本拍结果 IMAGE 的位置与朝向落定；不回到起始机位，不跳过尚未演示的穿越、下降或转向')
+_TRANSITION_STAGE_LADDER = (_R_TRANSITION_WORK, _R_TRANSITION_DETAIL, _R_TRANSITION_LAND)
+_HARDWARE_TRANSITION_STAGES = frozenset(('door_hardware_open', 'hatch_hardware_open', 'divider_open'))
+_R_SINGLE_TAKE = Rung(
+    'single_take', ('single take', 'one take', 'single shot', 'one shot'),
+    '单镜 single take', 'a single take', 1.0,
+    '用户明确指定的单镜覆盖：从起始 IMAGE 连续执行实际动作到结果 IMAGE，不插入剪辑、不给默认多镜检查冒充通过')
+_SINGLE_TAKE_LADDER = (_R_SINGLE_TAKE,)
+
 # 时长 → 施工镜头数：短片长一个特写插入（三镜），长片长两个（四镜）。约束是主镜与切回镜
 # 各 ≥1.3 秒、插入镜 ≥0.9 秒——插入本来就是短镜，读作插入；1 秒的**景别**才读作闪帧。
 _SHOT_COUNT_BY_DURATION = {4: 3, 6: 3, 8: 4, 10: 4}
@@ -332,10 +358,10 @@ OMNI_INSHOT_PHRASE = (
     "Inside every shot the frame keeps moving from its first to its last moment — handheld "
     "drift, ambient motion, and the subject's own action never freeze — while this beat's "
     "change advances only during the work shots. The only compressions in the clip fall "
-    "exactly on the listed cut marks; no shot contains a hold, a stall, or a deferred step "
+    "only at the described cuts; no shot contains a hold, a stall, or a deferred step "
     "that is then delivered all at once."
 )
-OMNI_INSHOT_MARKER = 'the only compressions in the clip fall exactly on the listed cut marks'
+OMNI_INSHOT_MARKER = 'the only compressions in the clip fall only at the described cuts'
 
 # 本 composer 自己产出的违规项前缀。
 # ERROR = 结构性硬伤（split_structural_video_errors 靠它认出该回炉的那一类）；
@@ -393,8 +419,7 @@ _ONE_TAKE_SUBSTITUTIONS = (
 _TIMELINE_RE = re.compile(r'\bCut this\b[^\n]*?\bseconds\.', re.IGNORECASE)
 
 # 记号禁用（omni-output-templates.md §Notation Ban）的确定性修复：一到二十的独立整数
-# 折成英文单词。IMAGE 编号与时间线句里的秒数不在此列（前者是锚点引用，后者是本次新增的
-# Timecode exemption）。
+# 折成英文单词。IMAGE 编号作为锚点引用保留，旧时间线在折词前直接删除。
 _SMALL_INTEGER_WORDS = {
     1: 'one', 2: 'two', 3: 'three', 4: 'four', 5: 'five', 6: 'six', 7: 'seven',
     8: 'eight', 9: 'nine', 10: 'ten', 11: 'eleven', 12: 'twelve', 13: 'thirteen',
@@ -464,10 +489,7 @@ def construction_shot_count(duration):
 def is_expanded_transition_stage_beat(beat):
     """这一拍是不是 expand_spatial_transition_beats 展开出来的原子级过门/空间重置子拍。
 
-    2026-08-06：这类子拍每个只装得下一个镜头动作，不该被套任何镜头梯（既不该被要求
-    写出整套 traversal 3 镜，也不该落回 construction 默认梯）。ladder_kind 与
-    omni_video_violations 的调用方都要认这同一个信号，否则镜头梯选型改对了、违规检查
-    那边的默认兜底又会把同一个要求悄悄塞回来。
+    子拍不套整套 traversal 或施工梯，使用只覆盖该阶段的三镜语法。
 
     'camera_reframe' 排除在外：那是同一个展开函数为长内景每三拍插的纯运镜换角度拍
     （operation == 'reframe'，不是过门），跟 prompt_pipeline.beat_is_crossing_clip
@@ -477,22 +499,15 @@ def is_expanded_transition_stage_beat(beat):
 
 
 def ladder_kind(beat=None, is_threshold_or_reveal=None, is_crossing=False):
-    """这一拍走哪套镜头梯：'construction' / 'traversal' / 'reward'。
-
-    返回 None 表示**拍型不明**（回炉通路里只拿到一段文本），或本拍不该套任何镜头梯。
-    此时调用方只做与拍型无关的清洗，不注入时间线——猜错等于给一段穿门镜头硬塞一张
-    施工切点表。
-
-    transition_stage 豁免：expand_spatial_transition_beats 会把规划期唯一的
-    bridge_stage=1 过门标记展开成 3~5 个原子级子拍（见 prompt_pipeline __init__.py），
-    每个子拍只装得下一个镜头动作。展开后的子拍仍带着 operation == 'threshold'，如果
-    照旧走 'traversal' 分支，就是要求每个子拍单独交付「逼近远景+门槛+落定」整套 3
-    镜——不可能完成，首稿必炸。只有还没被展开、仍是规划期原始标记的整段过门拍
-    （bridge_stage/hard_cut 但没有 transition_stage）才需要整套 traversal 镜头梯。"""
+    """拍型分流；原子过门阶段有自己的三镜梯，未知拍型返回 None。"""
     if beat:
-        if is_expanded_transition_stage_beat(beat):
-            return None
         operation = str(beat.get('operation') or '').strip().lower()
+        if operation == 'reframe' or beat.get('transition_stage') == 'camera_reframe':
+            # 纯换机位不算跨门，也不能误套要求施工和返回原机位的施工梯。
+            return 'transition_stage'
+        if is_expanded_transition_stage_beat(beat):
+            return ('transition_hardware' if beat.get('transition_stage') in _HARDWARE_TRANSITION_STAGES
+                    else 'transition_stage')
         if operation == 'reward':
             return 'reward'
         if operation == 'threshold' or beat.get('bridge_stage') or is_crossing:
@@ -507,6 +522,12 @@ def ladder_kind(beat=None, is_threshold_or_reveal=None, is_crossing=False):
 
 def ladder_for(duration, kind='construction'):
     """(时长, 拍型) → 镜头梯。"""
+    if kind == 'single_take':
+        return _SINGLE_TAKE_LADDER
+    if kind == 'transition_hardware':
+        return _TRANSITION_HARDWARE_LADDER
+    if kind == 'transition_stage':
+        return _TRANSITION_STAGE_LADDER
     if kind == 'traversal':
         return _TRAVERSAL_LADDER
     if kind == 'reward':
@@ -534,7 +555,7 @@ def shot_marks(duration, ladder):
 
 
 def timeline_sentence(duration, ladder):
-    """时间线句：本条片子唯一允许出现阿拉伯数字的地方。"""
+    """旧版兼容工具；当前生成不调用它，归一阶段会删除这种数字时间线。"""
     marks = shot_marks(duration, ladder)
     segments = [f"{rung.phrase} from {start:.1f} to {end:.1f}" for start, end, rung in marks]
     if len(segments) > 1:
@@ -559,7 +580,7 @@ def ladder_roles(ladder, insert_subject=None):
     lines = []
     for index, rung in enumerate(ladder, start=1):
         role = rung.role
-        if rung.key == 'close' and 'xclose' not in keys:
+        if rung.key == 'close' and 'xclose' not in keys and ladder != _TRANSITION_HARDWARE_LADDER:
             role = role + ('；本片长只有这一个插入镜，因此至少两处本次操作特有的持久痕迹'
                            '也在同一镜里给到')
         if rung.key == 'close' and subject:
@@ -569,13 +590,13 @@ def ladder_roles(ladder, insert_subject=None):
     return '\n'.join(lines)
 
 
-# 确定性注入的结构句合计约 130 词：锚定开场句由 fix_video_opening 补（44）、切点表
-# （30~55，随镜头数变）、节奏声明（13）、镜内连续性声明（62）。预算表按这个数拉开。
+# 压缩预留的结构句预算；包括锚定开场、节奏和镜内连续性句，不再包含时间线。
 _STRUCTURAL_INJECTION_WORDS = 130
 
 
 def video_word_targets(shot_count):
     """整条 VIDEO 的 (目标字数, 硬顶)，**含**下面确定性注入的那约 130 词结构句。"""
+    shot_count = max(3, shot_count)  # 用户单镜不扩大三镜的四百词额度。
     return 55 * shot_count + 175, 55 * shot_count + 235
 
 
@@ -612,7 +633,8 @@ def _missing_shot_rungs(text, ladder=None):
 
 _ALL_RUNGS = (_R_MAIN, _R_CLOSE, _R_XCLOSE, _R_RETURN,
               _R_ESTABLISHING, _R_FULL, _R_MEDIUM, _R_OUTRO,
-              _R_APPROACH, _R_THRESHOLD, _R_ARRIVAL, _R_DETAIL, _R_PULLBACK, _R_FINAL_WIDE)
+              _R_APPROACH, _R_THRESHOLD, _R_ARRIVAL, _R_DETAIL, _R_PULLBACK, _R_FINAL_WIDE,
+              _R_TRANSITION_WORK, _R_TRANSITION_DETAIL, _R_TRANSITION_LAND)
 
 
 def _extra_shot_rungs(text, ladder):
@@ -624,11 +646,30 @@ def _extra_shot_rungs(text, ladder):
     换掉机位，首尾帧锚跟着一起松掉。"""
     low = _normalized(text)
     in_ladder = {rung.key for rung in ladder}
+    # 空间/兑现的落点可用full-shot等词说明已选末镜的构图，不等于另开一镜。
+    # 只豁免末镜内明确的落帧描述；出现额外cut仍按新增景别报错。
+    _ordered_low, spans = _ordered_rung_spans(text, ladder)
+    landing_end = (spans[-1][1] if len(spans) == len(ladder)
+                   and spans[-1][2].key in ('transition_land', 'arrival', 'final_wide') else None)
+
+    def landing_framing(start):
+        if landing_end is None or start < landing_end:
+            return False
+        preceding = low[landing_end:start]
+        clause = re.split(r'[.!?;]', preceding)[-1]
+        return (not _CUT_RE.search(preceding) and bool(re.search(
+            r'\b(?:settle(?:s)?|finish(?:es)?|end(?:s)?|land(?:s)?)\s+'
+            r'(?:in|into|on)\s+(?:(?:the|a|an)\s+)?(?:[a-z]+\s+){0,3}$', clause)))
+
     extras = []
     for rung in _ALL_RUNGS:
         if rung.key in in_ladder:
             continue
-        if any(variant in low for variant in rung.variants):
+        allowed_variants = [variant for allowed in ladder for variant in allowed.variants]
+        if any(not any(variant in allowed for allowed in allowed_variants)
+               and any(not landing_framing(match.start()) for match in re.finditer(
+                   r'\b' + re.escape(variant) + r'\b', low))
+               for variant in rung.variants):
             extras.append(rung.label)
     return extras
 
@@ -678,44 +719,133 @@ def _stray_digits_image(text):
     return _bare_numbers(probe)
 
 
-def omni_image_violations(image_prompt):
+def omni_image_violations(image_prompt, word_limit=None):
     """IMAGE 正文对 omni 记号禁用的违规项。空列表 = 合规。
 
     此前记号禁用只在 VIDEO 上有门禁（_stray_digits），IMAGE 一侧既不改写也不校验，
     而 base 的锚点重述句恰恰会往 IMAGE 里写 `holding 45 percent of frame height`——
     契约在文档里写着"适用于 prompt bodies"，实现上却有一半没人管。"""
+    errors = []
+    if word_limit is not None and len((image_prompt or '').split()) > word_limit:
+        errors.append(f"IMAGE prompt word count ({len(image_prompt.split())}) exceeds limit of {word_limit} words")
     stray = _stray_digits_image(image_prompt)
-    if not stray:
-        return []
-    return [
-        OMNI_IMAGE_STYLE_PREFIX
-        + "IMAGE 正文出现阿拉伯数字（" + ', '.join(stray)
-        + "）——记号禁用同样适用于 IMAGE，计数与画高比例一律写成英文单词"
-    ]
+    if stray:
+        errors.append(
+            OMNI_IMAGE_STYLE_PREFIX
+            + "IMAGE 正文出现阿拉伯数字（" + ', '.join(stray)
+            + "）——记号禁用同样适用于 IMAGE，计数与画高比例一律写成英文单词")
+    return errors
 
 
-def omni_video_violations(video_prompt, ladder=None, duration=None, skip_shot_list=False):
+def _ordered_rung_spans(text, ladder):
+    """实际正文中的镜头位置；不把尾部概括或旧时间线当作实际分镜。"""
+    low = _normalized(_body_without_timeline(text))
+    cursor, spans = 0, []
+    for rung in ladder:
+        matches = [(low.find(v, cursor), v) for v in rung.variants]
+        matches = [(start, variant) for start, variant in matches if start >= 0]
+        if not matches:
+            return low, []
+        start, variant = min(matches, key=lambda item: (item[0], -len(item[1])))
+        spans.append((start, start + len(variant), rung))
+        cursor = start + len(variant)
+    return low, spans
+
+
+_CUT_RE = re.compile(
+    r'\b(?:clean|match)\s+cuts?\b'
+    r'|\bcut(?:s|ting)?\s+(?:to|into|in|back|away)\b'
+    r'|\bcut\s+(?:is|becomes|returns?|enters?|reveals?|moves?|leads?|drops?)\b')
+_NEGATED_CUT_RE = re.compile(r'\b(?:no|without|never|not|avoid(?:ing)?|forbid(?:den)?)\s+(?:(?:a|any|the)\s+)?(?:clean\s+|match\s+)?cuts?\b')
+
+
+def _shot_structure_errors(text, ladder):
+    """有限文本门禁：实际剪辑边界、可拍描述，以及施工返回机位的显式连续性。
+
+    这不代替画面或语义审查；它防止镜头名列表与自相矛盾的返回机位冒充通过。
+    """
+    low, spans = _ordered_rung_spans(text, ladder)
+    if len(spans) != len(ladder):
+        return []  # 缺镜头的错误由主门禁报告，避免重复噪声。
+    errors = []
+    missing_cuts = []
+    for index in range(1, len(spans)):
+        previous_end, current_start = spans[index - 1][1], spans[index][0]
+        boundary = _NEGATED_CUT_RE.sub(' ', low[previous_end:current_start])
+        boundary = re.sub(r'\b(?:audio|sound|music|soundtrack)\b[^.;]*', ' ', boundary)
+        if not _CUT_RE.search(boundary):
+            missing_cuts.append(str(index + 1))
+    if missing_cuts:
+        errors.append(OMNI_VIDEO_ERROR_PREFIX + 'VIDEO lacks an actual clean cut / match cut into shot(s) '
+                      + ', '.join(missing_cuts) + '; ordered shot names alone do not describe an edit')
+    # 至少有一小段可拍内容，防止 "wide shot, clean cut close-up, ..." 自证。
+    thin = []
+    stop = {'a', 'an', 'the', 'and', 'then', 'with', 'to', 'of', 'in', 'on', 'from',
+            'shot', 'shots', 'cut', 'cuts', 'cutting', 'clean', 'match', 'same', 'camera',
+            'setup', 'opening', 'working', 'returning', 'wide', 'close', 'up', 'insert'}
+    for index, (_start, end, rung) in enumerate(spans):
+        next_start = spans[index + 1][0] if index + 1 < len(spans) else len(low)
+        words = [word for word in re.findall(r'\b[a-z]+\b', low[end:next_start]) if word not in stop]
+        if len(words) < 4:
+            thin.append(rung.label)
+    if thin:
+        errors.append(OMNI_VIDEO_ERROR_PREFIX + 'VIDEO contains shot labels without enough visible action/detail: '
+                      + ' / '.join(thin))
+    return_span = next(((start, end) for start, end, rung in spans if rung.key == 'return'), None)
+    if return_span:
+        return_body = low[return_span[0]:]
+        same_setup = bool(re.search(r'\b(?:same|identical|unchanged)\s+(?:locked\s+)?(?:camera\s+|macro\s+)?setup\b', return_body))
+        same_position = bool(re.search(r'\b(?:same|identical|unchanged)\s+(?:opening\s+)?(?:camera\s+)?(?:position|viewpoint)\b', return_body))
+        explicit_unchanged = ('opening camera position' in return_body
+                              and re.search(r'\b(?:unchanged|identical|same)\b', return_body))
+        same_trio = ((same_position or explicit_unchanged)
+                     and re.search(r'\b(?:focal length|lens|focal setting)\b', return_body)
+                     and re.search(r'\b(?:framing|composition)\b', return_body))
+        contradictory_camera_re = re.compile(
+            r'\b(?:new|different|changed|another)\s+(?:(?:camera|overhead|tighter|wider)\s+)?'
+            r'(?:setup|position|viewpoint|framing|composition|focal length|lens|shot|view)\b'
+            r'|\b(?:tighter|wider|changed|different)\s+framing\b'
+            r'|\b(?:changes?|changing)\s+(?:the\s+)?(?:focal length|lens|framing|camera position)\b'
+            r'|\bcamera\s+(?:is\s+)?(?:repositioned|relocated)\b'
+            r'|\b(?:camera|returning\s+\w+\s+shot)(?:\s+\w+){0,6}\s+(?:new|different)\s+angle\b'
+            r'|\b(?:new|different)\s+overhead\b',
+        )
+        contradiction = None
+        for match in contradictory_camera_re.finditer(return_body):
+            prefix = return_body[max(0, match.start() - 30):match.start()]
+            if (re.search(r'\b(?:no|without|not|never)\b[^.;]*$', prefix)
+                    and not re.search(r'\b(?:but|however|instead)\b', prefix)):
+                continue
+            contradiction = match
+            break
+        if not (same_setup or same_trio) or contradiction:
+            errors.append(OMNI_VIDEO_ERROR_PREFIX + 'VIDEO returning shot must explicitly use the same camera setup '
+                          '(position, framing and focal length) as the opening working shot; a new overhead angle '
+                          'or different lens/framing is not a return to the anchor')
+    return errors
+
+
+def omni_video_violations(video_prompt, ladder=None, duration=None, skip_shot_list=False,
+                          allow_single_take=False):
     """VIDEO 正文对 omni 镜头语法的违规项。空列表 = 合规。
 
-    ladder 缺省按长片长四镜施工梯判（模块级调用方的口径）。duration 给了才查
-    时间线——回炉通路拿不到拍型时不该凭空要求一张切点表。
-    节奏声明不在这里查：它由 OmniComposer.ensure_pacing 确定性注入，查了也只会是死代码。
-
-    skip_shot_list（2026-08-06）：调用方已经用 is_expanded_transition_stage_beat 判定
-    这一拍是展开后的原子级过门/空间重置子拍、传了 ladder=None 时才该置 True——这类拍
-    根本不该套任何镜头梯。不加这个开关的话，下面 `ladder or _DEFAULT_CONSTRUCTION_LADDER`
-    这行会在 ladder=None 时悄悄换成四镜施工梯，一样保证首稿必炸，只是换了个错误的
-    期望镜头梯而已。"""
-    if skip_shot_list:
+    duration 用于选择默认施工梯。skip_shot_list 是旧调用方兼容参数；只有显式用户
+    单镜授权 allow_single_take 才豁免多镜语法，原子过门阶段必须传它自己的 ladder。
+    """
+    if allow_single_take:
         missing = extras = []
-        ladder = ladder or _DEFAULT_CONSTRUCTION_LADDER
+        ladder = _SINGLE_TAKE_LADDER
     else:
-        ladder = ladder or _DEFAULT_CONSTRUCTION_LADDER
+        ladder = ladder or (ladder_for(duration) if duration is not None else _DEFAULT_CONSTRUCTION_LADDER)
         body = _body_without_timeline(video_prompt)
         expected = ' / '.join(rung.label.split()[0] for rung in ladder)
         missing = _missing_shot_rungs(body, ladder)
         extras = _extra_shot_rungs(body, ladder)
     errors = []
+    ceiling = video_word_targets(max(3, len(ladder)))[1]
+    word_count = len((video_prompt or '').split())
+    if word_count > ceiling:
+        errors.append(OMNI_VIDEO_ERROR_PREFIX + f'VIDEO prompt word count ({word_count}) exceeds limit of {ceiling} words')
 
     if missing:
         errors.append(
@@ -734,12 +864,14 @@ def omni_video_violations(video_prompt, ladder=None, duration=None, skip_shot_li
             + "不是另起一镜"
         )
 
+    if not allow_single_take:
+        errors.extend(_shot_structure_errors(video_prompt, ladder))
     hits = _one_take_hits(video_prompt)
-    if hits:
+    if hits and not allow_single_take:
         errors.append(
             OMNI_VIDEO_ERROR_PREFIX
             + "VIDEO uses banned one-take wording (" + ', '.join(hits)
-            + ") — omni 的多镜头契约没有例外，包括过门拍与最终兑现拍"
+            + ") — 默认多镜头契约适用于过门与兑现；只有用户明确指定单镜才能覆盖"
         )
 
     stray = _stray_digits(video_prompt)
@@ -756,7 +888,7 @@ def omni_video_violations(video_prompt, ladder=None, duration=None, skip_shot_li
 
 
 class OmniComposer(BaseComposer):
-    """Gemini Omni 的 Phase 2：VIDEO 走弹性镜头梯 + 时间线切点，其余一切沿用 base。"""
+    """Gemini Omni 的 Phase 2：VIDEO 走分拍型自然分镜，其余一切沿用 base。"""
 
     profile = 'omni'
 
@@ -808,10 +940,10 @@ class OmniComposer(BaseComposer):
     # ── 时长与镜头梯 ────────────────────────────────────────────────────────
 
     def clip_duration(self):
-        """本单单段视频的时长（秒）。时间线把切点钉在秒上，所以这个数必须与生成端
-        送给 Flow 面板的那个一致——两边都走 server_common.resolve_video_duration，
+        """本单单段视频的时长（秒），决定施工三/四镜和相应预算，必须与生成端一致。
+        两边都走 server_common.resolve_video_duration，
         并且带上同一个 self._duration_hint（begin_run 里按 beat_ladder 拍重算好的），
-        保证合成阶段的切点表和生成阶段实际请求的时长不会走成两个数。"""
+        保证合成阶段的片长和生成阶段实际请求不会走成两个数。"""
         return server_common.resolve_video_duration(self.config, fallback_hint=self._duration_hint)
 
     def ladder_for_kind(self, duration, kind='construction', observed_shots=None,
@@ -840,6 +972,8 @@ class OmniComposer(BaseComposer):
 
     def ladder_for_beat(self, beat=None, is_threshold_or_reveal=None, is_crossing=None):
         """这一拍的镜头梯。拍型不明时返回 None（见 ladder_kind）。"""
+        if self.allows_single_take(beat):
+            return _SINGLE_TAKE_LADDER
         if is_crossing is None:
             is_crossing = bool(beat) and bool(pp.beat_is_crossing_clip(beat))
         kind = ladder_kind(beat, is_threshold_or_reveal, is_crossing)
@@ -849,6 +983,23 @@ class OmniComposer(BaseComposer):
                                     observed_shots=pp.observed_shot_count_of(beat),
                                     observed_scale=pp.observed_shot_scale_of(beat),
                                     observed_scales=pp.observed_shot_scale_sequence_of(beat))
+
+    def allows_single_take(self, beat=None):
+        """只接受明确用户输入标识；生成器自己写的 beat.video_shot_mode 不构成授权。"""
+        if self.profile != 'omni':
+            return False
+        if isinstance(beat, dict) and beat.get('user_single_take') is True:
+            return True
+        state = self.state or {}
+        brief = state.get('parsed_brief') or {}
+        if 'video_shot_mode' in brief:
+            return brief.get('video_shot_mode') == 'single_take'
+        return pp.omni_user_shot_mode(theme=state.get('theme', '')) == 'single_take'
+
+    def video_contract_errors(self, video_prompt, beat=None, ladder=None, duration=None):
+        return omni_video_violations(
+            video_prompt, ladder=ladder, duration=duration,
+            allow_single_take=self.allows_single_take(beat))
 
     # ── 风格分支 ────────────────────────────────────────────────────────────
 
@@ -865,8 +1016,8 @@ class OmniComposer(BaseComposer):
             return (
                 "- CAPTURE STYLE: the brief explicitly asked for a cinematic/commercial finish, so "
                 "the optional cinematic vocabulary is allowed (film-stock look, shallow depth of "
-                "field, deliberate push-ins, rack focus). Keep the cut shot structure and the "
-                "one-take ban regardless — a polished look is still cut coverage, never a oner."
+                "field, deliberate push-ins, rack focus). Preserve the applicable shot structure; "
+                "use a single take only when the user explicitly requests that override."
             )
         return (
             "- CAPTURE STYLE (default, no cinematic finish was requested): every shot reads as "
@@ -877,7 +1028,8 @@ class OmniComposer(BaseComposer):
             "small off-centre composition, and brief autofocus breathing that resolves. Two to four "
             "such capture artifacts per prompt. Do NOT write polished studio/cinematic lighting, "
             "colour grading, or empty quality words. Landmarks stay locked even though the framing "
-            "is loose: no primary landmark may leave the frame in the opening, staging, or closing shots."
+            "is loose: stationary working shots retain their primary landmarks; travelling transition "
+            "shots instead preserve the registered spatial path and their own first/last anchor views."
         )
 
     def ensure_pacing(self, video_prompt):
@@ -984,47 +1136,86 @@ class OmniComposer(BaseComposer):
         只覆盖 VIDEO：上面那份 base 契约里关于 IMAGE 的每一条（干净帧、无人称词、
         里程碑骨架、痕迹、包络覆盖……）继续照旧生效，一个字都不重复。
 
-        ladder 缺省用本单时长下的施工梯——批量直出的这一段是**每拍共享**的，而同一批
-        里可能混着过门拍与兑现拍，它们各自的切点表由 _inject_timeline 逐拍确定性覆写，
-        这里只需要把三套梯的规则讲清楚。"""
+        批量段共享默认施工梯，同时声明过门/兑现/原子阶段的优先分流；单拍传入其实际梯。
+        """
         duration = self.clip_duration()
-        ladder = ladder or self.ladder_for_kind(duration, 'construction')
-        target, ceiling = video_word_targets(len(ladder))
-        references = self.required_references_block(include_threshold=include_threshold)
+        generic_batch = ladder is None
+        ladder = ladder or (_SINGLE_TAKE_LADDER if self.allows_single_take()
+                            else self.ladder_for_kind(duration, 'construction'))
+        target, ceiling = video_word_targets(max(3, len(ladder)))
+        references = self.required_references_block(
+            include_threshold=include_threshold or ladder in (
+                _TRANSITION_HARDWARE_LADDER, _TRANSITION_STAGE_LADDER))
         references_section = (
             f"\n==================== OMNI REQUIRED REFERENCES ====================\n{references}"
             if references else '')
+        if ladder == _SINGLE_TAKE_LADDER:
+            return f"""
+
+==================== OMNI VIDEO OVERRIDE — EXPLICIT USER SINGLE TAKE ====================
+用户明确指定单镜，单段片长 {duration} 秒。此覆盖优先于本提示与参考文件里的默认多镜头规则。
+只写一个连续实拍镜头，从起始 IMAGE 的实际状态执行用户指定动作到结果 IMAGE；不添加特写插入、
+不添加剪辑、不写 edited construction time-lapse、不检查默认 cut / return-camera 梯。
+动作第一次发生完整可见，所有物件有既有来源，首尾锚点绑定、自然身体力学、材质与照明连续性继续生效。
+保留用户指定的固定机位、焦段与构图；计数写英文单词，使用自然叙事而非机械时间线。
+整条 VIDEO 硬顶 {ceiling} 词。审计写“用户单镜覆盖；默认多镜项不适用”，不得伪称这些项通过。
+{self.capture_style_rule()}
+{references_section}"""
+        keys = {rung.key for rung in ladder}
+        same_camera_rule = (
+            '第一镜与最后一镜是同一个机位、同一个构图、同一个焦段；最后一镜明确写明 '
+            'the same camera setup as the opening working shot。插入不改变完成度。'
+            if 'main' in keys and 'return' in keys else
+            '首镜与末镜分别绑定本拍自己的起始和结果 IMAGE，按该拍型的空间路径连接；'
+            '不要求不同位置的首尾使用同一机位，插入不推进空间位置或完成度。')
+        if generic_batch:
+            shot_scope = ('下面的默认梯仅普通施工适用。混合批次先按每拍的 operation / '
+                          'transition_stage 选择拍型：完整过门、兑现及展开子阶段各用自己的三镜，'
+                          '用户明确单镜覆盖优先；不能把下面施工梯套到整批。')
+            shot_count_rule = f'仅普通施工按下面 {len(ladder)} 镜默认梯的顺序写满'
+            same_camera_rule = (
+                '仅普通施工与入口硬件三镜要求首末同机位、构图、焦段并明确声明；'
+                '其他过门、空间移动和兑现拍分别绑定自己的起始及结果 IMAGE，'
+                '不要求不同位置的首尾回到同一机位。插入不推进完成度或空间位置。')
+            length_rule = (
+                f'普通施工参考梯目标 {target} 词上下；每拍按实际镜头数审计全文：'
+                '三镜特殊拍及用户单镜硬顶四百词，四镜施工硬顶四百五十五词。')
+        else:
+            shot_scope = '本拍按下面已选定的实际梯逐镜写可拍的动作与细节。'
+            shot_count_rule = f'本拍 {len(ladder)} 个镜头，按这个顺序写满'
+            length_rule = f'整条 VIDEO 目标 {target} 词上下，硬顶 {ceiling} 词。'
         return f"""
 
 ==================== OMNI VIDEO OVERRIDE (读到这里为止的 VIDEO 规则以本段为准) ====================
 本次输出的目标模型是 Gemini Omni，单段片长 {duration} 秒。上面所有关于 IMAGE 的规则**继续完全
 生效，不做任何修改**；唯独 VIDEO 的镜头语法整体改写为下面这套，与上文冲突处一律以本段为准。
 
-MANDATORY SHOT STRUCTURE — 每一条普通施工 VIDEO 都是**一条贯穿全段的主工作镜，中间被
-{'两个' if len(ladder) == 4 else '一个'}特写插入切开，最后切回同一机位收尾**。不是景别轮换：不要写
+MANDATORY SHOT STRUCTURE — {shot_scope} 普通施工是主工作镜、
+{'两个' if len(ladder) == 4 else '一个'}特写插入、切回同机位；过门、兑现和展开子阶段优先用各自梯。不要写
 establishing long shot / full shot / medium shot / wide outro shot 这一类旧梯的景别名，
-一个都不要。{duration} 秒对应 {len(ladder)} 个镜头，按这个顺序写满，镜头之间用 clean cut / match cut
+一个都不要。{shot_count_rule}，每个镜头边界实际用 clean cut / match cut
 衔接（禁止 cross-dissolve、fade、magical transition、instant transformation、teleport、
 跳过物理过程的快剪）：
 {ladder_roles(ladder, insert_subject)}
 
-SAME CAMERA SETUP（本次改造的核心）——第一镜与最后一镜是**同一个机位、同一个构图、同一个焦段**，
-只有施工完成度不同。正文在最后一镜里要写明它切回的是 the same camera setup as the opening wide
-working shot。插入镜是从这个机位切进去的细部，切回来时完成度必须与切走那一刻一致。
+ANCHOR CAMERA POLICY——{same_camera_rule}
 
 CINEMATIC NARRATIVE FLOW (纯自然语言多镜头因果流)——严禁使用任何机械时间戳或数字切点表。正文必须使用流畅的电影分镜叙事连词（例如 "The sequence opens with...", "Cutting in closer to a close-up insert...", "An extreme close-up insert reveals...", "Cutting back to a returning wide shot from the same camera setup..."）来自然串联各个镜头。正文所有计数和尺寸一律写成英文单词（three roof beams，不是 3 roof beams；ten seconds，不是 10s）。
 
 拍型分流：过门桥拍走 逼近远景 / 门槛 / 落定室内远景 三镜，最终兑现拍走 细部 / 拉开 / 终局远景
-三镜，两者都免除下面的节奏声明（它们是穿越与揭示，不压缩劳动），但**同样不许写成一镜到底**。
+三镜，优先于十秒施工四镜。展开入口硬件子阶段走固定三镜（主镜 / 特写 / 同机位返回），
+只开合原有入口或移走已有杂物，不安装新物件。展开的空间移动/转向/揭示子阶段走
+transition working shot / detail insert / landing shot 三镜，只完成自己的 transition_stage；
+insert不推进空间位置，首末分别绑定各自anchor，禁止每个子拍重演完整穿越。以上特殊拍型都免除施工节奏声明。
 
-ONE-TAKE BAN（无例外，过门拍与最终兑现拍也一样）：禁止写 oner、one-shot、one-take、
+DEFAULT ONE-TAKE BAN（过门拍与兑现拍同样适用；用户明确单镜覆盖优先）：禁止写 oner、one-shot、one-take、
 single continuous take、one continuous take、single take、unbroken take 或任何等义措辞。
 推镜、揭示、穿门这些动作是**镜头内部的运动**，不是"一条不间断的长镜头"。
 {self.capture_style_rule()}
 - PACING DECLARATION：普通施工拍在正文里声明一次时间基准，用这句原话——
-  "{OMNI_PACING_PHRASE}"（过门拍与最终兑现拍免除这句）。不要用 continuous 描述整条片段的拍法。
-- IN-SHOT CONTINUITY：上文那条 EVEN RATE 指令（"每一刻都在推进 / 不许把改动推迟后一次兑现"）
-  在多镜头包里**作废**，改用这句原话——
+  "{OMNI_PACING_PHRASE}"（所有过门阶段与最终兑现拍免除这句）。不要用 continuous 描述默认多镜片段的拍法。
+- IN-SHOT CONTINUITY（以下句子只用于普通施工；特殊过门与兑现不硬套施工推进量）：上文那条
+  EVEN RATE 指令（"每一刻都在推进 / 不许把改动推迟后一次兑现"）在默认多镜头包里作废，普通施工改用——
   "{OMNI_INSHOT_PHRASE}"
   理由：推进量全部集中在主镜，特写插入按契约不产生新的推进量，而切回镜恰恰是在剪辑点上
   做 same-way 压缩。要求"每一刻都在推进"等于要求模型违反自己的镜头级进度锁。
@@ -1034,14 +1225,16 @@ single continuous take、one continuous take、single take、unbroken take 或�
 - PHRASING VARIATION：镜头梯是固定骨架，因此逐拍复读是本技能的头号失败模式。锚定开场句、
   镜头名、工人造型短语、节奏声明这几项**必须逐字保留**；除此之外，相邻两拍的句式模板、镜头内的从句顺序、
   动词选择、转场措辞、形容词搭配都必须换过。
-- 长度：整条 VIDEO 目标 {target} 词上下，硬顶 {ceiling} 词。主镜与切回镜各 60–90 词
+- 长度：{length_rule} 普通施工主镜与切回镜各 60–90 词
   （它们承载起始状态、推进过程与结果状态），每个特写插入 30–50 词。
 {references_section}"""
 
     # ── 覆写钩子 ────────────────────────────────────────────────────────────
 
     def batch_system_prompt(self, config, packet, scup_ref, tbcp_ref):
-        include_threshold = bool(tbcp_ref)
+        include_threshold = bool(tbcp_ref) or any(
+            ladder_kind(beat) in ('transition_hardware', 'transition_stage')
+            for beat in (self.state or {}).get('beat_ladder', []) if isinstance(beat, dict))
         return (super().batch_system_prompt(config, packet, scup_ref, tbcp_ref)
                 + self.video_override_block(include_threshold=include_threshold))
 
@@ -1092,14 +1285,13 @@ single continuous take、one continuous take、single take、unbroken take 或�
             i, video_prompt, image_prompt, packet, mode, is_last, is_threshold_or_reveal,
             prev_video, prev_image, beat=beat, family=family, is_pre_bridge=is_pre_bridge,
             is_post_reveal_cleanup=is_post_reveal_cleanup,
-            video_word_limit=video_word_targets(len(_ceiling_ladder))[1])
+            video_word_limit=video_word_targets(max(3, len(_ceiling_ladder)))[1])
         errs = [e for e in (errs or [])
                 if not any(snippet in e for snippet in _BASE_ONLY_ERROR_SNIPPETS)]
         return (errs
-                + omni_video_violations(
-                    video_prompt, ladder=ladder,
-                    duration=self.clip_duration() if ladder else None,
-                    skip_shot_list=is_expanded_transition_stage_beat(beat))
+                + self.video_contract_errors(
+                    video_prompt, beat=beat, ladder=ladder,
+                    duration=self.clip_duration() if ladder else None)
                 + omni_image_violations(image_prompt))
 
     def split_structural_video_errors(self, errs):
@@ -1124,10 +1316,9 @@ single continuous take、one continuous take、single take、unbroken take 或�
             # base 的重写稿同样要过 omni 的镜头语法（它是照一镜到底的契约写的）。
             video_prompt = self.normalize_omni_video(video_prompt, beat=beat)
 
-        residual = omni_video_violations(
-            video_prompt, ladder=ladder,
-            duration=self.clip_duration() if ladder else None,
-            skip_shot_list=is_expanded_transition_stage_beat(beat))
+        residual = self.video_contract_errors(
+            video_prompt, beat=beat, ladder=ladder,
+            duration=self.clip_duration() if ladder else None)
         if omni_errs or [e for e in residual if e.startswith(OMNI_VIDEO_ERROR_PREFIX)]:
             video_prompt, omni_reworked = self.rework_omni_multishot(
                 config, i, video_prompt, packet, beat=beat)
@@ -1135,17 +1326,15 @@ single continuous take、one continuous take、single take、unbroken take 或�
         return video_prompt, reworked
 
     def normalize_reworked_video(self, video_prompt, beat=None):
-        """里程碑成对回炉是照一镜到底骨架写的：先洗掉 one-take 措辞、补回切点表与节奏
-        声明，再交回上游复验——否则每修一次里程碑就把镜头梯拆一次。"""
+        """里程碑回炉后按实际用户模式归一并交回上游复验，默认多镜与用户单镜不互相改写。"""
         return self.normalize_omni_video(video_prompt, beat=beat)
 
     def video_profile_violations(self, video_prompt, beat=None):
         """omni 的镜头语法硬伤（记号类瑕疵不算）。"""
         ladder = self.ladder_for_beat(beat) if beat else None
-        residual = omni_video_violations(
-            video_prompt, ladder=ladder,
-            duration=self.clip_duration() if ladder else None,
-            skip_shot_list=is_expanded_transition_stage_beat(beat))
+        residual = self.video_contract_errors(
+            video_prompt, beat=beat, ladder=ladder,
+            duration=self.clip_duration() if ladder else None)
         return [e for e in residual if e.startswith(OMNI_VIDEO_ERROR_PREFIX)]
 
     def finalize_fallback_video(self, video_prompt, contract):
@@ -1158,6 +1347,8 @@ single continuous take、one continuous take、single take、unbroken take 或�
             video_prompt, is_threshold_or_reveal=is_threshold_or_reveal,
             beat=beat, is_crossing=is_crossing)
         ladder = self.ladder_for_beat(beat, is_threshold_or_reveal, is_crossing=is_crossing)
+        if self.allows_single_take(beat):
+            return text
         if ladder and _missing_shot_rungs(_body_without_timeline(text), ladder):
             if not text.endswith(('.', '!', '?')):
                 text += '.'
@@ -1168,16 +1359,25 @@ single continuous take、one continuous take、single take、unbroken take 或�
 
     def fix_omni_video(self, i, video_prompt, packet, is_threshold_or_reveal,
                        beat=None, config=None, family=None):
-        """omni 版的 VIDEO 确定性修复链。与 base 的差异有四处：字数预算按镜头数缩放
-        并在注入后复裁一次、节奏声明换成多镜头版、时间线切点确定性注入、不走 base 的
+        """omni 版的 VIDEO 确定性修复链。字数预算按镜头数缩放并在注入后复裁，
+        节奏声明换成多镜头版、删除机械时间线，不走 base 的
         out-and-in 兜底（那句会塞进按 8 秒写死的时间戳与 Grid 记号，见模块 docstring）。"""
         ladder = self.ladder_for_beat(beat, is_threshold_or_reveal)
-        shot_count = len(ladder or _DEFAULT_CONSTRUCTION_LADDER)
+        shot_count = max(3, len(ladder or _DEFAULT_CONSTRUCTION_LADDER))
         _target, ceiling = video_word_targets(shot_count)
         text = pp.clean_prompt_text(video_prompt)
-        # 预压缩显式给下面的结构句注入让出余量，注入完再按硬顶复裁（见 video_draft_budget）。
-        text = pp.compress_prompt_to_budget(text, video_draft_budget(shot_count), config,
-                                            is_video=True)
+        # 已在交付硬顶内的正文不为套话预算先裁一次；旧预裁会删掉真实insert/cut。
+        # 超顶稿可以预压缩，但新损坏的镜头/机位结构不能成为后续复验的错误基线。
+        if len(text.split()) > ceiling:
+            before_draft_errors = set(self.video_contract_errors(
+                text, beat=beat, ladder=ladder, duration=self.clip_duration()))
+            draft = pp.compress_prompt_to_budget(text, video_draft_budget(shot_count), config,
+                                                 is_video=True)
+            after_draft_errors = self.video_contract_errors(
+                draft, beat=beat, ladder=ladder, duration=self.clip_duration())
+            if not [error for error in after_draft_errors
+                    if error not in before_draft_errors and 'word count' not in error]:
+                text = draft
         text = pp.fix_video_opening(i, text, profile='omni')
         text = pp.fix_sound_design(text, family=family or 'exterior')
         text = pp.fix_natural_body_mechanics(text)
@@ -1185,18 +1385,36 @@ single continuous take、one continuous take、single take、unbroken take 或�
                                             is_threshold_or_reveal=is_threshold_or_reveal)
         text = self.normalize_omni_video(
             text, is_threshold_or_reveal=is_threshold_or_reveal, beat=beat)
-        return pp.compress_prompt_to_budget(text, ceiling, config, is_video=True)
+        candidate = pp.compress_prompt_to_budget(text, ceiling, config, is_video=True)
+        # 压缩会删整句，可能恰好删掉cut、insert或same-camera。不得把损坏的短稿冒充合规。
+        before_errors = set(self.video_contract_errors(text, beat=beat, ladder=ladder,
+                                                      duration=self.clip_duration()))
+        after_errors = self.video_contract_errors(candidate, beat=beat, ladder=ladder,
+                                                 duration=self.clip_duration())
+        introduced = [error for error in after_errors
+                      if error not in before_errors and 'word count' not in error]
+        return text if introduced else candidate
 
     def normalize_omni_video(self, video_prompt, is_threshold_or_reveal=None, beat=None,
                              is_crossing=None):
-        """确定性归一：清一镜到底措辞、清 base 的 even-rate 句、折数字；拍型已知时再注入
-        时间线，普通施工拍额外补齐节奏声明与镜内连续性声明。
+        """确定性归一：默认清一镜到底措辞、清 base 的 even-rate 句、折数字与旧时间线；
+        普通施工拍补齐节奏声明，用户明确单镜则保留连续实拍叙述。
 
         拍型未知（回炉通路只拿到一段文本）时只做前三步：过门拍/兑现拍本来就免除节奏声明，
-        切点表也完全不同，猜错等于给它硬塞一份违约文案。"""
-        text = strip_one_take_language(video_prompt)
+        不猜未知拍型的结构。"""
+        user_single = self.allows_single_take(beat)
+        text = (video_prompt or '') if user_single else strip_one_take_language(video_prompt)
         text = _strip_base_even_rate(text)
         text = _digits_to_words(text)
+        text = text.replace('exactly on the listed cut marks', 'only at the described cuts')
+        if user_single:
+            text = text.replace('through the multi-shot sequence', 'through the same continuous take')
+            text = text.replace('subsequent shots continue the operation', 'the same shot continues the operation')
+            kept = [sentence for sentence in re.split(r'(?<=[.!?])\s+', text)
+                    if not any(marker in sentence.lower() for marker in (
+                        self.pacing_marker, 'inside every shot the frame keeps',
+                        'the only compressions in the clip fall'))]
+            return ' '.join(kept).strip()
 
         if is_crossing is None:
             is_crossing = bool(beat) and bool(pp.beat_is_crossing_clip(beat))
@@ -1223,6 +1441,35 @@ single continuous take、one continuous take、single take、unbroken take 或�
         （施工主体、镜头名、读哪份镜头语法契约），回炉的调用/复验流程不必复制第二份。"""
         multishot_ref = self.reference(self.multishot_reference)
         scales = ', '.join(rung.phrase for rung in ladder)
+        if ladder == _SINGLE_TAKE_LADDER:
+            return f"""You are rewriting ONE video prompt for an explicitly requested single continuous take.
+The user's single-take request overrides the default Gemini Omni multi-shot grammar.
+Keep the first/last IMAGE anchors, the same physical work, objects, material sources, traces,
+body mechanics, sound and available light. Keep all actions inside one uninterrupted shot.
+Do not add cuts, close-up inserts, edited time-lapse, or a multi-shot pacing declaration.
+Use English words for counts and natural prose, without timestamp tables. Keep the whole
+delivered prompt, including anchor instructions and sound, at or below four hundred words.
+Output ONLY the rewritten VIDEO body."""
+        if ladder in (_TRANSITION_HARDWARE_LADDER, _TRANSITION_STAGE_LADDER,
+                       _TRAVERSAL_LADDER, _REWARD_LADDER):
+            same_camera = ('Return to the identical opening camera position, framing and focal length; '
+                           'say the same camera setup explicitly in the returning shot.'
+                           if ladder == _TRANSITION_HARDWARE_LADDER else
+                           'The first and last shots use their OWN respective anchor camera positions; '
+                           'do not require them to be the same setup.')
+            return f"""You are rewriting ONE video prompt so it obeys the Gemini Omni multi-shot contract.
+{multishot_ref}
+Keep the exact first/last IMAGE binding and every existing physical detail, object, source,
+light and sound. Use exactly three shots in this order: {scales}. Write an actual clean cut
+or match cut into EACH later shot, and describe visible action or detail in each shot.
+{ladder_roles(ladder)}
+{same_camera}
+For an expanded transition, execute only the current stage: never redo the whole crossing,
+skip ahead to a later stage, add construction, or advance camera position during the insert.
+For a reward clip, retain the already finished state and the specified use action.
+Do not add construction repetition, material progress quotas or construction time-lapse.
+Write counts in English words and natural narrative prose, without numeric cut marks.
+Keep the entire delivered VIDEO at or below four hundred words. Output ONLY the VIDEO body."""
         return f"""You are rewriting ONE video prompt so it obeys the Gemini Omni multi-shot contract.
 
 {multishot_ref}
@@ -1239,6 +1486,7 @@ Rewrite rules (additive — do not lose content):
 - Preserve the visible stage-milestone skeleton VERBATIM in meaning: the declared visible start state, the declared resulting state, both declared progress lines (primary and secondary material/stock), the first effective tool contact at the opening moment, the material source/container and the movement path, and repeated work cycles. Use the words "repeated"/"repeatedly"/"cycle by cycle"/"course by course" literally — "repetitions" alone does not read as repeated cycles.
 - All numbers and counts must be written in English words. Never include arabic digits.
 - NEVER write oner, one-shot, one-take, single continuous take, one continuous take, single take, or unbroken take — there is no exemption.
+- Keep the entire delivered VIDEO at or below {video_word_targets(len(ladder))[1]} words, including the anchors, sound and continuity sentences.
 - Output ONLY the rewritten video prompt body. No headings, no labels, no commentary."""
 
     def rework_omni_multishot(self, config, i, video_prompt, packet, beat=None):
@@ -1268,9 +1516,8 @@ Rewrite rules (additive — do not lose content):
         candidate = pp.fix_video_opening(i, candidate, profile='omni')
         candidate = pp.fix_natural_body_mechanics(candidate)
         candidate = self.normalize_omni_video(candidate, beat=beat)
-        residual = omni_video_violations(
-            candidate, ladder=ladder, duration=duration if beat else None,
-            skip_shot_list=is_expanded_transition_stage_beat(beat))
+        residual = self.video_contract_errors(
+            candidate, beat=beat, ladder=ladder, duration=duration if beat else None)
         if [e for e in residual if e.startswith(OMNI_VIDEO_ERROR_PREFIX)]:
             if sys.stdout:
                 print(f"[OMNI] Beat {i} 多镜头回炉稿复验未通过，保留原稿（仅留痕）")
@@ -1328,8 +1575,17 @@ def fallback_ladder_clause(ladder):
     """占位兜底稿补的镜头梯声明：一句话里按顺序带齐每一级镜头名与 UGC 拍摄质感，
     让占位稿至少不违反 omni 的镜头语法（占位稿本身仍计入 fallback_count 门禁）。"""
     fragments = []
+    if ladder == _SINGLE_TAKE_LADDER:
+        return ('One single continuous take matches the first frame, shows the specified physical '
+                'action without cuts, and ends at the last-frame state in the same camera setup.')
     for rung in ladder:
-        fragment = _FALLBACK_SHOT_FRAGMENT[rung.key]
+        fragment = _FALLBACK_SHOT_FRAGMENT.get(rung.key)
+        if rung.key == 'transition_work':
+            fragment = 'a transition working shot matching the first frame and visibly continuing only the current spatial stage'
+        elif rung.key == 'transition_detail':
+            fragment = 'a detail insert showing the already visible orientation landmark without advancing the camera position'
+        elif rung.key == 'transition_land':
+            fragment = 'a landing shot resuming that same stage and settling at the last-frame position and orientation'
         if rung.key == 'main':
             fragment = (f'{rung.phrase} matching the person-free first frame, with the worker entering '
                         f'from the adjacent frame edge immediately afterwards into first effective tool contact '
@@ -1337,8 +1593,14 @@ def fallback_ladder_clause(ladder):
         elif rung.key == 'return':
             fragment = (f'{rung.phrase} from the same camera setup, matching the last frame '
                         f'as the last working motion ends with the worker withdrawing fully out of frame')
+        if ladder == _TRANSITION_HARDWARE_LADDER:
+            fragment = {
+                'main': 'a wide working shot matching the first frame as the existing entrance hardware or loose obstruction is opened or moved on camera',
+                'close': 'a close-up insert showing that same existing contact point at unchanged opening completion',
+                'return': 'a returning wide shot from the same camera setup, framing and focal length as the opening working shot, completing only the current entrance action and matching the last frame',
+            }[rung.key]
         fragments.append(fragment)
-    joined = ', '.join(fragments[:-1]) + f", and {fragments[-1]}"
+    joined = fragments[0] + ''.join(f'; a clean cut to {fragment}' for fragment in fragments[1:])
     count = _COUNT_WORDS.get(len(ladder), str(len(ladder)))
     return (f"The clip is cut as {count} shots in order — {joined} — joined by clean cuts and "
             f"recorded like casual smartphone footage in available light, with slight "

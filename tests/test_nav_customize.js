@@ -80,9 +80,8 @@ function createEnv(initialHidden = [], initialActive = 'main-tab-results') {
     const tabs = [
         'main-tab-results',
         'main-tab-projects',
-        'main-tab-gallery',
         'main-tab-ledger',
-        'main-tab-replica',
+        'main-tab-gallery',
     ];
 
     const buttonMap = {};
@@ -150,14 +149,14 @@ function createEnv(initialHidden = [], initialActive = 'main-tab-results') {
 {
     const env = createEnv([], 'main-tab-results');
     assert.equal(env.buttonMap['main-tab-results'].classList.contains('nav-hidden'), false);
-    assert.equal(env.buttonMap['main-tab-replica'].classList.contains('nav-hidden'), false);
+    assert.equal(env.buttonMap['main-tab-gallery'].classList.contains('nav-hidden'), false);
 }
 
 // 测试用例 2：持久化隐藏的标签在加载时自动标记 nav-hidden，若当前 active 处于隐藏标签，则自动平滑切至首个可见标签
 {
-    const env = createEnv(['main-tab-results', 'main-tab-replica'], 'main-tab-results');
+    const env = createEnv(['main-tab-results', 'main-tab-gallery'], 'main-tab-results');
     assert.equal(env.buttonMap['main-tab-results'].classList.contains('nav-hidden'), true);
-    assert.equal(env.buttonMap['main-tab-replica'].classList.contains('nav-hidden'), true);
+    assert.equal(env.buttonMap['main-tab-gallery'].classList.contains('nav-hidden'), true);
     assert.equal(env.buttonMap['main-tab-projects'].classList.contains('nav-hidden'), false);
     // 因为 main-tab-results 被隐藏了，applyNavPrefs 应该自动切到 projects
     assert.equal(env.getActiveTab(), 'projects');
@@ -166,22 +165,22 @@ function createEnv(initialHidden = [], initialActive = 'main-tab-results') {
     assert.equal(env.buttonMap['main-tab-results'].classList.contains('active'), false);
 }
 
-// 测试用例 3：外部调用 switchMainTab('replica') 后，被隐藏标签即便获得 active 属性，nav-hidden 仍旧保持，配合 CSS 彻底隐藏
+// 测试用例 3：外部调用 switchMainTab('gallery') 后，被隐藏标签即便获得 active 属性，nav-hidden 仍旧保持，配合 CSS 彻底隐藏
 {
-    const env = createEnv(['main-tab-replica'], 'main-tab-results');
-    assert.equal(env.buttonMap['main-tab-replica'].classList.contains('nav-hidden'), true);
-    env.sandbox.switchMainTab('replica');
-    assert.equal(env.buttonMap['main-tab-replica'].classList.contains('active'), true);
+    const env = createEnv(['main-tab-gallery'], 'main-tab-results');
+    assert.equal(env.buttonMap['main-tab-gallery'].classList.contains('nav-hidden'), true);
+    env.sandbox.switchMainTab('gallery');
+    assert.equal(env.buttonMap['main-tab-gallery'].classList.contains('active'), true);
     // nav-hidden 必须依然存在
-    assert.equal(env.buttonMap['main-tab-replica'].classList.contains('nav-hidden'), true);
+    assert.equal(env.buttonMap['main-tab-gallery'].classList.contains('nav-hidden'), true);
 }
 
 // 测试用例 4：重置偏好后恢复所有标签显示
 {
-    const env = createEnv(['main-tab-replica', 'main-tab-ledger'], 'main-tab-results');
-    assert.equal(env.buttonMap['main-tab-replica'].classList.contains('nav-hidden'), true);
+    const env = createEnv(['main-tab-gallery', 'main-tab-ledger'], 'main-tab-results');
+    assert.equal(env.buttonMap['main-tab-gallery'].classList.contains('nav-hidden'), true);
     env.sandbox.resetNavPrefs();
-    assert.equal(env.buttonMap['main-tab-replica'].classList.contains('nav-hidden'), false);
+    assert.equal(env.buttonMap['main-tab-gallery'].classList.contains('nav-hidden'), false);
     assert.equal(env.buttonMap['main-tab-ledger'].classList.contains('nav-hidden'), false);
 }
 

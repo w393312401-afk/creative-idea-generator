@@ -17,7 +17,8 @@ assert(htmlContent.includes('class="ratio-hint"'), 'HTML should contain class="r
 assert(htmlContent.includes('class="upload-text-desktop"'), 'HTML should contain class="upload-text-desktop"');
 assert(htmlContent.includes('class="upload-text-mobile"'), 'HTML should contain class="upload-text-mobile"');
 assert(!htmlContent.includes('style="display: block; font-size: 11px; font-weight: normal; opacity: 0.8; margin-top: 2px;"'), 'Inline styles on shortcut hint should be removed');
-assert(htmlContent.includes('id="t2i-model"') && htmlContent.includes('<option value="gpt-image-2">'), 't2i-model should include gpt-image-2 option');
+assert(htmlContent.includes('id="t2i-model"') && htmlContent.includes('<option value="gpt-image-2.5-sunburst">'), 't2i-model should include the current strongest GPT Image option');
+assert(!htmlContent.includes('<option value="gpt-image-2">'), 'retired GPT Image 2 must not be offered');
 console.log('✔ HTML markup checks passed');
 
 console.log('--- Checking CSS rules ---');
@@ -25,7 +26,10 @@ assert(cssContent.includes('@media (hover: none), (pointer: coarse)'), 'CSS shou
 assert(cssContent.includes('@media (max-width: 1024px)'), 'CSS should have max-width: 1024px');
 assert(cssContent.includes('@media (max-width: 768px)'), 'CSS should have max-width: 768px');
 assert(cssContent.includes('@media (max-width: 480px)'), 'CSS should have max-width: 480px');
-assert(cssContent.includes('font-size: 16px;'), 'CSS should enforce 16px font size on inputs in mobile');
+// 字号已走 token：--fs-lg 必须仍是 16px（移动端输入框 <16px 会触发 iOS 聚焦自动放大）
+const tokensContent = fs.readFileSync(path.join(rootDir, 'css/tokens.css'), 'utf8');
+assert(/--fs-lg:\s*16px;/.test(tokensContent), 'tokens.css must define --fs-lg as 16px');
+assert(cssContent.includes('font-size: 16px;') || cssContent.includes('font-size: var(--fs-lg)'), 'CSS should enforce 16px font size on inputs in mobile');
 assert(cssContent.includes('position: sticky;'), 'CSS should enable position: sticky for mobile footer');
 assert(cssContent.includes('safe-area-inset-bottom'), 'CSS should support safe-area-inset-bottom');
 assert(cssContent.includes('data-mobile-view="result"'), 'CSS should control data-mobile-view display');

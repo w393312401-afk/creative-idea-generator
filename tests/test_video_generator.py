@@ -3,6 +3,7 @@ import os
 import shutil
 import tempfile
 import unittest
+from types import SimpleNamespace
 
 from unittest.mock import patch
 
@@ -26,6 +27,21 @@ from video_generator import (
 )
 
 from datetime import datetime, timedelta
+
+
+def _merge_probe_fixture(cmd, captured, output_duration):
+    """Silent 8 s / 30 fps clips, with an independently specified export duration."""
+    if '-select_streams' in cmd and cmd[cmd.index('-select_streams') + 1].startswith('a'):
+        stdout = json.dumps({'streams': []}) if 'json' in cmd else ''
+    else:
+        duration = output_duration if cmd[-1] == captured.get('output_path') else 8.0
+        stdout = json.dumps({
+            'streams': [{'codec_type': 'video', 'width': 1080, 'height': 1920,
+                         'r_frame_rate': '30/1', 'avg_frame_rate': '30/1',
+                         'duration': str(duration)}],
+            'format': {'duration': str(duration)},
+        })
+    return SimpleNamespace(returncode=0, stderr='', stdout=stdout)
 
 
 class TestPromptRewrite(unittest.TestCase):
@@ -511,20 +527,21 @@ class TestMergeSkipMissing(unittest.TestCase):
             os.path.join(self.rel_project_dir, 'videos', 'vid_001.mp4'))
         with open(self.good_video, 'wb') as f:
             f.write(b'fake')
+        # These cases exercise slot selection, not motion-based retiming.
+        retime = patch('video_generator.retime_clips_for_merge',
+                       side_effect=lambda files, tmp, metas=None: (list(files), []))
+        retime.start()
+        self.addCleanup(retime.stop)
 
     def tearDown(self):
         os.chdir(self.orig_cwd)
         shutil.rmtree(self.base, ignore_errors=True)
 
-    def _fake_run(self, captured):
+    def _fake_run(self, captured, output_duration=2.0):
         def fake_run(cmd, cwd=None, **kwargs):
             captured.setdefault('calls', []).append(cmd)
             if cmd[0] == 'ffprobe':
-                class Probe:
-                    returncode = 0
-                    stderr = ''
-                    stdout = '5.0'
-                return Probe()
+                return _merge_probe_fixture(cmd, captured, output_duration)
             # 主合并调用：复刻真实 ffmpeg 行为——相对路径参数按子进程 cwd 解析，
             # 目标目录不存在就报错，不会自动创建目录
             out_arg = cmd[-1]
@@ -537,6 +554,8 @@ class TestMergeSkipMissing(unittest.TestCase):
                 return Fail()
             with open(resolved, 'wb') as f:
                 f.write(b'fake-mp4')
+            captured['output_path'] = out_arg
+            captured['inputs'] = [cmd[i + 1] for i, value in enumerate(cmd) if value == '-i']
             class Ok:
                 returncode = 0
                 stderr = ''
@@ -558,12 +577,15 @@ class TestMergeSkipMissing(unittest.TestCase):
         ffmpeg_cmd = next(c for c in captured['calls'] if c[0] == 'ffmpeg')
         self.assertTrue(os.path.isabs(ffmpeg_cmd[-1]),
                         f"ffmpeg output arg must be absolute: {ffmpeg_cmd[-1]}")
+        self.assertEqual(captured['inputs'], [self.good_video])
+        self.assertEqual(result['duration_seconds'], 2.0)
         # 跳过模式不应再生成任何占位/字幕相关的临时文件
         self.assertFalse(any('_ph_' in c for call in captured['calls'] for c in call))
 
     def test_applies_selected_1_5x_speed(self):
         captured = {}
-        with patch('video_generator.subprocess.run', side_effect=self._fake_run(captured)):
+        with patch('video_generator.subprocess.run',
+                   side_effect=self._fake_run(captured, output_duration=16 / 3)):
             result = _merge_skip_missing(
                 self.rel_project_dir, {'title': 'Test Project'},
                 expected_slots=[1, 2], good={1: self.good_video},
@@ -571,18 +593,27 @@ class TestMergeSkipMissing(unittest.TestCase):
 
         ffmpeg_cmd = next(c for c in captured['calls'] if c[0] == 'ffmpeg')
         filter_value = ffmpeg_cmd[ffmpeg_cmd.index('-filter_complex') + 1]
-        self.assertIn('setpts=0.6666666667*PTS', filter_value)
+        self.assertIn('setpts=(PTS-STARTPTS)*0.6666666667', filter_value)
         self.assertTrue(ffmpeg_cmd[-1].endswith('_partial_1_5x.mp4'))
         self.assertEqual(result['speed'], 1.5)
+        self.assertEqual(result['duration_seconds'], 5.33)
 
     def test_merge_speed_validation_and_filters(self):
         self.assertEqual(_normalize_merge_speed('1'), 1.0)
         self.assertEqual(_normalize_merge_speed(1.5), 1.5)
         self.assertEqual(_normalize_merge_speed(2), 2.0)
+        self.assertEqual(_normalize_merge_speed('3'), 3.0)
+        self.assertEqual(_normalize_merge_speed('4'), 4.0)
+        self.assertEqual(_merge_filter(3.0, True),
+                         '[0:v]setpts=0.3333333333*PTS[v];[0:a]atempo=2,atempo=1.5[a]')
+        self.assertEqual(_merge_filter(4.0, True),
+                         '[0:v]setpts=0.25*PTS[v];[0:a]atempo=2,atempo=2[a]')
+        self.assertEqual(_merge_filter(4.0, False),
+                         '[0:v]setpts=0.25*PTS[v]')
         self.assertEqual(_merge_filter(1.0, True),
                          '[0:v]setpts=1*PTS[v];[0:a]atempo=1[a]')
         with self.assertRaises(ValueError):
-            _normalize_merge_speed(3)
+            _normalize_merge_speed(5)
 
     def test_no_good_slots_returns_none(self):
         result = _merge_skip_missing(
@@ -619,6 +650,7 @@ class TestMergeSkipMissing(unittest.TestCase):
             self.assertIsNotNone(result)
             self.assertTrue(result.get('partial'))
             self.assertEqual(result.get('skipped_slots'), [2])
+            self.assertEqual(captured['inputs'], [self.good_video])
 
 
 class TestMergeManualUploadTrust(unittest.TestCase):
@@ -634,6 +666,10 @@ class TestMergeManualUploadTrust(unittest.TestCase):
         self.frames_dir = os.path.join(self.tmp, 'frames')
         os.makedirs(self.videos_dir)
         os.makedirs(self.frames_dir)
+        retime = patch('video_generator.retime_clips_for_merge',
+                       side_effect=lambda files, tmp, metas=None: (list(files), []))
+        retime.start()
+        self.addCleanup(retime.stop)
 
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
@@ -654,22 +690,17 @@ class TestMergeManualUploadTrust(unittest.TestCase):
         with open(os.path.join(self.tmp, 'manifest.json'), 'w', encoding='utf-8') as f:
             json.dump(manifest, f)
 
-    def _fake_run_factory(self, captured):
+    def _fake_run_factory(self, captured, output_duration=2.0):
         def fake_run(cmd, cwd=None, **kwargs):
             captured.setdefault('calls', []).append(cmd)
             if cmd[0] == 'ffprobe':
-                class Probe:
-                    returncode = 0
-                    stderr = ''
-                    stdout = '5.0'
-                return Probe()
-            i_idx = cmd.index('-i')
-            with open(cmd[i_idx + 1], 'r', encoding='utf-8') as f:
-                captured['concat_list'] = f.read()
+                return _merge_probe_fixture(cmd, captured, output_duration)
+            captured['inputs'] = [cmd[i + 1] for i, value in enumerate(cmd) if value == '-i']
             out_path = cmd[-1]
             os.makedirs(os.path.dirname(out_path) or '.', exist_ok=True)
             with open(out_path, 'wb') as f:
                 f.write(b'fake-merged-mp4')
+            captured['output_path'] = out_path
 
             class Ok:
                 returncode = 0
@@ -692,8 +723,7 @@ class TestMergeManualUploadTrust(unittest.TestCase):
 
         self.assertIsNotNone(result)
         self.assertEqual(result['status'], 'success')
-        concat_lines = [l for l in captured['concat_list'].splitlines() if l.strip()]
-        self.assertEqual(len(concat_lines), 1)
+        self.assertEqual(captured['inputs'], [os.path.join(self.videos_dir, 'vid_001.mp4')])
 
     def test_explicit_generated_override_bypasses_merge_recheck(self):
         self._touch(os.path.join(self.videos_dir, 'vid_001.mp4'))
@@ -709,8 +739,7 @@ class TestMergeManualUploadTrust(unittest.TestCase):
 
         self.assertIsNotNone(result)
         self.assertEqual(result['status'], 'success')
-        concat_lines = [l for l in captured['concat_list'].splitlines() if l.strip()]
-        self.assertEqual(len(concat_lines), 1)
+        self.assertEqual(captured['inputs'], [os.path.join(self.videos_dir, 'vid_001.mp4')])
 
     def test_auto_generated_slot_still_blocked_on_anchor_mismatch(self):
         """非手动上传的槽位锚点不符时留警告日志，仍按合并容错策略并入成片。"""
@@ -725,8 +754,7 @@ class TestMergeManualUploadTrust(unittest.TestCase):
             result = merge_project_videos(self.tmp)
         self.assertIsNotNone(result)
         self.assertEqual(result['status'], 'success')
-        concat_lines = [l for l in captured['concat_list'].splitlines() if l.strip()]
-        self.assertEqual(len(concat_lines), 1)
+        self.assertEqual(captured['inputs'], [os.path.join(self.videos_dir, 'vid_001.mp4')])
 
     def test_manual_upload_hero_clip_bypasses_anchor_mismatch(self):
         self._touch(os.path.join(self.videos_dir, 'vid_001.mp4'))
@@ -739,18 +767,20 @@ class TestMergeManualUploadTrust(unittest.TestCase):
         captured = {}
         # 只让"英雄片段"这一路锚点判定为不匹配，验证正片槽位（非手动上传）走的仍是
         # 真实校验结果、没有被这次修复连带放松。
-        def fake_verify(video_path, start_frame_path, end_frame_path, strict=False):
+        def fake_verify(video_path, start_frame_path, end_frame_path, strict=False, config=None):
             if 'vid_002' in video_path:
                 return False, 'forced mismatch'
             return True, 'ok'
         with patch('video_generator.verify_video_anchors', side_effect=fake_verify), \
-             patch('video_generator.subprocess.run', side_effect=self._fake_run_factory(captured)):
+             patch('video_generator.subprocess.run',
+                   side_effect=self._fake_run_factory(captured, output_duration=4.0)):
             result = merge_project_videos(self.tmp)
 
         self.assertIsNotNone(result)
         self.assertEqual(result['status'], 'success')
-        concat_lines = [l for l in captured['concat_list'].splitlines() if l.strip()]
-        self.assertEqual(len(concat_lines), 2, "手动上传的英雄片段应该照样拼进成片")
+        self.assertEqual(captured['inputs'], [os.path.join(self.videos_dir, f'vid_{slot:03d}.mp4')
+                                              for slot in (1, 2)],
+                         "手动上传的英雄片段应该照样拼进成片")
 
 
 class _FakeAccountPool:
@@ -898,7 +928,7 @@ class TestAccountRotationRing(unittest.TestCase):
 
 
 class TestPlanGenerationLegs(unittest.TestCase):
-    """切腿：每 switch_interval 个请求换一个号，全程同一个 IP（换 IP 已全局关停）。"""
+    """整条视频序列沿用可用账号，额度耗尽由服务换号。"""
 
     def _items(self, n):
         return [{'plan': {'slot': i}} for i in range(n)]
@@ -911,14 +941,15 @@ class TestPlanGenerationLegs(unittest.TestCase):
             self.assertEqual(len(legs[0]['items']), 12)
             self.assertIsNone(legs[0]['user_id'])
 
-    def test_switches_account_every_interval(self):
+    def test_available_pool_does_not_split_healthy_session(self):
         legs = plan_generation_legs(self._items(12), ['a', 'b', 'c'], 5)
-        self.assertEqual([len(l['items']) for l in legs], [5, 5, 2])
-        self.assertEqual([l['user_id'] for l in legs], ['a', 'b', 'c'])
+        self.assertEqual([len(l['items']) for l in legs], [12])
+        self.assertEqual([l['user_id'] for l in legs], [None])
 
-    def test_account_ring_wraps_around(self):
+    def test_old_interval_does_not_restore_previous_accounts(self):
         legs = plan_generation_legs(self._items(20), ['a', 'b'], 5)
-        self.assertEqual([l['user_id'] for l in legs], ['a', 'b', 'a', 'b'])
+        self.assertEqual([l['user_id'] for l in legs], [None])
+        self.assertEqual(legs[0]['items'], self._items(20))
 
     def test_never_emits_rotate_ip(self):
         """换 IP 已关停：腿计划里不该再出现任何换 IP 指示。"""
@@ -1221,5 +1252,3 @@ class TestDeclaredAnchorExtractionAndPlanning(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
-
-

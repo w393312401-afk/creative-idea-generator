@@ -1,15 +1,15 @@
 """Gemini Omni 提示词合成链路（prompt_pipeline.composers）的回归测试（2026-08-01）。
 
 背景：技能包按 profile 拆开之后，omni 包（gemini-omni-restoration-composer）的契约
-与 base 包最大的分歧在 VIDEO——Omni 的视频提示词是一段剪辑过的六镜头序列
-（远景/全景/中景/近景/特写/结果远景），默认 UGC 手机拍摄质感，且**没有例外地**禁止
-一镜到底措辞。IMAGE 段、Phase 1、槽位格式则是全 profile 共享的下游契约。
+与 base 包最大的分歧在 VIDEO——Omni 默认交付主工作镜加特写插入、再切回同机位的
+三镜或四镜序列，默认 UGC 手机拍摄质感。用户明确要求一镜到底时遵循该覆盖，
+IMAGE 段、Phase 1、槽位格式则是全 profile 共享的下游契约。
 
 这里钉住五组行为：
   1. 分派：get_composer 按 profile 给出实现，未知 profile 回落 base；
   2. 同一份 dimensions 在两个 profile 下 VIDEO 文本不同，且 IMAGE 段逐字一致；
-  3. omni 的 VIDEO 带六镜头轮换、不含一镜到底措辞（含兜底稿与确定性归一）；
-  4. 审计：六镜头缺失/一镜到底措辞算结构性硬伤，触发定向回炉；
+  3. 默认 omni 的 VIDEO 带主镜、插入和切回、不含一镜到底措辞；
+  4. 审计：默认多镜头缺失/一镜到底措辞算结构性硬伤，触发定向回炉；
   5. 断点续传指纹带 profile —— base 下合成到一半切 omni 必须重排而不是续传
      （否则会交付半 base 半 omni 的混合提示词集）。
 """
@@ -57,7 +57,7 @@ OMNI_VIDEO_DRAFT = (
     "after joint as the repointed run grows steadily and fine dust settles nearby. A clean cut "
     "at the three-second mark drops into a close-up insert on the trowel edge with minor "
     "handheld motion blur and small blown highlights, capturing mortar squeezing out under "
-    "pressure. A second insert at the five-second mark pushes to an extreme close-up insert on "
+    "pressure. A second clean cut enters an extreme close-up insert on "
     "the tooled joint lines and the dust edge engraved into the porous stone, with low-light "
     "noise and mild compression proving the physical causality. A final clean cut at the "
     "seven-second mark returns to a returning wide shot from the same camera setup as the "
@@ -204,20 +204,20 @@ class TestOmniVideoDiffersFromBase(_ComposeHarness):
         missing_images, missing_videos = pp._missing_prompt_slots(images, videos, (1, 4), (1, 3))
         self.assertEqual((missing_images, missing_videos), ([], []))
 
-    def test_omni_video_carries_the_six_shot_rotation(self):
-        out = self._compose(OMNI_CONFIG, 'fp-omni-six')
+    def test_omni_video_carries_the_four_shot_work_and_insert_structure(self):
+        out = self._compose(OMNI_CONFIG, 'fp-omni-four')
         _, videos = pp._parse_prompt_slots(out)
         for seq, slot in videos.items():
             text = _body(slot)
             self.assertEqual(omni_mod._missing_shot_rungs(text), [],
-                             f'VIDEO {seq} 六镜头轮换不完整')
+                             f'VIDEO {seq} 主镜、插入与切回结构不完整')
             self.assertEqual(omni_mod._one_take_hits(text), [],
                              f'VIDEO {seq} 出现一镜到底措辞')
             self.assertIn(omni_mod.OMNI_PACING_MARKER, text.lower(),
                           f'VIDEO {seq} 缺少 omni 的节奏声明')
 
     def test_base_video_is_untouched_by_the_omni_contract(self):
-        """base 必须零变化：既不该长出六镜头，也不该丢掉自己的节奏声明。"""
+        """base 必须零变化：既不该长出 Omni 镜头梯，也不该丢掉自己的节奏声明。"""
         out = self._compose(BASE_CONFIG, 'fp-base-untouched')
         _, videos = pp._parse_prompt_slots(out)
         for slot in videos.values():
@@ -229,7 +229,7 @@ class TestOmniVideoDiffersFromBase(_ComposeHarness):
 
 class TestOmniReferenceLoading(_ComposeHarness):
     def test_required_references_are_read_through_the_profile(self):
-        """SKILL.md §Required Reference Loading 声明的 7 个必读契约，必须经
+        """SKILL.md §Required Reference Loading 声明的必读契约，必须经
         load_reference_file(name, 'omni') 取——不硬编码路径，omni 包缺的文件才能回落。"""
         with patch.object(pp, 'load_reference_file', return_value='') as loader:
             self._compose(OMNI_CONFIG, 'fp-omni-refs')
@@ -267,7 +267,8 @@ class TestOmniAudit(_ComposeHarness):
     def test_violations_are_classified_as_structural(self):
         composer = composers.get_composer('omni')
         errs = omni_mod.omni_video_violations(self.NON_COMPLIANT)
-        self.assertEqual(len(errs), 2, errs)
+        self.assertTrue(any('not an edited multi-shot sequence' in e for e in errs), errs)
+        self.assertTrue(any('one-take wording' in e for e in errs), errs)
         structural, style = composer.split_structural_video_errors(errs)
         self.assertEqual(sorted(structural), sorted(errs))
         self.assertEqual(style, [])
@@ -410,16 +411,16 @@ class TestOmniDeterministicNormalisation(unittest.TestCase):
         self.assertTrue(composer.wants_cinematic())
         rule = composer.capture_style_rule()
         self.assertIn('cinematic', rule)
-        # 院线感也不解除一镜到底禁令。
-        self.assertIn('one-take ban', rule.lower())
+        # 只有院线风格不构成用户单镜授权。
+        errs = composer.video_profile_violations('A single continuous take shows the repair.')
+        self.assertTrue(any('one-take wording' in err for err in errs), errs)
 
 
 class TestOmniSystemPrompt(unittest.TestCase):
     def test_override_block_is_appended_not_replacing_the_image_rules(self):
         """omni 不复制一份 IMAGE 契约——base 那份必须原样还在，override 只追加在后面。"""
         packet = {'camera_dna': 'static shot', 'object_ledger': []}
-        # 片长要钉住：镜头梯（进而下面那几个镜头名）随它变，不钉就会跟着开发机的
-        # server_config.json 漂——六秒档只有三镜，extreme close-up 那一行根本不会出现。
+        # 片长要钉住：六秒档只有三镜，十秒档才有第二个 extreme close-up insert。
         omni_composer = composers.get_composer('omni')
         omni_composer.begin_run(dict(OMNI_CONFIG), {})
         with patch.object(pp, 'load_reference_file', return_value=''):
@@ -427,9 +428,10 @@ class TestOmniSystemPrompt(unittest.TestCase):
             omni_prompt = omni_composer.batch_system_prompt(dict(OMNI_CONFIG), packet, '', '')
         self.assertTrue(omni_prompt.startswith(base_prompt))
         self.assertIn('OMNI VIDEO OVERRIDE', omni_prompt)
-        for rung in ('establishing long shot', 'full shot', 'medium shot', 'close-up',
-                     'extreme close-up', 'wide outro shot'):
-            self.assertIn(rung, omni_prompt)
+        ladder = omni_composer.ladder_for_kind(10, 'construction')
+        self.assertEqual([rung.key for rung in ladder], ['main', 'close', 'xclose', 'return'])
+        for rung in ladder:
+            self.assertIn(rung.phrase, omni_prompt)
         self.assertIn(omni_mod.OMNI_PACING_PHRASE, omni_prompt)
         # 槽位标记不能被改掉（约束 B：下游全靠这个格式）。
         self.assertIn('===BEAT N VIDEO===', omni_prompt)
@@ -489,6 +491,18 @@ class TestFingerprintCarriesTheProfile(unittest.TestCase):
             state = pp.compose_anchor_and_packet(dict(BASE_CONFIG), self.DIMENSIONS)
         self.assertEqual(state['image_1_prompt'], 'base 语法的 IMAGE 1')
         self.assertEqual(state['compiled_videos'], {1: 'base 语法的一镜到底 VIDEO 1'})
+
+    def test_omni_resume_uses_user_authorization_instead_of_a_cached_model_claim(self):
+        for user_mode, cached_mode in [('multishot', 'single_take'), ('single_take', 'multishot')]:
+            with self.subTest(user_mode=user_mode):
+                dimensions = {**self.DIMENSIONS, 'video_shot_mode': user_mode}
+                fingerprint = pp.get_brief_fingerprint(dimensions, 'omni')
+                checkpoint = _make_state(fingerprint, total_beats=4)
+                checkpoint['parsed_brief']['video_shot_mode'] = cached_mode
+                pp.save_compose_checkpoint(fingerprint, checkpoint)
+                with patch.object(pp, '_chat', side_effect=AssertionError('续传时不该调模型')):
+                    state = pp.compose_anchor_and_packet(dict(OMNI_CONFIG), dimensions)
+                self.assertEqual(state['parsed_brief']['video_shot_mode'], user_mode)
 
     def test_switching_to_omni_replans_instead_of_resuming(self):
         base_fingerprint = self._save_base_checkpoint()

@@ -42,6 +42,9 @@
 async function initServerMode() {
     try {
         const m = await fetch('/api/mode').then(r => r.json());
+        if (m && m.image_gateway_models && typeof syncImageGatewayModelAvailability === 'function') {
+            syncImageGatewayModelAvailability(m.image_gateway_models);
+        }
         if (m && m.server_managed) {
             // Keep the settings button (gear button) permanently visible as requested by the user
             // const btn = document.getElementById('open-settings-btn');
@@ -365,32 +368,26 @@ const PRESETS = {
 // backward compatibility with any inline handlers still spelled the old way.
 function switchMainTab(tabName) {
     const aliases = { left: 'results', config: 'results', right: 'results' };
-    const tab = aliases[tabName] || tabName;
+    const requestedTab = aliases[tabName] || tabName;
+    const tab = ['results', 'image', 'projects', 'gallery'].includes(requestedTab) ? requestedTab : 'projects';
 
     const panels = {
         results: document.querySelector('.panel-right'),
         image: document.getElementById('panel-image-studio'),
         projects: document.getElementById('panel-projects'),
         gallery: document.getElementById('panel-gallery'),
-        replica: document.getElementById('panel-replica'),
     };
     const buttons = {
         results: document.getElementById('main-tab-results'),
         image: document.getElementById('main-tab-image'),
         projects: document.getElementById('main-tab-projects'),
         gallery: document.getElementById('main-tab-gallery'),
-        replica: document.getElementById('main-tab-replica'),
     };
 
     Object.keys(panels).forEach((key) => {
         if (panels[key]) panels[key].classList.toggle('mobile-active', key === tab);
         if (buttons[key]) buttons[key].classList.toggle('active', key === tab);
     });
-
-    // 图像工坊现与"创意工坊"同级挂在顶部 app-switcher 里，两者共享同一高亮态：
-    // 切到 image 时把"创意工坊"熄灭，切回其余任一子标签时把它点亮。
-    const workshopSwitcher = document.getElementById('switcher-workshop-btn');
-    if (workshopSwitcher) workshopSwitcher.classList.toggle('active', tab !== 'image');
 
     // 画廊首次进入时才扫描本地文件（js/gallery.js 提供；懒加载避免拖慢启动）
     if (tab === 'gallery' && typeof galleryTabEntered === 'function') {
@@ -402,11 +399,6 @@ function switchMainTab(tabName) {
     if (typeof projectsTabEntered === 'function') {
         if (tab === 'projects') projectsTabEntered();
         else if (typeof projectsTabLeft === 'function') projectsTabLeft();
-    }
-    // 爆款复刻：进入时拉一次任务列表。没有轮询——这条线的长耗时阶段全部走 SSE，
-    // 停在人工卡点后页面是静止的，轮询只会白烧请求。
-    if (tab === 'replica' && typeof replicaTabEntered === 'function') {
-        replicaTabEntered();
     }
 }
 
@@ -781,7 +773,8 @@ async function deleteIdeaItem(idea) {
 async function checkApiStatus() {
     const badge = document.getElementById('api-status-badge');
     badge.className = 'status-badge checking';
-    badge.querySelector('.status-text').textContent = '检测 API 连接中...';
+    badge.querySelector('.status-text').textContent = '检测模型接口…';
+    badge.title = '检测文本模型接口；图片与视频任务的状态请查看项目进度';
 
     try {
         const res = await fetch('/api/ping', {
@@ -793,14 +786,16 @@ async function checkApiStatus() {
 
         if (res.ok && data.online) {
             badge.className = 'status-badge online';
-            badge.querySelector('.status-text').textContent = `本地 ${config.model} 在线`;
+            badge.querySelector('.status-text').textContent = '模型接口在线';
+            badge.title = `文本模型：${config.model}`;
             return true;
         } else {
             throw new Error(data.message || `HTTP Error ${res.status}`);
         }
     } catch (e) {
         badge.className = 'status-badge offline';
-        badge.querySelector('.status-text').textContent = 'API 连接断开';
+        badge.querySelector('.status-text').textContent = '模型接口未连接';
+        badge.title = '文本模型接口暂不可用；这不代表正在生成的图片或视频已停止';
         console.error("API check failed:", e);
         return false;
     }
@@ -998,7 +993,7 @@ function setupEventListeners() {
     // （API Key 输入框与可见性切换按钮已随死配置一并移除：托管模式密钥在服务端）
 
     document.getElementById('save-settings-btn').addEventListener('click', () => {
-        saveConfig();
+        // 每项改动已独立保存；完成只关闭面板，不重复写入或提前宣告成功。
         settingsModal.classList.remove('active');
     });
     
@@ -1107,17 +1102,12 @@ function setupEventListeners() {
         });
     }
 
-    // 项目工作台入口。header 上原先是「任务列表」「点子库」两个抽屉切换按钮，
-    // 现在合并成这一个（见 index.html #open-projects-btn）——两个抽屉的内容都
-    // 搬进了 #panel-projects 主标签页。点它时若已有任务在跑就直接落到"运行中"
-    // 筛选，那正是用户点角标时想看的东西。
-    const openProjectsBtn = document.getElementById('open-projects-btn');
-    if (openProjectsBtn && typeof openProjectsWorkbench === 'function') {
-        openProjectsBtn.addEventListener('click', () => {
-            const badge = document.getElementById('active-task-count');
-            const hasRunning = badge && badge.style.display !== 'none';
-            openProjectsWorkbench(hasRunning ? 'running' : 'all');
-        });
+    // 项目工作台入口。原先 header 上有「项目」按钮，现已并入工作区标签栏（#main-tab-projects，
+    // 点它由 inline onclick 切到项目页）。运行中角标挂在这个标签里：点角标直接落到"运行中"筛选，
+    // 那正是用户点角标时想看的东西；点标签本身则保持当前筛选不动。
+    const taskBadge = document.getElementById('active-task-count');
+    if (taskBadge && typeof openProjectsWorkbench === 'function') {
+        taskBadge.addEventListener('click', () => openProjectsWorkbench('running'));
     }
 
     const clearAllBtn = document.getElementById('projects-clear-all-btn');
@@ -1200,17 +1190,7 @@ function setupEventListeners() {
     const cancelVideosBtn = document.getElementById('cancel-videos-btn');
     if (cancelVideosBtn) {
         cancelVideosBtn.addEventListener('click', () => {
-            // 见 cancel-frames-btn 的同款说明。
-            const rec = currentIdea && getIdeaTaskRecord(currentIdea.id, 'videos');
-            if (rec && rec.taskId) {
-                fetch('/api/compose-cancel', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ task_id: rec.taskId })
-                }).catch(e => console.error("Failed to cancel videos task on server:", e));
-            }
-            if (rec && rec.controller) rec.controller.abort();
-            showToast(rec && rec.taskId ? "已发送取消请求，视频序列生成即将停止" : "已取消视频序列生成", "info");
+            if (currentIdea) cancelVideoOperation(currentIdea);
         });
     }
 
@@ -1281,6 +1261,8 @@ function setupEventListeners() {
     // 管线条与 section 弹层：必须排在下面那批按钮监听之前绑定，管线条用的是
     // 捕获阶段拦截，绑定先后本身不影响，但放这里读起来跟 tab 一组更顺。
     initPipelineBar();
+    initResultLeftColumnToggle();
+    initMergedVideoSettingsButton();
     initSectionPops();
 
     // Idea Interaction Buttons
@@ -1397,18 +1379,8 @@ function setupEventListeners() {
 // formatTaskDuration 已于 2026-07-31（P4）随「激发任务列表」抽屉一并删除，
 // 任务的展示与操作全部由「📁 项目」主标签页承担（js/projects.js）。
 // 这里只保留两样别处还在用的东西：
-const MEDIA_TASK_TYPES = new Set(['frames', 'staged_render', 'videos', 'cover', 'video_chain']);
-const REPLICA_TASK_TYPES = new Set(['replica', 'replica_extract', 'replica_advance', 'replica_mutate']);
-const isReplicaTask = (t) => {
-    if (!t) return false;
-    const dims = t.dimensions || {};
-    const type = dims.type || '';
-    if (REPLICA_TASK_TYPES.has(type) || type.startsWith('replica')) return true;
-    if (dims.replica_job_id) return true;
-    if (String(t.id || '').startsWith('replica')) return true;
-    return false;
-};
-const isIdeationTask = (t) => !MEDIA_TASK_TYPES.has((t.dimensions && t.dimensions.type) || 'idea') && !isReplicaTask(t);
+const IDEATION_TASK_TYPES = new Set(['idea', 'spark', 'spark_seed', 'spark_followup', 'compose', 'stepped', 'stepped_advance']);
+const isIdeationTask = (t) => !!t && IDEATION_TASK_TYPES.has((t.dimensions && t.dimensions.type) || 'idea');
 
 let globalBadgeTimeout = null;
 
@@ -1422,10 +1394,11 @@ async function startGlobalTasksBadgePolling() {
             if (response.ok) {
                 const resData = await response.json();
                 // 与 renderTasks 同口径：图片/视频生成类任务不计入任务列表角标
-                const tasks = (Array.isArray(resData) ? resData : (resData.tasks || []))
-                    .filter(isIdeationTask);
+                const allTasks = Array.isArray(resData) ? resData : (resData.tasks || []);
+                window.dispatchEvent(new CustomEvent('spark:tasks-updated', { detail: { tasks: allTasks } }));
+                const tasks = allTasks.filter(isIdeationTask);
                 updateTasksBadge(tasks);
-                hasRunning = tasks.some(t => t.status === 'running');
+                hasRunning = allTasks.some(t => t.status === 'running');
             }
         } catch (e) {
             console.warn("Background badge poll failed:", e);
@@ -1645,7 +1618,7 @@ async function rerunCompletedTask(taskId, dimensions, event) {
     // 模型选择器现在长在项目工作台的详情栏里（原先是任务抽屉的成功卡，
     // 抽屉已随 P4 删除）。取不到就退回当前全局模型。
     const modelSelect = document.getElementById('projects-rerun-model');
-    const selectedModel = (modelSelect && modelSelect.value) || config.model || DEFAULT_CONFIG.model;
+    const selectedModel = normalizeLlmModel((modelSelect && modelSelect.value) || config.model || DEFAULT_CONFIG.model);
 
     // 这里的模型选择同时成为后续激发的全局模型，保证在线检测、页脚当前模型提示
     // 和本次请求使用同一条网关；新任务不复用旧 id，保留原成功结果供对比。
@@ -1664,39 +1637,6 @@ async function rerunCompletedTask(taskId, dimensions, event) {
         console.error('Rerun completed task failed:', e);
         showToast(`重新激发失败: ${e.message}`, 'error');
     }
-}
-
-function isReplicaProjectRow(p) {
-    if (!p) return false;
-    if (typeof projectReplicaJobId === 'function' && projectReplicaJobId(p)) return true;
-    const libId = String((p.library || {}).id || '');
-    if (libId.startsWith('replica')) return true;
-    const key = String(p.project_key || '');
-    if (key.includes('replica_') || key.startsWith('replica')) return true;
-    const title = String(p.title || '');
-    if (title.includes('爆款 1:1 复刻') || title.includes('二创变体') || title.includes('爆款复刻') || title.includes('· 爆款') || title.includes('· 二创')) return true;
-    const theme = String(p.theme || '');
-    if (theme.includes('爆款 1:1 复刻') || theme.includes('二创变体') || theme.includes('爆款复刻') || theme.includes('· 爆款') || theme.includes('· 二创')) return true;
-    const taskId = String((p.task || {}).id || '');
-    if (taskId.startsWith('replica')) return true;
-    return false;
-}
-
-function isReplicaIdea(item) {
-    if (!item) return false;
-    const id = String(item.id || '');
-    if (id.startsWith('replica')) return true;
-    if (String(item.source || '') === 'replica') return true;
-    const dims = item.dimensions || {};
-    if (dims.replica_job_id || item.replica_job_id || item.replica_variant_of) return true;
-    const pk = String(item.project_key || '');
-    if (pk.includes('replica_') || pk.startsWith('replica')) return true;
-    const creativity = String(item.creativity || '');
-    if (creativity.includes('爆款') || creativity.includes('复刻') || creativity.includes('二创变体')) return true;
-    const title = String(item.title || '');
-    const theme = String(item.theme || '');
-    if (title.includes('爆款 1:1 复刻') || title.includes('二创变体') || theme.includes('爆款 1:1 复刻') || theme.includes('二创变体') || title.includes('· 爆款') || title.includes('· 二创')) return true;
-    return false;
 }
 
 async function clearTasks(statusGroup) {
@@ -1719,7 +1659,7 @@ async function clearTasks(statusGroup) {
 
     let msg = "";
     if (statusGroup === "all") {
-        msg = `⚠️ 确定要彻底清空项目工作台的所有项目、任务记录及本地生成文件吗${countHint}？\n（将清除所有点子库项目、任务记录，并彻底删除 outputs/ 目录下的所有已生成图片与成片视频。爆款复刻素材库 outputs/replica_jobs/ 将被完整保留，不受影响）`;
+        msg = `⚠️ 确定要彻底清空项目工作台的所有项目、任务记录及本地生成文件吗${countHint}？\n（将清除所有点子库项目、任务记录，并彻底删除本地已生成的图片与成片视频）`;
     } else if (statusGroup === "completed") {
         msg = `确定要清空所有【已完成】的任务记录吗${countHint}？（仅清理历史记录，不影响已收藏的创意与磁盘素材）`;
     } else if (statusGroup === "failed_cancelled") {
@@ -1742,7 +1682,7 @@ async function clearTasks(statusGroup) {
             const libCount = data.deleted_library_count || 0;
             let toastMsg = `清空成功，共删除 ${data.count} 项`;
             if (statusGroup === "all") {
-                toastMsg = `彻底清空成功，已清理 ${data.count} 项及全部本地媒体文件（爆款复刻素材库已完整保留）`;
+                toastMsg = `彻底清空成功，已清理 ${data.count} 项及本地生成媒体文件`;
             } else if (libCount > 0) {
                 toastMsg = `清空成功，共删除 ${data.count} 项（含 ${libCount} 个已收藏创意）`;
             }
@@ -1833,8 +1773,8 @@ async function clearTasks(statusGroup) {
                                 currentGenerationController = null;
                             }
                             generationState.status = 'idle';
-                            const isCurrentReplica = currentIdea && isReplicaIdea(currentIdea);
-                            if (!isCurrentReplica) {
+                            const currentIdeaSaved = currentIdea && savedIdeas.some(item => item.id === currentIdea.id);
+                            if (!currentIdeaSaved) {
                                 currentIdea = null;
                                 const placeholderView = document.getElementById('output-placeholder-view');
                                 const loadingView = document.getElementById('output-loading-view');
@@ -2865,11 +2805,16 @@ async function streamVideosProgress(taskId, ownerIdea, targetSlots) {
     }
     const controller = new AbortController();
     const rec = beginIdeaTask(ownerId, 'videos', taskId, controller);
+    if (existingRec && existingRec.requestId) Object.assign(rec, {
+        requestId: existingRec.requestId, requestBody: existingRec.requestBody,
+        requestEndpoint: existingRec.requestEndpoint, cancelRequested: existingRec.cancelRequested
+    });
     // 调试模式（仅生成前 N 段）：标记本次任务的目标槽位范围，renderVideosForIdea
     // 靠这个字段区分"还没轮到（等待中）"和"这次任务压根没请求（正常缺段）"，
     // 同 streamFramesProgress/retrySingleFrame 的同款契约。
     if (targetSlots && targetSlots.length) rec.targetSlots = targetSlots;
-    const isCurrent = () => isIdeaTaskCurrent(ownerId, 'videos', taskId);
+    saveActiveBackgroundTasksToLocalStorage();
+    const isCurrent = () => getIdeaTaskRecord(ownerId, 'videos') === rec;
     const isViewing = () => isViewingIdea(ownerId);
     const setMeta = (text) => { rec.meta = text; if (isViewing()) meta.textContent = text; };
     const titleTag = () => isViewing() ? '' : `「${ownerIdea.title || '创意'}」`;
@@ -2949,6 +2894,17 @@ async function streamVideosProgress(taskId, ownerIdea, targetSlots) {
                     const msg = (data && data.message) || '生成失败';
                     setMeta(`视频 ${data.index} 生成失败: ${msg}`);
                     if (isViewing()) renderVideoSlotFailed(data.index, msg);
+                } else if (type === 'video_warning') {
+                    applyVideoProgress(type, data);
+                    setMeta((data && data.message) || '正在处理视频生成状态');
+                } else if (type === 'ip_rotating' || type === 'ip_rotated' || type === 'ip_rotation_failed') {
+                    const info = applyVideoProgress(type, data);
+                    const message = (data && data.message) || (info && info.label) || '正在处理出口 IP';
+                    rec.lastIpRotation = { ...data, stage: type };
+                    setMeta(message);
+                    if (type !== 'ip_rotating' && isViewing()) {
+                        showToast(message, type === 'ip_rotation_failed' ? 'error' : 'info');
+                    }
                 } else if (type === 'video_skipped') {
                     // 硬切占位槽（旧单专属，新单的 [CUT] 槽照常生成）：不生成片段，按已完成计入进度
                     applyVideoProgress('video_done', data);
@@ -3026,19 +2982,26 @@ async function streamVideosProgress(taskId, ownerIdea, targetSlots) {
             }
             await syncFrameRunToLibrary(watch.result, ownerIdea);
             if (isViewing()) renderVideosForIdea(ownerIdea);
+            const lastRun = (watch.result.video_generation_stats || {}).last_run || {};
+            const requested = targetSlots && targetSlots.length ? new Set(targetSlots.map(Number)) : null;
+            const entries = (watch.result.videos || []).filter(v => !requested || requested.has(Number(v.slot)));
+            const attemptedFailed = entries.filter(v => v.last_attempt
+                && (!lastRun.attempt_id || v.last_attempt.id === lastRun.attempt_id)
+                && ['failed', 'cancelled'].includes(v.last_attempt.status)).length;
+            const successful = entries.filter(v => v.status === 'success'
+                && !(v.last_attempt && (!lastRun.attempt_id || v.last_attempt.id === lastRun.attempt_id)
+                    && ['failed', 'cancelled'].includes(v.last_attempt.status))).length;
+            const partial = attemptedFailed > 0 || watch.result.completion_state === 'partial_failed';
             const videoRisks = summarizeRunQuality(watch.result);
-            if (videoRisks) {
-                setMeta(`视频生成完成，但存在质量风险：${videoRisks.join('；')}——建议处理后再合并成片`);
-                showToast(`${titleTag()}视频生成完成，但检测到质量风险，建议合并成片前先处理。`, 'warning');
-            } else {
-                showToast(`${titleTag()}已成功生成 ${(watch.result.videos || []).length} 段连续视频。`, "success");
-            }
+            const message = partial
+                ? `视频任务结束：本轮成功 ${successful} 段${attemptedFailed ? `，失败或取消 ${attemptedFailed} 段` : ''}，请检查缺段或合并结果。`
+                : videoRisks ? `视频生成完成，但存在质量风险：${videoRisks.join('；')}`
+                : `已成功生成 ${successful} 段连续视频。`;
+            setMeta(message);
+            showToast(`${titleTag()}${message}`, partial || videoRisks ? 'warning' : 'success');
             if (typeof NotificationCenter !== 'undefined') {
-                NotificationCenter.notify({
-                    type: 'success',
-                    title: '视频序列生成完成',
-                    message: `已成功生成 ${(watch.result.videos || []).length} 段连续视频片段！`
-                });
+                NotificationCenter.notify({ type: partial || videoRisks ? 'warning' : 'success',
+                    title: partial ? '视频任务仍需处理' : '视频序列生成完成', message });
             }
         }
     } catch (e) {
@@ -3314,6 +3277,10 @@ async function deleteFromLibrary(id) {
 }
 
 function loadSavedIdea(idea, options = {}) {
+    if (idea && idea.archived) {
+        if (typeof openArchivedProject === 'function') openArchivedProject(idea.project_key);
+        return;
+    }
     currentIdea = idea;
     syncCandidateModeToggleFromIdea(currentIdea);
     saveCurrentIdeaState();
@@ -3981,44 +3948,9 @@ async function generateFrames() {
         return;
     }
 
-    // 页面上这份提示词是不是最新的。必须排在 linter 之前：体检可能把提示词换成服务端
-    // 那份，linter 要 lint 的是换之后的那份。
+    // 生成前同步提示词的新版本，避免使用浏览器里过期的项目快照。
     if (typeof ensureFreshPromptBlock === 'function') {
         await ensureFreshPromptBlock(ownerIdea, '生成帧序列');
-    }
-
-    // ── 前置提示词静态合规审查（Pre-flight Prompt Linter）──
-    if (typeof lintPromptBlock === 'function') {
-        const lintReport = lintPromptBlock(ownerIdea.prompt_block);
-        if (!lintReport.passed) {
-            let linterProceed = false;
-            await new Promise(resolve => {
-                showPromptLinterModal({
-                    report: lintReport,
-                    actionTitle: '生成帧序列',
-                    onProceed: () => {
-                        linterProceed = true;
-                        resolve();
-                    },
-                    onAutoFix: async () => {
-                        const fixed = autoFixLintIssues(ownerIdea.prompt_block);
-                        ownerIdea.prompt_block = fixed;
-                        const pre = document.getElementById('idea-prompt-block');
-                        if (pre) pre.textContent = fixed;
-                        showToast('✨ 已自动修复提示词格式问题并继续！', 'success');
-                        linterProceed = true;
-                        resolve();
-                    },
-                    onEdit: () => {
-                        linterProceed = false;
-                        if (typeof switchMainTab === 'function') switchMainTab('prompts');
-                        if (typeof enterPromptEdit === 'function') enterPromptEdit();
-                        resolve();
-                    }
-                });
-            });
-            if (!linterProceed) return;
-        }
     }
 
     const btn = document.getElementById('generate-frames-btn');
@@ -4289,10 +4221,10 @@ async function openCandidateSelectionModal(seq, frameData) {
             bmBoxEl.innerHTML = `
                 <div style="display:flex; align-items:center; justify-content:space-between; background:rgba(245,158,11,0.08); border:1px solid rgba(245,158,11,0.3); border-radius:8px; padding:10px 14px; gap:12px; flex-wrap:wrap;">
                     <div style="display:flex; align-items:center; gap:12px;">
-                        <img src="${escapeHtml(refUrl)}" style="width:48px; height:85px; object-fit:cover; border-radius:4px; border:1px solid #f59e0b; cursor:pointer;" onclick="if(window.openLightbox) openLightbox('${escapeHtml(refUrl)}')" title="点击放大爆款原片节拍抽帧" />
+                        <img src="${escapeHtml(refUrl)}" style="width:48px; height:85px; object-fit:cover; border-radius:4px; border:1px solid #f59e0b; cursor:pointer;" onclick="if(window.openLightbox) openLightbox('${escapeHtml(refUrl)}')" title="点击放大参考原片节拍抽帧" />
                         <div>
                             <div style="font-weight:700; font-size:13px; color:#f59e0b; display:flex; align-items:center; gap:6px;">
-                                <span>🎯 爆款原片节拍抽帧 (REF ${padSeq})</span>
+                                <span>🎯 参考原片节拍抽帧 (REF ${padSeq})</span>
                                 <span style="font-size:11px; background:rgba(245,158,11,0.2); padding:1px 6px; border-radius:4px; font-weight:600;">${refRoleTag}</span>
                             </div>
                             <div style="font-size:11.5px; color:#94a3b8; margin-top:3px; line-height:1.4;">
@@ -4584,6 +4516,10 @@ async function generateVideos() {
     // Check for frames that failed the post-render sequence consistency review
     const reviewCheck = await confirmSequenceReviewOverride(ownerIdea, null);
     if (!reviewCheck.proceed) return;
+    if (isIdeaTaskActive(ownerIdea.id, 'videos')) {
+        showToast('该创意的视频任务正在进行中，请稍候', 'info');
+        return;
+    }
 
     const btn = document.getElementById('generate-videos-btn');
     const progress = document.getElementById('videos-progress');
@@ -4599,7 +4535,9 @@ async function generateVideos() {
         ? `准备生成视频序列（调试模式：仅前 ${targetSlots.length} 段）...`
         : '准备生成视频序列...';
 
+    let operation = null;
     try {
+        operation = beginVideoOperation(ownerIdea, targetSlots);
         const body = {
             config,
             title: getIdeaSaveTitle(ownerIdea),
@@ -4610,23 +4548,20 @@ async function generateVideos() {
         };
         if (targetSlots) body.target_slots = targetSlots;
 
-        const response = await fetch('/api/generate_videos', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(body)
-        });
-
-        if (!response.ok) {
-            const errText = await response.text();
-            throw new Error(`HTTP ${response.status}: ${errText}`);
-        }
-
-        const data = await response.json();
+        const data = await submitVideoOperation(operation, '/api/generate_videos', body);
+        if (operation.cancelRequested) { await cancelVideoOperation(ownerIdea, operation); return; }
         const taskId = data.task_id;
 
         // 同 generateFrames：不 await，交给 streamVideosProgress 在后台独立跑完。
         streamVideosProgress(taskId, ownerIdea, targetSlots);
     } catch (e) {
+        if (e.uncertain && operation) {
+            if (isViewingIdea(ownerIdea.id) && meta) meta.textContent = e.message;
+            showToast(e.message, 'warning');
+            scheduleVideoOperationRecovery(ownerIdea, operation);
+            return;
+        }
+        if (operation && getIdeaTaskRecord(ownerIdea.id, 'videos') === operation) endIdeaTask(ownerIdea.id, 'videos');
         console.error("Failed to generate videos:", e);
         showToast(`视频生成失败: ${e.message}`, "error");
 
@@ -4667,33 +4602,32 @@ async function generateVideoChain() {
 
     const targetSlots = typeof computeDebugTargets === 'function' ? computeDebugTargets('videos', ownerIdea, 'video') : null;
 
+    let operation = null;
     try {
+        operation = beginVideoOperation(ownerIdea, targetSlots);
         const body = {
             config,
             title: getIdeaSaveTitle(ownerIdea),
             display_title: ownerIdea.title,
             prompt_block: ownerIdea.prompt_block,
-            merge_speed: typeof getMergeSpeed === 'function' ? getMergeSpeed() : 2
+            merge_speed: typeof getMergeSpeed === 'function' ? getMergeSpeed() : 4
         };
         if (targetSlots) body.target_slots = targetSlots;
 
-        const response = await fetch('/api/generate_video_chain', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(body)
-        });
-
-        if (!response.ok) {
-            const errText = await response.text();
-            throw new Error(`HTTP ${response.status}: ${errText}`);
-        }
-
-        const data = await response.json();
+        const data = await submitVideoOperation(operation, '/api/generate_video_chain', body);
+        if (operation.cancelRequested) { await cancelVideoOperation(ownerIdea, operation); return; }
         const taskId = data.task_id;
 
         streamVideosProgress(taskId, ownerIdea, targetSlots);
         showToast("已启动纯视频链式生成通道！", "success");
     } catch (e) {
+        if (e.uncertain && operation) {
+            if (isViewingIdea(ownerIdea.id) && meta) meta.textContent = e.message;
+            showToast(e.message, 'warning');
+            scheduleVideoOperationRecovery(ownerIdea, operation);
+            return;
+        }
+        if (operation && getIdeaTaskRecord(ownerIdea.id, 'videos') === operation) endIdeaTask(ownerIdea.id, 'videos');
         console.error("Failed to generate video chain:", e);
         showToast(`纯视频链生成失败: ${e.message}`, "error");
 
@@ -4715,7 +4649,7 @@ async function generateVideoChain() {
 function getMergeSpeed() {
     const select = document.getElementById('merge-speed-select');
     const speed = Number(select && select.value);
-    return [1, 1.5, 2].includes(speed) ? speed : 2;
+    return [1, 1.5, 2, 3, 4].includes(speed) ? speed : 4;
 }
 
 function mergeSpeedLabel(speed = getMergeSpeed()) {
@@ -4747,6 +4681,13 @@ async function mergeVideos(force = false) {
         showToast("请先激发一个创意点子并生成视频！", "error");
         return;
     }
+    if (mergeInFlight) {
+        showToast('视频正在合并中，请稍候', 'info');
+        return;
+    }
+    // 请求等待期间可以切换创意，结果始终属于发起合并的项目。
+    const ownerIdea = currentIdea;
+    const viewingOwner = () => !!currentIdea && currentIdea.id === ownerIdea.id;
 
     const mergeBtn = document.getElementById('merge-videos-btn');
     const videosMeta = document.getElementById('videos-meta');
@@ -4773,12 +4714,13 @@ async function mergeVideos(force = false) {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
-                title: getIdeaSaveTitle(currentIdea),
+                config,
+                title: getIdeaSaveTitle(ownerIdea),
                 force: !!force,
                 speed,
                 // 首帧封面：档位来自合并控件，用哪张来自「成片首帧」用途分配
                 cover_burn: coverBurn,
-                cover: coverBurn === 'off' ? null : coverRoleUrl(currentIdea, 'video'),
+                cover: coverBurn === 'off' ? null : coverRoleUrl(ownerIdea, 'video'),
             })
         });
 
@@ -4786,7 +4728,7 @@ async function mergeVideos(force = false) {
 
         // 合成门禁拦截：缺失/失败片段 → 给出「重试」「跳过缺口强制合并」两条出路
         if (response.status === 409 && data.status === 'blocked') {
-            renderMergeBlocked(data);
+            if (viewingOwner()) renderMergeBlocked(data);
             return;
         }
 
@@ -4795,21 +4737,23 @@ async function mergeVideos(force = false) {
         }
 
         if (data.status === 'ok') {
-            if (!currentIdea.frameRun) {
-                currentIdea.frameRun = {};
+            if (!ownerIdea.frameRun) {
+                ownerIdea.frameRun = {};
             }
-            currentIdea.frameRun.merged_video = data.merged_video;
-            saveCurrentIdeaState();
+            ownerIdea.frameRun.merged_video = data.merged_video;
+            // 相同倍速会覆盖同名成片，推进版本后播放器才会读取新文件。
+            const mv = data.merged_video || {};
+            bustImageCache(mv.url || mv.file);
+            if (viewingOwner()) saveCurrentIdeaState();
 
-            const existingIdx = savedIdeas.findIndex(item => item.id === currentIdea.id);
+            const existingIdx = savedIdeas.findIndex(item => item.id === ownerIdea.id);
             if (existingIdx !== -1) {
-                savedIdeas[existingIdx].frameRun = currentIdea.frameRun;
+                savedIdeas[existingIdx].frameRun = ownerIdea.frameRun;
                 await persistIdeaItem(savedIdeas[existingIdx]);
             }
 
-            renderVideosForIdea(currentIdea);
+            if (viewingOwner()) renderVideosForIdea(ownerIdea);
 
-            const mv = data.merged_video || {};
             const mergedSpeedLabel = mergeSpeedLabel(mv.speed || speed);
             // 没烧成（选了封面却没进成片）要说出来：否则用户只能等平台缩略图出来才发现
             const coverNote = mv.cover_first_frame
@@ -4818,10 +4762,10 @@ async function mergeVideos(force = false) {
             if (mv.partial) {
                 const slots = (mv.skipped_slots || []).join(', ');
                 showToast(`已生成跳过缺口的合成片（${mergedSpeedLabel}）`, "success");
-                videosMeta.innerHTML = `已合成：槽位 <b>${escapeHtml(slots)}</b> 无视频文件被跳过（该处为硬切），其余片段全部拼接、${mergedSpeedLabel}${escapeHtml(coverNote)}。`;
+                if (viewingOwner()) videosMeta.innerHTML = `已合成：槽位 <b>${escapeHtml(slots)}</b> 无视频文件被跳过（该处为硬切），其余片段全部拼接、${mergedSpeedLabel}${escapeHtml(coverNote)}。`;
             } else {
                 showToast(`视频合并成功（${mergedSpeedLabel}）！`, "success");
-                videosMeta.textContent = `视频合并已完成（${mergedSpeedLabel}）${coverNote}！`;
+                if (viewingOwner()) videosMeta.textContent = `视频合并已完成（${mergedSpeedLabel}）${coverNote}！`;
             }
         } else {
             throw new Error(data.message || '合并失败');
@@ -4829,7 +4773,7 @@ async function mergeVideos(force = false) {
     } catch (e) {
         console.error("Failed to merge videos:", e);
         showToast(`合并视频失败: ${e.message}`, "error");
-        videosMeta.textContent = `合并视频失败: ${e.message}`;
+        if (viewingOwner()) videosMeta.textContent = `合并视频失败: ${e.message}`;
     } finally {
         mergeBtn.disabled = false;
         // innerHTML 还原后芯片里的 .step-stat 会带着合并前的旧文字回来，
@@ -5276,8 +5220,71 @@ function scrollToPipelineSection(sectionId) {
     if (!sectionId) return;
     const overview = document.getElementById('tab-panel-overview');
     if (overview && !overview.classList.contains('active')) switchTab('overview');
-    const el = document.getElementById(sectionId);
+    if (sectionId === 'cover-section' && overview?.classList.contains('is-left-column-collapsed')) {
+        setResultLeftColumnCollapsed(false, true);
+    }
+    let el = document.getElementById(sectionId);
+    // 成品区在没有成片时是隐藏的，滚过去等于没动；退回到产生它的视频片段区。
+    if (sectionId === 'merged-video-container' && (!el || el.style.display === 'none')) {
+        el = document.getElementById('videos-section');
+    }
     if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
+const RESULT_LEFT_COLUMN_STORAGE_KEY = 'spark_result_left_column_collapsed';
+
+function setResultLeftColumnCollapsed(collapsed, persist = false) {
+    const overview = document.getElementById('tab-panel-overview');
+    const toggle = document.getElementById('result-left-column-toggle');
+    if (!overview || !toggle) return;
+    overview.classList.toggle('is-left-column-collapsed', collapsed);
+    toggle.setAttribute('aria-expanded', String(!collapsed));
+    const action = collapsed ? '展开' : '收起';
+    const description = `${action}封面栏`;
+    toggle.setAttribute('aria-label', description);
+    toggle.title = description;
+    toggle.querySelector('.result-left-column-toggle-icon').textContent = collapsed ? '›' : '‹';
+    toggle.querySelector('.result-left-column-toggle-label').textContent = collapsed ? '展开封面' : '收起封面';
+    if (persist) {
+        try { localStorage.setItem(RESULT_LEFT_COLUMN_STORAGE_KEY, collapsed ? '1' : '0'); } catch (_) {}
+    }
+}
+
+/** 成品区的「合并设置」：成片速度、封面首帧在视频片段区的设置弹层里，这里直达并展开它。 */
+function initMergedVideoSettingsButton() {
+    const btn = document.getElementById('merged-video-settings');
+    if (!btn) return;
+    btn.addEventListener('click', () => {
+        scrollToPipelineSection('videos-section');
+        const pop = document.getElementById('videos-settings-pop');
+        const toggle = document.querySelector('.section-tool-btn[data-pop="videos-settings-pop"]');
+        if (pop && pop.hidden && toggle) toggle.click();
+    });
+}
+
+function storedResultLeftColumnPref() {
+    try { return localStorage.getItem(RESULT_LEFT_COLUMN_STORAGE_KEY); } catch (_) { return null; }
+}
+
+/**
+ * 有成片时封面默认收起（成片才是完成态的主角），没成片时展开。
+ * 只在用户从没手动切换过（没有存档偏好）时才自动处理，且不写存档——
+ * 一旦用户自己点过开关或点过「封面」芯片，就完全按用户的选择来。
+ */
+function syncResultLeftColumnForMerged(ready) {
+    if (storedResultLeftColumnPref() !== null) return;
+    setResultLeftColumnCollapsed(!!ready);
+}
+
+function initResultLeftColumnToggle() {
+    const toggle = document.getElementById('result-left-column-toggle');
+    if (!toggle) return;
+    const stored = storedResultLeftColumnPref();
+    setResultLeftColumnCollapsed(stored === '1');
+    toggle.addEventListener('click', () => {
+        const overview = document.getElementById('tab-panel-overview');
+        setResultLeftColumnCollapsed(!overview.classList.contains('is-left-column-collapsed'), true);
+    });
 }
 
 /** 主按钮：把点击转交给"下一步"对应的那枚芯片（也就是原来的生成按钮）。 */
@@ -5287,7 +5294,7 @@ function runPipelineNext() {
     if (!action) return;
     if (action === 'download') {
         const link = document.getElementById('merged-video-download');
-        scrollToPipelineSection('videos-section');
+        scrollToPipelineSection('merged-video-container');
         if (link && link.getAttribute('href') && link.getAttribute('href') !== '#') link.click();
         return;
     }
@@ -5376,6 +5383,7 @@ function initSectionPops() {
         if (pop && !pop.hidden) {
             btn.classList.add('active');
         }
+        if (pop) btn.setAttribute('aria-expanded', String(!pop.hidden));
         btn.addEventListener('click', (e) => {
             e.stopPropagation();
             const pop = document.getElementById(btn.dataset.pop);
@@ -5384,12 +5392,36 @@ function initSectionPops() {
             const section = btn.closest('.idea-section');
             if (section) {
                 section.querySelectorAll('.section-pop').forEach(p => { if (p !== pop) p.hidden = true; });
-                section.querySelectorAll('.section-tool-btn').forEach(b => { if (b !== btn) b.classList.remove('active'); });
+                section.querySelectorAll('.section-tool-btn').forEach(b => {
+                    if (b !== btn) {
+                        b.classList.remove('active');
+                        b.setAttribute('aria-expanded', 'false');
+                    }
+                });
             }
             pop.hidden = !willOpen;
             btn.classList.toggle('active', willOpen);
+            btn.setAttribute('aria-expanded', String(willOpen));
         });
     });
+
+    // 更多菜单共用原有按钮；选中操作、点击外部或按 Esc 后收起。
+    const menus = 'details.workspace-more, details.slot-more-actions, details.projects-more-actions';
+    document.addEventListener('click', (event) => {
+        document.querySelectorAll(menus).forEach(menu => {
+            if (!menu.contains(event.target) || event.target.closest('button, a')) menu.open = false;
+        });
+    });
+    document.addEventListener('keydown', (event) => {
+        if (event.key !== 'Escape') return;
+        const openMenus = Array.from(document.querySelectorAll(menus)).filter(menu => menu.open);
+        const focused = openMenus.find(menu => menu.contains(document.activeElement));
+        if (!focused) return;
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        openMenus.forEach(menu => { menu.open = false; });
+        focused.querySelector('summary')?.focus();
+    }, true);
 
     const skipCoverToggle = document.getElementById('frames-skip-cover-toggle');
     if (skipCoverToggle) {

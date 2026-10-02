@@ -418,21 +418,26 @@ async function editAccountPoolExpiresDate(account) {
 function buildCreditBadgeElement(account) {
     const badge = document.createElement('span');
     badge.className = 'account-pool-pill-badge';
+    const cooling = isAccountPoolCoolingDown(account);
+    const imageLimited = cooling && (account.cooldown_reason === 'image_quota_exceeded' || account.cooldown_reason === 'daily_limit_reached' || account.cooldown_reason === 'daily_limit' || account.cooldown_reason === 'image_limit_exceeded' || String(account.last_generation_error || '').includes('图片余额超限'));
+    const insufficientCredit = account.cooldown_reason === 'quota_exhausted'
+        || account.disabled_reason === 'zero_credit'
+        || (account.credit != null && account.credit < (account.min_credit ?? 15));
 
-    if (isAccountPoolCoolingDown(account)) {
+    if (insufficientCredit && !imageLimited && !(cooling && account.cooldown_reason === 'login_required')) {
+        badge.classList.add('badge-credit-low');
+        badge.textContent = `🔴 积分不足${account.credit != null ? ' · ' + account.credit + ' 积分' + (account.credit_trustworthy === false ? ' (缓存)' : '') : ''}`;
+        badge.title = `积分不足，暂不参与调度${cooling ? '；冷却至: ' + formatAccountPoolTimestamp(account.cooldown_until) : ''}${account.last_generation_error ? ' (' + account.last_generation_error + ')' : ''}`;
+    } else if (cooling) {
         badge.classList.add('badge-cooldown');
         if (account.cooldown_reason === 'login_required') {
             badge.textContent = '🔒 登录失效冷却中';
-        } else if (account.cooldown_reason === 'image_quota_exceeded' || account.cooldown_reason === 'daily_limit_reached' || account.cooldown_reason === 'daily_limit' || account.cooldown_reason === 'image_limit_exceeded' || String(account.last_generation_error || '').includes('图片余额超限')) {
+        } else if (imageLimited) {
             badge.textContent = '🚫 图片余额超限';
         } else {
             badge.textContent = '🧊 额度冷却中';
         }
         badge.title = `冷却至: ${formatAccountPoolTimestamp(account.cooldown_until)}${account.last_generation_error ? ' (' + account.last_generation_error + ')' : ''}`;
-    } else if (account.disabled_reason === 'zero_credit' || (account.credit != null && account.credit < (account.min_credit ?? 15))) {
-        badge.classList.add('badge-credit-low');
-        badge.textContent = `🔴 积分 ${account.credit != null ? account.credit : 0} (不足)`;
-        badge.title = '积分低于阈值，已自动停用调度';
     } else if (account.credit == null) {
         badge.classList.add('badge-credit-none');
         badge.textContent = '⚪ 积分未探测';
@@ -2320,6 +2325,7 @@ if (typeof module !== 'undefined' && module.exports) {
         computeAccountPoolStats,
         renderAccountPoolStats,
         setAccountPoolFilter,
+        buildCreditBadgeElement,
         buildHealthScoreBadgeElement,
         renderAccountPoolGlobalHUD,
         accountPoolCache,

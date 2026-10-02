@@ -209,7 +209,7 @@ def test_slot_grid_renders_states_badges_and_delegated_actions():
             c.querySelector('.slot-actions').style.opacity = 1;
             const r = c.getBoundingClientRect();
             return { card: { l: r.left, w: r.width },
-                     btns: Array.from(c.querySelectorAll('.slot-action-btn')).map(b => {
+                     btns: Array.from(c.querySelectorAll('.slot-action-btn')).filter(b => b.getClientRects().length).map(b => {
                          const q = b.getBoundingClientRect();
                          return { act: b.dataset.act, l: q.left, w: q.width };
                      }) };
@@ -217,7 +217,7 @@ def test_slot_grid_renders_states_badges_and_delegated_actions():
         outside = [b["act"] for b in btn_box["btns"]
                    if b["l"] < btn_box["card"]["l"] - 1
                    or b["l"] + b["w"] > btn_box["card"]["l"] + btn_box["card"]["w"] + 1]
-        check(len(btn_box["btns"]) == 5, "IMG 003 应有五枚操作按钮，实得 %d" % len(btn_box["btns"]))
+        check(len(btn_box["btns"]) == 1, "IMG 003 仅直接显示当前主动作，实得 %d" % len(btn_box["btns"]))
         check(not outside, "操作按钮不得溢出卡片，越界的有 %s" % outside)
 
         # 事件委托：点按钮应触发对应处理函数，且不触发 lightbox
@@ -246,7 +246,7 @@ def test_slot_grid_renders_states_badges_and_delegated_actions():
         check(before == after, "busy 不应增删按钮 (%d -> %d)" % (before, after))
         disabled = page.evaluate(
             "() => Array.from(document.querySelectorAll('#frames-grid .slot-action-btn'))"
-            ".filter(b => b.dataset.act !== 'describe-frame' && b.dataset.act !== 'view-candidates')"
+            ".filter(b => b.dataset.act !== 'preview-slot' && b.dataset.act !== 'describe-frame' && b.dataset.act !== 'view-candidates')"
             ".every(b => b.disabled)")
         check(disabled, "busy 时帧网格写操作类按钮应全部 disabled")
         page.eval_on_selector('#frame-slot-4 [data-act="retry-frame"]', "el => el.click()")
@@ -273,7 +273,7 @@ def test_slot_grid_renders_states_badges_and_delegated_actions():
             setFrameGridButtonsBusy(true);
             const st = t => Array.from(document.querySelectorAll(
                 `#beats-grid .slot-card[data-type="${t}"] .slot-action-btn`));
-            const busy = { img: st('image').filter(b => b.dataset.act !== 'describe-frame' && b.dataset.act !== 'view-candidates').every(b => b.disabled),
+            const busy = { img: st('image').filter(b => b.dataset.act !== 'preview-slot' && b.dataset.act !== 'describe-frame' && b.dataset.act !== 'view-candidates').every(b => b.disabled),
                            vid: st('video').some(b => b.disabled),
                            imgN: st('image').length, vidN: st('video').length };
             setFrameGridButtonsBusy(false);
@@ -296,7 +296,7 @@ def test_slot_grid_renders_states_badges_and_delegated_actions():
         stuck = page.evaluate("""() => {
             const btns = () => Array.from(document.querySelectorAll(
                 '#beats-grid .slot-card[data-type="image"] .slot-action-btn'))
-                .filter(b => b.dataset.act !== 'describe-frame' && b.dataset.act !== 'view-candidates');
+                .filter(b => b.dataset.act !== 'preview-slot' && b.dataset.act !== 'describe-frame' && b.dataset.act !== 'view-candidates');
             ideaTasksById['smoke1'] = { frames: { taskId: 't1' }, videos: null, cover: null };
             renderFramesForIdea(currentIdea);
             const during = btns().every(b => b.disabled);
@@ -315,7 +315,7 @@ def test_slot_grid_renders_states_badges_and_delegated_actions():
         refreshed = page.evaluate("""() => {
             const btns = () => Array.from(
                 document.querySelectorAll('#frames-grid .slot-action-btn'))
-                .filter(b => b.dataset.act !== 'describe-frame' && b.dataset.act !== 'view-candidates');
+                .filter(b => b.dataset.act !== 'preview-slot' && b.dataset.act !== 'describe-frame' && b.dataset.act !== 'view-candidates');
             ideaTasksById['smoke1'] = { frames: { taskId: 't1' }, videos: null, cover: null };
             refreshSlotGridBusy('image');
             const during = btns().every(b => b.disabled);
@@ -336,7 +336,7 @@ def test_slot_grid_renders_states_badges_and_delegated_actions():
         check(live["kind"] == "ready", "renderVideoSlotDone 应画出 ready 卡")
         check(live["label"] == "VID 004 (IMG 004 ➔ IMG 005)",
               "实时回调也要带槽位契约标签，实得 %s" % live["label"])
-        check(live["acts"] == ["retry-video", "upload-video", "delete-slot"],
+        check(live["acts"] == ["preview-slot", "retry-video", "upload-video", "delete-slot"],
               "实时回调画出的卡片必须带全部操作出口（旧实现一个都没有），实得 %s" % live["acts"])
         check(live["draggable"], "实时回调画出的卡片必须可拖（旧实现不可拖）")
 

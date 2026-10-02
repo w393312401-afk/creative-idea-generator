@@ -22,21 +22,27 @@ except ImportError:
 from server_common import (
     SERVER_CONFIG, SERVER_MANAGED, resolve_gateway, effective_config,
     OUTPUT_ROOT, SKILL_DIR, _get_project_dir, _safe_project_name,
-    IMG2IMG_CONTROL_PROMPT, IMG2IMG_CROSSING_REVEAL_CONTROL_PROMPT,
+    IMG2IMG_CONTROL_PROMPT, IMG2IMG_CAMERA_CUT_CONTROL_PROMPT,
+    IMG2IMG_CROSSING_REVEAL_CONTROL_PROMPT,
     resolve_cover_reference, project_cover_path,
     IMAGE_TASKS, IMAGE_TASKS_LOCK,
     apply_google_fx_runtime_overrides, fx_cancel_context, fx_request_deadline,
     read_manifest, write_manifest, GenerationCancelled, log,
-    gpt_image_pixel_size, drop_stale_review_verdicts, stamp_manifest_capabilities,
-    gate_setting, chain_guard_mode,
+    gpt_image_pixel_size, is_gpt_image_model, gpt_image_render_quality, resolve_image_model,
+    drop_stale_review_verdicts, stamp_manifest_capabilities,
+    gate_setting, chain_guard_mode, reviews_disabled,
     # 号池轮转口径（帧序列与视频序列共用，见 server_common 的「换 IP 已全局关停」注释）
     _get_account_pool_service, _select_pool_account,
     _account_switch_interval, _account_rotation_ring, revalidate_leg_account,
 )
 from frame_continuity import (
     analyze_frame, changed_grid_cells, continuity_max_retries, continuity_mode,
-    family_map, family_master, is_transition_frame, register_family_master,
+    family_map, family_master, is_camera_cut_frame, is_transition_frame,
+    register_family_master,
     transition_result,
+)
+from cockpit_image_responses import (
+    adapt_cockpit_image_request, ImageResponsesOutputError, ImageResponsesParameterError,
 )
 
 _CHAIN_GUARD_AUTOFIX_ATTEMPTS = 2
@@ -180,6 +186,45 @@ def _is_codex_origin(origin):
     return bool(codex) and origin and origin in codex
 
 
+def _safe_upstream_error_detail(raw_detail, req):
+    """Expose error fields, excluding echoed request configuration and credentials."""
+    credentials = []
+    if hasattr(req, 'header_items'):
+        for key, value in req.header_items():
+            if re.search(r'authorization|api[-_]?key|access[-_]?code|token|password', key, re.I):
+                credentials.extend((value, value.removeprefix('Bearer ').removeprefix('bearer ')))
+
+    def clean(value):
+        text = str(value)
+        for credential in credentials:
+            if credential:
+                text = text.replace(credential, '[redacted]')
+        text = re.sub(r'(?i)\bBearer\s+[^\s"\',;}]+', '[redacted]', text)
+        text = re.sub(r'\bsk-[A-Za-z0-9_-]{8,}', '[redacted]', text)
+        text = re.sub(
+            r'(?i)((?:\bconfig\b|\b(?:request|payload)\b(?:\s+body)?)["\'\s]*[:=]\s*)'
+            r'[\{\[].*', r'\1[redacted]', text, flags=re.DOTALL)
+        text = re.sub(
+            r'(?i)(["\']?(?:authorization|api[-_]?key|access[-_]?code|password|token)["\']?'
+            r'\s*[:=]\s*)["\']?[^\s"\',;}]+', r'\1[redacted]', text)
+        return text[:800]
+
+    try:
+        body = json.loads(raw_detail)
+    except (ValueError, TypeError):
+        return clean(raw_detail)
+    if isinstance(body, dict):
+        error = body.get('error', body)
+        if isinstance(error, dict):
+            fields = {key: clean(value) for key, value in error.items()
+                      if key in ('message', 'code', 'type', 'status', 'quotaResetDelay')
+                      and isinstance(value, (str, int, float))}
+            return json.dumps({'error': fields}, ensure_ascii=False) if fields else 'Upstream rejected the request'
+        if isinstance(error, str):
+            return clean(error)
+    return 'Upstream rejected the request'
+
+
 def _execute_request_with_retry(req, opener=None, timeout=None, max_attempts=2, initial_delay=2.0, cancel_check=None, on_attempt=None, emit_quota_failure=True):
     """emit_quota_failure=False：配额耗尽照常抛 QuotaExhaustedError，但不往进度流
     广播「上游报错」。只给「调用方撞到这堵墙时有等价的路可换、换完这一帧照渲」的
@@ -193,6 +238,9 @@ def _execute_request_with_retry(req, opener=None, timeout=None, max_attempts=2, 
     # 显式传入的 cancel_check 优先；否则退回 worker 通过 set_cancel_check_sink
     # 注册的线程局部默认值，见该函数的说明。
     check_cancel = cancel_check or getattr(_CANCEL_SINK, 'fn', None)
+    if check_cancel and check_cancel():
+        raise ImageTaskCancelled("任务已被用户取消")
+    req, normalize_image_response = adapt_cockpit_image_request(req)
 
     last_exception = None
     delay = initial_delay
@@ -212,14 +260,30 @@ def _execute_request_with_retry(req, opener=None, timeout=None, max_attempts=2, 
             log('DEBUG', 'HTTP', f"发送请求 {url_str}", attempt=f"{attempt+1}/{max_attempts}")
 
             with opener.open(req, timeout=timeout) as resp:
-                return resp.read()
+                raw_response = resp.read()
+                return normalize_image_response(raw_response) if normalize_image_response else raw_response
+        except ImageResponsesOutputError:
+            # HTTP succeeded; a missing/failed tool result must not trigger paid rerenders.
+            raise
         except urllib.error.HTTPError as e:
-            last_exception = e
             detail = ''
             try:
-                detail = e.read().decode('utf-8')[:800]
+                detail = _safe_upstream_error_detail(e.read().decode('utf-8', errors='replace'), req)
             except Exception:
                 pass
+            # 保留 HTTPError 类型，同时让 str(error) 和调用方第二次 read() 都有真实原因。
+            message = detail
+            try:
+                message = json.loads(detail).get('error', {}).get('message') or detail
+            except (ValueError, AttributeError):
+                pass
+            reason = _safe_upstream_error_detail(str(e.msg), req)
+            if message:
+                reason = f'{reason}: {message}'
+            e = urllib.error.HTTPError(e.url, e.code, reason, e.headers,
+                                       io.BytesIO(detail.encode('utf-8')))
+            e.upstream_detail = detail
+            last_exception = e
 
             log('WARN', 'HTTP', f"尝试 {attempt+1}/{max_attempts} 失败 HTTP {e.code}: {detail[:200]}")
             
@@ -380,7 +444,8 @@ def _threshold_reveal_context(manifest, sequence, frames_dir):
 
 
 def _continuity_family_maps(prompts_by_seq, videos):
-    return family_map([int(s) for s in (prompts_by_seq or {})], videos or {})
+    return family_map([int(s) for s in (prompts_by_seq or {})], videos or {},
+                      prompts_by_seq or {})
 
 
 def _continuity_family_id(families, sequence):
@@ -511,7 +576,7 @@ def update_manifest_stale_status(manifest, project_dir, regenerated_sequences=No
 
 
 def call_image_llm(config, prompt_content):
-    base_model = config.get('imageModel') or 'gemini-3.1-flash-image'
+    base_model = resolve_image_model(config.get('imageModel') or 'gemini-3.1-flash-image')
     if 'nano-banana-2' in base_model:
         base_model = base_model.replace('nano-banana-2', 'gemini-3.1-flash-image')
 
@@ -520,14 +585,14 @@ def call_image_llm(config, prompt_content):
     
     # 1. Aspect Ratio suffix
     aspect_ratio = config.get('imageAspectRatio')
-    if aspect_ratio:
+    if aspect_ratio and not is_gpt_image_model(base_model):
         # replace ':' with '-' to convert '9:16' to '9-16'
         ratio_suffix = aspect_ratio.replace(':', '-')
         model = f"{model}-{ratio_suffix}"
 
     # 2. Quality suffix
     quality = config.get('imageQuality')
-    if quality:
+    if quality and not is_gpt_image_model(base_model):
         q_lower = quality.lower()
         if q_lower in ('2k', 'medium'):
             model = f"{model}-2k"
@@ -562,13 +627,16 @@ def call_image_llm(config, prompt_content):
     return body['choices'][0]['message'].get('content') or ''
 
 
-def _quality_to_images_api(quality):
+def _quality_to_images_api(quality, model=None):
+    if is_gpt_image_model(model):
+        # imageQuality 是分辨率；细分 GPT 型号使用自己的默认渲染精度。
+        return gpt_image_render_quality(model, quality)
     return _image_quality_to_label(quality)
 
 
-def _image_size_to_api_size(aspect_ratio, model=None):
-    if model in ('gpt-image-2', 'gpt-image-2.5'):
-        return gpt_image_pixel_size(aspect_ratio)
+def _image_size_to_api_size(aspect_ratio, model=None, resolution=None):
+    if is_gpt_image_model(model):
+        return gpt_image_pixel_size(aspect_ratio, resolution, model)
     return aspect_ratio or '9:16'
 
 
@@ -614,11 +682,11 @@ def _image_quality_to_label(quality):
 
 
 def _image_generation_model(config):
-    model = config.get('imageModel') or 'gemini-3.1-flash-image'
+    model = resolve_image_model(config.get('imageModel') or 'gemini-3.1-flash-image')
     if 'nano-banana-2' in model:
         model = model.replace('nano-banana-2', 'gemini-3.1-flash-image')
-    if model in ('gpt-image-2', 'gpt-image-2.5'):
-        return model
+    if is_gpt_image_model(model):
+        return model.strip()
     if re.search(r'-\d+-\d+(?:-\d+k)?$', model.lower()):
         return model
 
@@ -635,8 +703,9 @@ def _image_generation_model(config):
 
 
 def _image_generation_model_for_request(model, size, quality):
-    if model in ('gpt-image-2', 'gpt-image-2.5'):
-        return model
+    model = resolve_image_model(model)
+    if is_gpt_image_model(model):
+        return model.strip()
     if re.search(r'-\d+-\d+(?:-\d+k)?$', model.lower()):
         return model
 
@@ -653,11 +722,11 @@ def _image_generation_model_for_request(model, size, quality):
 
 
 def _image_edit_model(config):
-    model = config.get('imageModel') or 'gemini-3.1-flash-image'
+    model = resolve_image_model(config.get('imageModel') or 'gemini-3.1-flash-image')
     if 'nano-banana-2' in model:
         model = model.replace('nano-banana-2', 'gemini-3.1-flash-image')
-    if model in ('gpt-image-2', 'gpt-image-2.5'):
-        return model
+    if is_gpt_image_model(model):
+        return model.strip()
     if re.search(r'-\d+-\d+(?:-\d+k)?$', model.lower()):
         return model
 
@@ -922,10 +991,10 @@ def _post_multipart(base_url, api_key, path, fields, file_field, file_path, time
     return json.loads(resp_bytes.decode('utf-8'))
 
 
-def _generate_text_image(config, prompt, target_path):
+def _generate_text_image(config, prompt, target_path, *, allow_text=False):
     model = _image_generation_model(config)
     base_url, api_key = resolve_gateway(model, config)
-    clean_render_prompt = (
+    clean_render_prompt = prompt if allow_text else (
         "Render a clean photorealistic image with no visible text, captions, labels, grid lines, "
         "measurement guides, letters, numbers, or percentages. Any terms such as Grid A2, Grid B1, "
         "coordinates, or percentage heights in the scene description are invisible composition "
@@ -933,13 +1002,15 @@ def _generate_text_image(config, prompt, target_path):
         f"{prompt}"
     )
     payload = {
-        'model': _image_generation_model(config),
+        'model': model,
         'prompt': clean_render_prompt,
-        'size': _image_size_to_api_size(config.get('imageAspectRatio'), model),
-        'quality': _quality_to_images_api(config.get('imageQuality')),
-        'image_size': _image_quality_to_label(config.get('imageQuality')),
-        'response_format': 'b64_json',
+        'size': _image_size_to_api_size(config.get('imageAspectRatio'), model,
+                                       config.get('imageQuality')),
+        'quality': _quality_to_images_api(config.get('imageQuality'), model),
     }
+    if not is_gpt_image_model(model):
+        payload['image_size'] = _image_quality_to_label(config.get('imageQuality'))
+        payload['response_format'] = 'b64_json'
     data = _post_json(base_url, api_key, '/images/generations', payload, timeout=300)
     if not data.get('data'):
         raise RuntimeError('text-to-image response contained no image data')
@@ -1092,9 +1163,11 @@ def _generate_image_edit(config, prompt, reference_path, target_path, control_pr
             ref_bytes = f.read()
         ref_mime = _detect_image_mime_from_path(reference_path)
 
-    # Ensure clean model name (no suffixes like -9-16-2k)
-    clean_model = re.sub(r'-\d+-\d+(?:-\d+k)?$', '', model, flags=re.IGNORECASE)
-    clean_model = re.sub(r'-(?:2k|4k)(?:-\d+x\d+)?$', '', clean_model, flags=re.IGNORECASE)
+    # 官方 GPT 型号后缀和日期必须完整保留；仅其他网关清理比例/画质魔法后缀。
+    clean_model = model
+    if not is_gpt_image_model(model):
+        clean_model = re.sub(r'-\d+-\d+(?:-\d+k)?$', '', model, flags=re.IGNORECASE)
+        clean_model = re.sub(r'-(?:2k|4k)(?:-\d+x\d+)?$', '', clean_model, flags=re.IGNORECASE)
 
     transport_mode = (config.get('imageEditTransport') or 'auto').strip().lower()
     chat_model = _chat_transport_model(clean_model)
@@ -1140,10 +1213,15 @@ def _generate_image_edit(config, prompt, reference_path, target_path, control_pr
                 # Windows 8046 的 multipart edits 路由实测认顶层像素 size；继续发旧的
                 # aspect_ratio 会让比例控制依赖网关版本。image_size 独立控制 1K/2K/4K：
                 # size=720x1280 + image_size=2K 实际返回 1536x2752。
-                'size': _image_edit_api_size(aspect_ratio),
-                'image_size': _image_quality_to_label(config.get('imageQuality')),
-                'response_format': 'b64_json',
+                'size': (gpt_image_pixel_size(aspect_ratio, config.get('imageQuality'), clean_model)
+                         if is_gpt_image_model(clean_model)
+                         else _image_edit_api_size(aspect_ratio)),
             }
+            if is_gpt_image_model(clean_model):
+                fields['quality'] = _quality_to_images_api(config.get('imageQuality'), clean_model)
+            else:
+                fields['image_size'] = _image_quality_to_label(config.get('imageQuality'))
+                fields['response_format'] = 'b64_json'
 
             for k, v in fields.items():
                 body_data.extend(f"--{boundary}\r\n".encode('utf-8'))
@@ -1163,7 +1241,7 @@ def _generate_image_edit(config, prompt, reference_path, target_path, control_pr
                 print(
                     f"[FRAME SEQUENCE] Image-to-Image edit via /images/edits (multipart) (attempt {attempt_no}/{max_attempts}): "
                     f"{os.path.basename(reference_path)} ({len(ref_bytes)} bytes) -> {clean_model} "
-                    f"size={fields['size']} image_size={fields['image_size']}"
+                    f"size={fields['size']} quality={fields.get('quality') or fields.get('image_size')}"
                 )
 
             req = urllib.request.Request(
@@ -1186,6 +1264,8 @@ def _generate_image_edit(config, prompt, reference_path, target_path, control_pr
             _decode_or_download_image(data['data'][0], target_path, config)
             return None  # 走的是 /images/edits 正常通道
 
+        except (ImageResponsesOutputError, ImageResponsesParameterError):
+            raise
         except QuotaExhaustedError as quota_err:
             if use_chat:
                 # chat 通道自己也没额度了：没有第三条路，就地停在配额耗尽这个真因上
@@ -1317,6 +1397,24 @@ def fx_bridge_target_sequences(prompts_by_seq, videos):
     }
 
 
+def fx_threshold_target_sequences(prompts_by_seq, videos):
+    """Target images that need the existing doorway/threshold grounding step."""
+    heads = fx_bridge_target_sequences(prompts_by_seq, videos)
+    for video_index, video in (videos or {}).items():
+        meta = str(video.get('meta', '') if isinstance(video, dict) else '').upper()
+        if 'CUT' in meta and 'BRIDGE' not in meta:
+            heads.add(int(video_index) + 1)
+    return heads
+
+
+def fx_camera_cut_target_sequences(prompts_by_seq):
+    """Generic viewpoint changes split FX batches without implying a doorway."""
+    return {
+        int(seq) for seq, item in (prompts_by_seq or {}).items()
+        if is_camera_cut_frame(item.get('meta', '') if isinstance(item, dict) else '')
+    }
+
+
 def split_fx_chunks_at_heads(chunks, heads):
     """Start a fresh Flow batch at every declared transition target frame."""
     heads = {int(s) for s in (heads or ())}
@@ -1334,14 +1432,15 @@ def split_fx_chunks_at_heads(chunks, heads):
 
 
 def fx_prompt_with_bridge_control(seq, item, prompts_by_seq, videos):
-    """Inline camera-motion control into the prompt because FX has no control_prompt channel."""
+    """Inline declared viewpoint changes because FX has no control_prompt channel."""
     body = str(item.get('prompt', '') if isinstance(item, dict) else item or '').strip()
     bridge_meta = _fx_bridge_meta(seq, prompts_by_seq, videos)
-    if not bridge_meta:
+    image_meta = str(item.get('meta', '') if isinstance(item, dict) else '')
+    if not bridge_meta and not is_camera_cut_frame(image_meta):
         return body
-    # TBCP v7：过门帧一律走弱参考揭示指令（闭门参考图里没有可推进/可旋转的室内），
-    # 直推与转向在图像侧不再分流。
-    control = IMG2IMG_CROSSING_REVEAL_CONTROL_PROMPT
+    # Doorway crossings keep their existing dedicated control when both signals exist.
+    control = (IMG2IMG_CROSSING_REVEAL_CONTROL_PROMPT if bridge_meta
+               else IMG2IMG_CAMERA_CUT_CONTROL_PROMPT)
     if control in body:
         return body
     return f'{control}\n\n{body}'.strip()
@@ -1394,32 +1493,12 @@ def split_fx_chunks_by_canvas(chunks, existing_frames, manifest=None):
 
 
 def plan_frame_chunk_accounts(chunks, ring, switch_interval):
-    """给每个链式批次分配号池账号（纯函数，可单测）。
+    """批次沿用当前可用账号，额度耗尽时由生成服务换号。
 
-    返回与 chunks 等长的 [{'user_id': ...}, ...]。所有批次都跑在同一个 IP 上——换 IP
-    已全局关停，见 server_common 的「换 IP 已全局关停」注释。
-
-    与视频序列（video_generator.plan_generation_legs 直接按请求数硬切）的差别在于帧的
-    批次边界是既定的：一个 chunk 就是外部脚本一次开浏览器、批内按提交顺序链式续图，
-    中途换不了号，所以只能整批整批地分配。「每 switch_interval 个请求换一个号」这个
-    节拍照旧，只是落到最近的批次边界上——累计够 switch_interval 帧才轮到下一个账号。
-
-    可换的账号 ≤1 个（含手动指定账号/空号池）时全部返回 user_id=None，沿用调用方已经
-    设好的账号。
+    保留旧参数供调用方兼容；分批与旧换号节拍不再触发新浏览器。
+    user_id=None 让后续批次跟随实际账号，包括批次中途刚换到的账号。
     """
-    if len(ring) <= 1:
-        return [{'user_id': None} for _ in chunks]
-    interval = max(1, switch_interval)
-    plans = []
-    leg_idx = 0
-    leg_frames = 0
-    for chunk in chunks:
-        if leg_frames >= interval and plans:
-            leg_idx += 1
-            leg_frames = 0
-        plans.append({'user_id': ring[leg_idx % len(ring)]})
-        leg_frames += len(chunk)
-    return plans
+    return [{'user_id': None} for _ in chunks]
 
 
 def _fx_src_dir(frames_dir):
@@ -1706,6 +1785,9 @@ def _fx_generate_batch(google_fx, models, config, prompt_texts, ref_path, cancel
     actual_account_id = account_binding.resolve_account(
         fallback=config.get('googleFxUserId') if isinstance(config, dict) else None
     )
+    if actual_account_id and isinstance(config, dict):
+        # 换号绑定在本批次作用域结束时会还原；保存实际账号供下一批续用。
+        config['googleFxUserId'] = actual_account_id
     returned_project_url = (result or {}).get('project_url') if isinstance(result, dict) else None
     if isinstance(attempt_state, dict):
         try:
@@ -1811,7 +1893,7 @@ def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=
     def _run_chunk_batch(chunk_prompts, ref_path, leg, chunk_sequences=None,
                          cover_reference=None):
         # Run chunk batch and save prefix, resume from first failed prompt.
-        user_id = (leg or {}).get('user_id') or pool_account_id or config.get('googleFxUserId')
+        user_id = (leg or {}).get('user_id') or config.get('googleFxUserId') or pool_account_id
         if user_id:
             config['googleFxUserId'] = user_id
             apply_google_fx_runtime_overrides(config)
@@ -2087,14 +2169,11 @@ def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=
         chunks = split_fx_chunks_by_canvas(chunks, manifest_frames_by_seq, manifest)
     # 声明式硬切和过门目标帧都另起一批。新批仍显式挂载上一帧作为参考，所以空间
     # 血统不断；但外景帧不会再与过门帧挤在同一个 Flow 批内链里，把批内参考惯性放大。
-    transition_heads = fx_bridge_target_sequences(prompts_by_seq, videos)
-    for _v_idx, _v in (videos or {}).items():
-        _vm = str(_v.get('meta', '') if isinstance(_v, dict) else '').upper()
-        if 'CUT' in _vm and 'BRIDGE' not in _vm:
-            transition_heads.add(int(_v_idx) + 1)
+    threshold_heads = fx_threshold_target_sequences(prompts_by_seq, videos)
+    transition_heads = threshold_heads | fx_camera_cut_target_sequences(prompts_by_seq)
     chunks = split_fx_chunks_at_heads(chunks, transition_heads)
     chunk_by_start = {c[0]: c for c in chunks}
-    # 批次边界定下来之后才能分账号：按换号节拍，每批绑号池里的下一个号（IP 始终不变）
+    # 批次沿用当前账号，余额耗尽才换号；轮转环仅作故障恢复的候选集合。
     ring = _account_rotation_ring(config, account_pool, pool_account_id) if pool_account_id else []
     leg_by_chunk_start = {
         c[0]: leg for c, leg in zip(chunks, plan_frame_chunk_accounts(
@@ -2180,7 +2259,7 @@ def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=
         # 过门/硬切目标帧组稿时还没有任何像素可看，只能凭文字空想门后长什么样。
         # 真正的过门前一帧此刻已经落盘（就是上面刚解出来的 ref_path）——改用它给
         # 模型看图联想，替掉组稿阶段那份没见过参考图的猜测（2026-08-07 复盘）。
-        if chunk[0] in transition_heads and ref_path and os.path.exists(ref_path):
+        if chunk[0] in threshold_heads and ref_path and os.path.exists(ref_path):
             target_item = prompts_by_seq[chunk[0]]
             reveal_ctx = _threshold_reveal_context(manifest, chunk[0], frames_dir)
             # 组稿产物是**状态的唯一权威**（它带着整份梯子写出来，本函数只见得到一张
@@ -2293,7 +2372,7 @@ def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=
 
                 # P1 换族锚点惯性检测（本地像素 MAD，不是视觉判定）：FX 链路只留痕
                 # 不自动重渲，本批后续帧已链在该帧上。
-                if is_bridge and s > 1:
+                if is_bridge and s > 1 and not reviews_disabled(config):
                     _stuck, _inertia_mad = detect_anchor_inertia(_webp_path(s), _webp_path(s - 1))
                     if _stuck:
                         vlm_reason = (f"anchor_inertia: 桥接帧与参考帧近乎相同"
@@ -2788,9 +2867,8 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
         vlm_qa_reason = None
         transport = None  # 非 None = 本帧不是走 /images/edits 渲的，见 chat_transport_note
         cover_anchor = False
-        # Only VIDEO slots carry [BRIDGE]/[BRIDGE TURN]/[CUT] tags per the delivery contract;
-        # the incoming transition (VIDEO seq-1) is the real signal for IMAGE seq, not the
-        # image's own tag.
+        # Threshold tags live on the incoming VIDEO; a generic camera cut is
+        # declared on its target IMAGE so it need not imply a door crossing.
         incoming_video = videos.get(seq - 1)
         incoming_meta = (incoming_video.get('meta', '') if isinstance(incoming_video, dict) else '').upper()
         is_bridge = (
@@ -2801,6 +2879,7 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
         is_turn = 'TURN' in incoming_meta
         # CUT changes the edit instruction, but does not break the image-reference chain.
         is_cut_head = ('CUT' in incoming_meta) and ('BRIDGE' not in incoming_meta)
+        is_camera_cut = is_camera_cut_frame(item.get('meta', ''))
         is_continuity_transition = is_transition_frame(
             seq, item.get('meta', ''), incoming_meta, _continuity_beat(manifest, seq))
         cover_ref = (resolve_cover_reference(config, title, project_dir=project_dir)
@@ -2897,6 +2976,8 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
                         # 转向版指令都以"参考帧里有可放大/可旋转的室内"为前提，在闭门
                         # 参考下只会得到那扇门的裁剪放大。统一走弱参考揭示指令。
                         ctrl_prompt = IMG2IMG_CROSSING_REVEAL_CONTROL_PROMPT
+                    elif is_camera_cut:
+                        ctrl_prompt = IMG2IMG_CAMERA_CUT_CONTROL_PROMPT
                     else:
                         # 过门/转向是全画幅相机运动，区域锁在语义上不适用，维持原样；
                         # 只有静态镜头下的常规拍才用这拍已声明的网格坐标收紧锁定范围。
@@ -2953,7 +3034,7 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
             # anchorInertiaAutoRetry=false 时仍然检测、仍然留痕，只是不自动重渲：
             # 检测本身是纯本地零成本的客观测量，关掉它等于让"桥接帧被惯性卡死"
             # 静默发生；有成本、有误判风险的是后面那次加强重渲，开关管的是它。
-            if is_bridge:
+            if is_bridge and not reviews_disabled(config):
                 stuck, inertia_mad = detect_anchor_inertia(target_path, previous_path)
                 if stuck and not gate_setting('anchorInertiaAutoRetry', config):
                     vlm_qa_reason = (f"anchor_inertia: 与参考帧近乎相同（MAD={inertia_mad:.2f}），"

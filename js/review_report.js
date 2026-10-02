@@ -139,7 +139,8 @@ function summarizeReviewState(frameRun) {
     const flagged = frames.filter(f => ISSUE_GATES.includes(gate(f))).length;
     const skipped = frames.filter(f => gate(f) === 'sequence_review_skipped')
         .map(f => Number(f.sequence)).filter(Number.isFinite);
-    const never = frames.filter(f => gate(f) === 'pending_manual_review')
+    const never = frames.filter(f => gate(f) !== 'sequence_reviewed_pass'
+        && !ISSUE_GATES.includes(gate(f)) && gate(f) !== 'sequence_review_skipped')
         .map(f => Number(f.sequence)).filter(Number.isFinite);
     const manual = frames.filter(
         f => typeof f.manual_issue === 'string' && f.manual_issue.trim()).length;
@@ -147,6 +148,8 @@ function summarizeReviewState(frameRun) {
     return {
         rendered: frames.length,
         passed, flagged, manual,
+        reviewed: passed + flagged,
+        unreviewed: frames.length - passed - flagged,
         skippedSeqs: skipped.sort((a, b) => a - b),
         neverSeqs: never.sort((a, b) => a - b),
         lastReviewedAt: stamps.length ? stamps[stamps.length - 1] : '',
@@ -156,9 +159,12 @@ function summarizeReviewState(frameRun) {
 /** 面板抬头那一句：说清"审过多少、几处问题、还有多少没审"。 */
 function reviewSummaryText(state, issueCount) {
     const parts = [];
-    parts.push(issueCount ? `${issueCount} 处待处理问题` : '未发现问题');
-    parts.push(`已审 ${state.passed + state.flagged}/${state.rendered} 帧`);
-    const unreviewed = state.skippedSeqs.length + state.neverSeqs.length;
+    const reviewed = state.passed + state.flagged;
+    const unreviewed = Math.max(0, state.rendered - reviewed);
+    parts.push(issueCount ? `${issueCount} 处待处理问题`
+        : !reviewed ? '尚未审查'
+        : unreviewed ? '已审部分未发现问题' : '未发现问题');
+    parts.push(`已审 ${reviewed}/${state.rendered} 帧`);
     if (unreviewed) parts.push(`${unreviewed} 帧未审查`);
     return parts.join(' · ');
 }
@@ -169,6 +175,30 @@ function reviewSummaryText(state, issueCount) {
 
 function padReviewSeq(n) {
     return String(n).padStart(3, '0');
+}
+
+/** 连续编号合成区间；完整编号仍保留在 data-seqs 中供定位使用。 */
+function reviewSeqRanges(sequences) {
+    const sorted = [...new Set(sequences.map(Number).filter(n => Number.isInteger(n) && n > 0))]
+        .sort((a, b) => a - b);
+    const ranges = [];
+    for (let i = 0; i < sorted.length; i++) {
+        const start = sorted[i];
+        let end = start;
+        while (sorted[i + 1] === end + 1) end = sorted[++i];
+        ranges.push(`IMG ${padReviewSeq(start)}` + (end === start ? '' : `–${padReviewSeq(end)}`));
+    }
+    return ranges.join('、');
+}
+
+function reviewPanelCollapsed(issueCount, preference) {
+    return preference === '1' || (preference !== '0' && !issueCount);
+}
+
+function setReviewPanelCollapsed(panel, collapsed) {
+    panel.classList.toggle('is-collapsed', collapsed);
+    const head = panel.querySelector('.review-panel-toggle');
+    if (head) head.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
 }
 
 /** 滚到某一帧的卡片并短暂高亮（复用工具条那套 .slot-flash）。 */
@@ -197,9 +227,9 @@ function reviewIssueRow(entry) {
     layerEl.title = entry.layer === 'global'
         ? '跨帧层检出：拿整段序列互相比出来的问题（施工顺序、空间拓扑）'
         : (entry.layer === 'manual' ? '人工标记：你自己写下的问题描述，尚未修复'
-        : (entry.layer === 'collage_macro' ? '拼图对标检出：与爆款 5 列大拼图相比的宏观阶段/光影演变偏差'
-        : (entry.layer === 'anchor' ? '首帧对标检出：首帧与爆款首帧/封面的机位、空间与初始状态对标偏差'
-                                    : '本拍检出：相邻两帧之间比出来的问题（含爆款原片关键帧对标）')));
+        : (entry.layer === 'collage_macro' ? '拼图对标检出：与参考原片 5 列大拼图相比的宏观阶段/光影演变偏差'
+        : (entry.layer === 'anchor' ? '首帧对标检出：首帧与参考首帧/封面的机位、空间与初始状态对标偏差'
+                                    : '本拍检出：相邻两帧之间比出来的问题（含参考原片关键帧对标）')));
     li.appendChild(layerEl);
 
     const textEl = document.createElement('span');
@@ -262,7 +292,9 @@ function renderReviewPanel(idea) {
     if (!state.rendered) { panel.hidden = true; return; }
     panel.hidden = false;
     panel.dataset.clean =
-        (!issues.length && !state.skippedSeqs.length && !state.neverSeqs.length) ? '1' : '0';
+        (!issues.length && state.reviewed === state.rendered) ? '1' : '0';
+    panel.dataset.issueCount = String(issues.length);
+    setReviewPanelCollapsed(panel, reviewPanelCollapsed(issues.length, panel.dataset.collapsePreference));
 
     const summaryEl = panel.querySelector('.review-panel-summary');
     if (summaryEl) summaryEl.textContent = reviewSummaryText(state, issues.length);
@@ -286,11 +318,16 @@ function renderReviewPanel(idea) {
         gapEl.hidden = !unreviewed.length;
         gapEl.dataset.seqs = unreviewed.join(',');
         const listEl = gapEl.querySelector('.review-gap-frames');
-        if (listEl) listEl.textContent = unreviewed.map(s => `IMG ${padReviewSeq(s)}`).join('、');
+        if (listEl) listEl.textContent = reviewSeqRanges(unreviewed);
     }
 
     const emptyEl = panel.querySelector('.review-panel-empty');
-    if (emptyEl) emptyEl.hidden = issues.length > 0;
+    if (emptyEl) {
+        emptyEl.hidden = issues.length > 0;
+        emptyEl.textContent = !state.reviewed ? '尚未完成审查，暂无审查结论。'
+            : state.unreviewed ? '已审部分未发现问题，其余图片尚未审查。'
+            : '本单没有待处理的审查问题。';
+    }
 }
 
 /** 面板事件：整块委托一次，重渲换掉行不影响。 */
@@ -302,14 +339,16 @@ function initReviewPanel() {
     const head = panel.querySelector('.review-panel-toggle');
     if (head) {
         // 折叠态记在本地：审过一轮、问题都看过之后不该每次进来都占半屏
-        let collapsed = false;
-        try { collapsed = localStorage.getItem('frames_review_panel_collapsed') === '1'; } catch (e) {}
-        panel.classList.toggle('is-collapsed', collapsed);
-        head.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+        try {
+            const preference = localStorage.getItem('frames_review_panel_collapsed');
+            if (preference === '0' || preference === '1') panel.dataset.collapsePreference = preference;
+        } catch (e) {}
+        setReviewPanelCollapsed(panel, reviewPanelCollapsed(Number(panel.dataset.issueCount || 0),
+            panel.dataset.collapsePreference));
         head.addEventListener('click', () => {
             const next = !panel.classList.contains('is-collapsed');
-            panel.classList.toggle('is-collapsed', next);
-            head.setAttribute('aria-expanded', next ? 'false' : 'true');
+            panel.dataset.collapsePreference = next ? '1' : '0';
+            setReviewPanelCollapsed(panel, next);
             try { localStorage.setItem('frames_review_panel_collapsed', next ? '1' : '0'); } catch (e) {}
         });
     }
@@ -435,8 +474,8 @@ function openFrameIssuePop(cardEl, seq) {
         foot.style.cssText = 'padding: 8px 12px; background: rgba(245,158,11,0.08); border-top: 1px solid rgba(245,158,11,0.25); display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 11.5px;';
         foot.innerHTML = `
             <div style="display:flex; align-items:center; gap:8px;">
-                <img src="${escapeHtml(refUrl)}" style="width:28px; height:50px; object-fit:cover; border-radius:3px; border:1px solid #f59e0b; cursor:pointer;" onclick="if(window.openLightbox) openLightbox('${escapeHtml(refUrl)}')" title="点击放大爆款原片抽帧" />
-                <span style="color:#f59e0b; font-weight:600;">🎯 爆款原片基准抽帧</span>
+                <img src="${escapeHtml(refUrl)}" style="width:28px; height:50px; object-fit:cover; border-radius:3px; border:1px solid #f59e0b; cursor:pointer;" onclick="if(window.openLightbox) openLightbox('${escapeHtml(refUrl)}')" title="点击放大参考原片抽帧" />
+                <span style="color:#f59e0b; font-weight:600;">🎯 参考原片基准抽帧</span>
             </div>
             <button type="button" class="action-btn text-btn mini-btn" style="color:#f59e0b; border-color:rgba(245,158,11,0.5); font-size:11px; padding:2px 8px;" onclick="if(typeof openBenchmarkCompare==='function') openBenchmarkCompare({ seq: ${seq} }); else if(typeof openCollageViewer==='function') openCollageViewer({ idea: typeof currentIdea !== 'undefined' ? currentIdea : null, initialMode: 'compare', compareType: 'benchmark', initialFrameSeq: ${seq} })">
                 ⇄ 分屏对标
@@ -477,6 +516,6 @@ if (typeof document !== 'undefined') {
 if (typeof module !== 'undefined' && module.exports) {
     module.exports = {
         collectReviewIssues, summarizeReviewState, reviewSummaryText,
-        reviewIssueSeverity, reviewLayerLabel,
+        reviewIssueSeverity, reviewLayerLabel, reviewSeqRanges, reviewPanelCollapsed,
     };
 }

@@ -73,6 +73,35 @@ def test_generation_continues_after_post_click_model_confirmation():
         ) == "9:16"
 
 
+def test_video_summary_does_not_confirm_omni_model():
+    summary = "Video · 360p · 10s crop_9_16 x1"
+    checks = helpers.check_fx_config(
+        summary,
+        model="Omni Flash",
+        orientation="9:16",
+        count="1x",
+        duration="10",
+        want_video=True,
+        resolution="360p",
+    )
+    assert checks["model"] is False
+    assert helpers._matches_model_status(summary, "Omni Flash") is False
+
+
+def test_actual_omni_1_1_dropdown_confirms_omni_family():
+    checks = helpers.check_fx_config(
+        "Video · 360p · 10s crop_9_16 x1",
+        model="Omni Flash",
+        orientation="9:16",
+        count="1x",
+        duration="10",
+        want_video=True,
+        resolved_model_text="Omni 1.1 Flash\narrow_drop_down",
+        resolution="360p",
+    )
+    assert checks["model"] is True
+
+
 def test_video_duration_verification_passes_duration():
     def _duration_checks(*_args, **kwargs):
         assert kwargs.get("duration") == "10"

@@ -75,6 +75,15 @@ class FrameContinuityTests(unittest.TestCase):
         self.assertEqual(result, {1: 'family-1', 2: 'family-1',
                                   3: 'family-2', 4: 'family-2'})
 
+    def test_explicit_camera_cut_starts_new_family_without_doorway_semantics(self):
+        self.assertTrue(fc.is_camera_cut_frame('CAMERA CUT'))
+        self.assertFalse(fc.is_camera_cut_frame('CUT'))
+        result = fc.family_map(
+            [1, 2, 3], {}, {1: '', 2: {'meta': 'CAMERA CUT'}, 3: ''})
+        self.assertEqual(result, {1: 'family-1', 2: 'family-2', 3: 'family-2'})
+        self.assertTrue(fc.is_transition_frame(2, 'CAMERA CUT'))
+        self.assertFalse(fc.is_transition_frame(3, ''))
+
     def test_family_master_sidecar_updates_when_head_is_regenerated(self):
         first = fc.register_family_master(self.tmp.name, 'family-1', 1, self.ref)
         changed = os.path.join(self.tmp.name, 'changed.png')

@@ -494,5 +494,5 @@ function refFrameRoleLabel(roles, seq) {
     const role = roles && (roles[seq] || roles[String(seq)]);
     if (role === 'envelope') return '[包络端点 · 原片未拍摄此镜]';
     if (role === 'establishing') return '[同空间全景参考 · 非本拍时刻]';
-    return '[爆款对标基准]';
+    return '[参考对标基准]';
 }

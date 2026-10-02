@@ -23,7 +23,6 @@ import unittest
 
 import prompt_pipeline as pp
 from prompt_pipeline.frame_state import compile_delta_image_prompt
-from prompt_pipeline import reverse as rv
 
 
 PACKET = {
@@ -193,37 +192,6 @@ class CastInFrameCheckTests(unittest.TestCase):
         self.assertEqual(pp.check_cast_in_frame(self.VIDEO_WITHOUT, ORIGINAL, beat), [])
 
 
-class StaticCastActionWarningTests(unittest.TestCase):
-    """反推侧：cast_action 写成站位而不是动作，要在体检里报出来。"""
-
-    @staticmethod
-    def _beat(bid, cast):
-        return {
-            'id': bid, 'stage': 'build', 'operation': 'masonry',
-            'workers_present': True, 'cast_action': cast,
-            'visible_action': 'the hand lays a course of blocks',
-        }
-
-    def _codes(self, cast):
-        buckets, _ = rv._scan_beat_craft([self._beat('B04', cast)])
-        return buckets
-
-    def test_remain_wording_is_flagged(self):
-        buckets = self._codes('two miniature figurines remain standing at the upper-left perimeter')
-        self.assertEqual(buckets['static_cast_action'], ['B04'])
-
-    def test_chinese_static_wording_is_flagged(self):
-        buckets = self._codes('两个人偶保持原样，站位不变')
-        self.assertEqual(buckets['static_cast_action'], ['B04'])
-
-    def test_a_real_move_is_not_flagged(self):
-        buckets = self._codes('the two figurines get up off the stone and turn to face the new wall')
-        self.assertEqual(buckets['static_cast_action'], [])
-
-    def test_the_symptom_code_is_repairable(self):
-        """报了却不在可回炉码里，等于报完没人管。"""
-        self.assertIn('static_cast_action', rv.CRAFT_REFINE_CODES)
-        self.assertIn('static_cast_action', rv._CRAFT_ISSUE_BRIEFS)
 
 
 if __name__ == '__main__':

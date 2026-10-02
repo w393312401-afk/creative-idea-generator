@@ -21,6 +21,7 @@ import os
 import shutil
 import tempfile
 import unittest
+from contextlib import ExitStack
 from unittest.mock import patch
 
 import prompt_pipeline as pp
@@ -117,7 +118,7 @@ class TestBeatLadderEarlyStop(unittest.TestCase):
             'beats_count': 11,
         }
 
-    def _run(self, ladders, rhythm_per_attempt):
+    def _run(self, ladders, rhythm_per_attempt, config=None):
         """rhythm_per_attempt：每一轮 rhythm_ladder_violations 该报几条（用来精确摆布
         「这一轮比上一轮好还是差」，不必去构造真的会触发某条判据的梯子）。"""
         pending = list(ladders)
@@ -142,7 +143,7 @@ class TestBeatLadderEarlyStop(unittest.TestCase):
                 patch.object(pp, 'rhythm_ladder_violations', side_effect=_rhythm), \
                 patch.object(pp, 'load_reference_file', return_value=''), \
                 patch.object(pp, 'get_cropped_templates', return_value=''):
-            state = pp.compose_anchor_and_packet({}, self.dimensions)
+            state = pp.compose_anchor_and_packet(config if config is not None else {}, self.dimensions)
         return state, planner_calls
 
     def test_stops_and_ships_the_better_earlier_draft(self):
@@ -195,6 +196,44 @@ class TestBeatLadderEarlyStop(unittest.TestCase):
             ladders=[_ladder_json(tag='clean')],
             rhythm_per_attempt=[0])
         self.assertEqual(len(planner_calls), 1)
+
+    def test_master_switch_accepts_quality_imperfect_ladder_without_review_or_retry(self):
+        ladder = json.loads(_ladder_json(tag='unreviewed'))
+        ladder[0]['milestone_name'] = 'one small section begins to receive framing'
+        ladder[0]['persistent_traces'] = ['one mark']
+        # The frame immediately after crossing violates the old cleanup-order gate.
+        ladder[3]['operation'] = 'repair'
+        self.assertTrue(pp.milestone_ladder_violations(ladder), 'Fixture must have real quality defects')
+        config = {'reviewsDisabled': True}
+        with ExitStack() as stack:
+            for name in (
+                'spatial_planning_violations', 'outline_contract_violations',
+                'outline_binding_violations', 'delta_visibility_violations',
+                'validate_frame_state_contract', 'validate_scene_states',
+            ):
+                stack.enter_context(patch.object(
+                    pp, name, side_effect=AssertionError(f'{name} must not run with reviews disabled')))
+            state, planner_calls = self._run([json.dumps(ladder)], [99], config=config)
+
+        self.assertEqual(len(planner_calls), 1, 'Quality defects must not trigger another paid planning request')
+        self.assertTrue(config['_planning_reviews_skipped'])
+        self.assertIn('one small section', state['beat_ladder'][0]['milestone_name'])
+
+    def test_master_switch_still_retries_missing_required_planning_fields(self):
+        ladder = json.loads(_ladder_json())
+        del ladder[0]['before_state']
+        _state, planner_calls = self._run(
+            [json.dumps(ladder), _ladder_json()], [], config={'reviewsDisabled': True})
+        self.assertEqual(len(planner_calls), 2)
+        self.assertIn('before_state', planner_calls[1])
+        self.assertIn('Required output structure is incomplete', planner_calls[1])
+
+    def test_master_switch_still_retries_invalid_indices(self):
+        ladder = json.loads(_ladder_json())
+        ladder[0]['index'] = 999
+        _state, planner_calls = self._run(
+            [json.dumps(ladder), _ladder_json()], [], config={'reviewsDisabled': True})
+        self.assertEqual(len(planner_calls), 2)
 
 
 if __name__ == '__main__':

@@ -45,9 +45,6 @@ L1 是**必要不充分**的：它保证提示词写对了，不保证模型照�
    这是本方案里**最便宜也最危险**的一条。
 5. **两种锁的互斥没人管。** 同一交付集里同时出现 `neon-yellow safety vest`（Hero Agent Lock）
    和具名身份块不会被拦截，已登记为 gap。协议说"混用等于放两个矛盾契约"，但没有执行点。
-6. **二创链路完全裸奔。** `replica_pipeline.py` 里 `character`/`cast` 零命中；
-   `reverse.py` 的 beat ladder 只有 `visual_subject`，没有人物身份概念。
-   `_MUTATE_SYSTEM` 换题材时会把人一起换掉。omni skill 同样没有 cast 概念。
 
 ---
 
@@ -158,12 +155,8 @@ Clean Frame 校验。
 
 ---
 
-### P3 — 覆盖二创与 omni（按需，最后做）
+### P3 — 覆盖 omni（按需，最后做）
 
-- **replica 链路**：beat ladder 增加 `cast_ref` 字段，`_MUTATE_SYSTEM` 的可变轴
-  （`visual_subject`、`visible_details` …）明确**排除**人物身份，换题材不换人。
-  > 注意二创用的是 `reference_frames` 方言，按原片口径校验会整条判死 —— cast 校验
-  > 接入变体路径时必须走变体口径，不能直接复用 VIDEO/IMAGE 的 slot 切分。
 - **omni skill**：目前无 cast 概念。P0-3 抽出 `prompt_pipeline/cast_lock.py` 后
   接进去即可，不需要第二套。
 

@@ -312,11 +312,18 @@ class TestVideoChainSequenceGeneration(unittest.TestCase):
         mock_fx_svc.return_value = (mock_svc, models)
         mock_extract.return_value = True
 
-        res = generate_video_chain_sequence(
-            self.config, self.title, self.prompt_block, on_progress=on_progress
-        )
+        with self.assertRaises(ConnectionError):
+            generate_video_chain_sequence(
+                self.config, self.title, self.prompt_block, on_progress=on_progress
+            )
 
-        # 仅生成了 Slot 1，Slot 2/3 被取消跳过
+        with open(os.path.join(self.tmp, 'manifest.json'), encoding='utf-8') as stream:
+            manifest = json.load(stream)
+        self.assertEqual(manifest['videos'][0]['last_attempt']['status'], 'cancelled')
+        self.assertEqual(manifest['video_generation_stats']['last_run']['cancelled_slots'], [1])
+        self.assertFalse(os.path.exists(os.path.join(self.tmp, 'videos', 'vid_001.mp4')))
+        mock_merge.assert_not_called()
+        # 仅发起了 Slot 1，下载后取消不会提交新结果，Slot 2/3 被取消跳过
         self.assertEqual(mock_svc.generate_videos_batch_google_fx.call_count, 1)
 
     @patch('video_generator._get_project_dir')

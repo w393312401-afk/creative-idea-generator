@@ -117,10 +117,12 @@ def live_server(tmp_path):
                # 穿不透这里 Popen 出来的真服务——不带这一项，这个用例会往开发者真实的
                # 去重记忆里塞 e2e 桩选题，之后真实激发会永久回避它。
                SPARK_USED_TOPIC_LEDGER_FILE=str(tmp_path / "used-topic-ledger.md"))
-    proc = subprocess.Popen([sys.executable, "server.py"], cwd=ROOT, env=env,
-                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    proc = None
     base = "http://127.0.0.1:%d" % port
     try:
+        # Popen 也放进 try：起不来（离线检查拦截子进程等）时同样要清掉 outputs 下的桩目录。
+        proc = subprocess.Popen([sys.executable, "server.py"], cwd=ROOT, env=env,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         for _ in range(60):
             try:
                 urllib.request.urlopen(base + "/index.html", timeout=2)
@@ -131,11 +133,12 @@ def live_server(tmp_path):
             raise RuntimeError("server 起不来")
         yield {"base": base, "run_dir": run_dir}
     finally:
-        proc.terminate()
-        try:
-            proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            proc.kill()
+        if proc is not None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
         shutil.rmtree(run_dir, ignore_errors=True)
 
 

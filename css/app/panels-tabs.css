@@ -14,7 +14,7 @@
     border-bottom: 2px solid transparent;
     color: var(--text-secondary);
     font-family: inherit;
-    font-size: 13px;
+    font-size: var(--fs-md);
     font-weight: 600;
     padding: 14px 10px;
     cursor: pointer;
@@ -72,22 +72,26 @@
 }
 
 .upload-text {
-    font-size: 13px;
+    font-size: var(--fs-md);
     font-weight: 600;
     color: var(--text-primary);
 }
 
 .upload-hint {
-    font-size: 11px;
+    font-size: var(--fs-xs);
     color: var(--text-muted);
 }
 
 /* --- Tasks Drawer Custom Styles --- */
-/* Header badge for active tasks（承载它的按钮从 #toggle-tasks-btn 换成了
-   #open-projects-btn —— 任务列表/点子库两个抽屉合并成项目工作台后 header 只剩
-   一个入口。角标本身的 id 与 updateTasksBadge 都没变。） */
-#open-projects-btn {
+/* 运行中任务角标：挂在「项目」工作区标签上（原先在 header 的 #open-projects-btn，
+   现已并入标签栏）。角标 id #active-task-count 与 updateTasksBadge 都没变。 */
+#main-tab-projects {
     position: relative;
+}
+/* 标签栏有 overflow 裁切，角标不能再往按钮外探（header 里时是 -5px），收进按钮内角 */
+#main-tab-projects .task-badge {
+    top: 3px;
+    right: 3px;
 }
 .task-badge {
     position: absolute;
@@ -95,11 +99,11 @@
     right: -5px;
     background: #ef4444;
     color: #ffffff;
-    font-size: 10px;
+    font-size: var(--fs-2xs);
     font-weight: bold;
     min-width: 16px;
     height: 16px;
-    border-radius: 8px;
+    border-radius: var(--radius-md);
     display: flex;
     align-items: center;
     justify-content: center;
@@ -139,9 +143,9 @@
 /* Task Cards inside drawer */
 /* Task Badge Statuses */
 .task-status-badge {
-    font-size: 10px;
+    font-size: var(--fs-2xs);
     padding: 2px 6px;
-    border-radius: 10px;
+    border-radius: var(--radius-md);
     font-weight: 600;
     white-space: nowrap;
 }
@@ -205,7 +209,7 @@ html[data-theme="dark"] .task-status-badge.completed {
 /* 联网参考案例库（左面板第 1 区，取代旧主题选择器；js/trend_refs.js） */
 .trend-refs-hint {
     margin: 0 0 10px 0;
-    font-size: 11px;
+    font-size: var(--fs-xs);
     line-height: 1.6;
     color: var(--text-secondary, #6B6256);
 }
@@ -220,17 +224,17 @@ html[data-theme="dark"] .task-status-badge.completed {
 
 .trend-refs-empty {
     padding: 14px 12px;
-    font-size: 12px;
+    font-size: var(--fs-sm);
     line-height: 1.6;
     color: var(--text-secondary, #6B6256);
     border: 1px dashed rgba(var(--ink-rgb), 0.15);
-    border-radius: 8px;
+    border-radius: var(--radius-md);
     text-align: center;
 }
 
 .trend-ref-item {
     border: 1px solid rgba(var(--ink-rgb), 0.1);
-    border-radius: 8px;
+    border-radius: var(--radius-md);
     background: rgba(var(--ink-rgb), 0.02);
     transition: border-color 0.15s ease, background 0.15s ease;
 }
@@ -255,9 +259,9 @@ html[data-theme="dark"] .task-status-badge.completed {
     height: 18px;
     line-height: 16px;
     text-align: center;
-    font-size: 12px;
+    font-size: var(--fs-sm);
     border: 1px solid rgba(var(--ink-rgb), 0.25);
-    border-radius: 4px;
+    border-radius: var(--radius-xs);
     color: #8A5A32;
 }
 
@@ -272,7 +276,7 @@ html[data-theme="dark"] .task-status-badge.completed {
 }
 
 .trend-ref-label {
-    font-size: 12px;
+    font-size: var(--fs-sm);
     font-weight: 600;
     color: var(--text-main, #3A342C);
     overflow: hidden;
@@ -281,16 +285,16 @@ html[data-theme="dark"] .task-status-badge.completed {
 }
 
 .trend-ref-meta {
-    font-size: 10px;
+    font-size: var(--fs-2xs);
     color: var(--text-secondary, #6B6256);
     margin-top: 2px;
 }
 
 .trend-ref-mini-btn {
     flex-shrink: 0;
-    font-size: 11px;
+    font-size: var(--fs-xs);
     padding: 3px 8px;
-    border-radius: 4px;
+    border-radius: var(--radius-xs);
     border: 1px solid rgba(var(--ink-rgb), 0.12);
     background: rgba(var(--ink-rgb), 0.03);
     color: var(--text-secondary, #6B6256);
@@ -313,7 +317,7 @@ html[data-theme="dark"] .task-status-badge.completed {
     white-space: pre-wrap;
     word-break: break-word;
     font-family: inherit;
-    font-size: 11px;
+    font-size: var(--fs-xs);
     line-height: 1.6;
     color: var(--text-secondary, #6B6256);
     max-height: 220px;
@@ -331,15 +335,15 @@ html[data-theme="dark"] .task-status-badge.completed {
 }
 
 .trend-refs-cap-note {
-    font-size: 10px;
+    font-size: var(--fs-2xs);
     color: var(--text-secondary, #6B6256);
 }
 
 .trend-refs-archive-toggle {
     flex-shrink: 0;
-    font-size: 10px;
+    font-size: var(--fs-2xs);
     padding: 3px 9px;
-    border-radius: 10px;
+    border-radius: var(--radius-md);
     border: 1px solid rgba(var(--ink-rgb), 0.14);
     background: transparent;
     color: var(--text-secondary, #6B6256);
@@ -386,12 +390,12 @@ html[data-theme="dark"] .task-status-badge.completed {
     margin-bottom: 10px;
     padding: 10px;
     border: 1px dashed rgba(var(--ink-rgb), 0.18);
-    border-radius: 8px;
+    border-radius: var(--radius-md);
     background: rgba(var(--ink-rgb), 0.02);
 }
 
 .trend-refs-direction-panel label {
-    font-size: 10.5px;
+    font-size: var(--fs-xs);
     font-weight: 600;
     color: var(--text-secondary, #6B6256);
     margin-top: 4px;
@@ -406,9 +410,9 @@ html[data-theme="dark"] .task-status-badge.completed {
     background: rgba(var(--ink-rgb), 0.04);
     border: 1px solid var(--border-color, rgba(var(--ink-rgb), 0.15));
     color: var(--text-main, #3A342C);
-    border-radius: 6px;
+    border-radius: var(--radius-sm);
     padding: 6px 8px;
-    font-size: 11.5px;
+    font-size: var(--fs-sm);
     font-family: inherit;
     outline: none;
     resize: vertical;
@@ -421,7 +425,7 @@ html[data-theme="dark"] .task-status-badge.completed {
 
 .trend-refs-direction-hint {
     margin: 6px 0 0 0;
-    font-size: 10px;
+    font-size: var(--fs-2xs);
     line-height: 1.5;
     color: var(--text-secondary, #6B6256);
 }
@@ -441,9 +445,9 @@ html[data-theme="dark"] .task-status-badge.completed {
     background: rgba(var(--ink-rgb), 0.04);
     border: 1px solid var(--border-color, rgba(var(--ink-rgb), 0.15));
     color: var(--text-main, #3A342C);
-    border-radius: 6px;
+    border-radius: var(--radius-sm);
     padding: 5px 9px;
-    font-size: 11px;
+    font-size: var(--fs-xs);
     font-family: inherit;
     outline: none;
 }
@@ -454,7 +458,7 @@ html[data-theme="dark"] .task-status-badge.completed {
 
 .trend-refs-selected-note {
     flex-shrink: 0;
-    font-size: 10px;
+    font-size: var(--fs-2xs);
     font-weight: 600;
     color: #8A5A32;
     white-space: nowrap;
@@ -466,9 +470,9 @@ html[data-theme="dark"] .task-status-badge.completed {
     background: rgba(var(--ink-rgb), 0.06);
     border: 1px solid rgba(176, 123, 82, 0.5);
     color: var(--text-main, #3A342C);
-    border-radius: 4px;
+    border-radius: var(--radius-xs);
     padding: 2px 5px;
-    font-size: 12px;
+    font-size: var(--fs-sm);
     font-family: inherit;
     font-weight: 600;
     outline: none;
@@ -499,9 +503,9 @@ html[data-theme="dark"] .task-status-badge.completed {
 #trend-refs-manage-modal .ledger-filter-chip {
     background: transparent;
     border: 1px solid var(--border-color);
-    border-radius: 20px;
+    border-radius: var(--radius-2xl);
     color: var(--text-secondary);
-    font-size: 12px;
+    font-size: var(--fs-sm);
     font-weight: 600;
     padding: 5px 14px;
     cursor: pointer;
@@ -532,9 +536,9 @@ html[data-theme="dark"] .task-status-badge.completed {
 #trend-refs-manage-modal .ledger-sort-select {
     background: rgba(var(--ink-rgb), 0.04);
     border: 1px solid var(--border-color);
-    border-radius: 8px;
+    border-radius: var(--radius-md);
     color: var(--text-main);
-    font-size: 12px;
+    font-size: var(--fs-sm);
     padding: 6px 12px;
     outline: none;
     transition: var(--transition-fast);
@@ -570,7 +574,7 @@ html[data-theme="dark"] .task-status-badge.completed {
 }
 
 #trend-refs-manage-modal .ledger-stats {
-    font-size: 12px;
+    font-size: var(--fs-sm);
     color: var(--text-muted, var(--text-secondary));
     margin-right: 4px;
     white-space: nowrap;
@@ -583,10 +587,10 @@ html[data-theme="dark"] .task-status-badge.completed {
     gap: 6px;
     background: rgba(var(--ink-rgb), 0.04);
     border: 1px solid var(--border-color);
-    border-radius: 8px;
+    border-radius: var(--radius-md);
     color: var(--text-primary);
     font-family: inherit;
-    font-size: 12px;
+    font-size: var(--fs-sm);
     font-weight: 600;
     padding: 6px 12px;
     cursor: pointer;
@@ -660,7 +664,7 @@ html[data-theme="dark"] .task-status-badge.completed {
 }
 
 #trend-refs-manage-modal .ledger-bulk-count {
-    font-size: 12px;
+    font-size: var(--fs-sm);
     color: var(--neon-cyan);
     font-weight: 600;
     white-space: nowrap;
@@ -691,11 +695,11 @@ html[data-theme="dark"] .task-status-badge.completed {
     align-items: center;
     gap: 8px;
     color: var(--text-secondary, #6B6256);
-    font-size: 11px;
+    font-size: var(--fs-xs);
 }
 
 .spinner-icon {
-    font-size: 18px;
+    font-size: var(--fs-xl);
     animation: spin 2s linear infinite;
     display: inline-block;
     will-change: transform;
@@ -712,13 +716,13 @@ html[data-theme="dark"] .task-status-badge.completed {
     align-items: center;
     gap: 6px;
     color: #ef4444;
-    font-size: 11px;
+    font-size: var(--fs-xs);
     padding: 10px;
     text-align: center;
 }
 
 .cover-error .error-icon {
-    font-size: 16px;
+    font-size: var(--fs-lg);
 }
 
 /* =====================================================================
@@ -728,7 +732,7 @@ html[data-theme="dark"] .task-status-badge.completed {
     display: flex;
     background: rgba(var(--panel-rgb), 0.45);
     border: 1px solid var(--border-color);
-    border-radius: 12px;
+    border-radius: var(--radius-lg);
     padding: 4px;
     margin-bottom: 12px;
     gap: 4px;
@@ -736,17 +740,13 @@ html[data-theme="dark"] .task-status-badge.completed {
 }
 
 .mobile-nav-btn {
-    /* 状态角标（.replica-tab-status-dot）绝对定位挂在按钮上，按钮必须是定位上下文。
-       没有这一条时最近的定位祖先是 .mobile-nav-tabs（nav-customize.css 给的），
-       角标会飘到整条标签栏的右上角，而不是它要标注的那一个标签上。 */
-    position: relative;
     flex: 1;
     background: transparent;
     border: none;
-    border-radius: 8px;
+    border-radius: var(--radius-md);
     color: var(--text-secondary);
     padding: 10px 8px;
-    font-size: 13px;
+    font-size: var(--fs-md);
     font-weight: 600;
     cursor: pointer;
     display: flex;
@@ -763,146 +763,89 @@ html[data-theme="dark"] .task-status-badge.completed {
     box-shadow: 0 0 10px rgba(176, 123, 82, 0.1);
 }
 
-/* ── 复刻标签页常驻状态指示点 ──────────────────────────────────
-   切走之后也要知道那条 job 在等你：跑着=蓝点呼吸，停在人工卡点=橙点，有硬伤=红点。
-   这一段必须待在任何媒体查询**之外** —— 它原先被写在 max-width:768px 块里，
-   于是桌面上 replicaUpdateTabBadge() 造出来的是个完全没有样式的空 span。 */
-.replica-tab-status-dot {
-    position: absolute;
-    top: 4px;
-    right: 4px;
-    width: 7px;
-    height: 7px;
-    border-radius: 50%;
-    background: #a1a1aa;
-    pointer-events: none;
-}
-
-.replica-tab-status-dot.is-error {
-    background: #ef4444;
-    box-shadow: 0 0 6px rgba(239, 68, 68, 0.6);
-}
-
-.replica-tab-status-dot.is-running {
-    background: #3b82f6;
-    box-shadow: 0 0 6px rgba(59, 130, 246, 0.6);
-    animation: replicaDotPulse 1.5s infinite;
-}
-
-.replica-tab-status-dot.is-pause {
-    background: #f59e0b;
-    box-shadow: 0 0 6px rgba(245, 158, 11, 0.6);
-}
-
-@keyframes replicaDotPulse {
-    0%, 100% { opacity: 1; transform: scale(1); }
-    50% { opacity: 0.4; transform: scale(0.85); }
-}
-
-@media (prefers-reduced-motion: reduce) {
-    .replica-tab-status-dot.is-running {
-        animation: none;
-    }
-}
-
 /* =====================================================================
    Mobile Responsive Adaptations (max-width: 768px)
    ===================================================================== */
 @media (max-width: 768px) {
+    /* 外壳（body 锁滚动 / 100dvh 容器 / flex 纵向 / .app-main 弹性填充）在 tokens.css
+       与 base.css 里已对所有宽度生效，这里只写手机上才不同的部分。≤1024px 的
+       「整页滚动」旧规则已删除，所以这一段不再需要靠 !important 去压它。 */
+
     /* 1. App Container & Body */
     body {
-        overflow: hidden !important; /* Keep native app-like scroll lock */
-        height: 100vh !important;
-        height: 100dvh !important; /* mobile URL-bar-aware; older browsers keep 100vh */
-        width: 100vw !important;
+        width: 100vw;
     }
 
     .app-container {
-        height: 100vh !important;
-        height: 100dvh !important;
-        padding: 12px !important;
+        padding: 12px; /* 不支持 env() 的浏览器回落到这一行 */
         /* Notched phones (viewport-fit=cover): keep content out of the safe areas */
         padding: calc(12px + env(safe-area-inset-top, 0px))
                  calc(12px + env(safe-area-inset-right, 0px))
                  calc(12px + env(safe-area-inset-bottom, 0px))
-                 calc(12px + env(safe-area-inset-left, 0px)) !important;
-        overflow: hidden !important;
-        display: flex !important;
-        flex-direction: column !important;
+                 calc(12px + env(safe-area-inset-left, 0px));
     }
 
     /* 2. Header Adjustments */
     .app-header {
-        padding: 0 4px 12px 4px !important;
-        margin-bottom: 12px !important;
-        gap: 8px !important;
-        display: flex !important;
-        justify-content: space-between !important;
-        align-items: center !important;
+        padding: 0 4px 12px 4px;
+        margin-bottom: 12px;
+        gap: 8px;
     }
 
     .logo-icon {
-        font-size: 24px !important;
+        font-size: 24px;
     }
 
     .logo-text h1 {
-        font-size: 18px !important;
-        letter-spacing: 1px !important;
+        font-size: var(--fs-xl);
+        letter-spacing: 1px;
     }
 
     .logo-text span {
-        display: none !important; /* Hide subtitle to save horizontal space */
+        /* Hide subtitle to save horizontal space. 这条的 !important 不能去：它同时要
+           压住 #spark-version-badge 的 inline style（版本脚本会写 display），手机上
+           徽标和副标题一并隐藏。 */
+        display: none !important;
     }
 
     .header-controls {
-        gap: 4px !important; /* 320px-wide phones need the row to fit with all 5 controls */
+        gap: 4px; /* 320px-wide phones need the row to fit with all 5 controls */
     }
 
     /* Hide text on header icon buttons to save space, keeping only icons */
     .header-controls .icon-btn {
-        padding: 8px !important;
-        border-radius: 8px !important;
-        gap: 0 !important;
+        padding: 8px;
+        border-radius: var(--radius-md);
+        gap: 0;
     }
-    
-    .header-controls .icon-btn span:not(#theme-toggle-icon):not(.task-badge) {
-        display: none !important; /* Hide the "项目" label, but keep the theme emoji and task-count badge */
+
+    .header-controls .icon-btn span:not(#theme-toggle-icon):not(.icon-always) {
+        display: none; /* 手机上只留图标：隐藏「控制台」等文字标签，保留主题 emoji 与 .icon-always 图标 */
     }
 
     /* API Status Badge on mobile: show only status dot, hide text to save space */
     #api-status-badge {
-        padding: 8px !important;
-        border-radius: 50% !important;
-        width: 32px !important;
-        height: 32px !important;
-        justify-content: center !important;
+        padding: 8px;
+        border-radius: 50%;
+        width: 32px;
+        height: 32px;
+        justify-content: center;
     }
-    
+
     #api-status-badge .status-text {
-        display: none !important;
+        display: none;
     }
 
     /* 4. Main Panel Layout overrides */
     .app-main {
-        flex-grow: 1 !important;
-        display: flex !important;
-        flex-direction: column !important;
-        height: calc(100% - 70px) !important; /* Leave space for header and tab bar */
-        min-height: 0 !important;
-        overflow: hidden !important;
-        gap: 0 !important;
+        overflow: hidden;
     }
 
-    .glass-panel {
-        display: none !important; /* Hide panels by default */
-        height: 100% !important;
-        max-height: 100% !important;
-        flex-direction: column !important;
-        overflow: hidden !important;
-    }
-
-    .glass-panel.mobile-active {
-        display: flex !important; /* Show active panel */
+    /* 显隐由 base.css 的 .app-main > .glass-panel(.mobile-active) 负责；手机上只需让
+       当前面板撑满 .app-main。 */
+    .app-main > .glass-panel {
+        height: 100%;
+        max-height: 100%;
     }
 
     .panel-body, .content-scroll-area {
@@ -918,7 +861,7 @@ html[data-theme="dark"] .task-status-badge.completed {
     }
 
     .panel-header h2 {
-        font-size: 16px !important;
+        font-size: var(--fs-lg) !important;
     }
 
     /* 5. Component Responsive Fine-tuning */
@@ -931,7 +874,7 @@ html[data-theme="dark"] .task-status-badge.completed {
     .preset-btn {
         flex: unset !important;
         width: calc(50% - 4px) !important; /* 2 columns for presets */
-        font-size: 11px !important;
+        font-size: var(--fs-xs) !important;
         padding: 8px !important;
     }
 
@@ -945,7 +888,7 @@ html[data-theme="dark"] .task-status-badge.completed {
 
     .anchor-node {
         padding: 8px 12px !important;
-        font-size: 11px !important;
+        font-size: var(--fs-xs) !important;
     }
 
     .sliders-container {
@@ -954,7 +897,7 @@ html[data-theme="dark"] .task-status-badge.completed {
 
     .segment-btn {
         padding: 8px 4px !important;
-        font-size: 11px !important;
+        font-size: var(--fs-xs) !important;
     }
 
     .slider-step-btn {
@@ -1005,7 +948,7 @@ html[data-theme="dark"] .task-status-badge.completed {
     .tab-btn {
         flex-shrink: 0 !important;
         padding: 8px 12px !important;
-        font-size: 12px !important;
+        font-size: var(--fs-sm) !important;
     }
     
     /* 10. Live console and spinner adjustments */
@@ -1043,7 +986,7 @@ html[data-theme="dark"] .task-status-badge.completed {
 
     .mobile-nav-btn {
         padding: 8px 3px;
-        font-size: 11px;
+        font-size: var(--fs-xs);
         gap: 3px;
         white-space: nowrap;
         min-width: 0;
@@ -1057,7 +1000,7 @@ html[data-theme="dark"] .task-status-badge.completed {
     }
 
     .mobile-nav-btn .btn-icon {
-        font-size: 13px;
+        font-size: var(--fs-md);
     }
 
 @media (max-width: 480px) {
@@ -1112,7 +1055,7 @@ html[data-theme="dark"] .task-status-badge.completed {
     }
 
     .idea-title-cn {
-        font-size: 12px;
+        font-size: var(--fs-sm);
     }
 
     /* — 折叠态：主标题一行截断，话题串与中文标题行整条收起 — */
@@ -1150,7 +1093,7 @@ html[data-theme="dark"] .task-status-badge.completed {
     }
 
     .section-title h3 {
-        font-size: 12px;
+        font-size: var(--fs-sm);
         letter-spacing: 0.3px;
     }
 
@@ -1164,7 +1107,7 @@ html[data-theme="dark"] .task-status-badge.completed {
 
     .cover-desc-text,
     .frames-desc {
-        font-size: 11.5px;
+        font-size: var(--fs-sm);
         line-height: 1.55;
     }
 
@@ -1177,7 +1120,7 @@ html[data-theme="dark"] .task-status-badge.completed {
     .prompt-pre,
     .prompt-editor {
         padding: 12px;
-        font-size: 11.5px;
+        font-size: var(--fs-sm);
         line-height: 1.6;
     }
     .prompt-display-container {
@@ -1188,7 +1131,7 @@ html[data-theme="dark"] .task-status-badge.completed {
         padding: 10px 12px;
     }
     .prompt-item-body {
-        font-size: 11.5px;
+        font-size: var(--fs-sm);
         line-height: 1.6;
         padding: 8px 10px;
     }
@@ -1224,7 +1167,7 @@ html[data-theme="dark"] .task-status-badge.completed {
 
     .audit-panel {
         padding: 12px;
-        font-size: 12px;
+        font-size: var(--fs-sm);
     }
 
     /* — 帧/视频卡片操作按钮：桌面靠 hover 浮现，触屏没有 hover 就永远点不到
@@ -1249,7 +1192,7 @@ html[data-theme="dark"] .task-status-badge.completed {
 
     .slot-actions .slot-action-btn {
         padding: 3px 6px;
-        font-size: 9.5px;
+        font-size: var(--fs-2xs);
         color: #fff;
     }
 }
@@ -1393,7 +1336,7 @@ html[data-theme="dark"] .task-status-badge.completed {
     height: 180px;
     cursor: default;
     gap: 8px;
-    border-radius: 10px;
+    border-radius: var(--radius-md);
 }
 
 .video-failed-placeholder {
@@ -1410,7 +1353,7 @@ html[data-theme="dark"] .task-status-badge.completed {
 }
 
 .video-failed-placeholder .error-text {
-    font-size: 11px;
+    font-size: var(--fs-xs);
     color: rgba(255, 75, 75, 0.9);
     max-width: 100px;
     white-space: nowrap;
@@ -1421,8 +1364,8 @@ html[data-theme="dark"] .task-status-badge.completed {
 
 .video-failed-placeholder .retry-video-btn {
     padding: 3px 8px;
-    font-size: 11px;
-    border-radius: 4px;
+    font-size: var(--fs-xs);
+    border-radius: var(--radius-xs);
     border: 1px solid rgba(255, 75, 75, 0.5);
     background: rgba(255, 75, 75, 0.1);
     color: #ff4b4b;
@@ -1438,8 +1381,8 @@ html[data-theme="dark"] .task-status-badge.completed {
 
 .video-failed-placeholder .upload-video-btn {
     padding: 3px 8px;
-    font-size: 11px;
-    border-radius: 4px;
+    font-size: var(--fs-xs);
+    border-radius: var(--radius-xs);
     border: 1px solid rgba(var(--ink-rgb), 0.3);
     background: rgba(var(--ink-rgb), 0.06);
     color: var(--text-main);
@@ -1496,7 +1439,7 @@ html[data-theme="dark"] .task-status-badge.completed {
     border-left: 1px solid var(--log-edge);
     /* 从 1000 降到 900，把主栈层让回给弹窗(1100)/灯箱(2000)/toast(3000)——
        它们此前都是为了压过这个日志抽屉才被迫抬高的 */
-    z-index: 900;
+    z-index: var(--z-drawer);
     display: flex;
     flex-direction: column;
     /* 收起靠位移而不是改尺寸：transform 走合成层，不触发主界面重排 */
@@ -1548,7 +1491,7 @@ html[data-theme="dark"] .task-status-badge.completed {
     display: flex;
     align-items: center;
     gap: 8px;
-    font-size: 13px;
+    font-size: var(--fs-md);
     font-weight: 600;
     color: var(--log-fg-dim);
     min-width: 0; /* 让下面那行长标题能省略，而不是把「收起」按钮挤出去 */
@@ -1568,13 +1511,18 @@ html[data-theme="dark"] .task-status-badge.completed {
     height: 8px;
     flex-shrink: 0;
     border-radius: 50%;
-    background: #ff4b4b; /* red when disconnected, green when connected */
+    background: #d97706; /* 日志断线只代表同步中断，不等同于生成失败。 */
     transition: background 0.3s;
 }
 
 .log-panel-status-dot.connected {
     background: #a6e22e;
     box-shadow: 0 0 8px #a6e22e;
+}
+
+.log-pill[data-connected="false"] .log-panel-status-dot {
+    background: #d97706;
+    box-shadow: none;
 }
 
 /* 连上之后，状态点跟着"有没有事"走，而不是只表示"连着没有"——连接正常但
@@ -1589,6 +1537,12 @@ html[data-theme="dark"] .task-status-badge.completed {
     box-shadow: 0 0 8px #ef4444;
 }
 
+.log-mode-tabs .log-action-btn[aria-pressed="true"] {
+    color: var(--log-accent, #66d9ef);
+    border-color: var(--log-accent, #66d9ef);
+    background: rgba(102, 217, 239, 0.08);
+}
+
 .log-panel-actions {
     display: flex;
     align-items: center;
@@ -1596,7 +1550,7 @@ html[data-theme="dark"] .task-status-badge.completed {
 }
 
 .log-panel-checkbox-label {
-    font-size: 11px;
+    font-size: var(--fs-xs);
     color: var(--log-fg-mute);
     display: flex;
     align-items: center;
@@ -1609,8 +1563,8 @@ html[data-theme="dark"] .task-status-badge.completed {
     border: 1px solid rgba(255, 255, 255, 0.1);
     color: var(--log-fg-dim);
     padding: 3px 10px;
-    font-size: 11px;
-    border-radius: 4px;
+    font-size: var(--fs-xs);
+    border-radius: var(--radius-xs);
     cursor: pointer;
     transition: all 0.2s;
 }
@@ -1625,10 +1579,15 @@ html[data-theme="dark"] .task-status-badge.completed {
 .log-mode-tabs {
     display: flex;
     flex-shrink: 0;
+    align-items: center;
+    gap: 4px;
     padding: 0 12px;
     background: #0d1018;
     border-bottom: 1px solid rgba(255, 255, 255, 0.05);
 }
+
+#log-scope-project { margin-left: auto; }
+.log-mode-tabs .log-action-btn { padding: 3px 7px; white-space: nowrap; }
 
 .log-mode-tab {
     background: transparent;
@@ -1636,7 +1595,7 @@ html[data-theme="dark"] .task-status-badge.completed {
     border-bottom: 2px solid transparent;
     color: var(--log-fg-mute);
     padding: 8px 14px;
-    font-size: 12px;
+    font-size: var(--fs-sm);
     font-weight: 600;
     cursor: pointer;
     transition: color 0.15s, border-color 0.15s;
@@ -1680,10 +1639,10 @@ html[data-theme="dark"] .task-status-badge.completed {
 .log-event-card {
     border: 1px solid rgba(255, 255, 255, 0.09);
     border-left-width: 3px;
-    border-radius: 8px;
+    border-radius: var(--radius-md);
     background: rgba(255, 255, 255, 0.025);
     padding: 10px 12px;
-    font-size: 12.5px;
+    font-size: var(--fs-md);
     line-height: 1.55;
 }
 
@@ -1698,7 +1657,7 @@ html[data-theme="dark"] .task-status-badge.completed {
 
 .log-event-icon {
     flex-shrink: 0;
-    font-size: 12px;
+    font-size: var(--fs-sm);
     line-height: 1.4;
 }
 
@@ -1716,14 +1675,14 @@ html[data-theme="dark"] .task-status-badge.completed {
    是有用的信号（偶发一次 vs 一直在撞），不能连同折叠一起丢掉。 */
 .log-event-count {
     flex-shrink: 0;
-    font-size: 11px;
+    font-size: var(--fs-xs);
     font-weight: 700;
     color: var(--log-fg-mute);
 }
 
 .log-event-meta {
     margin-top: 2px;
-    font-size: 11px;
+    font-size: var(--fs-xs);
     color: var(--log-fg-mute);
 }
 
@@ -1744,7 +1703,7 @@ html[data-theme="dark"] .task-status-badge.completed {
     border: none;
     padding: 0;
     font: inherit;
-    font-size: 11.5px;
+    font-size: var(--fs-sm);
     color: var(--log-accent);
     cursor: pointer;
     text-decoration: none;
@@ -1769,7 +1728,7 @@ html[data-theme="dark"] .task-status-badge.completed {
 }
 
 .log-event-empty-title {
-    font-size: 13px;
+    font-size: var(--fs-md);
     color: var(--log-fg-dim);
 }
 
@@ -1777,7 +1736,7 @@ html[data-theme="dark"] .task-status-badge.completed {
 .log-panel-foot {
     flex-shrink: 0;
     padding: 7px 12px;
-    font-size: 11px;
+    font-size: var(--fs-xs);
     color: var(--log-fg-mute);
     background: #0d1018;
     border-top: 1px solid rgba(255, 255, 255, 0.05);
@@ -1827,7 +1786,7 @@ html[data-theme="dark"] .task-status-badge.completed {
     gap: 8px;
     padding: 10px;
     border: 1px solid var(--log-edge);
-    border-radius: 8px;
+    border-radius: var(--radius-md);
     background: #111520;
     box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
 }
@@ -1855,10 +1814,10 @@ html[data-theme="dark"] .task-status-badge.completed {
     border: 1px solid rgba(255, 255, 255, 0.12);
     color: var(--log-fg-mute);
     padding: 2px 8px;
-    font-size: 10px;
+    font-size: var(--fs-2xs);
     font-weight: 700;
     letter-spacing: 0.03em;
-    border-radius: 10px;
+    border-radius: var(--radius-md);
     cursor: pointer;
     transition: all 0.15s;
     opacity: 0.55;
@@ -1876,8 +1835,8 @@ html[data-theme="dark"] .task-status-badge.completed {
     border: 1px solid rgba(255, 255, 255, 0.1);
     color: var(--log-fg);
     padding: 3px 8px;
-    font-size: 11px;
-    border-radius: 5px;
+    font-size: var(--fs-xs);
+    border-radius: var(--radius-sm);
     /* 窄栏里靠 min-width:0 才能真正收缩，不撑破 dock */
     min-width: 0;
     width: 100%;
@@ -1891,7 +1850,7 @@ html[data-theme="dark"] .task-status-badge.completed {
 }
 
 .log-filter-count {
-    font-size: 10px;
+    font-size: var(--fs-2xs);
     color: var(--log-fg-mute);
     margin-left: auto;
     white-space: nowrap;
@@ -1909,7 +1868,7 @@ html[data-theme="dark"] .task-status-badge.completed {
 }
 
 #log-output-lines {
-    font-size: 12px;
+    font-size: var(--fs-sm);
     line-height: 1.6;
     color: #f8f8f2;
 }
@@ -1948,7 +1907,7 @@ html[data-theme="dark"] .task-status-badge.completed {
     display: inline-block;
     min-width: 38px;
     font-weight: 700;
-    font-size: 10px;
+    font-size: var(--fs-2xs);
     margin-right: 6px;
 }
 
@@ -1986,10 +1945,10 @@ html[data-theme="dark"] .task-status-badge.completed {
     display: inline-block;
     margin-left: 6px;
     padding: 0 6px;
-    border-radius: 8px;
+    border-radius: var(--radius-md);
     background: rgba(255, 255, 255, 0.08);
     color: var(--log-fg-mute);
-    font-size: 10px;
+    font-size: var(--fs-2xs);
     cursor: pointer;
     user-select: none;
 }
@@ -2010,7 +1969,7 @@ html[data-theme="dark"] .task-status-badge.completed {
 
 .log-line-repeat-detail .log-line-repeat-item {
     color: rgba(255, 255, 255, 0.55);
-    font-size: 11px;
+    font-size: var(--fs-xs);
 }
 
 #log-problems-only-btn.active {
@@ -2026,7 +1985,7 @@ html[data-theme="dark"] .task-status-badge.completed {
     position: fixed;
     right: 20px;
     bottom: 20px;
-    z-index: 890;
+    z-index: var(--z-dock);
     display: flex;
     align-items: center;
     gap: 7px;
@@ -2035,7 +1994,7 @@ html[data-theme="dark"] .task-status-badge.completed {
     background: var(--bg-panel-solid);
     border: 1px solid var(--border-color);
     color: var(--text-secondary);
-    font-size: 12px;
+    font-size: var(--fs-sm);
     font-family: 'Consolas', 'Courier New', Courier, monospace;
     cursor: pointer;
     box-shadow: 0 4px 14px rgba(0, 0, 0, 0.28);
@@ -2057,10 +2016,10 @@ body.log-expanded .log-pill {
 .log-pill-badge {
     min-width: 18px;
     padding: 0 5px;
-    border-radius: 9px;
+    border-radius: var(--radius-md);
     background: #ef4444;
     color: #fff;
-    font-size: 10px;
+    font-size: var(--fs-2xs);
     font-weight: 700;
     line-height: 18px;
     text-align: center;
@@ -2076,15 +2035,10 @@ body.log-expanded .log-pill {
     display: none;
 }
 
-/* 主工作区给 dock 让出宽度。
-   用 width 而不是 margin-right：.app-container 在 tokens.css 里是写死的
-   width:100vw + box-sizing:border-box，加 margin 只会溢出、不会收缩。
-   ≥1200px 才推挤；再窄就让 dock 直接覆盖，挤下去两边都没法用。 */
-@media (min-width: 1200px) {
-    body.log-expanded .app-container {
-        width: calc(100vw - var(--log-dock-width, 420px));
-        transition: width 0.3s cubic-bezier(0.4, 0, 0.2, 1);
-    }
+/* 仅在主区域仍足够宽时并排；log-docked 随拖动与窗口尺寸实时更新。 */
+body.log-expanded.log-docked .app-container {
+    width: calc(100vw - var(--log-dock-width, 420px));
+    transition: width 0.3s cubic-bezier(0.4, 0, 0.2, 1);
 }
 
 /* 窄屏：dock 退化为全宽覆盖浮层，不推挤任何东西 */
@@ -2122,7 +2076,7 @@ body.log-expanded .log-pill {
     background: rgba(245, 158, 11, 0.9);
     color: #fff;
     padding: 2px 5px;
-    font-size: 9px;
+    font-size: var(--fs-2xs);
     border-radius: 3px;
     font-weight: bold;
     z-index: 10;
@@ -2148,7 +2102,7 @@ body.log-expanded .log-pill {
     background: rgba(239, 68, 68, 0.9);
     color: #fff;
     padding: 2px 5px;
-    font-size: 9px;
+    font-size: var(--fs-2xs);
     border-radius: 3px;
     font-weight: bold;
     z-index: 10;
@@ -2163,8 +2117,8 @@ body.log-expanded .log-pill {
     background: linear-gradient(135deg, #10b981, #059669);
     color: #fff;
     padding: 2px 6px;
-    font-size: 9px;
-    border-radius: 4px;
+    font-size: var(--fs-2xs);
+    border-radius: var(--radius-xs);
     font-weight: bold;
     z-index: 10;
     cursor: pointer;
@@ -2204,7 +2158,7 @@ body.log-expanded .log-pill {
 .candidate-card {
     background: var(--bg-card, #1e293b);
     border: 2px solid rgba(255, 255, 255, 0.08);
-    border-radius: 8px;
+    border-radius: var(--radius-md);
     overflow: hidden;
     display: flex;
     flex-direction: column;
@@ -2251,7 +2205,7 @@ body.log-expanded .log-pill {
     background: rgba(251, 146, 60, 0.92);
     color: #1a1a1a;
     padding: 2px 5px;
-    font-size: 9px;
+    font-size: var(--fs-2xs);
     border-radius: 3px;
     font-weight: bold;
     z-index: 10;
@@ -2277,7 +2231,7 @@ body.log-expanded .log-pill {
     background: rgba(139, 92, 246, 0.9);
     color: #fff;
     padding: 2px 5px;
-    font-size: 9px;
+    font-size: var(--fs-2xs);
     border-radius: 3px;
     font-weight: bold;
     z-index: 10;
@@ -2289,9 +2243,9 @@ body.log-expanded .log-pill {
 /* --- Task Drawer Optimization Styles --- */
 
 .task-type-badge {
-    font-size: 10px;
+    font-size: var(--fs-2xs);
     padding: 2px 6px;
-    border-radius: 4px;
+    border-radius: var(--radius-xs);
     font-weight: bold;
     margin-right: 6px;
     display: inline-block;
@@ -2360,7 +2314,7 @@ body.log-expanded .log-pill {
     display: flex;
     align-items: center;
     gap: 8px;
-    font-size: 12px;
+    font-size: var(--fs-sm);
     color: var(--text-muted);
     flex-wrap: wrap;
 }
@@ -2384,7 +2338,7 @@ body.log-expanded .log-pill {
     padding: 7px 12px;
     border: 1px solid var(--border-color);
     border-left: 3px solid var(--border-color);
-    border-radius: 10px;
+    border-radius: var(--radius-md);
     background: rgba(var(--ink-rgb), 0.03);
     color: var(--text-primary);
     font-family: inherit;
@@ -2412,7 +2366,7 @@ body.log-expanded .log-pill {
 }
 
 .account-pool-stat-tile .stat-icon {
-    font-size: 15px;
+    font-size: var(--fs-lg);
     line-height: 1;
 }
 
@@ -2424,13 +2378,13 @@ body.log-expanded .log-pill {
 }
 
 .account-pool-stat-tile .stat-value {
-    font-size: 16px;
+    font-size: var(--fs-lg);
     font-weight: 700;
     font-variant-numeric: tabular-nums;
 }
 
 .account-pool-stat-tile .stat-label {
-    font-size: 10.5px;
+    font-size: var(--fs-xs);
     color: var(--text-muted);
     white-space: nowrap;
 }
@@ -2477,7 +2431,7 @@ html[data-theme="dark"] .account-pool-stat-tile.tone-primary .stat-value { color
 .account-pool-search-icon {
     position: absolute;
     left: 9px;
-    font-size: 12px;
+    font-size: var(--fs-sm);
     opacity: 0.65;
     pointer-events: none;
 }
@@ -2486,11 +2440,11 @@ html[data-theme="dark"] .account-pool-stat-tile.tone-primary .stat-value { color
     width: 100%;
     height: 32px;
     padding: 0 28px 0 28px;
-    border-radius: 8px;
+    border-radius: var(--radius-md);
     border: 1px solid var(--border-color);
     background: rgba(var(--ink-rgb), 0.03);
     color: var(--text-primary);
-    font-size: 12px;
+    font-size: var(--fs-sm);
     font-family: inherit;
     outline: none;
     transition: var(--transition-fast);
@@ -2522,7 +2476,7 @@ html[data-theme="dark"] .account-pool-stat-tile.tone-primary .stat-value { color
     border-radius: 50%;
     background: rgba(var(--ink-rgb), 0.12);
     color: var(--text-muted);
-    font-size: 10px;
+    font-size: var(--fs-2xs);
     line-height: 1;
     cursor: pointer;
     font-family: inherit;
@@ -2536,7 +2490,7 @@ html[data-theme="dark"] .account-pool-stat-tile.tone-primary .stat-value { color
 /* ── 添加 / 导入导出折叠面板 ─────────────────────────────────── */
 .account-pool-add-panel {
     border: 1px solid var(--border-color);
-    border-radius: 10px;
+    border-radius: var(--radius-md);
     background: rgba(var(--ink-rgb), 0.025);
     flex-shrink: 0;
 }
@@ -2547,13 +2501,13 @@ html[data-theme="dark"] .account-pool-stat-tile.tone-primary .stat-value { color
     justify-content: space-between;
     gap: 10px;
     padding: 9px 14px;
-    font-size: 12.5px;
+    font-size: var(--fs-md);
     font-weight: 600;
     color: var(--text-primary);
     cursor: pointer;
     user-select: none;
     list-style: none;
-    border-radius: 10px;
+    border-radius: var(--radius-md);
 }
 
 .account-pool-add-summary::-webkit-details-marker {
@@ -2565,14 +2519,14 @@ html[data-theme="dark"] .account-pool-stat-tile.tone-primary .stat-value { color
 }
 
 .account-pool-add-summary-hint {
-    font-size: 11px;
+    font-size: var(--fs-xs);
     font-weight: 400;
     color: var(--text-muted);
 }
 
 .account-pool-add-panel[open] > .account-pool-add-summary {
     border-bottom: 1px solid var(--border-color);
-    border-radius: 10px 10px 0 0;
+    border-radius: var(--radius-md) var(--radius-md) 0 0;
     color: var(--primary, #D69A55);
 }
 
@@ -2602,7 +2556,7 @@ html[data-theme="dark"] .account-pool-stat-tile.tone-primary .stat-value { color
 
 /* 批量条钉在列表顶部：选完往下滚时按钮不会跟着滚走 */
 .account-pool-bulk-title {
-    font-size: 12px;
+    font-size: var(--fs-sm);
     font-weight: 700;
     color: var(--primary, #D69A55);
     white-space: nowrap;
@@ -2615,7 +2569,7 @@ html[data-theme="dark"] .account-pool-stat-tile.tone-primary .stat-value { color
     align-items: center;
     background: rgba(var(--ink-rgb), 0.05);
     border: 1px solid var(--border-color);
-    border-radius: 8px;
+    border-radius: var(--radius-md);
     padding: 2px;
     gap: 2px;
 }
@@ -2626,10 +2580,10 @@ html[data-theme="dark"] .account-pool-stat-tile.tone-primary .stat-value { color
     gap: 4px;
     height: 26px;
     padding: 0 10px;
-    font-size: 11.5px;
+    font-size: var(--fs-sm);
     font-weight: 500;
     border: none;
-    border-radius: 6px;
+    border-radius: var(--radius-sm);
     background: transparent;
     color: var(--text-muted);
     cursor: pointer;
@@ -2656,14 +2610,14 @@ html[data-theme="dark"] .account-pool-view-btn.active {
 }
 
 .account-pool-bulk-count {
-    font-size: 12px;
+    font-size: var(--fs-sm);
     color: var(--primary, #D69A55);
     font-weight: 600;
     white-space: nowrap;
     padding: 3px 9px;
     background: var(--primary-glow, rgba(214, 154, 85, 0.16));
     border: 1px solid var(--border-glow, rgba(214, 154, 85, 0.3));
-    border-radius: 12px;
+    border-radius: var(--radius-lg);
 }
 
 .account-pool-bulk-bar {
@@ -2674,7 +2628,7 @@ html[data-theme="dark"] .account-pool-view-btn.active {
     padding: 8px 12px;
     background: rgba(var(--ink-rgb), 0.035);
     border: 1px solid var(--border-glow, rgba(214, 154, 85, 0.35));
-    border-radius: 9px;
+    border-radius: var(--radius-md);
     margin-bottom: 12px;
     flex-wrap: wrap;
     box-shadow: 0 2px 8px rgba(0, 0, 0, 0.05);
@@ -2693,18 +2647,18 @@ html[data-theme="dark"] .account-pool-view-btn.active {
     justify-content: flex-end;
     gap: 8px;
     margin-bottom: 10px;
-    font-size: 12px;
+    font-size: var(--fs-sm);
     color: var(--text-muted);
 }
 
 .account-pool-sort-select {
     height: 32px;
     padding: 0 10px;
-    border-radius: 7px;
+    border-radius: var(--radius-md);
     border: 1px solid var(--border-color);
     background: var(--bg-card, rgba(var(--ink-rgb), 0.04));
     color: var(--text-primary);
-    font-size: 12px;
+    font-size: var(--fs-sm);
     font-family: inherit;
     outline: none;
     cursor: pointer;
@@ -2747,7 +2701,7 @@ html[data-theme="dark"] .account-pool-view-btn.active {
     padding: 9px 12px;
     border: 1px solid var(--border-color);
     border-left: 3px solid var(--border-color);
-    border-radius: 10px;
+    border-radius: var(--radius-md);
     background: rgba(var(--ink-rgb), 0.025);
     transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
 }
@@ -2856,7 +2810,7 @@ html[data-theme="dark"] .account-pool-view-btn.active {
     flex-direction: column;
     background: rgba(var(--ink-rgb), 0.03);
     border: 1px solid var(--border-color);
-    border-radius: 12px;
+    border-radius: var(--radius-lg);
     padding: 11px 12px;
     gap: 9px;
     transition: all 0.22s cubic-bezier(0.4, 0, 0.2, 1);
@@ -2914,10 +2868,10 @@ html[data-theme="dark"] .account-pool-view-btn.active {
 }
 
 .account-pool-name-input.card-name-input {
-    font-size: 13.5px;
+    font-size: var(--fs-base);
     font-weight: 700;
     padding: 3px 6px;
-    border-radius: 5px;
+    border-radius: var(--radius-sm);
     background: rgba(var(--ink-rgb), 0.03);
     border: 1px solid transparent;
 }
@@ -2928,9 +2882,9 @@ html[data-theme="dark"] .account-pool-view-btn.active {
 }
 
 .account-pool-note-input.card-note-input {
-    font-size: 11.5px;
+    font-size: var(--fs-sm);
     padding: 2px 6px;
-    border-radius: 5px;
+    border-radius: var(--radius-sm);
 }
 
 .account-pool-card-metrics {
@@ -2950,7 +2904,7 @@ html[data-theme="dark"] .account-pool-view-btn.active {
     display: flex;
     flex-direction: column;
     gap: 4px;
-    font-size: 11.5px;
+    font-size: var(--fs-sm);
     color: var(--text-secondary);
 }
 
@@ -2963,7 +2917,7 @@ html[data-theme="dark"] .account-pool-view-btn.active {
 
 .account-pool-card-meta-item .meta-label {
     color: var(--text-muted);
-    font-size: 11px;
+    font-size: var(--fs-xs);
     min-width: 32px;
     flex-shrink: 0;
 }
@@ -2972,12 +2926,12 @@ html[data-theme="dark"] .account-pool-view-btn.active {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-    font-size: 11.5px;
+    font-size: var(--fs-sm);
 }
 
 .account-pool-card-meta-item .meta-val.monospace {
     font-family: var(--font-mono, monospace);
-    font-size: 11px;
+    font-size: var(--fs-xs);
 }
 
 .account-pool-card-meta-item .meta-val.has-exp {
@@ -2990,9 +2944,9 @@ html[data-theme="dark"] .account-pool-card-meta-item .meta-val.has-exp {
 }
 
 .account-pool-card-alert {
-    font-size: 11px;
+    font-size: var(--fs-xs);
     padding: 4px 8px;
-    border-radius: 6px;
+    border-radius: var(--radius-sm);
     line-height: 1.4;
     margin-top: 2px;
 }
@@ -3061,7 +3015,7 @@ html[data-theme="dark"] .account-pool-card-alert.alert-priority {
 .account-pool-card-footer .account-pool-mini-btn {
     min-width: 0;
     padding: 4px 6px;
-    font-size: 11px;
+    font-size: var(--fs-xs);
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -3102,7 +3056,7 @@ html[data-theme="dark"] .account-pool-card-alert.alert-priority {
 
 .account-pool-card-cred-wrap .account-pool-cred-form {
     margin: 0;
-    border-radius: 8px;
+    border-radius: var(--radius-md);
     border-left: 3px solid var(--primary, #D69A55);
 }
 
@@ -3111,10 +3065,10 @@ html[data-theme="dark"] .account-pool-card-alert.alert-priority {
     display: inline-flex;
     align-items: center;
     gap: 4px;
-    font-size: 11px;
+    font-size: var(--fs-xs);
     font-weight: 600;
     padding: 2px 7px;
-    border-radius: 5px;
+    border-radius: var(--radius-sm);
     background: rgba(var(--ink-rgb), 0.05);
     color: var(--text-secondary);
     border: 1px solid rgba(var(--ink-rgb), 0.08);
@@ -3132,7 +3086,7 @@ html[data-theme="dark"] .account-pool-card-alert.alert-priority {
 
 .account-pool-chip.chip-uid {
     font-family: var(--font-mono, monospace);
-    font-size: 10.5px;
+    font-size: var(--fs-xs);
     opacity: 0.85;
 }
 
@@ -3164,10 +3118,10 @@ html[data-theme="dark"] .account-pool-chip.chip-priority {
     display: inline-flex;
     align-items: center;
     gap: 4px;
-    font-size: 11px;
+    font-size: var(--fs-xs);
     font-weight: 600;
     padding: 2px 8px;
-    border-radius: 6px;
+    border-radius: var(--radius-sm);
     line-height: 1.3;
     white-space: nowrap;
     border: 1px solid transparent;
@@ -3241,7 +3195,7 @@ html[data-theme="dark"] .account-pool-pill-badge.badge-tasks {
 }
 
 .account-pool-meta-text {
-    font-size: 11px;
+    font-size: var(--fs-xs);
     color: var(--text-muted);
 }
 
@@ -3256,12 +3210,12 @@ html[data-theme="dark"] .account-pool-pill-badge.badge-tasks {
 
 .account-pool-seq-badge {
     flex-shrink: 0;
-    font-size: 11.5px;
+    font-size: var(--fs-sm);
     font-weight: 700;
     color: var(--text-muted);
     background: rgba(var(--ink-rgb), 0.05);
     padding: 2px 7px;
-    border-radius: 5px;
+    border-radius: var(--radius-sm);
     min-width: 26px;
     text-align: center;
     user-select: none;
@@ -3288,10 +3242,10 @@ html[data-theme="dark"] .account-pool-pill-badge.badge-tasks {
     align-items: center;
     justify-content: center;
     gap: 4px;
-    font-size: 11.5px;
+    font-size: var(--fs-sm);
     font-weight: 600;
     padding: 3px 9px;
-    border-radius: 6px;
+    border-radius: var(--radius-sm);
     border: 1px solid transparent;
     cursor: pointer;
     user-select: none;
@@ -3337,7 +3291,7 @@ html[data-theme="dark"] .account-pool-status-badge.is-disabled {
 .account-pool-priority-star {
     flex-shrink: 0;
     cursor: pointer;
-    font-size: 16px;
+    font-size: var(--fs-lg);
     line-height: 1;
     user-select: none;
     transition: transform 0.15s ease;
@@ -3367,11 +3321,11 @@ html[data-theme="dark"] .account-pool-status-badge.is-disabled {
     display: inline-flex;
     align-items: center;
     gap: 3px;
-    font-size: 11px;
+    font-size: var(--fs-xs);
     color: var(--text-secondary);
     background: rgba(var(--ink-rgb), 0.05);
     padding: 1px 6px;
-    border-radius: 4px;
+    border-radius: var(--radius-xs);
     margin-left: 6px;
     cursor: pointer;
     border: 1px dashed rgba(var(--ink-rgb), 0.15);
@@ -3388,11 +3342,11 @@ html[data-theme="dark"] .account-pool-status-badge.is-disabled {
     border: none;
     border-bottom: 1px solid rgba(var(--ink-rgb), 0.12);
     background: transparent;
-    font-size: 13px;
+    font-size: var(--fs-md);
     font-weight: 600;
     color: var(--text-primary);
     padding: 2px 4px;
-    border-radius: 4px;
+    border-radius: var(--radius-xs);
     font-family: inherit;
     transition: var(--transition-fast);
 }
@@ -3412,11 +3366,11 @@ html[data-theme="dark"] .account-pool-status-badge.is-disabled {
     border: none;
     border-bottom: 1px solid transparent;
     background: transparent;
-    font-size: 11.5px;
+    font-size: var(--fs-sm);
     font-style: italic;
     color: var(--text-secondary);
     padding: 2px 4px;
-    border-radius: 4px;
+    border-radius: var(--radius-xs);
     font-family: inherit;
     transition: var(--transition-fast);
 }
@@ -3433,7 +3387,7 @@ html[data-theme="dark"] .account-pool-status-badge.is-disabled {
 }
 
 .account-pool-meta {
-    font-size: 11px;
+    font-size: var(--fs-xs);
     color: var(--text-secondary);
     margin-top: 2px;
     display: flex;
@@ -3455,11 +3409,11 @@ html[data-theme="dark"] .account-pool-status-badge.is-disabled {
     align-items: center;
     justify-content: center;
     gap: 4px;
-    font-size: 11.5px;
+    font-size: var(--fs-sm);
     font-weight: 500;
     padding: 4px 10px;
     min-height: 28px;
-    border-radius: 7px;
+    border-radius: var(--radius-md);
     border: 1px solid var(--border-color);
     background: rgba(var(--ink-rgb), 0.04);
     color: var(--text-primary);
@@ -3551,7 +3505,7 @@ html[data-theme="dark"] .account-pool-mini-btn.is-on {
     padding: 12px 16px;
     border: 1px solid var(--border-color);
     border-left: 3px solid var(--primary, #D69A55);
-    border-radius: 0 10px 10px 0;
+    border-radius: 0 var(--radius-md) var(--radius-md) 0;
     background: rgba(var(--ink-rgb), 0.035);
     display: flex;
     flex-direction: column;
@@ -3560,7 +3514,7 @@ html[data-theme="dark"] .account-pool-mini-btn.is-on {
 }
 
 .account-pool-cred-title {
-    font-size: 12px;
+    font-size: var(--fs-sm);
     font-weight: 600;
     color: var(--text-primary);
 }
@@ -3575,10 +3529,10 @@ html[data-theme="dark"] .account-pool-mini-btn.is-on {
     flex: 1;
     min-width: 160px;
     height: 32px;
-    font-size: 12px;
+    font-size: var(--fs-sm);
     padding: 0 10px;
     border: 1px solid var(--border-color);
-    border-radius: 6px;
+    border-radius: var(--radius-sm);
     background: rgba(var(--ink-rgb), 0.05);
     color: var(--text-primary);
     font-family: inherit;
@@ -3599,7 +3553,7 @@ html[data-theme="dark"] .account-pool-mini-btn.is-on {
     display: flex;
     align-items: center;
     gap: 6px;
-    font-size: 11px;
+    font-size: var(--fs-xs);
     color: var(--text-secondary);
     cursor: pointer;
 }
@@ -3615,7 +3569,7 @@ html[data-theme="dark"] .account-pool-mini-btn.is-on {
 }
 
 .account-pool-cred-hint {
-    font-size: 11px;
+    font-size: var(--fs-xs);
     line-height: 1.5;
     color: var(--text-muted);
 }
@@ -3627,9 +3581,9 @@ html[data-theme="dark"] .account-pool-mini-btn.is-on {
     display: inline-flex;
     align-items: center;
     gap: 6px;
-    font-size: 11px;
+    font-size: var(--fs-xs);
     padding: 3.5px 8px;
-    border-radius: 6px;
+    border-radius: var(--radius-sm);
     margin-top: 4px;
     line-height: 1.4;
     background: rgba(59, 130, 246, 0.1);
@@ -3672,7 +3626,7 @@ html[data-theme="dark"] .account-pool-login-meta.is-no-2fa {
     min-width: 200px;
     line-height: 1.4;
     color: var(--text-muted);
-    font-size: 11.5px;
+    font-size: var(--fs-sm);
 }
 
 #account-pool-import-all-btn {
@@ -3710,13 +3664,13 @@ html[data-theme="dark"] .account-pool-login-meta.is-no-2fa {
     justify-content: center;
     background: rgba(0, 0, 0, 0.78);
     backdrop-filter: blur(10px);
-    z-index: 1100;
+    z-index: var(--z-modal);
 }
 
 .apd-modal-content {
     background: var(--bg-panel-solid, #1c150f);
     border: 1px solid var(--border-glow, rgba(214, 154, 85, 0.35));
-    border-radius: 14px;
+    border-radius: var(--radius-xl);
     box-shadow: 0 25px 60px rgba(0, 0, 0, 0.75), 0 0 35px var(--primary-glow, rgba(214, 154, 85, 0.15));
     width: 90vw;
     max-width: 820px;
@@ -3758,8 +3712,8 @@ html[data-theme="dark"] .account-pool-login-meta.is-no-2fa {
 
 .apd-nav-btn {
     padding: 4px 10px;
-    font-size: 12px;
-    border-radius: 6px;
+    font-size: var(--fs-sm);
+    border-radius: var(--radius-sm);
     border: 1px solid var(--border-color);
     background: rgba(var(--ink-rgb), 0.05);
     color: var(--text-primary);
@@ -3792,7 +3746,7 @@ html[data-theme="dark"] .account-pool-login-meta.is-no-2fa {
     gap: 16px;
 }
 
-@media (max-width: 680px) {
+@media (max-width: 768px) {
     .apd-grid-2col {
         grid-template-columns: 1fr;
     }
@@ -3801,7 +3755,7 @@ html[data-theme="dark"] .account-pool-login-meta.is-no-2fa {
 .apd-section-card {
     background: rgba(var(--ink-rgb), 0.025);
     border: 1px solid var(--border-color);
-    border-radius: 10px;
+    border-radius: var(--radius-md);
     padding: 14px;
     display: flex;
     flex-direction: column;
@@ -3809,7 +3763,7 @@ html[data-theme="dark"] .account-pool-login-meta.is-no-2fa {
 }
 
 .apd-section-title {
-    font-size: 12.5px;
+    font-size: var(--fs-md);
     font-weight: 700;
     color: var(--primary, #D69A55);
     display: flex;
@@ -3830,7 +3784,7 @@ html[data-theme="dark"] .account-pool-login-meta.is-no-2fa {
     min-width: 120px;
     background: rgba(var(--ink-rgb), 0.04);
     border: 1px solid var(--border-color);
-    border-radius: 8px;
+    border-radius: var(--radius-md);
     padding: 10px 12px;
     display: flex;
     flex-direction: column;
@@ -3838,12 +3792,12 @@ html[data-theme="dark"] .account-pool-login-meta.is-no-2fa {
 }
 
 .apd-hero-metric-label {
-    font-size: 11px;
+    font-size: var(--fs-xs);
     color: var(--text-muted);
 }
 
 .apd-hero-metric-val {
-    font-size: 15px;
+    font-size: var(--fs-lg);
     font-weight: 700;
     color: var(--text-primary);
     display: flex;
@@ -3858,7 +3812,7 @@ html[data-theme="dark"] .account-pool-login-meta.is-no-2fa {
 }
 
 .apd-field-label {
-    font-size: 11.5px;
+    font-size: var(--fs-sm);
     font-weight: 600;
     color: var(--text-secondary);
 }
@@ -3868,10 +3822,10 @@ html[data-theme="dark"] .account-pool-login-meta.is-no-2fa {
     height: 34px;
     padding: 0 10px;
     border: 1px solid var(--border-color);
-    border-radius: 6px;
+    border-radius: var(--radius-sm);
     background: rgba(var(--ink-rgb), 0.04);
     color: var(--text-primary);
-    font-size: 12.5px;
+    font-size: var(--fs-md);
     font-family: inherit;
     transition: var(--transition-fast);
 }
@@ -3900,18 +3854,18 @@ html[data-theme="dark"] .account-pool-login-meta.is-no-2fa {
     padding: 10px 12px;
     background: rgba(var(--ink-rgb), 0.025);
     border: 1px solid var(--border-color);
-    border-radius: 9px;
+    border-radius: var(--radius-md);
 }
 
 .account-pool-add-row select,
 .account-pool-add-row input[type="text"] {
     height: 34px;
     padding: 0 10px;
-    border-radius: 6px;
+    border-radius: var(--radius-sm);
     border: 1px solid var(--border-color);
     background: rgba(var(--ink-rgb), 0.04);
     color: var(--text-primary);
-    font-size: 12px;
+    font-size: var(--fs-sm);
     font-family: inherit;
     outline: none;
     transition: var(--transition-fast);
@@ -3946,7 +3900,7 @@ html[data-theme="dark"] .account-pool-login-meta.is-no-2fa {
 #account-pool-add-btn {
     height: 34px;
     padding: 0 16px;
-    border-radius: 6px;
+    border-radius: var(--radius-sm);
     background: var(--primary, #D69A55);
     color: #ffffff;
     border: 1px solid transparent;
@@ -3979,7 +3933,7 @@ html[data-theme="dark"] .account-pool-login-meta.is-no-2fa {
     }
 
     .group-title {
-        font-size: 12px;
+        font-size: var(--fs-sm);
     }
 
     /* 「1. 联网参考案例库 / 🎯搜索方向 / 🔍搜一批新参考」窄屏放不下时换行，
@@ -4006,7 +3960,7 @@ html[data-theme="dark"] .account-pool-login-meta.is-no-2fa {
     .panel-footer .config-summary-box {
         margin-bottom: 8px;
         padding: 8px 10px;
-        font-size: 11.5px;
+        font-size: var(--fs-sm);
         align-items: flex-start;
     }
 
@@ -4041,8 +3995,8 @@ html[data-theme="dark"] .account-pool-login-meta.is-no-2fa {
     align-items: center;
     gap: 7px;
     padding: 4px 12px;
-    border-radius: 20px;
-    font-size: 12px;
+    border-radius: var(--radius-2xl);
+    font-size: var(--fs-sm);
     font-weight: 500;
     cursor: pointer;
     transition: all 0.2s ease;
@@ -4121,4 +4075,3 @@ html[data-theme="dark"] .account-pool-login-meta.is-no-2fa {
     color: #dc2626;
     border: 1px solid rgba(239, 68, 68, 0.3);
 }
-

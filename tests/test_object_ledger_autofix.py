@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Tests for Object Ledger Auto-Fix (AI & Deterministic In-Flight Repair).
-Specification: docs/reference/replica_baseline_and_orthogonal_mutation_spec.md
+Regression checks for construction ledger diagnostics.
 """
 
 import os
@@ -17,10 +16,6 @@ from prompt_pipeline.object_ledger import (
 from prompt_pipeline.ontology import (
     build_pack,
     infer_role,
-)
-from prompt_pipeline.mutate import (
-    _autofix_variant_beats_deterministic,
-    generate_orthogonal_variant,
 )
 
 
@@ -188,65 +183,3 @@ def test_user_broken_beats_triggers_exact_violations():
     assert ('phantom', 'ceiling_rib') in rules_and_objects
     assert len(violations) >= 4
     assert len([v for v in violations if v.get('severity') == 'blocking']) >= 1
-
-
-def test_deterministic_autofix_resolves_all_four_violations():
-    """验证确定性自愈算法能够 100% 自动消除这 4 条违规，闭合物件账。"""
-    beats = _broken_user_beats()
-    src_beats = _clean_source_beats()
-    axes = {
-        'environment': '英格兰科茨沃尔德低洼凹槽',
-        'material': '干垒石灰岩拱套 + 花旗松骨架',
-        'function': '硬派皮具与手作工坊',
-        'hero_reveal': '边牧犬舒服蜷卧在羊毛厚垫上',
-    }
-    pack = build_pack(axes)
-
-    initial_violations = validate_object_ledger(beats)
-    assert len(initial_violations) >= 4
-    assert len([v for v in initial_violations if v.get('severity') == 'blocking']) >= 1
-
-    # 运行自愈
-    fixed_beats = _autofix_variant_beats_deterministic(
-        source_beats=src_beats,
-        variant_beats=beats,
-        blocking=initial_violations,
-        effective_axes=axes,
-        pack=pack,
-    )
-
-    # 验证自愈后 0 阻断违规
-    after_violations = validate_object_ledger(fixed_beats)
-    blocking_after = [v for v in after_violations if v.get('severity') == 'blocking']
-    assert blocking_after == []
-    assert len(fixed_beats) == len(beats)
-
-
-def test_generate_orthogonal_variant_with_autofix():
-    """验证 generate_orthogonal_variant 在启用 autofix 时自动修复并顺利返回。"""
-    baseline_doc = {
-        'job_id': 'base_test_001',
-        'video_duration_sec': 36.0,
-        'beats': _clean_source_beats(),
-    }
-    target_axes = {
-        'environment': '英格兰科茨沃尔德下沉石灰岩槽',
-        'material': '手工干垒石灰岩 + 白栎木门板 + 铝箔防潮层',
-        'function': '一人一犬硬核手作皮具工坊',
-        'hero_reveal': '边牧犬在铸铁木柴炉火前蜷卧',
-    }
-
-    # 当 autofix=True 时，即使有初始问题也会自动闭合账本并返回
-    variant_doc = generate_orthogonal_variant(
-        baseline_doc=baseline_doc,
-        mutation_axes=target_axes,
-        preset='custom',
-        strict=True,
-        autofix=True,
-    )
-    assert variant_doc is not None
-    assert 'beats' in variant_doc
-    assert len(variant_doc['beats']) == len(baseline_doc['beats'])
-    # 确保没有残留阻断问题
-    final_blocking = [v for v in variant_doc.get('validation', []) if v.get('severity') == 'blocking']
-    assert final_blocking == []

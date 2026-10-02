@@ -24,11 +24,31 @@ import contextvars
 
 _TASK_ACCOUNT = contextvars.ContextVar("google_fx_task_account", default=None)
 _PIN_RESOLVER = None
+_ACCOUNT_OBSERVER = None
+
+
+def install_account_observer(observer):
+    """宿主注入"某上下文绑定了账号"的只读观察回调（控制台作战板用）；传 None 卸载。
+
+    observer(user_id) 只能做记录，异常会被吞掉，绝不能影响账号解析本身。
+    """
+    global _ACCOUNT_OBSERVER
+    _ACCOUNT_OBSERVER = observer
+
+
+def _observe(user_id):
+    if _ACCOUNT_OBSERVER is None or not user_id:
+        return
+    try:
+        _ACCOUNT_OBSERVER(user_id)
+    except Exception:
+        pass
 
 
 def set_task_account(user_id):
     """把当前执行上下文绑定到某个 AdsPower user_id，返回可用于还原的 token。"""
     value = str(user_id).strip() if user_id else ""
+    _observe(value)
     return _TASK_ACCOUNT.set(value or None)
 
 
@@ -84,5 +104,8 @@ def resolve_account(explicit=None, fallback=None):
         if candidate:
             value = str(candidate).strip()
             if value:
+                # 显式传入的账号可能是嵌套探针探别的号，不代表本任务占用的账号，不上报。
+                if not explicit:
+                    _observe(value)
                 return value
     return ""

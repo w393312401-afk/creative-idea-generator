@@ -40,13 +40,44 @@ function syncSettingsSkillProfilePicker() {
 const LLM_MODEL_PICKER_FAMILIES = [
     { key: 'gpt', label: 'GPT' },
     { key: 'gemini', label: 'Gemini' },
-    { key: 'claude', label: 'Claude' },
 ];
+
+// 与服务端 resolve_chat_model 一致：已下架的文本模型不会再以自定义/历史选项回流。
+// 生图模型与用户自定义模型保持原值。
+function normalizeLlmModel(value) {
+    const model = String(value || '').trim();
+    const lower = model.toLowerCase();
+    if (lower.includes('image')) return model;
+    if (/^claude(?:[-.]|$)/.test(lower) || /^gpt-(?:3\.5|4o?|4\.\d+|5(?:\.\d+)?)(?:-|$)/.test(lower)) {
+        return 'gpt-6.1-sol';
+    }
+    if (/^gemini-3-flash(?:-agent)?$/.test(lower)
+            || /^gemini-3\.1-pro(?:-[a-z-]+)?$/.test(lower)
+            || /^gemini-3\.[567]-flash(?:-[a-z-]+)?$/.test(lower)) {
+        return 'gemini-3.8-flash-high';
+    }
+    const known = Object.values(LLM_MODEL_GROUPS).flat().find(item => item.value.toLowerCase() === lower);
+    return known ? known.value : model;
+}
+
+function migrateRetiredLlmModels(settings) {
+    let changed = false;
+    for (const key of ['model', 'cheapModel', 'auxModel', 'reviewModel']) {
+        if (!settings[key]) continue;
+        const current = normalizeLlmModel(settings[key]);
+        if (current !== settings[key]) {
+            settings[key] = current;
+            changed = true;
+        }
+    }
+    return changed;
+}
 
 function syncSettingsLlmModelPicker() {
     const select = document.getElementById('settings-llm-model');
     if (!select) return;
-    const current = config.model || DEFAULT_CONFIG.model;
+    const current = normalizeLlmModel(config.model) || DEFAULT_CONFIG.model;
+    config.model = current;
     select.innerHTML = '';
 
     LLM_MODEL_PICKER_FAMILIES.forEach(fam => {
@@ -91,20 +122,23 @@ function syncFramesImageModelPicker() {
     const options = isFx ? FX_IMAGE_MODELS : IMAGE_MODELS;
     const current = isFx
         ? normalizeGoogleFxImageModel(config.googleFxImageModel)
-        : (config.imageModel || 'nano-banana-2');
+        : (normalizeApiImageModel(config.imageModel) || DEFAULT_CONFIG.imageModel);
     if (isFx) config.googleFxImageModel = current;
+    else config.imageModel = current;
 
     sel.innerHTML = '';
     options.forEach(m => {
         const opt = document.createElement('option');
         opt.value = m.value;
         opt.textContent = m.label;
+        if (!isFx) applyApiImageModelOptionAvailability(opt);
         sel.appendChild(opt);
     });
     if (!options.some(m => m.value === current)) {
         const opt = document.createElement('option');
         opt.value = current;
         opt.textContent = `${current} (自定义)`;
+        if (!isFx) applyApiImageModelOptionAvailability(opt);
         sel.appendChild(opt);
     }
     sel.value = current;
@@ -121,7 +155,7 @@ function syncFramesImageModelPicker() {
                 const fxSel = document.getElementById('settings-fx-image-model');
                 if (fxSel) fxSel.value = config.googleFxImageModel;
             } else {
-                config.imageModel = sel.value;
+                config.imageModel = normalizeApiImageModel(sel.value);
                 const apiSel = document.getElementById('settings-api-image-model');
                 if (apiSel) apiSel.value = config.imageModel;
             }
@@ -142,21 +176,39 @@ function syncFramesImageModelPicker() {
 function syncSettingsApiImageModelPicker() {
     const sel = document.getElementById('settings-api-image-model');
     if (!sel) return;
-    const current = config.imageModel || DEFAULT_CONFIG.imageModel;
+    const current = normalizeApiImageModel(config.imageModel) || DEFAULT_CONFIG.imageModel;
+    config.imageModel = current;
     sel.innerHTML = '';
     IMAGE_MODELS.forEach(m => {
         const opt = document.createElement('option');
         opt.value = m.value;
         opt.textContent = m.label;
+        applyApiImageModelOptionAvailability(opt);
         sel.appendChild(opt);
     });
     if (!IMAGE_MODELS.some(m => m.value === current)) {
         const opt = document.createElement('option');
         opt.value = current;
         opt.textContent = `${current} (自定义)`;
+        applyApiImageModelOptionAvailability(opt);
         sel.appendChild(opt);
     }
     sel.value = current;
+}
+
+const _warnedUnavailableImageGatewayModels = new Set();
+
+function syncImageGatewayModelAvailability(report) {
+    setImageGatewayModelCatalog(report);
+    const current = normalizeApiImageModel(config.imageModel);
+    if (!isApiImageModelAvailable(current) && !_warnedUnavailableImageGatewayModels.has(current)) {
+        _warnedUnavailableImageGatewayModels.add(current);
+        showToast(`${unavailableApiImageModelMessage(current)} 已保留当前选择（封面与帧序列）。`, 'warning');
+    }
+    syncFramesImageModelPicker();
+    syncSettingsApiImageModelPicker();
+    updateCoverModelDisplay();
+    if (typeof syncImageStudioModelAvailability === 'function') syncImageStudioModelAvailability();
 }
 
 function loadConfig() {
@@ -201,15 +253,14 @@ function loadConfig() {
                 localStorage.setItem('spark_config', JSON.stringify(config));
             }
 
-            // 自动迁移废弃旧模型（3.6 / 3.5 / 3.1 pro / gemini-3-flash）到新推荐模型 gemini-3.8-flash-high
-            const DEPRECATED_MODELS = new Set([
-                'gemini-3-flash', 'gemini-3-flash-agent',
-                'gemini-3.6-flash-high', 'gemini-3.6-flash-low',
-                'gemini-3.5-flash', 'gemini-3.5-flash-low', 'gemini-3.5-flash-extra-low',
-                'gemini-3.1-pro-high', 'gemini-3.1-pro-low'
-            ]);
-            if (DEPRECATED_MODELS.has(config.model)) {
-                config.model = DEFAULT_CONFIG.model;
+            const normalizedImageModel = normalizeApiImageModel(config.imageModel);
+            if (normalizedImageModel !== config.imageModel) {
+                config.imageModel = normalizedImageModel;
+                localStorage.setItem('spark_config', JSON.stringify(config));
+            }
+
+            // 同时迁移辅助模型，防止旧配置继续调用已从列表移除的文本模型。
+            if (migrateRetiredLlmModels(config)) {
                 localStorage.setItem('spark_config', JSON.stringify(config));
             }
         } catch (e) {
@@ -305,7 +356,7 @@ function loadConfig() {
     }
     updateDesktopPermissionStatus();
 
-    // 端口已永久固定（应用 8085 / 代理 8046，gpt-5.5 由服务端 resolve_gateway 固定路由），
+    // 端口已永久固定（应用 8085 / 代理 8046，GPT 由服务端 resolve_gateway 路由），
     // 原「GPT 代理端口」选择器已移除，防止端口漂移。
     updateCoverModelDisplay();
     syncFramesImageModelPicker();
@@ -317,7 +368,7 @@ function loadConfig() {
 // 显隐一律用空串还原（而不是写死 'block'）：配置中心的字段行是 CSS grid
 // （.settings-field），内联 display:block 会把 label/控件/说明拍回竖排。
 // 「帧序列生成方式」只决定生图走哪条路，所以只切生图模型那两行：api → API 生图模型
-// （IMAGE_MODELS，含 gpt-image-2），google_fx → FX 生图模型。视频三行始终显示，
+// （IMAGE_MODELS，含 gpt-image-2.5），google_fx → FX 生图模型。视频三行始终显示，
 // 视频生成任何时候都走 AdsPower/google_fx。
 function updateFxImageModelVisibility() {
     const backendSelect = document.getElementById('settings-image-backend');
@@ -371,7 +422,7 @@ function updateFxVideoDurationVisibility() {
 function applySettingsFormToConfig() {
     const llmModelSelect = document.getElementById('settings-llm-model');
     if (llmModelSelect && llmModelSelect.value) {
-        config.model = llmModelSelect.value;
+        config.model = normalizeLlmModel(llmModelSelect.value);
     }
     const skillProfileSelect = document.getElementById('settings-skill-profile');
     if (skillProfileSelect && skillProfileSelect.value) {
@@ -385,7 +436,7 @@ function applySettingsFormToConfig() {
     const apiImageModelSelect = document.getElementById('settings-api-image-model');
     // 空值只可能出现在选项还没渲染出来的时候，别拿它覆盖掉用户存着的模型
     if (apiImageModelSelect && apiImageModelSelect.value) {
-        config.imageModel = apiImageModelSelect.value;
+        config.imageModel = normalizeApiImageModel(apiImageModelSelect.value);
     }
     const fxImageModelSelect = document.getElementById('settings-fx-image-model');
     if (fxImageModelSelect) {
@@ -439,76 +490,93 @@ function applySettingsFormToConfig() {
 }
 
 function saveConfig() {
-    applySettingsFormToConfig();
-    try {
-        localStorage.setItem('spark_config', JSON.stringify(config));
-    } catch (e) {
-        console.warn('Failed to save spark_config:', e);
-    }
-    updateCoverModelDisplay();
-    syncFramesImageModelPicker();
-    syncSettingsApiImageModelPicker();
-    syncSettingsLlmModelPicker();
-    syncSettingsSkillProfilePicker();
-    showToast("API 配置保存成功！", "success");
-    checkApiStatus();
+    return autoSaveConfig();
 }
 
-/* ── 改动即存 ─────────────────────────────────────────────────────────
-   配置中心的每个控件 change 即落盘，用户不必记得回头按保存按钮（和激发页脚
-   的模型选择器、帧序列卡片的生图模型选择器是同一套约定）。反馈只在弹窗头部
-   闪一个「✓ 已保存」——每改一项弹一次 toast 太吵。
-   不在这里调 checkApiStatus()：本表单没有一项会改变 LLM 网关路由。 */
+/* 配置改动即时保存，服务端确认后才显示已同步。失败保持可见，支持重试。 */
 let settingsSavedFlagTimer = null;
+let _settingsSaveRevision = 0;
 
-function flashSettingsSaved() {
+function setSettingsSaveState(state, message) {
     const flag = document.getElementById('settings-saved-flag');
+    const retry = document.getElementById('settings-sync-retry');
+    if (settingsSavedFlagTimer) clearTimeout(settingsSavedFlagTimer);
+    if (retry) retry.hidden = state !== 'error';
     if (!flag) return;
     flag.hidden = false;
-    if (settingsSavedFlagTimer) clearTimeout(settingsSavedFlagTimer);
-    settingsSavedFlagTimer = setTimeout(() => { flag.hidden = true; }, 1600);
+    flag.dataset.state = state;
+    flag.textContent = message;
+    if (state === 'saved') {
+        settingsSavedFlagTimer = setTimeout(() => { flag.hidden = true; }, 2400);
+    }
 }
 
-// FX 模型设置由服务端 server_config.json 统一管理：前端改了之后要同步推到
-// 服务端，否则 effective_config 会采用 SERVER_CONFIG 里的旧值（服务端优先）。
-// 静默调用，失败不弹 toast——下一次生成请求仍然会把最新 config 带过去。
 const _FX_SERVER_SYNC_KEYS = ['videoModel', 'googleFxImageModel', 'videoDuration', 'videoResolution', 'videoRefMode'];
 let _fxSyncPending = null;
+let _fxSyncQueued = null;
+let _fxSyncInFlight = false;
 
-function syncFxModelToServer() {
+async function flushFxModelSync() {
+    if (_fxSyncInFlight || !_fxSyncQueued) return;
+    const { patch, revision } = _fxSyncQueued;
+    _fxSyncQueued = null;
+    _fxSyncInFlight = true;
+    try {
+        const response = await fetch('/api/google-fx/config', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ patch }),
+        });
+        const data = await response.json();
+        if (!response.ok || data.status !== 'ok') throw new Error(data.message || `HTTP ${response.status}`);
+        if (revision === _settingsSaveRevision) setSettingsSaveState('saved', '✓ 已保存并同步');
+    } catch (error) {
+        if (revision === _settingsSaveRevision) {
+            setSettingsSaveState('error', '已存本机，服务端未同步');
+        }
+    } finally {
+        _fxSyncInFlight = false;
+        // 串行写入，避免较旧的请求在新设置之后落盘。
+        if (_fxSyncQueued && !_fxSyncPending) flushFxModelSync();
+    }
+}
+
+function syncFxModelToServer(revision = _settingsSaveRevision) {
     const patch = {};
     for (const key of _FX_SERVER_SYNC_KEYS) {
         if (key in config) patch[key] = config[key];
     }
-    if (!Object.keys(patch).length) return;
-    // 防抖：快速连续切换模型时只发最后一次
+    if (!Object.keys(patch).length) {
+        setSettingsSaveState('saved', '✓ 已保存');
+        return;
+    }
+    setSettingsSaveState('saving', '正在保存…');
+    _fxSyncQueued = { patch, revision };
     if (_fxSyncPending) clearTimeout(_fxSyncPending);
     _fxSyncPending = setTimeout(() => {
         _fxSyncPending = null;
-        fetch('/api/google-fx/config', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ patch }),
-        }).catch(() => {});  // 静默失败
+        flushFxModelSync();
     }, 300);
 }
 
 function autoSaveConfig() {
     applySettingsFormToConfig();
+    const revision = ++_settingsSaveRevision;
     try {
         localStorage.setItem('spark_config', JSON.stringify(config));
-    } catch (e) {
-        console.warn('Failed to save spark_config:', e);
+    } catch (error) {
+        if (_fxSyncPending) clearTimeout(_fxSyncPending);
+        _fxSyncPending = null;
+        _fxSyncQueued = null;
+        setSettingsSaveState('error', '本机保存失败，请重试');
+        return false;
     }
     updateCoverModelDisplay();
     syncFramesImageModelPicker();
     syncSettingsApiImageModelPicker();
-    // 链路选择器停在 auto 时，徽标显示的是"跟着视频模型现在实际走哪条"——
-    // 改了 FX 视频模型下拉框却不重刷，徽标就会停在旧链路上，看起来像没生效。
     syncIdeationSkillProfilePicker();
-    // 同步 FX 模型设置到服务端 server_config.json
-    syncFxModelToServer();
-    flashSettingsSaved();
+    syncFxModelToServer(revision);
+    return true;
 }
 
 function resetConfig() {
@@ -574,16 +642,9 @@ function resetConfig() {
     // applySettingsFormToConfig 之后——那一步不碰门禁项，但顺序颠倒会让人误以为
     // 它会把删掉的键再写回来。
     if (typeof resetGateSettings === 'function') resetGateSettings();
-    try {
-        localStorage.setItem('spark_config', JSON.stringify(config));
-    } catch (e) {
-        console.warn('Failed to save spark_config on reset:', e);
-    }
-    updateCoverModelDisplay();
-    syncFramesImageModelPicker();
     syncSettingsLlmModelPicker();
     syncSettingsSkillProfilePicker();
-    showToast('已恢复默认配置', 'success');
+    autoSaveConfig();
 }
 
 /* ══════════════════════════════════════════════════════════════════════
@@ -620,7 +681,108 @@ function switchSettingsSection(name) {
     }
 }
 
+function findSettingsFields(query) {
+    const pane = document.getElementById('settings-pane');
+    const words = String(query || '').trim().toLocaleLowerCase().split(/\s+/).filter(Boolean);
+    if (!pane || !words.length) return [];
+    return Array.from(pane.querySelectorAll('.settings-field')).filter(field => {
+        const section = field.closest('.settings-section');
+        if (!section || section.dataset.section === 'pool') return false;
+        // Closed details are searchable; controls disabled by the chosen backend are not.
+        for (let node = field; node && node !== section; node = node.parentElement) {
+            if (node.hidden || node.style.display === 'none') return false;
+        }
+        const label = field.querySelector('label');
+        const hint = field.querySelector('.settings-hint');
+        const text = `${label ? label.textContent : ''} ${hint ? hint.textContent : ''}`.toLocaleLowerCase();
+        return words.every(word => text.includes(word));
+    });
+}
+
+function initSettingsSearch() {
+    const input = document.getElementById('settings-search-input');
+    const results = document.getElementById('settings-search-results');
+    const wrap = document.getElementById('settings-search-wrap');
+    const modal = document.getElementById('settings-modal');
+    if (!input || !results || !wrap || input.dataset.bound) return;
+    input.dataset.bound = '1';
+
+    const close = () => {
+        results.hidden = true;
+        input.setAttribute('aria-expanded', 'false');
+    };
+    const search = () => {
+        results.replaceChildren();
+        if (!input.value.trim()) { close(); return; }
+        const matches = findSettingsFields(input.value);
+        const description = document.createElement('p');
+        description.className = 'settings-search-description';
+        description.textContent = matches.length
+            ? `找到 ${matches.length} 项${matches.length > 10 ? '，先显示前 10 项，可缩小关键词' : ''}`
+            : '没有匹配项。仅查找当前生成方式可用的设置；账号请到「生成号池」查看。';
+        results.appendChild(description);
+        matches.slice(0, 10).forEach(field => {
+            const section = field.closest('.settings-section');
+            const label = field.querySelector('label');
+            const title = section.querySelector('.settings-section-title');
+            const button = document.createElement('button');
+            button.type = 'button';
+            button.className = 'settings-search-result';
+            const name = document.createElement('span');
+            name.textContent = label.textContent;
+            const location = document.createElement('small');
+            location.textContent = title ? title.textContent : '';
+            button.appendChild(name);
+            button.appendChild(location);
+            button.addEventListener('click', () => {
+                switchSettingsSection(section.dataset.section);
+                for (let node = field.parentElement; node && node !== section; node = node.parentElement) {
+                    if (node.tagName === 'DETAILS') node.open = true;
+                }
+                const previous = modal && modal.querySelector('.settings-search-highlight');
+                if (previous) previous.classList.remove('settings-search-highlight');
+                field.classList.add('settings-search-highlight');
+                const control = field.querySelector('input:not([disabled]), select:not([disabled]), textarea:not([disabled]), button:not([disabled])');
+                if (!control) field.tabIndex = -1;
+                (control || field).focus({ preventScroll: true });
+                field.scrollIntoView({ block: 'center' });
+                input.value = '';
+                close();
+            });
+            results.appendChild(button);
+        });
+        results.hidden = false;
+        input.setAttribute('aria-expanded', 'true');
+    };
+    input.addEventListener('input', search);
+    input.addEventListener('focus', search);
+    wrap.addEventListener('keydown', event => {
+        if (event.key === 'Escape' && !results.hidden) {
+            event.preventDefault();
+            event.stopPropagation();
+            input.focus();
+            close();
+        } else if ((event.key === 'ArrowDown' || event.key === 'Enter') && event.target === input && !results.hidden) {
+            const first = results.querySelector('button');
+            if (first) {
+                event.preventDefault();
+                if (event.key === 'Enter') first.click();
+                else first.focus();
+            }
+        }
+    });
+    if (modal) modal.addEventListener('click', event => {
+        if (!wrap.contains(event.target)) close();
+    });
+}
+
 function initSettingsCenter() {
+    initSettingsSearch();
+    const retrySave = document.getElementById('settings-sync-retry');
+    if (retrySave && !retrySave.dataset.bound) {
+        retrySave.dataset.bound = '1';
+        retrySave.addEventListener('click', autoSaveConfig);
+    }
     const nav = document.getElementById('settings-nav');
     if (nav && !nav.dataset.bound) {
         nav.dataset.bound = '1';
@@ -639,6 +801,7 @@ function initSettingsCenter() {
             const el = e.target;
             if (!el.matches('input, select, textarea')) return;
             if (el.closest('.account-pool-manage-body')) return;
+            if (el.closest('[data-settings-navigation]')) return;
             autoSaveConfig();
         });
     }
@@ -1043,6 +1206,24 @@ async function loadCurrentIdeaState() {
         }
     }
 
+    // A cached editing view may belong to a project archived from another window.
+    // Verify its server record before exposing controls that can recreate assets.
+    const recoveryId = (loadedIdea || {}).id || storedId;
+    if (recoveryId) {
+        try {
+            const response = await fetch(`/api/library/item?id=${encodeURIComponent(recoveryId)}`);
+            const latest = response.ok ? await response.json() : null;
+            if (latest && latest.archived) loadedIdea = latest;
+        } catch (e) { /* Existing offline recovery still applies. */ }
+    }
+    if (loadedIdea && loadedIdea.archived) {
+        currentIdea = null;
+        localStorage.removeItem('spark_current_idea');
+        localStorage.removeItem('spark_current_idea_id');
+        if (typeof openArchivedProject === 'function') await openArchivedProject(loadedIdea.project_key);
+        return;
+    }
+
     if (loadedIdea) {
         currentIdea = loadedIdea;
         renderIdea(loadedIdea);
@@ -1066,6 +1247,12 @@ async function loadCurrentIdeaState() {
                 .then(r => r.ok ? r.json() : null)
                 .then(fullItem => {
                     if (fullItem && fullItem.id === loadedIdea.id && currentIdea && currentIdea.id === loadedIdea.id) {
+                        if (fullItem.archived) {
+                            currentIdea = null;
+                            saveCurrentIdeaState();
+                            if (typeof openArchivedProject === 'function') openArchivedProject(fullItem.project_key);
+                            return;
+                        }
                         currentIdea = { ...loadedIdea, ...fullItem };
                         renderIdea(currentIdea);
                     }
@@ -1078,6 +1265,12 @@ async function loadCurrentIdeaState() {
             .then(r => r.ok ? r.json() : null)
             .then(fullItem => {
                 if (fullItem && fullItem.id) {
+                    if (fullItem.archived) {
+                        currentIdea = null;
+                        saveCurrentIdeaState();
+                        if (typeof openArchivedProject === 'function') openArchivedProject(fullItem.project_key);
+                        return;
+                    }
                     currentIdea = fullItem;
                     renderIdea(fullItem);
                     const placeholderView = document.getElementById('output-placeholder-view');

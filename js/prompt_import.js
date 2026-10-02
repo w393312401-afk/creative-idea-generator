@@ -11,7 +11,7 @@
    表上多出来的一行：一次导入 = 一个新项目，落库后自动打开它的激发结果页。它从不
    改写已有项目的提示词——改已有一单走结果页的「✏️ 手动编辑」。
 
-   核心是「格式不对能自动补全」：外面写出来的集子几乎不会正好落在本项目的
+   核心是「认出常见写法、保留真实正文」：外面写出来的集子几乎不会正好落在本项目的
    槽位契约上（图片提示词 / 图片 N: / 视频提示词 / 视频 N:）。常见的歪法与
    本模块的处理一一对应，见 normalizePromptSetText：
      · ```代码围栏、Markdown 标题（## 图片 1）、加粗（**图片 1:**）、
@@ -19,9 +19,9 @@
      · 英文/别名标签（IMAGE 1 / IMG 1 / Frame 1 / VIDEO 1 / VID 1 / Clip 1）；
      · 正文与标签挤在同一行（前端老解析器会把这种正文静默丢掉，是两次事故的
        前提，这里一律把正文挪到下一行）；
-     · 槽位号乱了（从 0 起、跳号、重号、01 这种补零）→ 按出现顺序重编成 1..N；
-     · 视频缺段（有视频提示词但不齐）→ 补上「视频 k:」骨架 + 占位正文，
-       占位正文必须由人填掉才能保存（校验在 validatePromptEditorText 里）。
+     · Markdown 标题与代码块重复写了同一个槽位号 → 合并，不生成空白拍；
+     · 图片编号正规化时同步映射视频编号，视频缺段只提示，不造占位正文；
+     · 保留导入原文，便于后续核对；不因补全规则丢弃已有视频。
 
    两条底线，和手动编辑一致：
      1) 槽位号是契约不是标签——图片必须从 1 连续编到 N，视频必须落在 1..N 内。
@@ -40,7 +40,7 @@ function buildPromptImportHeaderRe(alias) {
     return new RegExp(
         '^(?:' + alias + ')'                                 // 别名
         + '(?:\\s*提示词|\\s*提示|\\s*prompt)?'                // 「图片提示词 3:」
-        + '\\s*(?:第|no\\.?|#)?\\s*(\\d{1,3})'                // 1 槽位号（含 01 这种补零）
+        + '[\\s_-]*(?:第|no\\.?|#)?\\s*(\\d{1,4})(?!\\d)'      // IMG_001 / VIDEO-041
         + '\\s*(?:张|段|帧|号|个)?'                            // 「图片第 3 张:」
         + '((?:\\s*(?:[（\\(].*?[）\\)]|\\[.*?\\]))*)'         // 2 tags（[META] 与 （简介））
         + '\\s*([:：]|[-–—=>|~]+|、|\\.)?'                     // 3 分隔符
@@ -77,7 +77,13 @@ function stripPromptImportDecorations(line) {
     s = s.replace(/^>\s*/, '');             // > 图片 1
     s = s.replace(/^[-*+•·]\s+/, '');       // - 图片 1
     s = s.replace(/^\d+[.)、]\s+/, '');      // 1) 图片 1
-    s = s.replace(/[*_`]/g, '');            // **图片 1:** / `图片 1:`
+    // 只去掉包在标题外面的成对标记，不能改掉同行正文中的下划线或 Markdown。
+    const wrap = s.match(/^(\*\*|__|`{1,3}|\*)/);
+    if (wrap) {
+        s = s.slice(wrap[1].length);
+        const end = s.indexOf(wrap[1]);
+        if (end >= 0) s = s.slice(0, end) + s.slice(end + wrap[1].length);
+    }
     return s.trim();
 }
 
@@ -109,9 +115,17 @@ function matchPromptImportHeader(line) {
             summary = '';
         }
         const sep = m[3] || '';
-        const inline = (m[4] || '').trim();
+        let inline = (m[4] || '').trim();
         const isColon = /^[:：]$/.test(sep);
-        if (!isColon && inline) continue;   // 无冒号又还有正文 → 不是头行，是正文
+        // 标题里的首尾帧/时长是说明，不是新提示词，也不能把正文引用当成头行。
+        const rangeLabel = /^(?:[|—–-]\s*)?(?:(?:IMAGE|IMG|图片|图像)[\s_-]*\d+\s*(?:→|->|=>|–|—|至|到|to)\s*(?:(?:IMAGE|IMG|图片|图像)[\s_-]*)?\d+)(?:\s*(?:[|·,，;；—–-]|\(|（|\[).*)?$/i;
+        const markdownHeading = /^\s*#{1,6}\s+/.test(line);
+        if (inline && !isColon) {
+            if (rangeLabel.test(inline) || (markdownHeading && sep)) {
+                summary = [summary, inline].filter(Boolean).join(' · ');
+                inline = '';
+            } else continue;
+        }
         return {
             type,
             index: parseInt(m[1], 10),
@@ -125,7 +139,9 @@ function matchPromptImportHeader(line) {
 
 function promptImportHeaderLine(type, index, meta, summary) {
     const label = type === 'image' ? '图片' : '视频';
-    const sumStr = summary ? `（${summary}）` : '';
+    // 描述里常含“IMAGE 1 → IMAGE 2 (6s)”；内层括号不能提前闭合标准标题标签。
+    const safeSummary = String(summary || '').replace(/[（(\[]/g, '〔').replace(/[）)\]]/g, '〕');
+    const sumStr = safeSummary ? `（${safeSummary}）` : '';
     const metaStr = meta ? ` [${meta}]` : '';
     return `${label} ${index}${sumStr}${metaStr}:`;
 }
@@ -157,6 +173,7 @@ function normalizePromptSetText(raw) {
     let droppedMarkers = 0;
     let droppedSectionLines = 0;
     let inlineMoved = 0;
+    let repeatedHeaders = 0;
     // 正文中间遇到 Markdown 小标题后置位：它开了文档的新一节（「## 提示词质量审核报告」
     // 这类），后面的内容不再属于上一拍。不这么断，那份审核报告表格会被整段接到
     // 最后一段视频的提示词末尾，然后原样送去渲染。下一个槽位头行才解除。
@@ -193,6 +210,20 @@ function normalizePromptSetText(raw) {
 
         const header = matchPromptImportHeader(rawLine);
         if (header) {
+            // 常见粘贴格式：### VIDEO 29 → ```text → VIDEO 29: 正文。
+            // 第二个标签属于同一段；旧逻辑会新增一条空段，随后把全部视频编号推后。
+            if (current && current.type === header.type && current.srcIndex === header.index
+                    && !current.bodyLines.some(l => l.trim())) {
+                current.meta = header.meta || current.meta;
+                current.summary = current.summary || header.summary;
+                if (header.inline) {
+                    current.bodyLines.push(header.inline);
+                    inlineMoved++;
+                }
+                repeatedHeaders++;
+                skippingSection = false;
+                continue;
+            }
             flush();
             skippingSection = false;
             current = {
@@ -258,92 +289,83 @@ function normalizePromptSetText(raw) {
             + '（不属于任何一拍，如附在末尾的质量审核报告）');
     }
     if (inlineMoved) fixes.push(`把 ${inlineMoved} 处与标签挤在同一行的正文挪到了下一行`);
+    if (repeatedHeaders) fixes.push(`合并了 ${repeatedHeaders} 处标题与正文重复的槽位标签`);
 
-    // ── 图片槽位号：本就是 1..N 就照原样，否则按出现顺序重编 ──
+    // 同一编号若对应不同正文，不能再按出现次序重编号：那会把视频绑到错误的图。
+    // 完全相同的重复块可安全去重；其余情况保留原文并报告冲突。
+    const deduplicate = (items, label) => {
+        const seen = new Map();
+        for (const slot of items) {
+            const previous = seen.get(slot.srcIndex);
+            if (!previous) { seen.set(slot.srcIndex, slot); continue; }
+            if (previous.body === slot.body && previous.meta === slot.meta) {
+                fixes.push(`去掉了重复出现的${label} ${slot.srcIndex}（正文相同）`);
+                continue;
+            }
+            return { error: `${label} ${slot.srcIndex} 出现了不同的正文，无法确定对应关系。请保留需要的那一份后再导入。` };
+        }
+        return { items: Array.from(seen.values()) };
+    };
+    const uniqueImages = deduplicate(images, '图片');
+    const uniqueVideos = deduplicate(videos, '视频');
+    if (uniqueImages.error || uniqueVideos.error) {
+        return { ok: false, error: uniqueImages.error || uniqueVideos.error };
+    }
+    images.splice(0, images.length, ...uniqueImages.items);
+    videos.splice(0, videos.length, ...uniqueVideos.items);
+
+    // 连续编号即使在文件中乱序也按编号排列。其他编号建立显式映射，视频沿用同一映射。
     const srcImageIndices = images.map(s => s.srcIndex);
-    const canonical = srcImageIndices.length === new Set(srcImageIndices).size
-        && srcImageIndices.every((n, i) => n === i + 1);
-    if (canonical) {
-        images.forEach((s, i) => { s.index = i + 1; });
-    } else {
-        images.forEach((s, i) => { s.index = i + 1; });
+    const sortedIndices = [...srcImageIndices].sort((a, b) => a - b);
+    const canonical = sortedIndices.every((n, i) => n === i + 1);
+    if (canonical) images.sort((a, b) => a.srcIndex - b.srcIndex);
+    const imageIndexMap = new Map();
+    images.forEach((s, i) => {
+        s.index = i + 1;
+        imageIndexMap.set(s.srcIndex, s.index);
+    });
+    if (!canonical) {
         fixes.push(`图片槽位号重编成 1–${images.length}`
-            + `（原文是 ${srcImageIndices.join('/')}，槽位号必须从 1 连续编到 N）`);
+            + `（原文是 ${srcImageIndices.join('/')}，对应视频同步映射）`);
     }
     const imageCount = images.length;
-
-    // ── 视频槽位号：视频 k 接的是 IMG k → IMG k+1，所以普通段只能落在 1..N-1；
-    //    收尾英雄段（[HERO]）的槽位号恒等于最后一张图，与 delete_slot 里
-    //    `_video_target` 的约定同源 ──
-    const heroVideos = videos.filter(v => /HERO/i.test(v.meta || ''));
-    const plainVideos = videos.filter(v => !/HERO/i.test(v.meta || ''));
     const droppedVideos = [];
-    const filledVideos = [];
-
+    const filledVideos = []; // 保留旧调用方字段；导入不再生成占位正文。
+    const outVideos = [];
+    for (const video of videos) {
+        const index = /HERO/i.test(video.meta || '')
+            ? imageCount : imageIndexMap.get(video.srcIndex);
+        if (index === undefined) {
+            return { ok: false, error: `视频 ${video.srcIndex} 没有对应的图片编号，无法确定首帧。原有视频未被丢弃，请核对编号后再导入。` };
+        }
+        if (outVideos.some(v => v.index === index)) {
+            return { ok: false, error: `多段视频对应到图片 ${index}，请核对视频编号或 HERO 标记后再导入。` };
+        }
+        video.index = index;
+        outVideos.push(video);
+    }
+    outVideos.sort((a, b) => a.index - b.index);
+    if (outVideos.some(v => v.index !== v.srcIndex)) {
+        fixes.push('视频槽位号已按对应图片同步映射，保留原有首帧关系');
+    }
+    const presentVideos = new Set(outVideos.map(v => v.index));
+    const missingVideos = [];
     if (videos.length) {
-        const plainCanonical = plainVideos.every((v, i) => v.srcIndex === i + 1)
-            && plainVideos.length <= Math.max(1, imageCount - 1);
-        plainVideos.forEach((v, i) => { v.index = i + 1; });
-        if (!plainCanonical && plainVideos.length) {
-            fixes.push(`视频槽位号按出现顺序重编成 1–${plainVideos.length}`
-                + `（原文是 ${plainVideos.map(v => v.srcIndex).join('/')}）`);
-        }
-        // 比"图片数-1"还多出来的段没有对应的首尾锚点图，留着必被契约拦下
-        const maxPlain = Math.max(0, imageCount - 1);
-        while (plainVideos.length > maxPlain) {
-            const extra = plainVideos.pop();
-            droppedVideos.push(extra.index);
-        }
-        if (droppedVideos.length) {
-            fixes.push(`丢弃了 ${droppedVideos.length} 段多余的视频提示词`
-                + `（共 ${imageCount} 张图，最多只能有 ${maxPlain} 段普通视频）`);
-        }
-        // 英雄段收到 N 号（只留一段，多的当普通段已被上面处理不到，直接丢）
-        heroVideos.forEach((v, i) => {
-            if (i === 0) v.index = imageCount;
-            else { v.index = -1; droppedVideos.push(v.srcIndex); }
-        });
-
-        // 缺段补骨架：集子里有视频提示词、却没配齐，说明它本意是要视频的
-        const present = new Set(plainVideos.map(v => v.index));
-        for (let k = 1; k <= maxPlain; k++) {
-            if (present.has(k)) continue;
-            plainVideos.push({
-                type: 'video', index: k, meta: '',
-                body: typeof promptBeatVideoPlaceholder === 'function'
-                    ? promptBeatVideoPlaceholder(k)
-                    : `（在此填写第 ${k} 段视频的提示词）`,
-            });
-            filledVideos.push(k);
-        }
-        if (filledVideos.length) {
-            fixes.push(`补上了缺失的视频 ${filledVideos.join('、')} 的骨架`
-                + '（正文是占位符，必须填成真提示词才能保存）');
+        for (let k = 1; k < imageCount; k++) {
+            if (!presentVideos.has(k)) missingVideos.push(k);
         }
     }
 
-    const outVideos = plainVideos.concat(heroVideos.filter(v => v.index > 0))
-        .filter(v => v.index >= 1 && v.index <= imageCount)
-        .sort((a, b) => a.index - b.index);
-
-    // ── 空正文也补占位符：空槽位存进去等于交付一条空提示词，渲染时照着空文字画图 ──
-    const emptyBodies = [];
-    images.forEach(s => {
-        if (s.body && s.body.trim()) return;
-        s.body = typeof promptBeatImagePlaceholder === 'function'
-            ? promptBeatImagePlaceholder(s.index)
-            : `（在此填写第 ${s.index} 张图片的提示词）`;
-        emptyBodies.push(`图片 ${s.index}`);
-    });
-    outVideos.forEach(v => {
-        if (v.body && v.body.trim()) return;
-        v.body = typeof promptBeatVideoPlaceholder === 'function'
-            ? promptBeatVideoPlaceholder(v.index)
-            : `（在此填写第 ${v.index} 段视频的提示词）`;
-        emptyBodies.push(`视频 ${v.index}`);
-    });
+    // 没有正文就是没有可生成的内容，不能自动写一句“在此填写”冒充成功导入。
+    const emptyBodies = images.concat(outVideos)
+        .filter(s => !s.body || !s.body.trim())
+        .map(s => `${s.type === 'image' ? '图片' : '视频'} ${s.index}`);
     if (emptyBodies.length) {
-        fixes.push(`${emptyBodies.join('、')} 的正文是空的，已填占位符待补`);
+        return {
+            ok: false,
+            error: `${emptyBodies.join('、')} 没有提示词正文。请补上实际内容后再导入；不会自动生成占位提示词。`,
+            emptyBodies,
+        };
     }
 
     // ── 按契约布局重新输出 ──
@@ -369,6 +391,7 @@ function normalizePromptSetText(raw) {
         videoCount: outVideos.length,
         fixes,
         filledVideos,
+        missingVideos,
         emptyBodies,
         droppedVideos,
         suggestedTitle,
@@ -389,11 +412,14 @@ function promptImportReportHtml(report, sourceLabel) {
     if (report.noVideos) {
         rows.push('<li>⚠️ 没有视频提示词，导入后只能生成帧序列</li>');
     }
+    if (report.missingVideos && report.missingVideos.length) {
+        rows.push(`<li>缺少视频 ${report.missingVideos.join('、')}，仅导入已有正文，不生成占位提示词</li>`);
+    }
     if (report.fixes.length) {
-        rows.push('<li>自动补全：<ul style="margin:4px 0 0 16px;">'
+        rows.push('<li>自动整理：<ul style="margin:4px 0 0 16px;">'
             + report.fixes.map(f => `<li>${escapeHtml(f)}</li>`).join('') + '</ul></li>');
     } else {
-        rows.push('<li>格式本就合规，未作改动</li>');
+        rows.push('<li>已识别全部提示词，正文未作改动</li>');
     }
     if (report.hasPlaceholder) {
         rows.push('<li>⚠️ 含占位正文，<b>保存前必须替换成真提示词</b>（占位符会被当真提示词拿去渲染）</li>');
@@ -471,6 +497,8 @@ async function importPromptSetAsNewIdea(report, sourceLabel) {
         audit_md: '手动导入的提示词集，未经本机质量门与工序一致性二次校验。',
         repair_md: '',
         imported_at: new Date(stamp).toISOString(),
+        imported_source_text: report.sourceText || report.text,
+        imported_source_label: sourceLabel || '粘贴的文本',
     };
     if (promptSlots) idea.prompt_slots = promptSlots;
 
@@ -512,6 +540,7 @@ async function runPromptSetImport(raw, sourceLabel) {
         showToast('已取消导入。', 'info');
         return false;
     }
+    report.sourceText = String(raw);
     return importPromptSetAsNewIdea(report, sourceLabel);
 }
 
@@ -535,9 +564,9 @@ function openPromptImportDialog() {
             <div class="modal-body" style="padding-top: 10px;">
                 <p style="margin-bottom: 10px; font-size: 13px; line-height: 1.7; color: var(--text-secondary);">
                     选一个 <b>.md / .txt</b> 文件，或把整份提示词集粘到下面的框里。
-                    格式不合本项目契约（<code>图片 N:</code> / <code>视频 N:</code>）时会<b>自动补全</b>：
-                    去围栏与标题、认 IMAGE/IMG/VIDEO/VID 等别名、全角冒号、同行正文下移、
-                    槽位号重编、视频缺段补骨架。改了什么会先列给你看，确认后才落地。
+                    自动识别 <code>图片 N:</code> / <code>视频 N:</code>、IMAGE/IMG/VIDEO/VID、
+                    Markdown 标题、代码块和重复标签，并保留原始文件内容。
+                    缺少的视频会列出提示，不再填入占位文字，也不会把后面的段落挤到错误编号。
                 </p>
                 <div class="prompt-import-drop" id="prompt-import-drop" style="border:1px dashed rgba(0,242,254,0.45); border-radius:8px; padding:14px; text-align:center; margin-bottom:12px; cursor:pointer;">
                     <span style="font-size:13px; color: var(--text-secondary);">点击选择文件，或把 .md / .txt 拖到这里</span>

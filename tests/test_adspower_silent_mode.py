@@ -50,12 +50,15 @@ def test_runtime_config_env_overrides(monkeypatch):
     assert get_runtime_adspower_headless() is True
 
 
-def test_get_ads_ws_url_injects_silent_launch_args(monkeypatch):
+def test_get_ads_ws_url_injects_silent_launch_args(monkeypatch, ads_inventory_reader):
     captured_urls = []
 
     def mock_get(url, *args, **kwargs):
         captured_urls.append(url)
         resp = MagicMock()
+        if url.endswith('/browser/local-active'):
+            resp.json.return_value = {"code": 0, "data": {"list": []}}
+            return resp
         resp.json.return_value = {
             "code": 0,
             "data": {"ws": {"puppeteer": "ws://127.0.0.1:9222/devtools"}}
@@ -68,8 +71,10 @@ def test_get_ads_ws_url_injects_silent_launch_args(monkeypatch):
 
     ws = get_ads_ws_url(user_id="test_user", port=50325, auto_rotate_proxy=False)
     assert ws == "ws://127.0.0.1:9222/devtools"
-    assert len(captured_urls) == 1
-    start_url = captured_urls[0]
+    assert len(captured_urls) == 3
+    assert captured_urls[0].endswith('/browser/local-active')
+    assert captured_urls[1].endswith('/browser/active')
+    start_url = captured_urls[2]
 
     assert "launch_args=" in start_url
     # 解析 query string
@@ -99,4 +104,3 @@ def test_console_schema_and_direct_env_for_silent_mode(monkeypatch):
     clean_true = fx_console.validate_patch({"adsPowerSilentMode": True})
     fx_console.apply_direct_env(clean_true)
     assert os.environ["ADSPOWER_SILENT_MODE"] == "1"
-

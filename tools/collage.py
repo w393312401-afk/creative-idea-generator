@@ -67,7 +67,7 @@ def build_keyframe_collage(
     Pass `max_frames=0` to disable sampling entirely. Callers whose collage carries an
     index contract — "tile k is exactly item k of some parallel list" — MUST do so:
     dropping a frame shifts every later tile by one, which is worse than having no
-    collage at all. See `prompt_pipeline.reverse._build_pass_b_sheets`.
+    collage at all.
     """
     if not frame_paths:
         return None
@@ -80,8 +80,8 @@ def build_keyframe_collage(
     out.parent.mkdir(parents=True, exist_ok=True)
     paths = [Path(p) for p in frame_paths]
 
-    # max_frames <= 0 表示"不降采样，全都要"（带下标契约的拼图必须走这条，见
-    # prompt_pipeline/reverse.py 的调用点）。max_frames == 1 单独挡掉：下面的
+    # max_frames <= 0 表示"不降采样，全都要"（带下标契约的拼图必须走这条）。
+    # max_frames == 1 单独挡掉：下面的
     # step 要除以 max_frames-1，取 1 会直接 ZeroDivisionError；而"只留一张"本就
     # 不是拼图，退回首帧即可。
     if max_frames is not None and max_frames > 0 and len(paths) > max_frames:

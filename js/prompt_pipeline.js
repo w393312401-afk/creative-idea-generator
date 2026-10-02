@@ -223,6 +223,7 @@ function renderPromptDisplay(promptText, targetEl) {
     if (!raw || raw === '（本次未返回提示词内容）') {
         el.className = 'prompt-pre prompt-empty';
         el.textContent = raw || '在左侧选择维度并点击「激发」，这里会输出经 gemini-veo / omni-restoration-composer skill 合成的完整图片 / 视频提示词集。';
+        if (typeof syncPromptBrowser === 'function') syncPromptBrowser(el);
         return;
     }
 
@@ -231,6 +232,7 @@ function renderPromptDisplay(promptText, targetEl) {
         // 无标准槽位时无损降级为普通代码块展示
         el.className = 'prompt-pre';
         el.textContent = raw;
+        if (typeof syncPromptBrowser === 'function') syncPromptBrowser(el);
         return;
     }
 
@@ -353,6 +355,7 @@ function renderPromptDisplay(promptText, targetEl) {
             const badge = headerEl.querySelector('.prompt-section-fold-badge');
             if (badge) badge.hidden = !isCollapsed;
             headerEl.title = isCollapsed ? `点击展开「${sec.title}」` : `点击折叠/展开「${sec.title}」`;
+            if (typeof rememberPromptFolds === 'function') rememberPromptFolds(el, [secEl]);
         });
 
         secFoldItemsBtn.addEventListener('click', (e) => {
@@ -368,6 +371,7 @@ function renderPromptDisplay(promptText, targetEl) {
             });
             const span = secFoldItemsBtn.querySelector('span');
             if (span) span.textContent = hasExpanded ? '展开条目' : '折叠条目';
+            if (typeof rememberPromptFolds === 'function') rememberPromptFolds(el, cards);
         });
 
         sec.items.forEach(item => {
@@ -447,7 +451,7 @@ function renderPromptDisplay(promptText, targetEl) {
                     <path d="M12 20h9"></path>
                     <path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"></path>
                 </svg>
-                <span>编辑</span>
+                <span>修改此段</span>
             `;
             editBtn.addEventListener('click', (e) => {
                 e.stopPropagation();
@@ -502,9 +506,11 @@ function renderPromptDisplay(promptText, targetEl) {
             // 点击卡片头部或预览条折叠/展开
             itemHeader.addEventListener('click', () => {
                 cardEl.classList.toggle('is-collapsed');
+                if (typeof rememberPromptFolds === 'function') rememberPromptFolds(el, [cardEl]);
             });
             previewEl.addEventListener('click', () => {
                 cardEl.classList.remove('is-collapsed');
+                if (typeof rememberPromptFolds === 'function') rememberPromptFolds(el, [cardEl]);
             });
 
             // 卡片正文
@@ -519,6 +525,7 @@ function renderPromptDisplay(promptText, targetEl) {
         secEl.appendChild(listEl);
         el.appendChild(secEl);
     });
+    if (typeof syncPromptBrowser === 'function') syncPromptBrowser(el);
 }
 
 /**
@@ -555,6 +562,7 @@ function toggleFoldAllPrompts(targetContainer) {
             c.classList.remove('is-collapsed');
         }
     });
+    if (typeof rememberPromptFolds === 'function') rememberPromptFolds(container, [...sections, ...cards]);
 
     const btn = document.getElementById('toggle-fold-all-prompts-btn');
     if (btn) {
@@ -635,12 +643,15 @@ function jumpFromPromptToMedia(type, index) {
  * 从画面帧 / 视频卡片跳转并高亮对应的提示词卡片
  */
 function jumpFromMediaToPrompt(type, seq) {
+    const ownerAtJump = typeof currentIdea !== 'undefined' ? currentIdea?.id : null;
     if (typeof switchMainTab === 'function') switchMainTab('results');
     if (typeof switchTab === 'function') {
         switchTab('prompts');
     }
 
     setTimeout(() => {
+        if (ownerAtJump && (!currentIdea || currentIdea.id !== ownerAtJump)) return;
+        if (typeof jumpToPromptInBrowser === 'function' && jumpToPromptInBrowser(type, seq)) return;
         const sel = `.prompt-item-card[data-type="${type}"][data-index="${seq}"]`;
         const target = document.querySelector(sel);
         if (target) {
@@ -670,6 +681,13 @@ function jumpFromMediaToPrompt(type, seq) {
 function enterInlinePromptEdit(cardEl, item) {
     if (!cardEl || !item) return;
     if (cardEl.classList.contains('is-inline-editing')) return;
+    const ownerIdea = (typeof currentIdea !== 'undefined') ? currentIdea : null;
+    if (!ownerIdea || !ownerIdea.prompt_block) return;
+    const display = document.getElementById('idea-prompt-block');
+    if (display && display.querySelector('.is-inline-editing')) {
+        if (typeof showToast === 'function') showToast('请先保存或取消正在修改的提示词，再修改另一段。', 'info');
+        return;
+    }
 
     if (typeof currentIdea !== 'undefined' && currentIdea && typeof isIdeaTaskActive === 'function'
             && (isIdeaTaskActive(currentIdea.id, 'frames') || isIdeaTaskActive(currentIdea.id, 'videos'))) {
@@ -692,10 +710,10 @@ function enterInlinePromptEdit(cardEl, item) {
     formEl.innerHTML = `
         <textarea class="prompt-inline-textarea" spellcheck="false" placeholder="在此编辑提示词正文..."></textarea>
         <div class="prompt-inline-actions">
-            <span class="prompt-inline-hint">快捷键：⌘/Ctrl+Enter 保存，Esc 取消</span>
+            <span class="prompt-inline-hint">只修改此段 · ⌘/Ctrl+Enter 保存，Esc 取消</span>
             <div class="prompt-inline-buttons">
                 <button type="button" class="action-btn text-btn mini-btn prompt-inline-cancel-btn">✖ 取消</button>
-                <button type="button" class="action-btn text-btn mini-btn primary prompt-inline-save-btn">💾 保存</button>
+                <button type="button" class="action-btn text-btn mini-btn primary prompt-inline-save-btn">保存此段</button>
             </div>
         </div>
     `;
@@ -716,6 +734,8 @@ function enterInlinePromptEdit(cardEl, item) {
     };
 
     const saveEdit = async () => {
+        if (textarea.disabled || !currentIdea || currentIdea.id !== ownerIdea.id
+                || cardEl.isConnected === false) return;
         const newBody = textarea.value.trim();
         if (newBody === origBody.trim()) {
             cancelEdit();
@@ -727,10 +747,8 @@ function enterInlinePromptEdit(cardEl, item) {
             return;
         }
 
-        const ownerIdea = (typeof currentIdea !== 'undefined') ? currentIdea : null;
-        if (!ownerIdea || !ownerIdea.prompt_block) return;
-
-        const updatedBlock = replaceSinglePromptSlotBody(ownerIdea.prompt_block, item.type, item.index, newBody);
+        const baseBlock = ownerIdea.prompt_block;
+        const updatedBlock = replaceSinglePromptSlotBody(baseBlock, item.type, item.index, newBody);
 
         textarea.disabled = true;
         const saveBtn = formEl.querySelector('.prompt-inline-save-btn');
@@ -745,7 +763,7 @@ function enterInlinePromptEdit(cardEl, item) {
             request: () => slotPostJson('/api/edit_prompts', {
                 title: getIdeaSaveTitle(ownerIdea),
                 prompt_block: updatedBlock,
-                prev_prompt_block: ownerIdea.prompt_block || '',
+                prev_prompt_block: baseBlock,
             }),
             beforeApply: async (d) => {
                 await applyPromptBlockToIdea(ownerIdea, d.prompt_block, d.prompt_slots, true);
@@ -757,14 +775,14 @@ function enterInlinePromptEdit(cardEl, item) {
 
         if (ok) {
             if (typeof recordPromptHistory === 'function') {
-                recordPromptHistory(ownerIdea.id, updatedBlock, `单条就地编辑 ${item.shortLabel}`);
+                recordPromptHistory(ownerIdea.id, ownerIdea.prompt_block, `单条就地编辑 ${item.shortLabel}`);
             }
-            renderPromptDisplay(updatedBlock);
+            // applyPromptBlockToIdea 已按项目归属展示后端权威文本；旧请求不能重画新项目。
         } else {
             textarea.disabled = false;
             if (saveBtn) {
                 saveBtn.disabled = false;
-                saveBtn.textContent = '💾 保存';
+                saveBtn.textContent = '保存此段';
             }
         }
     };

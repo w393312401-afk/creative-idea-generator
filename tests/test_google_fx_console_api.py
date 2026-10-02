@@ -130,6 +130,35 @@ def test_status_snapshot_aggregates_runtime_accounts_tasks_and_selectors(monkeyp
     assert 'apiKey' not in str(snapshot) and 'password' not in str(snapshot)
 
 
+@pytest.mark.parametrize('mode, warns', [
+    ('accepting', False),
+    ('running', False),
+    ('draining', True),
+])
+def test_status_diagnostic_accepts_current_and_legacy_ready_modes(monkeypatch, mode, warns):
+    """当前 accepting 与旧 running 均可接收任务，不能误报为拒绝新任务。"""
+    control = FxControlPlane()
+    queue = control.snapshot()
+    queue['mode'] = mode
+    monkeypatch.setattr(control, 'snapshot', lambda: queue)
+    monkeypatch.setattr(server, 'FX_CONTROL', control)
+    monkeypatch.setattr(server, 'ACTIVE_TASKS', {})
+    monkeypatch.setattr(server, 'effective_config', lambda _: {'adsPowerPort': '50325'})
+    monkeypatch.setattr(server.socket, 'create_connection', _connected_socket)
+    monkeypatch.setattr(server, '_get_account_pool', lambda: _Pool([]))
+    monkeypatch.setattr(server, '_get_proxy_pool', lambda: type(
+        'ProxyPool', (), {'summary': lambda self: {}})())
+    monkeypatch.setattr(selector_stats, 'summarize', lambda: [])
+
+    snapshot = server._google_fx_status_snapshot()
+
+    warnings = [item for item in snapshot['diagnostics']
+                if item['code'] == 'service_not_accepting']
+    assert bool(warnings) is warns
+    if warns:
+        assert mode in warnings[0]['message']
+
+
 def test_status_snapshot_never_triggers_adspower_name_healing(monkeypatch):
     """S3 回归：快照必须用 heal=False。
 
@@ -175,12 +204,7 @@ def test_status_snapshot_reports_unprobed_and_login_required(monkeypatch):
 
 
 def test_locked_default_account_marks_switch_interval_inert(monkeypatch):
-    """「锁定默认环境」会把轮转环压成单元素，换号节拍那个数字一次都用不上。
-
-    回归的是一个纯粹的"配了但没生效"：控制台状态条照旧显示「换号节拍 每 15 次请求」、
-    保存时还回一句"已保存并热生效"，而 _account_rotation_ring 早就退化成 [默认账号]，
-    两条链的切腿逻辑都走单腿分支，整条序列一个号跑到底。
-    """
+    """旧换号节拍保留配置值，但锁定环境也按额度用尽后换号。"""
     monkeypatch.setattr(server, 'effective_config', lambda _: {
         'adsPowerPort': '50325',
         'googleFxIpRotateRequests': 15,
@@ -194,13 +218,12 @@ def test_locked_default_account_marks_switch_interval_inert(monkeypatch):
     ]))
 
     snapshot = server._google_fx_status_snapshot()
-    assert snapshot['configuration']['account_switch_requests'] == 15
     assert snapshot['configuration']['account_switch_effective'] is False
     assert 'switch_interval_inert' in {item['code'] for item in snapshot['diagnostics']}
 
 
-def test_switch_interval_not_flagged_when_default_account_is_unlocked(monkeypatch):
-    """只是钉了默认环境、没勾锁定时，后续仍按节拍轮转——不该误报成不生效。"""
+def test_switch_interval_remains_inert_when_default_account_is_unlocked(monkeypatch):
+    """不锁定默认环境也优先复用浏览器，旧请求计数不再触发换号。"""
     monkeypatch.setattr(server, 'effective_config', lambda _: {
         'adsPowerPort': '50325',
         'googleFxIpRotateRequests': 15,
@@ -213,28 +236,23 @@ def test_switch_interval_not_flagged_when_default_account_is_unlocked(monkeypatc
     ]))
 
     snapshot = server._google_fx_status_snapshot()
-    assert snapshot['configuration']['account_switch_effective'] is True
-    assert 'switch_interval_inert' not in {item['code'] for item in snapshot['diagnostics']}
+    assert snapshot['configuration']['account_switch_effective'] is False
+    note = next(item for item in snapshot['diagnostics'] if item['code'] == 'switch_interval_inert')
+    assert note['level'] == 'info'
+    assert '复用' in note['message']
 
 
-def test_inert_config_notes_cover_locked_switch_interval():
-    """保存回执：热生效不等于跑得起来，被压住的字段要如实说出来。"""
-    assert server._inert_config_notes({
+@pytest.mark.parametrize('preferred,locked', [('pinned', True), ('', True), ('pinned', False), ('', False)])
+def test_inert_config_notes_cover_legacy_switch_interval(preferred, locked):
+    """保存回执始终说明额度策略，避免旧配置被误认为仍控制轮转。"""
+    notes = server._inert_config_notes({
         'googleFxIpRotateRequests': 15,
-        'googleFxSequenceUserId': 'pinned',
-        'googleFxSequenceUserLock': True,
-    }), '锁定 + 指定环境时换号节拍必须被标为不生效'
-    # 勾了锁定却没指定环境是被 validate_patch 拦下的空承诺，行为仍是自动选号轮转
-    assert server._inert_config_notes({
-        'googleFxIpRotateRequests': 15,
-        'googleFxSequenceUserId': '',
-        'googleFxSequenceUserLock': True,
-    }) == []
-    assert server._inert_config_notes({
-        'googleFxIpRotateRequests': 15,
-        'googleFxSequenceUserId': 'pinned',
-        'googleFxSequenceUserLock': False,
-    }) == []
+        'googleFxSequenceUserId': preferred,
+        'googleFxSequenceUserLock': locked,
+    })
+    assert notes
+    assert '余额' in '；'.join(notes)
+    assert '24' in '；'.join(notes)
 
 
 def test_status_endpoint_is_gated_and_returns_snapshot(monkeypatch):
@@ -333,3 +351,76 @@ def test_schema_marks_restart_required_fields():
     # 这些的读取方每次调用现读，能热生效
     assert schema['googleFxPacingMinSeconds']['hot'] is True
     assert schema['googleFxMaxWaitSeconds']['hot'] is True
+    # 旧数值仍可通过 API 保存/导入，但界面不再提供一个会误导调度行为的编辑框。
+    assert schema['googleFxIpRotateRequests']['inactive'] is True
+    assert fx_console.validate_patch({'googleFxIpRotateRequests': 20}) == {'googleFxIpRotateRequests': 20}
+
+@pytest.mark.parametrize('task,expected', [
+    ({'status': 'completed', 'dimensions': {'type': 'frames'},
+      'result': {'frames': [{'sequence': 1, 'url': '/frame.webp'}]}}, 'completed'),
+    ({'status': 'completed', 'dimensions': {'type': 'frames'},
+      'result': {'frames': [{'sequence': 1, 'status': 'failed'}]}}, 'partial_failed'),
+    ({'status': 'completed', 'dimensions': {'type': 'frames'},
+      'result': {'frames': [], 'halted_at_sequence': 3}}, 'partial_failed'),
+    ({'status': 'completed', 'dimensions': {'type': 'frames'},
+      'result': {'frames': [{'sequence': 1}], 'videos': [{'status': 'failed'}]}}, 'completed'),
+    ({'status': 'completed', 'result': {'completion_state': 'partial_failed'}}, 'partial_failed'),
+    ({'status': 'completed', 'result': {'merge_error': 'missing clip'}}, 'partial_failed'),
+    ({'status': 'completed', 'result': {'completion_state': 'completed_with_warnings'}}, 'completed_with_warnings'),
+    ({'status': 'running', 'outcome': 'partial_failed', 'result': {'has_failures': True}}, 'running'),
+])
+def test_task_outcome_uses_real_results_without_stale_retry_or_unrelated_video_errors(task, expected):
+    assert server._task_outcome(task) == expected
+
+
+def test_task_list_exposes_small_business_outcome_summary(monkeypatch):
+    tasks = {
+        'videos_partial': {'id': 'videos_partial', 'status': 'completed',
+            'dimensions': {'type': 'videos'}, 'events': [], 'last_active': 20,
+            'error': None, 'outcome': 'partial_failed',
+            'result': {'completion_state': 'partial_failed', 'videos': [{'slot': 44, 'status': 'failed'}]}},
+        'frames_ok': {'id': 'frames_ok', 'status': 'completed',
+            'dimensions': {'type': 'frames'}, 'events': [], 'last_active': 10,
+            'error': None, 'result': {'frames': [{'sequence': 1, 'url': '/ok.webp'}]}},
+    }
+    monkeypatch.setattr(server, 'ACTIVE_TASKS', tasks)
+    monkeypatch.setattr(server, 'cleanup_old_tasks', lambda: None)
+    handler = object.__new__(server.SparkRequestHandler)
+    handler.path = '/api/tasks'
+    handler._gate = lambda: True
+    responses = []
+    handler._send_json = lambda payload, status=200: responses.append(payload)
+    handler.do_GET()
+    rows = {task['id']: task for task in responses[0]['tasks']}
+    assert rows['videos_partial']['outcome'] == 'partial_failed'
+    assert rows['videos_partial']['result']['has_failures'] is True
+    assert rows['frames_ok']['result']['completion_state'] == 'completed'
+    assert 'frames' not in rows['frames_ok']['result']  # Polling stays lightweight.
+
+
+def test_fx_status_keeps_historical_failures_separate_from_current_intervention(monkeypatch):
+    monkeypatch.setattr(server, 'effective_config', lambda _: {'adsPowerPort': '50325'})
+    monkeypatch.setattr(server.socket, 'create_connection', _connected_socket)
+    monkeypatch.setattr(server, '_get_account_pool', lambda: _Pool([]))
+    monkeypatch.setattr(server, 'ACTIVE_TASKS', {
+        'videos_partial': {'status': 'completed', 'outcome': 'partial_failed',
+            'dimensions': {'type': 'videos'}, 'events': [], 'last_active': 20},
+        'frames_running': {'status': 'running', 'outcome': 'partial_failed',
+            'dimensions': {'type': 'frames'}, 'events': [], 'last_active': 30},
+    })
+    monkeypatch.setattr(server, '_fx_task_timeline', lambda *_: [
+        {'stage': 'old', 'duration_seconds': 900, 'slow': True},
+        {'stage': 'submitting', 'duration_seconds': 5, 'slow': False},
+    ])
+    monkeypatch.setattr(server, '_fx_manual_intervention', lambda *_: {'code': 'login_required'})
+    snapshot = server._google_fx_status_snapshot()
+    rows = {task['id']: task for task in snapshot['tasks']}
+    assert rows['videos_partial']['outcome'] == 'partial_failed'
+    assert rows['videos_partial']['manual_intervention'] is None
+    assert rows['videos_partial']['stuck_stage'] is None
+    assert rows['frames_running']['outcome'] == 'running'
+    assert rows['frames_running']['manual_intervention']['code'] == 'login_required'
+    assert rows['frames_running']['stuck_stage'] is None, 'A slow past stage is not a current stall'
+    recent = next(row for row in snapshot['diagnostics'] if row['code'] == 'recent_failures')
+    assert recent['level'] == 'info'
+    assert recent['message'].startswith('历史记录')

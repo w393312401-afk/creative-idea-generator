@@ -134,6 +134,18 @@ const FRAME_BADGE_DEFS = [
 
 const VIDEO_BADGE_DEFS = [
     {
+        id: 'retry-failed', text: '本次重试失败 · 保留原片', cls: 'vlm-failed-badge',
+        test: v => v.status === 'success' && v.last_attempt && v.last_attempt.status === 'failed',
+        tip: v => v.last_attempt.error || '本次重试失败，仍可播放上次成功的视频。',
+        hover: v => `（本次重试失败：${v.last_attempt.error || '仍保留上次成功的视频'}）`,
+    },
+    {
+        id: 'retry-cancelled', text: '本次重试取消 · 保留原片', cls: 'degraded-badge',
+        test: v => v.status === 'success' && v.last_attempt && v.last_attempt.status === 'cancelled',
+        tip: () => '本次重试已取消，仍可播放上次成功的视频。',
+        hover: () => '（本次重试已取消，保留上次成功的视频）',
+    },
+    {
         id: 'prompt-dirty', text: '提示词已改', cls: 'stale-badge', isIssue: true,
         test: v => !!(v && v.prompt_dirty),
         tip: () => '这一段的视频提示词已被手动改写，片段仍是按旧提示词生成的，建议重跑',
@@ -218,6 +230,9 @@ function frameActions(state, ctx) {
         Object.assign({ busy, busyTip: BUSY_TIP_FRAMES }, opts));
     const list = [];
     if (state.kind === 'ready') {
+        list.push(slotAction('preview-slot', '查看', {
+            cls: 'preview-slot-btn', idle: '放大查看这张图片', busy: false,
+        }));
         if (state.flags.fixable) {
             list.push(mk('fix-frame', '修复此帧问题', {
                 cls: 'fix-frame-btn', variant: 'danger',
@@ -239,10 +254,10 @@ function frameActions(state, ctx) {
             }));
         }
         if (state.flags.hasBenchmarkRef) {
-            // 对标原片：打开本拍生成帧与爆款原片节拍抽帧的分屏对比滑块
+            // 对标原片：打开本拍生成帧与参考原片节拍抽帧的分屏对比滑块
             list.push(slotAction('compare-benchmark', '🎯 对标原片', {
                 cls: 'compare-benchmark-btn',
-                idle: '打开本拍生成帧与爆款原片节拍抽帧的分屏对比滑块',
+                idle: '打开本拍生成帧与参考原片节拍抽帧的分屏对比滑块',
                 busy: false,
             }));
         }
@@ -285,7 +300,10 @@ function frameActions(state, ctx) {
             idle: DELETE_TIP,
         }));
     }
-    return list;
+    const primary = state.kind !== 'ready' ? 'retry-frame'
+        : state.flags.fixable ? 'fix-frame'
+        : state.flags.hasCandidates ? 'view-candidates' : 'preview-slot';
+    return list.map(a => Object.assign(a, { primary: a.act === primary }));
 }
 
 function videoActions(state, ctx) {
@@ -297,7 +315,7 @@ function videoActions(state, ctx) {
     // 占位卡是浅色底，上传/删除沿用 secondary 的浅色描边；出图卡是深色底，
     // 删除用红底跟其余按钮区分（两种底色下的既有外观）
     const sub = isReady ? '' : ' secondary';
-    return [
+    const list = [
         mk('retry-video', state.kind === 'missing' ? '生成' : '重试', {
             cls: 'retry-video-btn',
             idle: isReady ? '重新生成此槽位视频（覆盖当前片段）' : '',
@@ -312,6 +330,11 @@ function videoActions(state, ctx) {
             idle: DELETE_TIP,
         }),
     ];
+    if (isReady) list.unshift(slotAction('preview-slot', '播放', {
+        cls: 'preview-slot-btn', idle: '打开并播放这段视频', busy: false,
+    }));
+    const primary = isReady ? 'preview-slot' : 'retry-video';
+    return list.map(a => Object.assign(a, { primary: a.act === primary }));
 }
 
 // ── 状态构造 ────────────────────────────────────────────────────────

@@ -174,17 +174,13 @@ def _render_batch(config, title, prompt_block, batch_sequences, on_progress=None
     return True
 
 
-def start_stepped_pipeline(config, dimensions, on_progress=None, precomposed=None):
+def start_stepped_pipeline(config, dimensions, on_progress=None):
     """Starts the stepped pipeline: compose Phase 1 + render anchor, then pause for review.
 
     Unlike run_autonomous_pipeline which runs to completion, this pauses at review_anchor
     so the user can inspect Frame 1 before committing to the rest of the pipeline.
     Title is derived from compose_anchor_and_packet (same as run_autonomous_pipeline).
 
-    `precomposed`：一份已经跑完的 Phase 1 产物（形状同 compose_anchor_and_packet 的返回值）。
-    给了就跳过重合成。目前唯一的来源是爆款复刻线的交接（replica_pipeline.handoff_to_render）：
-    那边已经合成过一次并让产物过了 banned 门禁，这里再合成一遍等于既重复付钱、又把渲染
-    建在一份没审过的提示词上。其余调用方一律不传，行为与之前逐字相同。
     """
     state = {
         'pipeline_id': f'stepped_{uuid.uuid4().hex[:12]}',
@@ -212,11 +208,9 @@ def start_stepped_pipeline(config, dimensions, on_progress=None, precomposed=Non
         if on_progress:
             on_progress('stepped_stage', {
                 'stage': 'compose_phase1',
-                'message': ('阶段 1/7: 沿用复刻线已合成并通过门禁的提示词，跳过重新合成...'
-                            if precomposed else
-                            '阶段 1/7: 正在解析创意简报并生成首帧 Prompt...')})
+                'message': '阶段 1/7: 正在解析创意简报并生成首帧 Prompt...'})
 
-        compose_state = precomposed or compose_anchor_and_packet(
+        compose_state = compose_anchor_and_packet(
             config, dimensions, on_progress=on_progress)
         # Title comes from compose_anchor_and_packet, same as run_autonomous_pipeline
         title = compose_state['title']
@@ -323,7 +317,7 @@ def advance_stepped_pipeline(title, action='approve', on_progress=None, config=N
                 # 事后门禁复核：若简报带有 banned_elements，对 Phase 2 重写后的成稿做二次扫描
                 banned = (state.get('parsed_brief') or {}).get('banned_elements') or []
                 if banned:
-                    from prompt_pipeline.reverse import banned_element_hits
+                    from prompt_pipeline.reference_context import banned_element_hits
                     hits = banned_element_hits(prompt_block, banned)
                     state['banned_hits'] = hits
                     if hits and on_progress:

@@ -151,7 +151,7 @@ def _is_image_quota_failure(reason):
     """图片单日配额（≠ 账号积分耗尽）。判据收在 google_fx_credit 里统一维护——
     这里、server_common.failover_and_select_next_account、helpers
     ._classify_failure_for_switch 三处此前各抄一份 token 清单，改一处漏两处。"""
-    return is_image_quota_message(reason)
+    return is_image_quota_message(str(reason or ""))
 
 
 def _record_current_generation_failure(reason):
@@ -214,12 +214,21 @@ def _create_fresh_flow_canvas(page, stale_url=""):
     """
     stale_project = _flow_project_id(stale_url)
     try:
-        page.goto(
-            FLOW_HOME_URL,
-            timeout=60000,
-            wait_until="domcontentloaded",
+        # The connection routine may have just loaded the ready project list.
+        # Reuse that DOM; a project (including a route-less editor) still needs
+        # to be left before creating this task's isolated canvas.
+        current_url = str(getattr(page, "url", "") or "")
+        on_project_list = (
+            is_flow_url(current_url)
+            and not is_flow_project_url(current_url)
+            and _find_fx_prompt_input(page, announce=False) is None
         )
-        random_sleep(1, 2)
+        if not on_project_list:
+            page.goto(
+                FLOW_HOME_URL,
+                timeout=60000,
+                wait_until="domcontentloaded",
+            )
     except Exception as nav_err:
         raise RuntimeError(f"Cannot open the Flow workspace: {nav_err}") from nav_err
 
@@ -286,7 +295,6 @@ def _enter_bound_project(page, requested_project_url):
 
     try:
         page.goto(requested_project_url, timeout=60000, wait_until="domcontentloaded")
-        random_sleep(1, 2)
     except Exception as nav_err:
         log(f"⚠️ 打开已绑定 Flow 画布失败: {nav_err}，不重试，直接新建画布", "GoogleFX")
         return None
@@ -423,7 +431,6 @@ def _open_image_flow_canvas(page, requested_project_url=None, require_fresh_canv
 
     try:
         page.goto(target_url, timeout=60000, wait_until="domcontentloaded")
-        random_sleep(1, 2)
     except Exception as nav_err:
         raise RuntimeError(f"Cannot open the Flow workspace: {nav_err}") from nav_err
 
@@ -617,17 +624,29 @@ def _generate_images_batch_google_fx_single_attempt(req: ImageBatchRequest):
                 getattr(req, "require_fresh_canvas", False)
                 and not getattr(req, "project_url", None)
             )
+            requested_project_url = getattr(req, "project_url", None)
             project_url = _open_image_flow_canvas(
-                page, getattr(req, "project_url", None),
+                page, requested_project_url,
                 require_fresh_canvas=require_fresh_canvas,
             )
 
             # 🛠️ 0. 新建/清理画布
-            _has_ref_images = bool([r for r in (req.images or []) if r and os.path.exists(clean_path(str(r)))])
+            ref_image_refs = [clean_path(str(r)) for r in (req.images or []) if r]
+            valid_refs = list(dict.fromkeys(p for p in ref_image_refs if os.path.exists(p)))
+            # Local uploads cannot appear on the canvas before we upload them.
+            # Waiting for a tile on a new canvas cost the full 10 s every time.
+            # Only an existing bound canvas with reusable UUIDs needs that wait.
+            requested_pid = _flow_project_id(requested_project_url)
+            expects_canvas_refs = bool(
+                not require_fresh_canvas
+                and requested_pid
+                and requested_pid == _flow_project_id(project_url)
+                and any(_extract_media_uuid(os.path.basename(path)) for path in valid_refs)
+            )
             # 画布刚为本次任务新建出来时，绝不允许 _prepare_fx_canvas 的"优先打开最新
             # 历史项目"兜底把我们送回上一个任务的画布。
             _prepare_fx_canvas(
-                page, has_refs=_has_ref_images,
+                page, has_refs=expects_canvas_refs,
                 require_fresh_canvas=require_fresh_canvas,
             )
             if project_url:
@@ -678,9 +697,6 @@ def _generate_images_batch_google_fx_single_attempt(req: ImageBatchRequest):
             except Exception as e:
                 log(f"  ⚠️ 清空输入框异常: {e}", "GoogleFX")
 
-            ref_image_refs = [clean_path(str(r)) for r in (req.images or []) if r]
-            # ⚠️ 去重：防止 n8n 传入重复路径导致同一图片多次处理
-            valid_refs = list(dict.fromkeys(p for p in ref_image_refs if os.path.exists(p)))
             if valid_refs:
                 log(f"🖼️ 检测到 {len(valid_refs)} 张参考图，从文件名提取 UUID 并在画布挂载...", "GoogleFX")
                 mounted_count = 0
@@ -712,11 +728,10 @@ def _generate_images_batch_google_fx_single_attempt(req: ImageBatchRequest):
                             result.setdefault('uploaded_reference_uuids', {})[local_path] = _ok
                     if _ok:
                         mounted_count += 1
-                        _rr, _rs = _wait_for_flow_reference_ready(page, timeout_seconds=15, settle_range=(0.5, 1.0))
-                        if _rr:
-                            log(f"  ✅ 参考图已挂入编辑器 (sel={_rs!r})", "GoogleFX")
-                        else:
-                            log(f"  ⚠️ 挂载后未检测到 cancel chip，继续", "GoogleFX")
+                        # Both mount paths already verify the exact UUID in the
+                        # prompt bar. Legacy chip selectors can miss the new UI
+                        # and add another 15 s after a successful mount.
+                        log("  ✅ 参考图已确认挂入编辑器", "GoogleFX")
                     else:
                         log(f"  ❌ 参考图挂载失败，UUID 与上传回退均未成功: "
                             f"{os.path.basename(local_path)}", "GoogleFX")

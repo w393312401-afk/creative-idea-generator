@@ -1,0 +1,70 @@
+/* 并发作战板（P0 只读）。颜色全部走 tokens.css；项目色相通过 --h 注入。 */
+.fxb-head { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; margin-bottom: 12px; }
+.fxb-pill { display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px; border-radius: 999px; border: 1px solid var(--border-color); font-size: var(--fs-sm); color: var(--text-secondary); }
+.fxb-pill.full { border-color: var(--warning); color: var(--warning); }
+.fxb-meter { display: inline-flex; gap: 3px; }
+.fxb-meter i { width: 14px; height: 8px; border-radius: 2px; background: var(--border-color); }
+.fxb-meter i.on { background: var(--primary); }
+.fxb-note { color: var(--text-muted); font-size: var(--fs-xs); }
+.fxb-sec { margin-top: 14px; }
+.fxb-sec h5 { margin: 0 0 8px; font-size: var(--fs-base); color: var(--text-primary); }
+.fxb-sec h5 small { margin-left: 6px; font-weight: 400; font-size: var(--fs-xs); color: var(--text-muted); }
+.fxb-scroll { overflow-x: auto; }
+
+.fxb-grid { min-width: 600px; }
+.fxb-axis, .fxb-lane { display: grid; grid-template-columns: 150px 1fr; align-items: center; }
+.fxb-axis { font-size: var(--fs-2xs); color: var(--text-muted); padding-bottom: 4px; }
+.fxb-ticks { position: relative; height: 14px; }
+.fxb-ticks span { position: absolute; transform: translateX(-50%); white-space: nowrap; }
+.fxb-ticks span:first-child { transform: none; }
+.fxb-ticks span:last-child { transform: translateX(-100%); color: var(--primary); font-weight: 600; }
+.fxb-lane { min-height: 48px; border-top: 1px solid var(--border-color); }
+.fxb-who { padding: 6px 10px 6px 0; font-size: var(--fs-sm); color: var(--text-secondary); line-height: 1.35; }
+.fxb-who b { font-size: var(--fs-md); color: var(--text-primary); }
+.fxb-sub { font-size: var(--fs-2xs); color: var(--text-muted); }
+.fxb-track { position: relative; height: 48px;
+  background: repeating-linear-gradient(90deg, transparent 0 calc(33.333% - 1px), var(--border-color) calc(33.333% - 1px) 33.333%); }
+.fxb-track::after { content: ""; position: absolute; right: 0; top: 0; bottom: 0; width: 2px; background: var(--primary); pointer-events: none; }
+.fxb-idle { position: absolute; inset: 7px 8px 7px 0; border: 1px dashed var(--border-color); border-radius: var(--radius-sm); color: var(--text-muted); font-size: var(--fs-xs); display: flex; align-items: center; padding-left: 10px; }
+.fxb-bar { position: absolute; top: 7px; height: 34px; padding: 0 8px; border: 0; border-radius: var(--radius-sm); display: flex; flex-direction: column; justify-content: center; align-items: flex-start; overflow: hidden; white-space: nowrap; text-align: left; cursor: pointer; color: #fff; font: inherit; font-size: var(--fs-2xs); line-height: 1.25;
+  background: hsl(var(--h, 30) 48% 42%); }
+.fxb-bar.sys { background: var(--text-muted); }
+.fxb-bar b { font-size: var(--fs-xs); }
+.fxb-bar.done { opacity: .5; }
+.fxb-bar.cancelled { opacity: .5; background-image: repeating-linear-gradient(135deg, transparent 0 5px, rgba(255,255,255,.25) 5px 6px); }
+.fxb-bar.stall { outline: 2px solid var(--warning); outline-offset: 1px; }
+.fxb-bar.stall::after { content: "!"; position: absolute; right: 6px; top: 6px; width: 16px; height: 16px; border-radius: 50%; background: var(--warning); color: #fff; font-weight: 700; font-size: var(--fs-xs); line-height: 16px; text-align: center; }
+.fxb-bar.error { outline: 2px solid var(--error); outline-offset: -2px; }
+.fxb-bar.run::after { content: ""; position: absolute; right: 7px; top: 50%; width: 7px; height: 7px; margin-top: -3.5px; border-radius: 50%; background: #fff; animation: fxb-pulse 1.4s ease-in-out infinite; }
+@keyframes fxb-pulse { 50% { opacity: .25; } }
+@media (prefers-reduced-motion: reduce) { .fxb-bar.run::after { animation: none; } }
+
+.fxb-table { width: 100%; min-width: 360px; border-collapse: collapse; font-size: var(--fs-sm); }
+.fxb-table th { text-align: left; font-weight: 500; font-size: var(--fs-2xs); color: var(--text-muted); padding: 0 8px 6px; }
+.fxb-table td { border-top: 1px solid var(--border-color); padding: 7px 8px; vertical-align: middle; }
+.fxb-proj { white-space: nowrap; font-weight: 600; color: var(--text-primary); }
+.fxb-dot { display: inline-block; width: 10px; height: 10px; margin-right: 6px; border-radius: 3px; background: hsl(var(--h) 48% 42%); }
+.fxb-chip { display: inline-flex; align-items: center; gap: 4px; padding: 2px 9px; border-radius: 999px; border: 1px solid var(--border-color); background: transparent; font: inherit; font-size: var(--fs-xs); color: var(--text-secondary); white-space: nowrap; cursor: pointer; }
+.fxb-chip.todo, .fxb-chip.none { border-color: transparent; color: var(--text-muted); cursor: default; }
+.fxb-chip.done { color: var(--success); }
+.fxb-chip.run { border-color: hsl(var(--h, 30) 48% 42%); color: var(--text-primary); }
+.fxb-chip.wait { border-style: dashed; }
+.fxb-chip.fail { border-color: var(--error); color: var(--error); }
+
+.fxb-item { display: grid; grid-template-columns: 22px 1fr auto; gap: 2px 10px; align-items: start; padding: 9px 0; border-top: 1px solid var(--border-color); }
+.fxb-item:first-child { border-top: 0; }
+.fxb-ico { text-align: center; line-height: 1.5; }
+.fxb-msg { font-size: var(--fs-md); color: var(--text-primary); }
+.fxb-tag { margin-left: 6px; padding: 0 6px; border-radius: var(--radius-xs); background: var(--border-color); color: var(--text-muted); font-size: var(--fs-2xs); }
+.fxb-item.stalled .fxb-msg { color: var(--warning); }
+.fxb-item.orphan .fxb-msg { color: var(--text-secondary); }
+.fxb-acts { display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
+.fxb-why { grid-column: 2; font-size: var(--fs-xs); color: var(--text-muted); }
+
+.fxb-res { display: flex; flex-wrap: wrap; gap: 6px; }
+.fxb-acct { padding: 3px 10px; border: 1px solid var(--border-color); border-radius: var(--radius-md); font-size: var(--fs-xs); color: var(--text-secondary); }
+.fxb-acct.off { opacity: .55; }
+@media (max-width: 768px) {
+  .fxb-item { grid-template-columns: 22px 1fr; }
+  .fxb-acts { grid-column: 2; }
+}

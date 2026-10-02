@@ -45,6 +45,9 @@ _LOCK = threading.Lock()
 # AdsPower 的 userProxyConfig 只认这几种；socks5 还要本机装了 PySocks 才能自检。
 PROXY_TYPES = ("http", "https", "socks5")
 
+# 旧条目没有来源字段，按静态出口处理。机场仅在静态候选耗尽时兜底。
+PROXY_SOURCE_PRIORITIES = {"static": 0, "airport": 100}
+
 # 连通性检测打这个地址读出口 IP。走代理直连，不开浏览器——检测一条代理不该
 # 去排 FX 的浏览器串行锁。
 _CHECK_URL = "https://ipinfo.io/json"
@@ -128,6 +131,28 @@ def _clean_type(value) -> str:
     return proxy_type
 
 
+def _proxy_source(info: dict) -> str:
+    source = str(info.get("source") or "static").strip().lower()
+    return source if source in PROXY_SOURCE_PRIORITIES else "static"
+
+
+def _proxy_priority(info: dict) -> int:
+    return PROXY_SOURCE_PRIORITIES[_proxy_source(info)]
+
+
+def _proxy_fallback_tier(info: dict) -> int:
+    if _proxy_source(info) != "airport":
+        return 0
+    try:
+        return max(0, int(info.get("fallback_tier") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _proxy_selection_key(info: dict) -> tuple:
+    return (_proxy_priority(info), _proxy_fallback_tier(info))
+
+
 def proxy_url(entry: dict) -> str:
     """拼 requests 用的代理 URL（含账密）。仅用于本地检测，不写进日志。"""
     scheme = entry.get("proxy_type") or "http"
@@ -166,6 +191,9 @@ def public_entry(proxy_id: str, info: dict) -> dict:
         "user": info.get("user") or "",
         "has_password": bool(info.get("password")),
         "note": info.get("note") or "",
+        "source": _proxy_source(info),
+        "priority": _proxy_priority(info),
+        "fallback_tier": _proxy_fallback_tier(info),
         "disabled": bool(info.get("disabled")),
         "bound_user_id": info.get("bound_user_id") or "",
         "applied_at": info.get("applied_at"),
@@ -190,7 +218,7 @@ class ProxyPool:
         with _LOCK:
             state = _read_state()
         rows = [public_entry(pid, info) for pid, info in state["proxies"].items()]
-        # 默认排序：可用的在前，其次未检测，失败/禁用沉底；同档按标签稳定排序。
+        # 来源优先级决定选路顺序；同来源中检测通过、未检测、失败、禁用依次排序。
         def _rank(row):
             if row["disabled"]:
                 return 3
@@ -199,7 +227,7 @@ class ProxyPool:
             if row["last_check_status"] != "ok":
                 return 1
             return 0
-        rows.sort(key=lambda r: (_rank(r), r["label"] or r["endpoint"]))
+        rows.sort(key=lambda r: (_proxy_selection_key(r), _rank(r), r["label"] or r["endpoint"]))
         return rows
 
     def get(self, proxy_id: str) -> Optional[dict]:
@@ -210,11 +238,12 @@ class ProxyPool:
     def add_proxy(self, host: str, port, proxy_type: str = "http", user: str = "",
                   password: str = "", label: str = "", note: str = "",
                   proxy_id: str = "", bound_user_id: str = "",
-                  keep_password: bool = False) -> dict:
+                  keep_password: bool = False, source: Optional[str] = None) -> dict:
         """新增或更新一条代理（带 proxy_id 即更新）。
 
         keep_password=True：编辑时前端没回传密码就沿用原密码（列表接口本来就
         不回传明文，不这样处理的话一次改备注就会把密码清空）。
+        source 不传时沿用已有来源，新条目默认 static；机场条目的桥接元数据编辑时保留。
         """
         host = str(host or "").strip()
         if not host:
@@ -222,6 +251,10 @@ class ProxyPool:
         port = _clean_port(port)
         proxy_type = _clean_type(proxy_type)
         proxy_id = str(proxy_id or "").strip()
+        if source is not None:
+            source = str(source).strip().lower()
+            if source not in PROXY_SOURCE_PRIORITIES:
+                raise ValueError("代理来源只支持 static 或 airport")
 
         with _LOCK:
             state = _read_state()
@@ -243,6 +276,7 @@ class ProxyPool:
                 or str(existing.get("password") or "") != resolved_password
             )
             entry = {
+                **existing,
                 "label": str(label or "").strip() or existing.get("label") or f"{host}:{port}",
                 "proxy_type": proxy_type,
                 "host": host,
@@ -255,7 +289,10 @@ class ProxyPool:
                 "applied_at": existing.get("applied_at"),
                 "use_count": int(existing.get("use_count") or 0),
                 "created_at": existing.get("created_at") or _now_iso(),
+                "source": source if source is not None else _proxy_source(existing),
             }
+            entry["priority"] = _proxy_priority(entry)
+            entry["fallback_tier"] = _proxy_fallback_tier(entry)
             if endpoint_changed:
                 entry.update({"last_check_at": None, "last_check_status": None,
                               "last_check_error": None, "exit_ip": "",
@@ -389,6 +426,8 @@ class ProxyPool:
         if resp.get("code") != 0:
             raise RuntimeError(f"AdsPower 拒绝了代理下发: {resp.get('msg') or resp}")
 
+        from . import egress
+        egress.invalidate(user_id)  # 出口变了：并发时的"同出口"判定不能再用旧缓存
         applied_at = _now_iso()
         with _LOCK:
             state = _read_state()
@@ -406,19 +445,29 @@ class ProxyPool:
     # ── 轮换取号 ──────────────────────────────────
 
     def usable_proxies(self) -> list:
-        """可参与轮换的代理：未禁用，且最近一次检测不是失败（没检测过也算可用，
+        """按静态优先、机场兜底列出可参与轮换的代理：未禁用，且最近一次检测不是失败（没检测过也算可用，
         跟号池对"未探测账号"的处理一致——不知道不等于坏，但会如实标出来）。"""
         return [row for row in self.list_proxies()
                 if not row["disabled"] and row["last_check_status"] != "failed"]
 
-    def pick_proxy(self) -> Optional[dict]:
-        """按游标轮转取一条可用代理（含密码，供 proxy_rotator 直接下发）。"""
+    def pick_proxy(self, exclude_proxy_ids=None) -> Optional[dict]:
+        """在最高优先级可用层内轮转取号（含密码，供 proxy_rotator 直接下发）。
+
+        已尝试的 ID 可由一次换 IP 操作排除；先试完静态出口才会进入机场层，
+        机场内 fallback_tier 较小的层先尝试（美国为 0，其它地区为 1）。
+        游标只作用于所选层，不能把机场提前到尚未尝试的静态候选前面。
+        """
+        excluded = {str(pid) for pid in (exclude_proxy_ids or ())}
         with _LOCK:
             state = _read_state()
             usable = [(pid, info) for pid, info in state["proxies"].items()
-                      if not info.get("disabled") and info.get("last_check_status") != "failed"]
+                      if pid not in excluded and not info.get("disabled")
+                      and info.get("last_check_status") != "failed"]
             if not usable:
                 return None
+            selection_key = min(_proxy_selection_key(info) for _, info in usable)
+            usable = [(pid, info) for pid, info in usable
+                      if _proxy_selection_key(info) == selection_key]
             usable.sort(key=lambda item: item[1].get("created_at") or "")
             index = state.get("rotate_index", 0) % len(usable)
             proxy_id, info = usable[index]
@@ -431,6 +480,8 @@ class ProxyPool:
                 pass
             entry = dict(state["proxies"][proxy_id])
         entry["proxy_id"] = proxy_id
+        entry["source"] = _proxy_source(entry)
+        entry["priority"], entry["fallback_tier"] = selection_key
         return entry
 
     # ── 摘要与导入 ────────────────────────────────

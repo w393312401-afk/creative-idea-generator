@@ -11,6 +11,8 @@ from unittest.mock import patch
 from frame_generator import (
     plan_fx_chunks,
     fx_bridge_target_sequences,
+    fx_threshold_target_sequences,
+    fx_camera_cut_target_sequences,
     split_fx_chunks_at_heads,
     fx_prompt_with_bridge_control,
     plan_frame_chunk_accounts,
@@ -104,6 +106,31 @@ class TestPlanFxChunks(unittest.TestCase):
         self.assertIn('CROSSING REVEAL', rendered)
         self.assertIn('do not reproduce its composition', rendered)
 
+    def test_fx_generic_camera_cut_uses_same_world_control(self):
+        prompts = {2: {'prompt': 'CAM-E southeast exterior service view.',
+                       'meta': 'CAMERA CUT'}}
+        rendered = fx_prompt_with_bridge_control(2, prompts[2], prompts, {})
+        self.assertIn('DECLARED CAMERA CUT', rendered)
+        self.assertIn('same physical site', rendered)
+        self.assertNotIn('CROSSING REVEAL', rendered)
+        prompts[2]['prompt'] = rendered
+        self.assertEqual(fx_prompt_with_bridge_control(2, prompts[2], prompts, {}),
+                         rendered)
+
+    def test_fx_camera_cut_splits_batch_but_never_enters_threshold_grounding(self):
+        prompts = {i: {'prompt': f'CAM-A frame {i}', 'meta': ''}
+                   for i in range(1, 5)}
+        prompts[2]['meta'] = 'CAMERA CUT'
+        videos = {2: {'meta': 'BRIDGE'}}
+        threshold_heads = fx_threshold_target_sequences(prompts, videos)
+        camera_heads = fx_camera_cut_target_sequences(prompts)
+        self.assertEqual(threshold_heads, {3})
+        self.assertEqual(camera_heads, {2})
+        self.assertEqual(
+            split_fx_chunks_at_heads(plan_fx_chunks(prompts),
+                                     threshold_heads | camera_heads),
+            [[1], [2], [3, 4]])
+
 
 class TestPlanFrameChunkAccounts(unittest.TestCase):
     """只换号、不换 IP：每批绑一个号池账号，IP 全程不动（换 IP 已全局关停）。"""
@@ -115,21 +142,21 @@ class TestPlanFrameChunkAccounts(unittest.TestCase):
             plans = plan_frame_chunk_accounts(chunks, ring, 5)
             self.assertEqual(plans, [{'user_id': None}] * 2)
 
-    def test_switches_account_per_batch(self):
+    def test_batches_keep_current_account_until_exhausted(self):
         chunks = [[1, 2, 3, 4, 5], [6, 7, 8, 9, 10], [11, 12]]
         plans = plan_frame_chunk_accounts(chunks, ['a', 'b', 'c'], 5)
-        self.assertEqual([p['user_id'] for p in plans], ['a', 'b', 'c'])
+        self.assertEqual([p['user_id'] for p in plans], [None, None, None])
 
-    def test_ring_wraps_around(self):
+    def test_batches_do_not_wrap_back_to_an_exhausted_account(self):
         chunks = [[1, 2, 3, 4, 5]] * 4
         plans = plan_frame_chunk_accounts(chunks, ['a', 'b'], 5)
-        self.assertEqual([p['user_id'] for p in plans], ['a', 'b', 'a', 'b'])
+        self.assertEqual([p['user_id'] for p in plans], [None] * 4)
 
     def test_interval_larger_than_batch_keeps_account_across_batches(self):
-        """节拍 10 帧 + 每批 5 帧 = 两批共用一个号。"""
+        """旧节拍不再强制切换账号。"""
         chunks = [[1, 2, 3, 4, 5]] * 4
         plans = plan_frame_chunk_accounts(chunks, ['a', 'b'], 10)
-        self.assertEqual([p['user_id'] for p in plans], ['a', 'a', 'b', 'b'])
+        self.assertEqual([p['user_id'] for p in plans], [None] * 4)
 
     def test_never_emits_rotate_ip(self):
         """换 IP 已关停：计划里不该再出现任何换 IP 指示。"""
@@ -138,11 +165,11 @@ class TestPlanFrameChunkAccounts(unittest.TestCase):
             for plan in plan_frame_chunk_accounts(chunks, ring, 5):
                 self.assertNotIn('rotate_ip', plan)
 
-    def test_short_chunks_from_cut_heads_still_accumulate_to_interval(self):
-        """硬切把批次切碎（1 帧、2 帧）时，按累计帧数而不是按批数换号。"""
+    def test_short_chunks_from_cut_heads_keep_current_account(self):
+        """场景硬切会拆分批次，但不会提前换浏览器。"""
         chunks = [[1], [2, 3], [4, 5, 6], [7, 8]]
         plans = plan_frame_chunk_accounts(chunks, ['a', 'b'], 5)
-        self.assertEqual([p['user_id'] for p in plans], ['a', 'a', 'a', 'b'])
+        self.assertEqual([p['user_id'] for p in plans], [None] * 4)
 
     def test_no_chunks(self):
         self.assertEqual(plan_frame_chunk_accounts([], ['a', 'b'], 5), [])
@@ -1382,6 +1409,33 @@ class TestRegionLockControlPrompt(unittest.TestCase):
 
         self.assertEqual(len(calls), 2)
         self.assertNotIn('REGION LOCK', calls[1])
+
+    def test_target_image_camera_cut_changes_only_declared_frame_control(self):
+        block = ('图片 1:\nCAM-A exterior.\n\n'
+                 '图片 2 [CAMERA CUT]:\nCAM-E southeast service view.\n\n'
+                 '图片 3:\nCAM-E service cabinet complete.\n\n'
+                 '视频 1:\nThe camera cuts to the southeast.\n\n'
+                 '视频 2:\nThe worker finishes the cabinet.\n')
+        images, _ = _parse_prompt_slots(block)
+        self.assertEqual(images[2]['meta'], 'CAMERA CUT')
+        calls = []
+
+        def fake_image_edit(config, prompt, reference_path, target_path, *args, **kwargs):
+            calls.append((prompt, kwargs.get('control_prompt', '')))
+            _write_test_image(target_path, (72, 128))
+            return False
+
+        with patch('frame_generator._generate_image_edit', side_effect=fake_image_edit), \
+             patch('frame_generator._continuity_result', return_value=({}, 'fam-1')):
+            generate_frame_sequence(
+                {'coverReferencePath': self.cover}, 'camera_cut_gate', block,
+                on_progress=lambda *a: None)
+
+        self.assertEqual(len(calls), 3)
+        self.assertIn('DECLARED CAMERA CUT', calls[1][1])
+        self.assertNotIn('camera ABSOLUTELY locked', calls[1][1])
+        self.assertNotIn('CROSSING REVEAL', calls[1][1])
+        self.assertIn('camera ABSOLUTELY locked', calls[2][1])
 
 
 class TestCollageQAWiring(unittest.TestCase):

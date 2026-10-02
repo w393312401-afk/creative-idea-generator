@@ -10,8 +10,9 @@
       若当前激活的标签被隐藏，自动平滑切换到第一个可见标签。
    2. 至少保留一个可见标签，全部隐藏会让整条栏变成空盒子。
 
-   顶部 app-switcher（创意工坊 / 图像工坊 / 控制台）不在管辖范围内：那三个
-   是应用级入口（其中两个是真链接，跳到别的 HTML 页），藏掉等于把出口封死。
+   工作区标签（创作结果 / 项目 / 画廊 / 图像工坊）都在这条栏里，都可排序、隐藏。
+   唯一的应用级出口「控制台」在 header 右侧（真链接，跳到另一个 HTML 页），不在
+   管辖范围内：藏掉等于把出口封死。
    ===================================================================== */
 
 (function () {
@@ -21,7 +22,7 @@
     const BAR_SELECTOR = '.mobile-nav-tabs';
     const BTN_SELECTOR = '.mobile-nav-btn';
 
-    // { order: ['main-tab-config', ...], hidden: ['main-tab-replica', ...] }
+    // { order: ['main-tab-config', ...], hidden: ['main-tab-gallery', ...] }
     function readPrefs() {
         try {
             const raw = localStorage.getItem(PREFS_KEY);

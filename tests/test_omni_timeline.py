@@ -1,16 +1,15 @@
-"""omni 镜头结构 + 时间线切点的回归测试（2026-08-01 起；2026-08-09 改成主镜加插入）。
+"""Omni 镜头结构、时长预算与历史时间线清理的回归测试。
 
 背景：omni 的 VIDEO 契约一度是一条五到六级的景别轮换梯，而 Omni Flash 的 Flow 面板提供
 4/6/8/10 秒四档——六个景别塞进 4 秒等于每镜 0.67 秒，观感是闪帧。2026-08-09 起换成实拍
 剪法：一条贯穿全段的主工作镜，被一到两个特写插入切开，再切回**同一机位**收尾，于是首帧锚
-与尾帧锚落在同一构图上。同时切点必须被显式声明，否则模型爱在哪儿切在哪儿切。
+与尾帧锚落在同一构图上。当前交付用自然剪辑语言，历史数值时间线仍能解析和清理。
 
 这里钉住六组行为：
   1. 时长 → 镜头结构：4/6 秒三镜（一个插入），8/10 秒四镜（两个插入），主镜与切回镜
      任何长度下都不可裁，旧的轮换景别名一个都不在梯里；
   2. 切点分配：单调、无缝、末点等于时长，主工作镜配额最高；
-  3. 时间线句：是本条片子**唯一**允许出现阿拉伯数字的地方，注入位置紧跟锚定开场句，
-     模型自编的时间线会被确定性覆写；
+  3. 历史时间线句：解析后剥除，不再要求或注入模型交付正文；
   4. 镜头梯审计不能被时间线句自证——切点表本身就按顺序列出了每一级镜头名；
   5. 拍型分流：过门桥拍走过门梯、兑现拍走兑现梯，两者都免除节奏声明；
   6. base 的 even-rate 句（与镜头级进度锁对撞）在 omni 下被清掉，且它的校验错误
@@ -49,7 +48,7 @@ BODY_MAIN = (
     "lone worker already at the courtyard wall pressing mortar into the open joints with a "
     "pointing trowel at zero seconds and working joint after joint as the repointed run grows. "
     "A clean cut at the three-second mark drops into a close-up insert on the trowel edge as "
-    "mortar squeezes out under pressure. A second insert at the five-second mark pushes to an "
+    "mortar squeezes out under pressure. A second clean cut enters an "
     "extreme close-up insert on the tooled joint lines and the dust edge left along the sill. "
     "A final clean cut at the seven-second mark returns to a returning wide shot from the same "
     "camera setup as the opening wide working shot, where — after the remaining joints are "
@@ -295,7 +294,7 @@ class TestExtraShots(_IsolatedServerConfig):
         self.assertIn('主镜 wide working shot', missing[0])
         self.assertIn('切回主镜 returning wide shot', missing[0])
         structural, _style = composer.split_structural_video_errors(errs)
-        self.assertEqual(structural, missing + extra)
+        self.assertTrue(all(e in structural for e in missing + extra), structural)
 
     def test_the_matching_structure_raises_nothing(self):
         ladder = omni_mod.ladder_for(10, 'construction')

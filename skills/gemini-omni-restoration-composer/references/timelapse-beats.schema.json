@@ -2,7 +2,7 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "$id": "timelapse-beats.schema.json",
   "title": "timelapse_beats.json",
-  "description": "反推模式（Tier 4）Stage 1 的唯一交付契约。对话里的 Claude 手工反推、以及 app 内 replica_pipeline 的自动反推，都以本文件为准。不要在别处再写一份字段说明——SKILL.md 只描述纪律，字段以此为准。",
+  "description": "反推模式（Tier 4）Stage 1 的唯一交付契约。对话里的视频分析与手工反推以本文件为准。不要在别处再写一份字段说明——SKILL.md 只描述纪律，字段以此为准。",
   "type": "object",
   "required": ["video_duration_sec", "beats", "banned_elements"],
   "additionalProperties": true,
@@ -202,7 +202,7 @@
         "stage": {
           "type": "string",
           "enum": ["demolition", "structural", "rough_in", "enclosure", "surface", "floor", "fixtures", "furnishing", "reveal"],
-          "description": "施工阶段。九档的释义以 prompt_pipeline/reverse.py 的 _STAGE_RANK 与 _PASS_B_SYSTEM 为准，两处必须一致（tests/test_replica_wiring.py 钉住）。要点：墙体龙骨与保温属 enclosure，不属 structural，更不属 fixtures；fixtures 专指通电/通水设备，本拍没有这类设备就一定不是 fixtures；rough_in 只指日后会被盖住的线管水管本身。校验器据此判施工依赖顺序，标错会报出一条与真实病灶无关的硬伤。"
+          "description": "施工阶段。采用本字段 enum 中的九档阶段。要点：墙体龙骨与保温属 enclosure，不属 structural，更不属 fixtures；fixtures 专指通电/通水设备，本拍没有这类设备就一定不是 fixtures；rough_in 只指日后会被盖住的线管水管本身。校验器据此判施工依赖顺序，标错会报出一条与真实病灶无关的硬伤。"
         },
         "space": {
           "type": "string",

@@ -195,7 +195,7 @@ class TestCanvasAssetsAreClaimedInsteadOfUploaded(unittest.TestCase):
              patch.object(V.time, 'sleep', lambda *_a: None):
             return runner._upload_references(object(), [(0, self.req)])
 
-    def _fake_upload(self, page, local_path, timeout=45, extra_known_uuids=None):
+    def _fake_upload(self, page, local_path, timeout=45, extra_known_uuids=None, upload_state=None):
         self.uploads.append(local_path)
         return UUID_3
 

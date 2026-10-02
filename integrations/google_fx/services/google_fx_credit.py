@@ -41,6 +41,7 @@ from ..utils.browser import (
     flow_onboarding_required, _flow_project_crashed, is_google_login_page, random_sleep,
     attempt_auto_login, BrowserSessionClosedError, _browser_session_is_closed,
     wait_for_login_redirect, FLOW_HOME_URL, FLOW_HOST_HINTS,
+    bring_page_to_front_if_allowed,
 )
 from ..utils.browser_gate import browser_slot
 from ..utils.logger import log, set_task_label, reset_task_label
@@ -64,6 +65,19 @@ _CREDIT_LABEL_PATTERN = re.compile(
 )
 _PROBE_ERRORS = {}
 _PROBE_ERRORS_LOCK = threading.Lock()
+
+_CREDIT_ELEMENT_VISIBLE_JS = """el => {
+    if (!el.getClientRects().length) return false;
+    for (let node = el; node; node = node.parentElement) {
+        const style = window.getComputedStyle(node);
+        if (node.getAttribute('aria-hidden') === 'true' ||
+            style.display === 'none' || style.visibility === 'hidden' ||
+            style.visibility === 'collapse' || parseFloat(style.opacity) === 0) {
+            return false;
+        }
+    }
+    return true;
+}"""
 
 # ⏱️ 探针预算（2026-07-27）
 # 探针在 FX_CONTROL 队列里独占浏览器，而每个子步骤此前只各管各的超时：AdsPower
@@ -335,6 +349,47 @@ def _extract_credit_number(text: str) -> Optional[int]:
     return None
 
 
+def _read_credit_element(locator, selector: str, timeout: int = 1500):
+    """读取已定位余额元素的文本与无障碍描述，不扫描页面其它数字。
+
+    新版账号面板可能把完整余额放在链接的 aria-label/description，画面只显示
+    数字。裸数字仅在专用 .credits-count 内可信，通用链接/账号弹层仍必须有积分标签。
+    """
+    texts = []
+    try:
+        text = (locator.inner_text(timeout=timeout) or "").strip()
+        texts.append(text)
+        value = _extract_credit_number(text)
+        if value is not None:
+            return value, text
+    except Exception:
+        pass
+    for attribute in ("aria-label", "aria-description", "title"):
+        try:
+            text = (locator.get_attribute(attribute, timeout=timeout) or "").strip()
+            texts.append(text)
+            value = _extract_credit_number(text)
+            if value is not None:
+                return value, text
+        except Exception:
+            pass
+    if selector == ".credits-count":
+        for text in texts:
+            if re.fullmatch(r"\d[\d,]*", text):
+                return int(text.replace(",", "")), text
+    error_text = next((text for text in texts if is_credit_exhausted_message(text)), "")
+    return None, error_text or next((text for text in texts if text), "")
+
+
+def _credit_element_is_visible(locator) -> bool:
+    if not locator.is_visible(timeout=500):
+        return False
+    # Playwright 的 is_visible 不排除透明/aria-hidden 的祖先；隐藏的旧告警
+    # 不能从下面的余额读取兜底重新冒出来。简单的旧页面测试桩仍可复用。
+    evaluate = getattr(locator, "evaluate", None)
+    return bool(evaluate(_CREDIT_ELEMENT_VISIBLE_JS)) if callable(evaluate) else True
+
+
 def _set_probe_error(user_id: str, message: Optional[str], kind: str = 'probe'):
     """记录本次探测失败原因。
 
@@ -469,8 +524,13 @@ def detect_page_credit_exhaustion(page, deep: bool = False) -> Optional[str]:
     if not page:
         return None
     saw_credit_hint = False
+    exhaustion_text = None
+    measured_credit = None
     try:
-        # 1. 检查可见的错误对话框 / 弹层 / 告警条 / Toast / 积分链接与按钮
+        # 1. 检查可见的错误对话框 / 弹层 / 告警条 / Toast / 积分链接与按钮。
+        # 新版 Flow 的发送按钮只用 aria-label="Insufficient credits warning"
+        # 表示积分不足，innerText 只有图标；必须读取可见元素的语义属性。
+        # 这些属性只作报错文案，绝不提取其中的数字作为实测余额。
         # balance=true 的那几个是"余额本体"选择器，读到的整行数字可以当真实余额拿去
         # 跟阈值比；其余是弹窗/Toast 之类的**文案**容器，只做关键词匹配——套餐宣传
         # 文案（"1,000 monthly Google Flow credits"）就挂在这类容器里，拿它们的
@@ -495,24 +555,34 @@ def detect_page_credit_exhaustion(page, deep: bool = False) -> Optional[str]:
                     "[data-test-id*='credit']",
                     "[class*='credit']",
                 ]},
+                { balance: false, attributes: true, selectors:
+                    ['credit', '积分', '点数', '额度', '配额'].flatMap(term => [
+                        `[aria-label*="${term}" i]`, `[title*="${term}" i]`,
+                    ]),
+                },
             ];
+            const visible = __CREDIT_ELEMENT_VISIBLE__;
             const out = [];
             for (const g of groups) {
                 for (const sel of g.selectors) {
                     try {
                         const elements = document.querySelectorAll(sel);
                         for (const el of elements) {
-                            const style = window.getComputedStyle(el);
-                            if (style.display !== 'none' && style.visibility !== 'hidden' && parseFloat(style.opacity) > 0) {
-                                const t = (el.innerText || el.textContent || '').trim();
-                                if (t) out.push({ text: t, balance: g.balance });
+                            if (visible(el)) {
+                                const texts = g.attributes
+                                    ? [el.getAttribute('aria-label'), el.getAttribute('title')]
+                                    : [el.innerText || el.textContent];
+                                for (const text of texts) {
+                                    const t = (text || '').trim();
+                                    if (t) out.push({ text: t, balance: g.balance });
+                                }
                             }
                         }
                     } catch (e) {}
                 }
             }
             return out;
-        }""")
+        }""".replace("__CREDIT_ELEMENT_VISIBLE__", _CREDIT_ELEMENT_VISIBLE_JS))
 
         threshold = min_usable_credit()
         for entry in (dialog_texts or []):
@@ -523,39 +593,45 @@ def detect_page_credit_exhaustion(page, deep: bool = False) -> Optional[str]:
                 text, is_balance = (entry or {}).get("text") or "", bool((entry or {}).get("balance"))
             if not text:
                 continue
+            if is_balance:
+                credit_num = _extract_credit_number(text)
+                if credit_num is not None:
+                    measured_credit = credit_num
+                    if credit_num < threshold:
+                        return _insufficient_credit_reason(credit_num, threshold, text.splitlines()[0][:100].strip())
             if is_credit_exhausted_message(text):
-                first_line = text.splitlines()[0][:100].strip()
-                return f"页面提示积分耗尽: {first_line}"
+                # 先完成可见余额扫描，保留当前实测值；明确告警仍走快路径，
+                # 不必等头像菜单深探成功才能换号。
+                exhaustion_text = exhaustion_text or text.splitlines()[0][:100].strip()
             if is_credit_hint_message(text):
                 # 弱信号：措辞像积分刷新提示，但也可能是套餐宣传。不下结论，
                 # 只记一笔，交给下面的深探去读真实余额。
                 saw_credit_hint = True
-            if is_balance:
-                credit_num = _extract_credit_number(text)
-                if credit_num is not None and credit_num < threshold:
-                    return _insufficient_credit_reason(credit_num, threshold, text.splitlines()[0][:100].strip())
-
         # 2. 检查 UI 上的余额元素 (a[href*='credits'])：低于「选号最低积分」即判不可用。
         #    这里原本只判 == 0，于是"还剩 10 分但跑不动一段视频"永远识别不出来。
         credit_elements = UI_SELECTORS.get("google_fx", {}).get("credit_display", [])
         for sel in credit_elements:
             try:
                 locator = page.locator(sel).first
-                if locator.count() > 0 and locator.is_visible(timeout=500):
-                    t = (locator.inner_text(timeout=500) or "").strip()
+                if locator.count() > 0 and _credit_element_is_visible(locator):
+                    credit_num, t = _read_credit_element(locator, sel, timeout=500)
                     if not t:
                         continue
-                    credit_num = _extract_credit_number(t)
                     if credit_num is not None:
+                        measured_credit = credit_num
                         if credit_num < threshold:
                             return _insufficient_credit_reason(credit_num, threshold, t)
                     elif is_credit_exhausted_message(t):
-                        return f"账号菜单/顶栏显示积分耗尽: {t}"
+                        exhaustion_text = exhaustion_text or t[:100]
             except Exception:
                 continue
 
     except Exception as e:
         log(f"⚠️ 页面积分状态探测异常: {type(e).__name__}: {e}", "GoogleFX")
+
+    if exhaustion_text:
+        measured = f" [credit={measured_credit}]" if measured_credit is not None else ""
+        return f"页面提示积分耗尽: {exhaustion_text}{measured}"
 
     # ── 深探：快路径在项目页上基本读不到余额，失败诊断时改点开头像菜单实读 ──
     if deep or saw_credit_hint:
@@ -753,7 +829,7 @@ def probe_flow_credit(
     try:
         # 探针优先级高于生成任务：它很短，且选号要靠它的结果，不该排在长任务后面。
         with browser_slot('credit_probe', cancel_check=_slot_cancel,
-                          priority=40, task_id=task_id):
+                          priority=40, task_id=task_id, user_id=user_id):
             entered_slot = True
             _checkpoint()
             with _probe_cancel_context(task_id, wall_deadline=time.time() + _remaining()) as state:
@@ -886,6 +962,13 @@ def _account_menu_is_open(page) -> bool:
         try:
             locator = page.locator(selector).first
             if locator.count() and locator.is_visible(timeout=500):
+                # 新版发送区的 Insufficient credits warning 也会命中宽泛的
+                # [aria-label*='Credits']，但它不是账号面板。否则这里误报
+                # menu_open，后面永远不点头像，只反复扫描一个未打开的菜单。
+                if selector.startswith("[aria-label"):
+                    balance, text = _read_credit_element(locator, selector, timeout=500)
+                    if balance is None and is_credit_exhausted_message(text):
+                        continue
                 return True
         except Exception:
             continue
@@ -931,7 +1014,7 @@ def _read_credit_from_account_menu(page, overall_timeout_seconds: float = 30.0,
     把"点击头像 + 尝试读积分"当成一个整体重试单元，反复整轮重试，而不是
     分别重试两个独立步骤。"""
     try:
-        page.bring_to_front()
+        bring_page_to_front_if_allowed(page)
     except Exception:
         pass
 
@@ -952,32 +1035,37 @@ def _read_credit_from_account_menu(page, overall_timeout_seconds: float = 30.0,
         menu_open = _account_menu_is_open(page)
         clicked = menu_open or _try_click_once(page, trigger_selectors)
 
-        if clicked and (menu_open or _wait_for_account_menu(page)):
-            remaining = max(0.5, deadline - time.monotonic())
-            credit = _scan_menu_for_credit(page, timeout_seconds=min(8.0, remaining))
+        if clicked:
             try:
-                page.keyboard.press("Escape")
-            except Exception:
-                pass
-            try:
-                for close_sel in [
-                    "button[aria-label='关闭账号面板']",
-                    "button[aria-label='Close account panel']",
-                    "button[aria-label*='关闭']",
-                    "button[aria-label*='Close' i]",
-                    ".panel button.close-btn",
-                    "button.close-btn",
-                ]:
-                    close_btn = page.locator(close_sel).first
-                    if close_btn.count() and close_btn.is_visible(timeout=100):
-                        close_btn.click(timeout=1000, force=True)
-                        break
-            except Exception:
-                pass
-            if credit is not None:
-                return credit
-            # 点击没报错但没读到积分数字：可能是点了没反应（hydration 延迟），
-            # 整轮（点击+读取）重来，而不是继续死等这一次的对话框冒出数字。
+                if menu_open or _wait_for_account_menu(page):
+                    remaining = max(0.5, deadline - time.monotonic())
+                    credit = _scan_menu_for_credit(page, timeout_seconds=min(8.0, remaining))
+                    if credit is not None:
+                        return credit
+                    # 点击没报错但没读到积分数字：整轮重试。
+            finally:
+                # Even an apparently successful click can have opened a
+                # different overlay. Restore the canvas before uploading the
+                # next reference image, including probe timeout/error paths.
+                try:
+                    page.keyboard.press("Escape")
+                except Exception:
+                    pass
+                try:
+                    for close_sel in [
+                        "button[aria-label='关闭账号面板']",
+                        "button[aria-label='Close account panel']",
+                        "button[aria-label*='关闭']",
+                        "button[aria-label*='Close' i]",
+                        ".panel button.close-btn",
+                        "button.close-btn",
+                    ]:
+                        close_btn = page.locator(close_sel).first
+                        if close_btn.count() and close_btn.is_visible(timeout=100):
+                            close_btn.click(timeout=1000, force=True)
+                            break
+                except Exception:
+                    pass
 
         time.sleep(0.5)
 
@@ -1010,8 +1098,7 @@ def _scan_menu_for_credit(page, timeout_seconds: float = 8.0, poll_interval: flo
                 locator = page.locator(selector).first
                 if locator.count() == 0 or not locator.is_visible(timeout=500):
                     continue
-                text = locator.inner_text(timeout=1500)
-                observed = _extract_credit_number(text)
+                observed, _ = _read_credit_element(locator, selector)
                 if observed is not None:
                     break
             except Exception:
@@ -1024,7 +1111,7 @@ def _scan_menu_for_credit(page, timeout_seconds: float = 8.0, poll_interval: flo
                     locator = page.locator(selector).last
                     if locator.count() == 0 or not locator.is_visible(timeout=500):
                         continue
-                    observed = _extract_credit_number(locator.inner_text(timeout=1500))
+                    observed, _ = _read_credit_element(locator, selector)
                     if observed is not None:
                         break
                 except Exception:
