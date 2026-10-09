@@ -12,6 +12,7 @@
 - [Google FX 服务管理中心 · 使用说明书](guides/google_fx_console_manual.md)
 - [SPARK 图像生成与图生图接口说明书](guides/image_generation_guide.md)
 - [成片交给 Codex 精剪](guides/codex_video_editing.md)
+- [成片引导动画（精剪成片自动烧录 · 自定义透明视频）](guides/engagement_cta.md)
 - [Antigravity Tools 公网访问与接口请求指南](guides/public_access_guide.md)
 
 ## 技术参考

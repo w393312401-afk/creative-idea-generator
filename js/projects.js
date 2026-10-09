@@ -167,7 +167,7 @@ async function projectsSetSection(section) {
 
 function projectsTabEntered() {
     projectsTabActive = true;
-    refreshProjects();
+    if (!document.hidden) refreshProjects();
     projectsSchedulePoll();
 }
 
@@ -183,12 +183,22 @@ function projectsTabLeft() {
 // 轮询时一律跳过（assets=0）——只有手动刷新和首次进入才算一遍文件数。
 function projectsSchedulePoll() {
     if (projectsPollTimer) clearTimeout(projectsPollTimer);
-    if (!projectsTabActive) return;
+    projectsPollTimer = null;
+    if (!projectsTabActive || document.hidden) return;
     const hasRunning = (projectsRows || []).some(projectsIsRunning);
     projectsPollTimer = setTimeout(() => {
-        if (!projectsTabActive) return;
+        if (!projectsTabActive || document.hidden) return;
         refreshProjects({ assets: false, silent: true }).finally(projectsSchedulePoll);
     }, hasRunning ? 4000 : 30000);
+}
+
+function projectsVisibilityChanged() {
+    if (document.hidden) {
+        if (projectsPollTimer) clearTimeout(projectsPollTimer);
+        projectsPollTimer = null;
+    } else if (projectsTabActive) {
+        refreshProjects({ assets: false, silent: true }).finally(projectsSchedulePoll);
+    }
 }
 
 async function refreshProjects(options = {}) {
@@ -317,7 +327,8 @@ function projectsHandleCoverError(img) {
     const fallback = img && img.dataset ? img.dataset.fallback : '';
     if (fallback && !img.dataset.fallbackTried) {
         img.dataset.fallbackTried = '1';
-        img.src = fallback;
+        if (typeof MediaPreview !== 'undefined') MediaPreview.setSource(img, fallback);
+        else img.src = fallback;
         return;
     }
     if (img) img.outerHTML = `<div class="project-thumb-icon">${img.dataset?.placeholder === 'archive' ? '📦' : '💡'}</div>`;
@@ -339,7 +350,9 @@ function projectsCoverHtml(p) {
     const fallback = candidates[1]
         ? ` data-fallback="${escapeHtml(candidates[1])}"`
         : '';
-    return `<img src="${escapeHtml(candidates[0])}"${fallback}${archived ? ' data-placeholder="archive"' : ''} alt="" loading="lazy"
+    const sourceAttrs = typeof MediaPreview !== 'undefined'
+        ? MediaPreview.attrs(candidates[0]) : `src="${escapeHtml(candidates[0])}"`;
+    return `<img ${sourceAttrs}${fallback}${archived ? ' data-placeholder="archive"' : ''} alt="" loading="lazy"
                  onerror="projectsHandleCoverError(this)">`;
 }
 
@@ -741,9 +754,12 @@ async function projectsBulkDeleteProjects(rows) {
                 if (p.saved && p.id) deletedLibIds.add(p.id);
             });
             if (deletedLibIds.size && typeof savedIdeas !== 'undefined' && Array.isArray(savedIdeas)) {
-                savedIdeas = savedIdeas.filter(i => !deletedLibIds.has(i.id));
-                try { localStorage.setItem('spark_library', JSON.stringify(savedIdeas)); }
-                catch (e) { console.warn('[library] localStorage 镜像写入失败', e); }
+                if (typeof forgetLibraryIdeas === 'function') forgetLibraryIdeas([...deletedLibIds]);
+                else {
+                    savedIdeas = savedIdeas.filter(i => !deletedLibIds.has(i.id));
+                    try { localStorage.setItem('spark_library', JSON.stringify(savedIdeas)); }
+                    catch (e) { console.warn('[library] localStorage 镜像写入失败', e); }
+                }
                 if (typeof updateFavoriteButtonState === 'function') updateFavoriteButtonState();
             }
             return data.count || rows.length;
@@ -817,9 +833,12 @@ async function projectsBulkUnsave(rows) {
     }
 
     if (removed.size && typeof savedIdeas !== 'undefined' && Array.isArray(savedIdeas)) {
-        savedIdeas = savedIdeas.filter(i => !removed.has(i.id));
-        try { localStorage.setItem('spark_library', JSON.stringify(savedIdeas)); }
-        catch (e) { console.warn('[library] localStorage 镜像写入失败', e); }
+        if (typeof forgetLibraryIdeas === 'function') forgetLibraryIdeas([...removed]);
+        else {
+            savedIdeas = savedIdeas.filter(i => !removed.has(i.id));
+            try { localStorage.setItem('spark_library', JSON.stringify(savedIdeas)); }
+            catch (e) { console.warn('[library] localStorage 镜像写入失败', e); }
+        }
         if (typeof updateFavoriteButtonState === 'function') updateFavoriteButtonState();
     }
     return removed.size;
@@ -930,8 +949,10 @@ function projectsModelOptions(selectedModel) {
     return families.map(family => {
         const models = (groups[family.key] || []).slice();
         // 保留自定义模型；已下架的文本模型在上面迁移到当前型号。
-        if (!known.some(m => m.value === selected) && family.key === 'gpt') {
-            models.push({ value: selected, label: `${selected}（历史模型）` });
+        // claude-* 的自定义型号归到 Claude 分组，其余沿用 GPT 分组。
+        const customFamily = /^claude(?:[-.]|$)/i.test(selected) ? 'claude' : 'gpt';
+        if (!known.some(m => m.value === selected) && family.key === customFamily) {
+            models.push({ value: selected, label: `${selected}（${customFamily === 'claude' ? '自定义' : '历史模型'}）` });
         }
         const options = models.map(m =>
             `<option value="${escapeHtml(m.value)}"${m.value === selected ? ' selected' : ''}>${escapeHtml(m.label)}</option>`
@@ -1040,7 +1061,13 @@ function projectsArchiveFilesHtml(p) {
             ? '保留文件已保存，点击完成归档继续清理剩余内容。'
             : videos.length ? `保留成片、节拍数据和全套提示词${cover ? '，以及封面缩略图' : ''}，其余项目文件已永久删除。`
                 : `未保留成片视频，只保留全套提示词和节拍数据（如有）${cover ? '，以及封面缩略图' : ''}，其余项目文件已永久删除。`}</p>
-        ${videos.map(file => `<figure class="projects-archive-video"><video controls preload="metadata" src="${escapeHtml(file.url)}"${cover ? ` poster="${escapeHtml(cover)}"` : ''}></video><figcaption>${escapeHtml(file.name || '成片')}</figcaption></figure>`).join('')}
+        ${videos.map(file => {
+            const sourceAttrs = typeof MediaPreview !== 'undefined'
+                ? MediaPreview.attrs(file.url) : `src="${escapeHtml(file.url)}"`;
+            const posterAttrs = cover ? (typeof MediaPreview !== 'undefined'
+                ? MediaPreview.attrs(cover, 'poster') : `poster="${escapeHtml(cover)}"`) : '';
+            return `<figure class="projects-archive-video"><video controls preload="metadata" ${sourceAttrs}${posterAttrs ? ` ${posterAttrs}` : ''}></video><figcaption>${escapeHtml(file.name || '成片')}</figcaption></figure>`;
+        }).join('')}
         ${projectsFilesListHtml(files)}
         ${files.length ? '' : '<p class="projects-detail-hint">归档文件信息暂时不可用，请刷新项目列表。</p>'}</div>`;
 }
@@ -1186,14 +1213,23 @@ function projectsApplyArchiveResults(results, sourceRows, deletedLibraryIds) {
     });
     const matches = idea => Boolean(idea && (byKey.has(idea.project_key) || ideaIds.has(String(idea.id))));
     if (typeof savedIdeas !== 'undefined' && Array.isArray(savedIdeas)) {
-        savedIdeas = savedIdeas.filter(idea => !matches(idea));
-        successfulRows.forEach(p => {
+        const archives = successfulRows.map(p => {
             const result = byKey.get(p.project_key);
             const id = (result.library || {}).id || result.library_id || (p.library || {}).id;
-            if (id) savedIdeas.push({ id, project_key: p.project_key, title: p.title, theme: p.theme,
-                archived: true, archive_pending: Boolean(result.archive_pending), archive: result.archive || result });
-        });
-        try { localStorage.setItem('spark_library', JSON.stringify(savedIdeas)); } catch (_) {}
+            return id ? { id, project_key: p.project_key, title: p.title, theme: p.theme,
+                archived: true, archive_pending: Boolean(result.archive_pending), archive: result.archive || result } : null;
+        }).filter(Boolean);
+        if (typeof rememberLibraryArchive === 'function' && typeof forgetLibraryIdeas === 'function') {
+            const retainedIds = new Set(archives.map(idea => String(idea.id)));
+            const entries = typeof libraryEntries === 'function' ? libraryEntries() : savedIdeas;
+            const obsolete = entries.filter(idea => matches(idea) && !retainedIds.has(String(idea.id))).map(idea => idea.id);
+            forgetLibraryIdeas([...(deletedLibraryIds || []), ...obsolete]);
+            archives.forEach(rememberLibraryArchive);
+        } else {
+            savedIdeas = savedIdeas.filter(idea => !matches(idea));
+            savedIdeas.push(...archives);
+            try { localStorage.setItem('spark_library', JSON.stringify(savedIdeas)); } catch (_) {}
+        }
     }
     try {
         const snapshot = JSON.parse(localStorage.getItem('spark_current_idea') || 'null');
@@ -1503,6 +1539,7 @@ async function projectsRunAction(act, p, event, jobId) {
 function initProjects() {
     const container = document.getElementById('projects-list');
     if (!container) return;   // console.html 等页面没有工作台面板
+    document.addEventListener('visibilitychange', projectsVisibilityChanged);
     projectsUpdateSectionUi();
 
     // Empty launches begin at the workbench; keep restored results and active

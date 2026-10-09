@@ -474,7 +474,7 @@ function openFrameIssuePop(cardEl, seq) {
         foot.style.cssText = 'padding: 8px 12px; background: rgba(245,158,11,0.08); border-top: 1px solid rgba(245,158,11,0.25); display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 11.5px;';
         foot.innerHTML = `
             <div style="display:flex; align-items:center; gap:8px;">
-                <img src="${escapeHtml(refUrl)}" style="width:28px; height:50px; object-fit:cover; border-radius:3px; border:1px solid #f59e0b; cursor:pointer;" onclick="if(window.openLightbox) openLightbox('${escapeHtml(refUrl)}')" title="点击放大参考原片抽帧" />
+                <img ${typeof MediaPreview !== 'undefined' ? MediaPreview.attrs(refUrl) : `src="${escapeHtml(refUrl)}"`} style="width:28px; height:50px; object-fit:cover; border-radius:3px; border:1px solid #f59e0b; cursor:pointer;" onclick="if(window.openLightbox) openLightbox('${escapeHtml(refUrl)}')" title="点击放大参考原片抽帧" />
                 <span style="color:#f59e0b; font-weight:600;">🎯 参考原片基准抽帧</span>
             </div>
             <button type="button" class="action-btn text-btn mini-btn" style="color:#f59e0b; border-color:rgba(245,158,11,0.5); font-size:11px; padding:2px 8px;" onclick="if(typeof openBenchmarkCompare==='function') openBenchmarkCompare({ seq: ${seq} }); else if(typeof openCollageViewer==='function') openCollageViewer({ idea: typeof currentIdea !== 'undefined' ? currentIdea : null, initialMode: 'compare', compareType: 'benchmark', initialFrameSeq: ${seq} })">

@@ -45,6 +45,13 @@ class BrowserEnvironmentError(RuntimeError):
 
 
 _ADS_BROWSER_LIFECYCLE_LOCK = threading.RLock()
+_ADS_PROFILE_LIFECYCLE_LOCKS = {}
+_ADS_PROFILE_LOCKS_GUARD = threading.Lock()
+
+
+def _profile_lifecycle_lock(user_id):
+    with _ADS_PROFILE_LOCKS_GUARD:
+        return _ADS_PROFILE_LIFECYCLE_LOCKS.setdefault(str(user_id), threading.RLock())
 
 
 # ── Flow 站点地址（唯一事实来源） ────────────────────────────────────────────
@@ -329,6 +336,7 @@ def ensure_profile_exclusive(user_id, port=None, timeout=20):
     acknowledgement is not proof that Chromium has released its memory yet.
 
     并发方案 R4：只关"无主"的浏览器，永不关别的任务租约内的环境（lease_registry）。
+    Flow 绑定的环境也一律保留：它的 FX 租约结束后，账号维护可能仍在提交凭证。
     没装登记簿或没有他人租约时，行为与旧的"单环境模式"完全一致。
     """
     user_id = str(user_id or "").strip()
@@ -347,6 +355,9 @@ def ensure_profile_exclusive(user_id, port=None, timeout=20):
             log(f"🔒 环境 {skipped} 被其它任务租用，保留不关", "浏览器切换")
         for previous in others:
             _check_browser_start_cancelled()
+            if lease_registry.protected_from_cleanup(previous):
+                log(f"🔒 环境 {previous} 由账号维护系统管理或状态未确认，保留不关", "浏览器切换")
+                continue
             log(f"🧹 单环境模式：先关闭 {previous}，再使用 {user_id}", "浏览器切换")
             try:
                 requests.get(f"http://127.0.0.1:{port}/api/v1/browser/stop",
@@ -624,10 +635,31 @@ def get_ads_ws_url(user_id=None, port=None, auto_rotate_proxy=True,
     if port is None:
         port = get_runtime_default_port() or DEFAULT_PORT
 
+    # Explicit profiles and fallback defaults must satisfy the same atomic claim.
+    lease_registry.require_claim(user_id)
+
+    if lease_registry.concurrency() > 1 and lease_registry.current_claim() == user_id:
+        # Independent leased profiles must not share a lock during a potentially
+        # long browser/start retry. Keep orphan cleanup serialized, then start
+        # under this profile's own lock. A running image profile takes the warm
+        # path without waiting for another profile's startup or cleanup.
+        with _profile_lifecycle_lock(user_id):
+            if account_binding.current_fixed_task_account():
+                auto_rotate_proxy = False
+                max_start_attempts = 1
+            elif not get_running_ads_ws_url(user_id, port=port):
+                ensure_profile_exclusive(user_id, port=port)
+            return _start_or_reuse_ads_browser(
+                user_id, port, auto_rotate_proxy, max_start_attempts, start_timeout)
+
     # Include the already-running fast path: leftover profiles must be closed
     # even when the target itself needs no browser/start request.
     with _ADS_BROWSER_LIFECYCLE_LOCK:
-        ensure_profile_exclusive(user_id, port=port)
+        if account_binding.current_fixed_task_account():
+            auto_rotate_proxy = False
+            max_start_attempts = 1
+        else:
+            ensure_profile_exclusive(user_id, port=port)
         return _start_or_reuse_ads_browser(
             user_id, port, auto_rotate_proxy, max_start_attempts, start_timeout)
 
@@ -747,6 +779,8 @@ def _start_or_reuse_ads_browser(user_id, port, auto_rotate_proxy,
                     f"AdsPower 启动失败 (已尝试 {max_start_attempts} 次): {start_err} (user_id={user_id}, port={port})"
                 )
 
+        if account_binding.current_fixed_task_account():
+            raise account_binding.FixedAccountStopError("固定视频账号浏览器连接不可用，保留原窗口并停止任务")
         # 强制关闭并等待
         try:
             requests.get(api_stop_url, timeout=10)
@@ -813,6 +847,7 @@ def _recover_valid_page(context, broken_page):
     candidates = [
         p for p in getattr(context, "pages", [])
         if _is_manageable_user_page(p) and not (callable(getattr(p, "is_closed", None)) and p.is_closed())
+        and (not account_binding.current_fixed_task_account() or is_flow_url(str(getattr(p, 'url', ''))))
     ]
     # 优先选不是 broken_page 的其他活页
     for pg in reversed(candidates):
@@ -871,7 +906,7 @@ def find_or_create_page(context, url_pattern, fallback_url=None, *, user_id=None
             continue
 
     # 2. 如果没有匹配到 Flow 页面，优先复用已有空白页/其它标签页，避免调用 context.new_page() 产生多余标签页
-    if not target_page:
+    if not target_page and not account_binding.current_fixed_task_account():
         for pg in reversed(pages):
             try:
                 target_page = pg
@@ -926,7 +961,8 @@ def find_or_create_page(context, url_pattern, fallback_url=None, *, user_id=None
 
     # 5. 【核心修复】：清理并关闭除 target_page 外的所有多余用户标签页，保证浏览器标签栏始终保持一个 Flow 窗口
     # 注意：绝不关闭 chrome:// 等内部页面，否则会导致 CDP 挂起死锁
-    remaining_pages = [p for p in getattr(context, "pages", []) if _is_manageable_user_page(p)]
+    remaining_pages = ([] if account_binding.current_fixed_task_account() else
+                       [p for p in getattr(context, "pages", []) if _is_manageable_user_page(p)])
     for pg in remaining_pages:
         if pg != target_page:
             try:
@@ -1235,6 +1271,8 @@ def attempt_auto_login(page, user_id=None, context_label="Flow导航", cancel_ch
 
     没配凭据 / 熔断中 / 登录失败一律返回 False，调用方照旧走既有的人工处理路径。
     """
+    if account_binding.current_fixed_task_account():
+        raise account_binding.FixedAccountStopError("固定视频账号需要重新登录，已停止本任务，请人工恢复登录")
     # 普通生图/视频服务通常依赖当前任务绑定，不显式传 user_id；服务刚启动且尚未
     # 建立任务绑定时，则必须回退到控制台配置的默认 AdsPower 环境。旧逻辑只做
     # 前半段，导致“默认环境打开即掉登录”看得到登录页却永远找不到对应凭据。

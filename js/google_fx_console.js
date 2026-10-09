@@ -898,6 +898,7 @@
       const current = value ?? spec.default ?? '';
       const values = [...(spec.options || [])];
       const labels = ({
+        videoProvider: { google_fx: 'Google FX（AdsPower）', flow2api: 'Flow2API' },
         videoRefMode: { VIDEO_FRAMES: '帧（首尾帧）', VIDEO_REFERENCES: '素材（主体与风格）', INGREDIENTS: '素材（主体与风格）' },
         googleFxAccountStrategy: { credit_desc: '积分最多优先', expiration_asc: '重置日期最早优先', rotation: '均衡使用' },
         adsPowerMacWindowMode: { hide: '隐藏浏览器窗口', focus: '仅归还焦点', off: '不干预窗口' },
@@ -1031,7 +1032,7 @@
       const values = { ...config, ...pending };
       Object.entries(state.configSchema).forEach(([key, spec]) => {
         const common = !spec.inactive && (spec.group === '模型' ||
-          ['adsPowerSilentMode', 'googleFxSequenceUserId', 'googleFxSequenceUserLock'].includes(key));
+          ['adsPowerSilentMode', 'googleFxSequenceUserId', 'googleFxSequenceUserLock', 'videoRetryCount', 'videoContinuousGeneration'].includes(key));
         const bucket = groups[common ? 'common' : 'advanced'];
         const group = spec.group || '其它';
         (bucket[group] = bucket[group] || []).push([key, spec]);
@@ -1079,7 +1080,7 @@
   // 避免主界面仍然发送旧模型覆盖服务端的最新选择。两个页面（index.html /
   // console.html）共享 localStorage，主页面刷新或跨标签页 storage 事件都会
   // 自动加载新值。
-  const _FX_MODEL_SYNC_KEYS = ['videoModel', 'googleFxImageModel', 'videoDuration', 'videoResolution', 'videoRefMode'];
+  const _FX_MODEL_SYNC_KEYS = ['videoProvider', 'videoModel', 'googleFxImageModel', 'videoDuration', 'videoResolution', 'videoRefMode', 'flow2apiVideoConcurrency', 'videoRetryCount', 'videoContinuousGeneration'];
 
   function syncFxModelToMainConfig(serverConfig) {
     if (!serverConfig) return;

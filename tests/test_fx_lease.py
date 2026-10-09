@@ -60,6 +60,32 @@ def test_registry_defaults_to_no_leases_and_swallows_errors():
     lease_registry.touch()
 
 
+def test_cleanup_registry_preserves_legacy_providers_and_protects_unknown_results():
+    assert lease_registry.protected_from_cleanup('neighbor') is False
+    lease_registry.install(_Provider([]))
+    assert lease_registry.protected_from_cleanup('neighbor') is False
+
+    class IntegratedLegacy(_Provider):
+        account_admission_factory = object()
+
+    lease_registry.install(IntegratedLegacy([]))
+    assert lease_registry.protected_from_cleanup('neighbor') is True
+
+    class Unknown(_Provider):
+        def protected_from_cleanup(self, profile):
+            return None
+
+    lease_registry.install(Unknown([]))
+    assert lease_registry.protected_from_cleanup('neighbor') is True
+
+    class Broken(_Provider):
+        def protected_from_cleanup(self, profile):
+            raise RuntimeError('binding unavailable')
+
+    lease_registry.install(Broken([]))
+    assert lease_registry.protected_from_cleanup('neighbor') is True
+
+
 def test_log_line_is_a_heartbeat():
     provider = _Provider([])
     lease_registry.install(provider)
@@ -240,6 +266,59 @@ def test_without_registry_every_other_profile_is_stopped_as_before(monkeypatch):
 
     assert sorted(stopped) == ['b', 'c']
     assert browser.ensure_single_ads_browser is browser.ensure_profile_exclusive  # 旧名仍可用
+
+
+@pytest.mark.parametrize('binding_state', ['bound', 'busy', 'unknown', 'invalid_guard'])
+def test_neighbor_cleanup_keeps_flow_bound_or_unknown_profiles_and_prunes_unbound(monkeypatch, binding_state):
+    stopped, probed, released = [], [], []
+
+    class ProbeGuard:
+        def close(self):
+            released.append('managed')
+
+    def factory(profile):
+        probed.append(profile)
+        if profile == 'unbound':
+            return None
+        if binding_state in {'busy', 'unknown'}:
+            raise RuntimeError(binding_state)
+        if binding_state == 'invalid_guard':
+            return object()
+        return ProbeGuard()
+
+    def fake_get(url, params=None, timeout=None):
+        profile = (params or {}).get('user_id')
+        assert profile == 'unbound', 'managed neighbor must never receive stop/active cleanup requests'
+        if 'browser/stop' in url:
+            stopped.append(profile)
+        return _Resp({'code': 0, 'data': {'status': 'Inactive'}})
+
+    monkeypatch.setattr(browser.requests, 'get', fake_get)
+    monkeypatch.setattr(browser, 'list_running_ads_browsers', lambda port=None, strict=False: [
+        {'user_id': 'me'}, {'user_id': 'managed'}, {'user_id': 'unbound'}])
+    lease_registry.install(FxControlPlane(account_admission_factory=factory))
+
+    assert browser.ensure_profile_exclusive('me', port=1) == ['unbound']
+    assert stopped == ['unbound']
+    assert probed == ['managed', 'unbound']
+    assert released == (['managed'] if binding_state == 'bound' else [])
+
+
+def test_cleanup_with_control_provider_without_flow_integration_keeps_previous_behavior(monkeypatch):
+    stopped = []
+
+    def fake_get(url, params=None, timeout=None):
+        if 'browser/stop' in url:
+            stopped.append((params or {}).get('user_id'))
+        return _Resp({'code': 0, 'data': {'status': 'Inactive'}})
+
+    monkeypatch.setattr(browser.requests, 'get', fake_get)
+    monkeypatch.setattr(browser, 'list_running_ads_browsers', lambda port=None, strict=False: [
+        {'user_id': 'me'}, {'user_id': 'neighbor'}])
+    lease_registry.install(FxControlPlane())
+
+    assert browser.ensure_profile_exclusive('me', port=1) == ['neighbor']
+    assert stopped == ['neighbor']
 
 
 # ── R3/R7：选号绕开他人租约 ────────────────────────────

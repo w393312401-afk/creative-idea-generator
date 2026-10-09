@@ -58,8 +58,8 @@ assert.ok(promptImportJs.includes("if (e.target === modal) close()"),
     'prompt_import.js must support backdrop click');
 
 // 4.6 prompt_linter.js
-assert.ok(promptLinterJs.includes("if (e.target === modal)"),
-    'prompt_linter.js must support backdrop click');
+assert.ok(!promptLinterJs.includes("document.createElement"),
+    'retired prompt preflight must not create a blocking modal');
 
 // 4.7 collage_viewer.js
 assert.ok(collageViewerJs.includes("if (e.target === modal) closeCollageViewer()"),

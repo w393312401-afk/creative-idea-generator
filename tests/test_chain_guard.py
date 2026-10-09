@@ -14,6 +14,7 @@ import contextlib
 import shutil
 import tempfile
 import unittest
+import pytest
 from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -25,6 +26,28 @@ import prompt_pipeline as pp
 import chain_guard as cg
 import candidate_selection_pipeline as csp
 import frame_generator as fg
+
+
+@pytest.fixture(autouse=True)
+def historical_guard_algorithm_only(monkeypatch):
+    """Archived guard algorithms with mocked model/generation calls.
+
+    This file does not test production policy; retirement is asserted without these
+    overrides in test_runtime_review_retirement.py.
+    """
+    monkeypatch.setattr(cg, 'reviews_disabled', lambda config=None: False)
+    monkeypatch.setattr(csp, 'reviews_disabled', lambda config=None: False)
+    monkeypatch.setattr(fg, 'reviews_disabled', lambda config=None: False)
+    # Any test not providing its own fake response must remain offline.
+    def offline_chat(*args, **kwargs):
+        raise RuntimeError('Historical guard tests never call a live review model')
+    monkeypatch.setattr(cg, '_multimodal_chat', offline_chat)
+    monkeypatch.setattr(pp, '_multimodal_chat', offline_chat)
+    monkeypatch.setattr(pp, '_chat', offline_chat)
+    monkeypatch.setattr(pp, '_execute_request_with_retry', offline_chat)
+    resolver = lambda config=None: (config or {}).get('chainGuardMode', 'autofix_soft')
+    monkeypatch.setattr(csp, 'chain_guard_mode', resolver)
+    monkeypatch.setattr(fg, 'chain_guard_mode', resolver)
 
 
 class TestChainGuard(unittest.TestCase):
@@ -870,7 +893,7 @@ class TestAutofixSoftMode(unittest.TestCase):
         定义它的 halt/autofix 语义，会静默落进"两个都是 False"（既不修也不停），
         看上去和 report 一模一样。"""
         registered = set(server_common._GATE_BY_KEY['chainGuardMode']['options'])
-        self.assertEqual(registered, {'off', 'report', 'halt', 'autofix', 'autofix_soft'})
+        self.assertEqual(registered, {'off'})
         expected = {
             'off': (False, False),
             'report': (False, False),
@@ -1015,4 +1038,3 @@ class TestAnchorClassifierCalibration(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
-

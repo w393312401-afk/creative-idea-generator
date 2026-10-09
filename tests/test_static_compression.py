@@ -60,7 +60,7 @@ def test_identity_and_range_remain_uncompressed(asset):
 
 def test_not_modified_keeps_vary(asset):
     _, headers, _ = request({'Accept-Encoding': 'gzip'})
-    status, headers, body = request({'Accept-Encoding': 'gzip', 'If-Modified-Since': headers['last-modified']})
+    status, headers, body = request({'Accept-Encoding': 'gzip', 'If-None-Match': headers['etag']})
     assert status == 304 and body == b''
     assert headers['vary'] == 'Accept-Encoding'
 

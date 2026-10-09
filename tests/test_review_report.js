@@ -213,18 +213,12 @@ assert.ok(slotModelJs.includes('点徽标查看明细'), 'hover 只留摘要');
 assert.ok(css.includes('.slot-badges > .slot-badge.is-clickable'), '可点徽标缺少 pointer-events 复位');
 assert.ok(css.includes('.slot-badges > .slot-badge.candidate-selection-badge'), '4选1 徽标同款复位');
 
-// ── 结构化播报的消费端（api_client 的 sequence_review 观察者）─────────
+// 历史报告仍能读取；旧序列审查入口不再发起新审查任务。
 const apiJs = fs.readFileSync(path.join(root, 'js', 'api_client.js'), 'utf8');
-assert.ok(apiJs.includes('Array.isArray(evData.lines)'),
-    'sequence_review_result 要优先按结构化 lines 逐行画');
-assert.ok(apiJs.includes("feedLine(`　${l.text}`, l.cls || '')"),
-    'lines 的每一行各占一行、按语义着色');
-assert.ok(apiJs.includes('evData.message'),
-    'message 兜底必须留着——老服务端不会给 lines');
-assert.ok(apiJs.includes("'review-beat'"),
-    '审干净的拍要收进一条就地刷新的计数行，不能一拍灌一行');
-// 复用说明只该播一次：lines 里已经有了就不再另外补一句
-assert.ok(apiJs.includes('hadLines'), '有 lines 时不重复播报复用/完成');
+const reviewStart = apiJs.indexOf('async function runSequenceReview(');
+const reviewEntry = apiJs.slice(reviewStart, apiJs.indexOf('\n}', reviewStart) + 2);
+assert.ok(reviewEntry.includes('永久退役'));
+assert.ok(!reviewEntry.includes('fetch('), 'retired manual review must not submit a new job');
 
 console.log('review report tests passed');
 

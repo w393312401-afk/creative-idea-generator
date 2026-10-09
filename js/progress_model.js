@@ -15,7 +15,13 @@
             percent: Number(prev.percent) || 0,
             outlineCount: Number(prev.outlineCount) || 0,
             total: Number(prev.total) || 0,
+            current: Number(prev.current) || 0,
             slotStatus: { ...(prev.slotStatus || {}) },
+            recoveryActive: !!prev.recoveryActive,
+            recoveryPhase: prev.recoveryPhase || '',
+            recoverySlots: [...(prev.recoverySlots || [])],
+            retryRound: Number(prev.retryRound) || 0,
+            nextRetryAt: Number(prev.nextRetryAt) || 0,
             repairCount: Number(prev.repairCount) || 0,
             phase: prev.phase || 'pending',
             label: prev.label || '',
@@ -45,12 +51,21 @@
 
     function markSlot(state, slot, status) {
         if (slot !== undefined && slot !== null && slot !== '') {
+            // SSE 重放历史 start/error 时，不回退已交付槽位。
+            if (state.slotStatus[String(slot)] === 'done' && status !== 'done') return;
             state.slotStatus[String(slot)] = status;
         }
     }
 
     function terminalSlotCount(state) {
         return Object.values(state.slotStatus).filter(v => v === 'done' || v === 'failed').length;
+    }
+
+    function activeVideoSlots(state) {
+        return Object.keys((state && state.slotStatus) || {})
+            .filter(slot => state.slotStatus[slot] === 'active')
+            .map(Number).filter(slot => Number.isInteger(slot) && slot > 0)
+            .sort((a, b) => a - b);
     }
 
     function normalizeCompose(stage, details, state) {
@@ -134,7 +149,7 @@
         let label = messageFrom(details, state.label || '准备生成帧序列...');
         let percent = state.percent;
         let current = null;
-        let total = Number(details && details.total) || state.total || 0;
+        let total = Math.max(Number(details && details.total) || 0, state.total || 0);
         let status = 'running';
         let slot = details && (details.sequence || details.slot);
 
@@ -184,7 +199,7 @@
             status = 'failed';
         } else if (stage === 'frame') {
             current = Number(details && details.current) || 0;
-            total = Number(details && details.total) || state.total || 0;
+            total = Math.max(Number(details && details.total) || 0, state.total || 0);
             state.total = total || state.total;
             slot = details && details.frame && (details.frame.sequence || details.frame.slot);
             markSlot(state, slot, 'done');
@@ -209,7 +224,7 @@
         let label = messageFrom(details, state.label || '准备生成视频...');
         let percent = state.percent;
         let current = null;
-        let total = Number(details && details.total) || state.total || 0;
+        let total = Math.max(Number(details && details.total) || 0, state.total || 0);
         let status = 'running';
         let slot = details && details.index;
 
@@ -220,6 +235,9 @@
             state.total = total;
             percent = 5;
             label = total ? `开始生成 ${total} 段视频` : '开始生成视频';
+            ((details && details.slots) || []).forEach(index => {
+                if (!state.slotStatus[String(index)]) markSlot(state, index, 'queued');
+            });
         } else if (stage === 'video_start') {
             current = Number(details && details.current) || null;
             state.total = total || state.total;
@@ -248,6 +266,24 @@
             label = slot ? `VID ${String(slot).padStart(3, '0')} 生成失败` : '视频生成失败';
             if (details && details.message) label += `：${details.message}`;
             status = 'failed-slot';
+        } else if (stage === 'video_recovery') {
+            state.recoveryActive = true;
+            state.recoveryPhase = details && details.phase || 'waiting';
+            state.recoverySlots = ((details && details.slots) || []).map(Number)
+                .filter(index => Number.isInteger(index) && index > 0);
+            state.retryRound = Number(details && details.retry_round) || 0;
+            state.nextRetryAt = Number(details && details.next_retry_at) || 0;
+            ((details && details.completed_slots) || []).forEach(index => markSlot(state, index, 'done'));
+            state.recoverySlots.forEach(index => markSlot(state, index, 'recovering'));
+            const successful = Object.values(state.slotStatus).filter(value => value === 'done').length;
+            current = successful;
+            const denom = state.total || total || successful || 1;
+            percent = 5 + clamp(successful / denom, 0, 1) * 83;
+            label = `已生成 ${successful}/${denom} 段视频 · `
+                + messageFrom(details, state.recoveryPhase === 'querying' ? '正在自动核对原视频'
+                    : state.recoveryPhase === 'retrying' ? '正在自动补跑未完成片段' : '等待自动恢复后继续生成');
+            status = 'recovering';
+            slot = null;
         } else if (stage === 'video_warning') {
             label = messageFrom(details, '正在处理视频生成状态');
             status = 'active';
@@ -286,7 +322,27 @@
             status = 'failed';
         }
 
-        return { phase, label, percent, current, total, slot, status };
+        if (stage === 'result' || stage === 'error') {
+            Object.keys(state.slotStatus).forEach(index => {
+                if (['active', 'queued', 'recovering'].includes(state.slotStatus[index])) {
+                    markSlot(state, index, 'stopped');
+                }
+            });
+        }
+        const activeSlots = activeVideoSlots(state);
+        if (activeSlots.length) {
+            const activeLabel = `并发处理中 ${activeSlots.length} 段：`
+                + activeSlots.map(index => `VID ${String(index).padStart(3, '0')}`).join('、');
+            const successful = Object.values(state.slotStatus).filter(value => value === 'done').length;
+            const failed = Object.values(state.slotStatus).filter(value => value === 'failed').length;
+            const summary = total ? `已生成 ${successful}/${total} 段视频` : '';
+            label = activeLabel + (summary ? ` · ${summary}` : '')
+                + (failed ? ` · ${failed} 段待重试` : '')
+                + (stage !== 'video_start' && stage !== 'video_done' && messageFrom(details, '')
+                    ? ` · ${messageFrom(details, '')}` : '');
+        }
+
+        return { phase, label, percent, current, total, slot, status, activeSlots, activeCount: activeSlots.length };
     }
 
     function normalizeCover(stage, details, state) {
@@ -322,7 +378,18 @@
             result = normalizeCompose(stage, details, state);
         }
 
-        const monotonicPercent = toPercent(Math.max(state.percent, result.percent || 0));
+        // 恢复开始时去掉先前失败槽位累计的虚假进度；后续只按成功交付计数。
+        const recoveryProgress = resolvedTaskType === 'videos' && state.recoveryActive
+            && !['result', 'error', 'merge_start', 'merge_done', 'merge_error', 'merge_skip'].includes(stage);
+        if (recoveryProgress) {
+            result.current = Object.values(state.slotStatus).filter(value => value === 'done').length;
+            result.percent = 5 + clamp(result.current / (state.total || result.total || 1), 0, 1) * 83;
+        }
+        const monotonicPercent = toPercent(recoveryProgress ? result.percent : Math.max(state.percent, result.percent || 0));
+        const mediaTask = resolvedTaskType === 'frames' || resolvedTaskType === 'videos';
+        const current = recoveryProgress ? result.current : mediaTask
+            ? Math.max(state.current || 0, Number(result.current) || 0, terminalSlotCount(state))
+            : result.current;
         const next = {
             ...state,
             taskType: resolvedTaskType,
@@ -331,19 +398,22 @@
             message: result.label,
             percent: monotonicPercent,
             total: result.total || state.total,
-            slotStatus: state.slotStatus
+            ...(mediaTask ? { current } : {}),
+            slotStatus: state.slotStatus,
+            ...(resolvedTaskType === 'videos' ? { activeSlots: result.activeSlots, activeCount: result.activeCount } : {})
         };
 
         return {
             phase: result.phase,
             label: result.label,
             percent: monotonicPercent,
-            current: result.current,
+            current,
             total: result.total || state.total || null,
             slot: result.slot,
             status: result.status,
             message: result.label,
-            monotonic: true,
+            monotonic: !recoveryProgress,
+            ...(resolvedTaskType === 'videos' ? { activeSlots: result.activeSlots, activeCount: result.activeCount } : {}),
             state: next
         };
     }
@@ -372,6 +442,7 @@
         normalizeGenerationProgress,
         progressFromEvents,
         createProgressState,
+        activeVideoSlots,
         inferTaskType
     };
 

@@ -27,7 +27,7 @@ from server_common import (
     resolve_cover_reference, project_cover_path,
     IMAGE_TASKS, IMAGE_TASKS_LOCK,
     apply_google_fx_runtime_overrides, fx_cancel_context, fx_request_deadline,
-    read_manifest, write_manifest, GenerationCancelled, log,
+    read_manifest, write_manifest, manifest_lock, GenerationCancelled, log,
     gpt_image_pixel_size, is_gpt_image_model, gpt_image_render_quality, resolve_image_model,
     drop_stale_review_verdicts, stamp_manifest_capabilities,
     gate_setting, chain_guard_mode, reviews_disabled,
@@ -56,6 +56,114 @@ class QuotaExhaustedError(RuntimeError):
 
 class FrameContinuityError(RuntimeError):
     """A rendered frame failed the deterministic continuity gate after retry."""
+
+
+_VIDEO_MANIFEST_FIELDS = (
+    'videos', 'video_generation_stats', 'merged_video', 'merge_error', 'video_collage_url',
+    'generation_channel',
+    'video_prompt_optimizations', 'prompt_block', 'prompt_slots',
+    'auto_video', 'auto_generate_videos', 'auto_generate_videos_preference_explicit', 'video_frame_pairing',
+)
+
+
+def write_frame_manifest(project_dir, manifest, preserve_video_state=False):
+    """Persist image state without overwriting videos generated between frames."""
+    if not preserve_video_state:
+        write_manifest(project_dir, manifest)
+        return
+    with manifest_lock(project_dir):
+        latest = read_manifest(project_dir) or {}
+        merged = dict(manifest)
+        for key in _VIDEO_MANIFEST_FIELDS:
+            if key in latest:
+                merged[key] = latest[key]
+            else:
+                merged.pop(key, None)
+        projects = {**(latest.get('google_fx_projects') or {}),
+                    **(manifest.get('google_fx_projects') or {})}
+        if projects:
+            merged['google_fx_projects'] = projects
+        capabilities = dict(merged.get('capability_degraded') or {})
+        latest_video_capability = (latest.get('capability_degraded') or {}).get('videos')
+        if latest_video_capability:
+            capabilities['videos'] = latest_video_capability
+        else:
+            capabilities.pop('videos', None)
+        if capabilities:
+            merged['capability_degraded'] = capabilities
+        else:
+            merged.pop('capability_degraded', None)
+        write_manifest(project_dir, merged)
+        if read_manifest(project_dir) != merged:
+            raise RuntimeError('帧清单保存失败，已停止自动视频生成，避免使用未提交的帧记录。')
+        manifest.clear()
+        manifest.update(merged)
+
+
+def refresh_committed_frame_records(project_dir, manifest, frames_by_sequence):
+    """Carry guard/autofix changes on every frame into the image worker snapshot."""
+    latest = read_manifest(project_dir) or {}
+    for frame in latest.get('frames') or []:
+        if isinstance(frame, dict) and (frame.get('sequence') or frame.get('slot')):
+            frames_by_sequence[int(frame.get('sequence') or frame.get('slot'))] = frame
+    manifest['frames'] = [frames_by_sequence[seq] for seq in sorted(frames_by_sequence)]
+
+
+def commit_frame_prompt_changes(project_dir, previous_prompt_block, prompt_block):
+    """Commit accepted image fixes without reverting other slots' video edits."""
+    from prompt_pipeline import _parse_prompt_slots, _format_prompt_block, prompt_slots_list
+
+    before_images, before_videos = _parse_prompt_slots(previous_prompt_block)
+    after_images, after_videos = _parse_prompt_slots(prompt_block)
+    changes = [
+        {slot for slot in set(before) | set(after) if before.get(slot) != after.get(slot)}
+        for before, after in ((before_images, after_images), (before_videos, after_videos))
+    ]
+    with manifest_lock(project_dir):
+        latest = read_manifest(project_dir) or {}
+        latest_block = latest.get('prompt_block') or ''
+        if latest_block and not any(changes):
+            return latest_block
+        images, videos = _parse_prompt_slots(latest_block or previous_prompt_block)
+        for destination, after, changed in (
+                (images, after_images, changes[0]), (videos, after_videos, changes[1])):
+            for slot in changed:
+                if slot in after:
+                    destination[slot] = after[slot]
+                else:
+                    destination.pop(slot, None)
+        committed = _format_prompt_block(images, videos)
+        latest['prompt_block'] = committed
+        latest['prompt_slots'] = prompt_slots_list(committed)
+        write_manifest(project_dir, latest)
+        if read_manifest(project_dir) != latest:
+            raise RuntimeError('修复后的提示词保存失败，已停止自动视频生成。')
+        return committed
+
+
+def emit_frame_ready(project_dir, sequence, on_progress, current, total, skipped=False,
+                     prompt_block=None, previous_prompt_block=None):
+    """Announce a committed, settled frame after continuity and guard checks."""
+    if prompt_block is not None:
+        commit_frame_prompt_changes(project_dir, previous_prompt_block or prompt_block, prompt_block)
+    if not on_progress:
+        return
+    manifest = read_manifest(project_dir) or {}
+    frame = next((item for item in manifest.get('frames') or []
+                  if isinstance(item, dict)
+                  and int(item.get('sequence') or item.get('slot') or 0) == int(sequence)), None)
+    if not frame:
+        return
+    raw = str(frame.get('file') or '')
+    paths = [raw, os.path.join(os.path.dirname(os.path.abspath(__file__)), raw.lstrip('/')),
+             os.path.join(project_dir, 'frames', os.path.basename(raw))]
+    if not any(path and os.path.isfile(path) and os.path.getsize(path) > 0 for path in paths):
+        return
+    on_progress('frame_ready', {
+        'sequence': int(sequence), 'slot': int(frame.get('slot') or sequence),
+        'frame': dict(frame), 'current': current, 'total': total, 'skipped': bool(skipped),
+        'prompt_block': manifest.get('prompt_block') or '',
+    })
 
 
 _CONTINUITY_RETRY_CONTROL = (
@@ -170,11 +278,21 @@ def _annotate_unreachable_gateway(err, req):
     except Exception:
         origin = '上游网关'
     which = ('codexBaseUrl（gpt-5 / gpt-image-2 / codex 系列走这个网关）'
-             if _is_codex_origin(origin) else 'baseUrl')
+             if _is_codex_origin(origin) else
+             'claudeBaseUrl（claude 系列走这个网关）' if _is_claude_origin(origin) else 'baseUrl')
     return urllib.error.URLError(
         f'{reason} —— 连不上本地网关 {origin}；'
         f'请确认该网关进程在跑，或把 server_config.json 的 {which} 改成它当前的端口'
     )
+
+
+def _is_claude_origin(origin):
+    try:
+        from server_common import SERVER_CONFIG
+        claude = (SERVER_CONFIG.get('claudeBaseUrl') or '')
+    except Exception:
+        claude = ''
+    return bool(claude) and origin and origin in claude
 
 
 def _is_codex_origin(origin):
@@ -520,8 +638,14 @@ def _continuity_should_retry(result, retry_no, max_retries):
     )
 
 
-def update_manifest_stale_status(manifest, project_dir, regenerated_sequences=None, finalize=False):
-    """帧内容变了 → 已合并视频/视频清单作废（旧行为，任何调用都执行）。
+def update_manifest_stale_status(manifest, project_dir, regenerated_sequences=None, finalize=False,
+                                 frames_changed=True):
+    """帧内容变了 → 已合并视频/视频清单作废（默认任何调用都执行）。
+
+    frames_changed=False 表示这一轮没有任何帧被真正重新生成（整轮都复用了磁盘上的
+    现成帧）。此时视频所依据的首尾帧没变，不能清空 videos / merged_video，否则只是
+    重跑一遍"复用旧帧"的帧序列，就会把已交付视频的记录抹掉，下次整单视频任务据此
+    把已经付费生成的段落当成没做过而重新提交。
 
     finalize=True 时（帧生成整轮成功收尾处调用）额外维护 i2i 链的血统标记：
     部分重生（regenerated_sequences 为槽位子集）后，位于最早重生帧之后、又没被本轮
@@ -536,10 +660,11 @@ def update_manifest_stale_status(manifest, project_dir, regenerated_sequences=No
       2. 盖上运行时能力印章（server_common.stamp_manifest_capabilities）：numpy/ffmpeg/
          技能契约缺失时本地视觉探针整套静默跳过，"这单压根没做内容级校验"必须是清单上
          的一行，而不是靠人回忆当时的环境。"""
-    if 'merged_video' in manifest:
-        del manifest['merged_video']
-    if 'videos' in manifest:
-        manifest['videos'] = []
+    if frames_changed:
+        if 'merged_video' in manifest:
+            del manifest['merged_video']
+        if 'videos' in manifest:
+            manifest['videos'] = []
     if not finalize:
         return
     stamp_manifest_capabilities(manifest, 'frames')
@@ -841,6 +966,25 @@ def _extract_image_prompts(block):
     return items
 
 
+def _write_image_bytes_atomic(target_path, image_bytes):
+    """Publish only complete images so readers cannot cache a partial file."""
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode='wb', dir=os.path.dirname(os.path.abspath(target_path)),
+            prefix=f'.{os.path.basename(target_path)}.', suffix='.tmp', delete=False,
+        ) as temporary:
+            temporary_path = temporary.name
+            temporary.write(image_bytes)
+        os.replace(temporary_path, target_path)
+    finally:
+        if temporary_path is not None:
+            try:
+                os.unlink(temporary_path)
+            except OSError:
+                pass
+
+
 def _decode_or_download_image(data_item, target_path, config):
     b64 = None
     url = None
@@ -872,14 +1016,12 @@ def _decode_or_download_image(data_item, target_path, config):
             # ~1254x1254 方图，闭源改不了——落盘前按配置比例居中裁剪兜底，
             # 否则方帧混进 9:16 链，i2v 配对/合成必然构图跳变。比例已一致时是 no-op。
             img = _crop_to_aspect_ratio(img, config.get('imageAspectRatio') or '9:16')
-            img.save(target_path, format='WEBP', quality=80)
+            encoded = io.BytesIO()
+            img.save(encoded, format='WEBP', quality=80)
+            image_bytes = encoded.getvalue()
         except Exception as e:
             print(f"Failed to convert image to WebP: {e}. Saving raw bytes instead.")
-            with open(target_path, 'wb') as f:
-                f.write(image_bytes)
-    else:
-        with open(target_path, 'wb') as f:
-            f.write(image_bytes)
+    _write_image_bytes_atomic(target_path, image_bytes)
 
 
 def _save_image_station_result(resp_data):
@@ -1971,7 +2113,7 @@ def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=
                                 _match_color_lab(_webp_path(seq), _webp_path(1), _webp_path(seq))
                             _record_frame(
                                 seq, item, fx_src_path, fx_uuid,
-                                'pending_manual_review', None,
+                                'retired', None,
                                 cover_reference=(cover_reference if seq == 1 else None),
                                 fx_account_id=generated_account_by_path.get(saved_path),
                             )
@@ -2097,7 +2239,7 @@ def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=
 
     def _save_manifest():
         manifest['frames'] = [manifest_frames_by_seq[s] for s in sorted(manifest_frames_by_seq.keys())]
-        write_manifest(project_dir, manifest)
+        write_frame_manifest(project_dir, manifest, preserve_video_state=bool(config.get('_auto_generate_videos')))
 
     generated_count = 0
 
@@ -2164,7 +2306,7 @@ def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=
         return frame_info
 
     chunks = plan_fx_chunks(
-        gen_seqs, chunk_size=(1 if continuity_mode(config) != 'off' else _FX_CHUNK_SIZE))
+        gen_seqs, chunk_size=(1 if config.get('_auto_generate_videos') or continuity_mode(config) != 'off' else _FX_CHUNK_SIZE))
     if target_sequences is not None:
         chunks = split_fx_chunks_by_canvas(chunks, manifest_frames_by_seq, manifest)
     # 声明式硬切和过门目标帧都另起一批。新批仍显式挂载上一帧作为参考，所以空间
@@ -2217,11 +2359,16 @@ def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=
                     'fx_src': os.path.relpath(own_src, os.path.dirname(os.path.abspath(__file__))).replace('\\', '/') if own_src else None,
                     'aspect_ratio': config.get('imageAspectRatio') or '9:16',
                     'image_size': _image_quality_to_label(config.get('imageQuality')),
-                    'retry_count': 0, 'quality_gate': 'pending_manual_review',
+                    'retry_count': 0, 'quality_gate': 'retired',
                     'vlm_qa_reason': None, 'parent_hash': '',
                 }
                 manifest_frames_by_seq[seq] = existing
+            _save_manifest()
             _emit_frame(existing)
+            if chain_guard_review:
+                emit_frame_ready(project_dir, seq, on_progress, generated_count, total_to_generate,
+                                 skipped=True,
+                                 prompt_block=prompt_block if config.get('_auto_generate_videos') else None)
             done_seqs.add(seq)
             continue
 
@@ -2354,6 +2501,7 @@ def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=
 
         try:
             for offset, s in enumerate(chunk):
+                prompt_before_frame = prompt_block
                 if s in checkpointed_seqs:
                     done_seqs.add(s)
                     continue
@@ -2368,7 +2516,7 @@ def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=
                 render_src = local_paths[offset]
                 _, fx_src_path, fx_uuid = _fx_store_frame(render_src, frames_dir, s)
                 _align_frame_color(s)
-                quality_gate, vlm_reason = 'pending_manual_review', None
+                quality_gate, vlm_reason = 'retired', None
 
                 # P1 换族锚点惯性检测（本地像素 MAD，不是视觉判定）：FX 链路只留痕
                 # 不自动重渲，本批后续帧已链在该帧上。
@@ -2598,6 +2746,11 @@ def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=
 
                 if manifest.get('halted_at_sequence'):
                     break
+                refresh_committed_frame_records(project_dir, manifest, manifest_frames_by_seq)
+                if chain_guard_review:
+                    emit_frame_ready(project_dir, s, on_progress, generated_count, total_to_generate,
+                                     prompt_block=prompt_block if config.get('_auto_generate_videos') else None,
+                                     previous_prompt_block=prompt_before_frame)
         finally:
             shutil.rmtree(temp_out, ignore_errors=True)
 
@@ -2817,8 +2970,8 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
     manifest.pop('halted_at_beat', None)
     manifest.pop('halted_at_sequence', None)
 
+    total_to_generate = len(target_sequences) if target_sequences is not None else len(prompts)
     if on_progress:
-        total_to_generate = len(target_sequences) if target_sequences is not None else len(prompts)
         on_progress('start', {'total': total_to_generate})
 
     manifest_frames_by_seq = {
@@ -2829,7 +2982,9 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
 
     previous_path = None
     generated_count = 0
+    frames_regenerated = False
     for item in prompts:
+        prompt_before_frame = prompt_block
         # 用提示词块里的真实槽位号，绝不能用枚举位置：单帧/子集渲染时
         # prompt_block 可能只含目标槽位，枚举位置永远从 1 开始，
         # 会导致 `seq in target_sequences` 永假 → 一帧不渲染，
@@ -2852,6 +3007,8 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
         # we can skip the external API call and use the existing file immediately.
         already_exists = os.path.exists(target_path) and os.path.getsize(target_path) > 0
         skip_api_call = already_exists and (target_sequences is None)
+        if not skip_api_call:
+            frames_regenerated = True
 
         # 确保重渲前已有历史帧安全归档入候选池，不被新生成覆盖
         if not skip_api_call and already_exists:
@@ -3016,7 +3173,7 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
             # Apply LAB color matching to prevent pink drift.  A new camera family owns a
             # separate colour baseline; forcing every interior frame toward IMAGE 1's outdoor
             # palette is itself a continuity defect.
-            if seq > 1 and os.path.exists(target_path):
+            if not reviews_disabled(config) and seq > 1 and os.path.exists(target_path):
                 first_frame_path = os.path.join(frames_dir, 'img_001.webp')
                 color_reference = (None if is_continuity_transition else
                                    _continuity_color_reference(
@@ -3117,7 +3274,7 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
 
             continuity_failed = continuity_check.get('status') == 'failed'
             current_quality_gate = (
-                'frame_continuity_failed' if continuity_failed else 'pending_manual_review')
+                'frame_continuity_failed' if continuity_failed else 'retired')
             if continuity_check.get('status') == 'warned':
                 _warning = continuity_check.get('reason') or '本地连续性检查留痕'
                 vlm_qa_reason = f'CONTINUITY WARN: {_warning}'
@@ -3129,7 +3286,7 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
             model = existing_frame.get('model', '') if existing_frame else _image_generation_model(config)
             retries = existing_frame.get('retry_count', 0) if existing_frame else 0
             
-            current_quality_gate = existing_frame.get('quality_gate', 'pending_manual_review') if existing_frame else 'pending_manual_review'
+            current_quality_gate = existing_frame.get('quality_gate', 'retired') if existing_frame else 'retired'
             vlm_qa_reason = existing_frame.get('vlm_qa_reason') if existing_frame else None
             # 断点续传复用盘上这一帧时，降档留痕要跟着一起沿用——这一帧还是上一轮那张
             # 降档图，重放一次 manifest 不能把它洗成"正常帧"
@@ -3312,8 +3469,8 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
         # 逐帧落盘（与 FX 路径一致）：旧行为只在整轮结束时写一次 manifest，
         # 中途崩溃会丢掉所有逐帧质检门禁记录，劣化帧拦截随之失效
         manifest['frames'] = [manifest_frames_by_seq[s] for s in sorted(manifest_frames_by_seq.keys())]
-        update_manifest_stale_status(manifest, project_dir)
-        write_manifest(project_dir, manifest)
+        update_manifest_stale_status(manifest, project_dir, frames_changed=frames_regenerated)
+        write_frame_manifest(project_dir, manifest, preserve_video_state=bool(config.get('_auto_generate_videos')))
 
         if on_progress:
             # guard_pending：这一帧落盘后还有一道链上守卫要审（见下面的守卫分支）。
@@ -3504,11 +3661,19 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
                 except Exception as guard_err:
                     log('WARN', 'CHAIN_GUARD', f"拍 {beat} 链上守卫执行异常: {guard_err}")
 
+        refresh_committed_frame_records(project_dir, manifest, manifest_frames_by_seq)
+        if chain_guard_review:
+            emit_frame_ready(project_dir, seq, on_progress, generated_count, total_to_generate,
+                             skipped=skip_api_call,
+                             prompt_block=prompt_block if config.get('_auto_generate_videos') else None,
+                             previous_prompt_block=prompt_before_frame)
+
     manifest['frames'] = [manifest_frames_by_seq[s] for s in sorted(manifest_frames_by_seq.keys())]
     update_manifest_stale_status(manifest, project_dir,
-                                 regenerated_sequences=target_sequences, finalize=True)
+                                 regenerated_sequences=target_sequences, finalize=True,
+                                 frames_changed=frames_regenerated)
     if manifest.get('halted_at_sequence'):
-        write_manifest(project_dir, manifest)
+        write_frame_manifest(project_dir, manifest, preserve_video_state=bool(config.get('_auto_generate_videos')))
         manifest['manifest'] = '/' + os.path.relpath(manifest_path, os.path.dirname(os.path.abspath(__file__))).replace('\\', '/')
         manifest['project_dir'] = os.path.abspath(project_dir)
         return manifest
@@ -3550,27 +3715,12 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
                     str(collage_path),
                     os.path.dirname(os.path.abspath(__file__))).replace('\\', '/')
 
-            flagged = []
-            for s in sorted(manifest_frames_by_seq.keys()):
-                check = manifest_frames_by_seq[s].get('continuity_check') or {}
-                status = check.get('status')
-                if status in ('warned', 'failed'):
-                    flagged.append({'sequence': s, 'status': status, 'reason': check.get('reason')})
-            qa_report_path = os.path.join(project_dir, 'continuity_qa_report.json')
-            with open(qa_report_path, 'w', encoding='utf-8') as f:
-                json.dump({
-                    'version': 'frame-continuity-qa-v1',
-                    'total_frames': len(manifest_frames_by_seq),
-                    'flagged_frames': flagged,
-                }, f, ensure_ascii=False, indent=2)
-            manifest['continuity_qa_report_url'] = '/' + os.path.relpath(
-                qa_report_path, os.path.dirname(os.path.abspath(__file__))).replace('\\', '/')
         except Exception as collage_err:
             if sys.stdout:
-                print(f"[COLLAGE QA] 拼图/质检报告生成失败（不影响渲染结果）：{collage_err}")
+                print(f"[COLLAGE QA] 拼图生成失败（不影响渲染结果）：{collage_err}")
 
     manifest_path = os.path.join(project_dir, 'manifest.json')
-    write_manifest(project_dir, manifest)
+    write_frame_manifest(project_dir, manifest, preserve_video_state=bool(config.get('_auto_generate_videos')))
     manifest['manifest'] = '/' + os.path.relpath(manifest_path, os.path.dirname(os.path.abspath(__file__))).replace('\\', '/')
     manifest['project_dir'] = os.path.abspath(project_dir)
     return manifest

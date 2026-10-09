@@ -63,3 +63,35 @@ p = progressFromEvents(partialVideos, 'videos', 'completed');
 assert.strictEqual(p.label, '本次生成已结束 · 1 段待重试');
 p = progressFromEvents(partialVideos.concat([['video_done', { index: 1, total: 2 }]]), 'videos', 'completed');
 assert.strictEqual(p.label, '视频序列生成完成');
+
+// 已处理失败不等于交付；恢复查询和等待仍属于同一个运行任务。
+const allSlots = Array.from({ length: 27 }, (_, i) => i + 1);
+let recovery = next('start', { total: 27, slots: allSlots }, 'videos');
+for (const index of allSlots) recovery = next(index <= 24 ? 'video_done' : 'video_error',
+  { index, current: index, total: 27 }, 'videos', recovery.state);
+assert.strictEqual(recovery.current, 27, '旧进度会将失败计入已处理数');
+const phases = ['querying', 'waiting', 'retrying'];
+for (const phase of phases) {
+  recovery = next('video_recovery', { phase, slots: [25, 26, 27],
+    completed_slots: allSlots.slice(0, 24), retry_round: 2, next_retry_at: 2000000000,
+    message: '自动恢复未完成片段' }, 'videos', recovery.state);
+  assert.strictEqual(recovery.current, 24);
+  assert.strictEqual(recovery.status, 'recovering');
+  assert.strictEqual(recovery.state.recoveryPhase, phase);
+  assert.strictEqual(recovery.state.retryRound, 2);
+  assert.strictEqual(recovery.state.nextRetryAt, 2000000000);
+  assert.strictEqual(recovery.state.slotStatus['25'], 'recovering');
+  assert.strictEqual(recovery.state.slotStatus['1'], 'done');
+  assert(recovery.percent < 85);
+  assert.match(recovery.label, /24\/27/);
+  assert(!recovery.label.includes('结束'));
+}
+recovery = next('video_start', { index: 25, current: 27, total: 27 }, 'videos', recovery.state);
+assert.strictEqual(recovery.current, 24, '补跑提交序号不增加已交付数');
+recovery = next('video_done', { index: 25, current: 27, total: 27 }, 'videos', recovery.state);
+assert.strictEqual(recovery.current, 25);
+const recovered = next('video_recovery', { phase: 'waiting', slots: [26, 27], completed_slots: [25] }, 'videos', recovery.state);
+assert.strictEqual(recovered.current, 25, '渐进批次的恢复不能抹掉此前已完成槽位');
+const cancelledRecovery = next('error', { message: '用户取消' }, 'videos', recovered.state);
+assert.strictEqual(cancelledRecovery.state.slotStatus['26'], 'stopped');
+assert.strictEqual(cancelledRecovery.state.slotStatus['25'], 'done');

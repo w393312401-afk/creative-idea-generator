@@ -538,7 +538,7 @@ class TestComposeRemainingBeatsResume(unittest.TestCase):
         number actually generated (from either path) in the order _chat was asked for
         them, same contract the pre-batching tests already relied on. Always returns
         well-formed content — tests that need a mid-run failure inject it via
-        validate_beat_prompts (see _validation_crashes_on), since batching means there's
+        checkpoint commits (see _checkpoint_crashes_on), since batching means there's
         no longer a separate `_chat` "turn" per beat to fail in isolation."""
         def fake_chat(config, system, user, temperature=0.85, max_tokens=16384, timeout=240, on_chunk=None, model=None):
             batch_beats = self._beat_numbers_from_batch_user(user)
@@ -591,32 +591,26 @@ class TestComposeRemainingBeatsResume(unittest.TestCase):
         self.assertIsNone(pp.load_compose_checkpoint(self.fingerprint))
 
     @staticmethod
-    def _validation_crashes_on(beat_num, flag):
-        """validate_beat_prompts side_effect: raises a code-level error for `beat_num`
-        while `flag['value']` is True (simulates a real bug hit while processing that
-        beat's batched result), passes everyone else. Beats are now generated together
-        in one batched _chat call, so a crash can no longer be injected by making _chat
-        itself raise only for one beat's turn (there IS no separate turn) — the
-        equivalent, realistic failure point is a code bug in the per-beat processing
-        that runs after the batch response comes back, which is exactly what the merged
-        parse+commit loop's own NameError-class handling exists to catch."""
-        def side_effect(i, *args, **kwargs):
-            if i == beat_num and flag['value']:
-                raise NameError(f"simulated code bug hitting beat {beat_num}")
-            return []
+    def _checkpoint_crashes_on(beat_num, flag):
+        """Fail the per-beat checkpoint commit without invoking retired quality rules."""
+        save = pp.save_compose_checkpoint
+        def side_effect(fingerprint, checkpoint):
+            if beat_num in checkpoint.get('pass_beats_done', []) and flag['value']:
+                raise RuntimeError(f"simulated checkpoint commit failure at beat {beat_num}")
+            return save(fingerprint, checkpoint)
         return side_effect
 
     def test_crash_mid_run_checkpoints_completed_beats_only(self):
         crash_flag = {'value': True}
         state = self._make_state(total_beats=4)
         calls = []
-        with patch.object(pp, 'validate_beat_prompts', side_effect=self._validation_crashes_on(3, crash_flag)), \
+        with patch.object(pp, 'save_compose_checkpoint', side_effect=self._checkpoint_crashes_on(3, crash_flag)), \
              patch.object(pp, '_chat', side_effect=self._fake_chat_factory(calls)):
             with self.assertRaises(RuntimeError):
                 pp.compose_remaining_beats({'composeBatchSize': 3}, state)
 
         # 窗口大小显式钉成 3（默认值是 5，会把 4 拍装进同一窗，测不到跨窗那一刀）：
-        # 第一窗覆盖 1-3 拍，崩在校验第 3 拍时，第 4 拍所在的第二窗还没发出去。
+        # 第一窗覆盖 1-3 拍，崩在提交第 3 拍存档时，第 4 拍所在的第二窗还没发出去。
         self.assertEqual(sorted(set(calls)), [1, 2, 3])
         checkpoint = pp.load_compose_checkpoint(self.fingerprint)
         self.assertIsNotNone(checkpoint, "a crash mid-loop must still leave a checkpoint behind")
@@ -628,7 +622,7 @@ class TestComposeRemainingBeatsResume(unittest.TestCase):
         # 复现步骤 1:第一次跑,处理 beat 3 时崩溃(模拟真实代码 bug),beat 1/2 已经成功。
         crash_flag = {'value': True}
         state = self._make_state(total_beats=4)
-        with patch.object(pp, 'validate_beat_prompts', side_effect=self._validation_crashes_on(3, crash_flag)), \
+        with patch.object(pp, 'save_compose_checkpoint', side_effect=self._checkpoint_crashes_on(3, crash_flag)), \
              patch.object(pp, '_chat', side_effect=self._fake_chat_factory([])):
             with self.assertRaises(RuntimeError):
                 pp.compose_remaining_beats({}, state)
@@ -640,7 +634,7 @@ class TestComposeRemainingBeatsResume(unittest.TestCase):
         # 再次调用 compose_remaining_beats——这次 bug 已修复(crash_flag 关闭)。
         crash_flag['value'] = False
         calls = []
-        with patch.object(pp, 'validate_beat_prompts', side_effect=self._validation_crashes_on(3, crash_flag)), \
+        with patch.object(pp, 'save_compose_checkpoint', side_effect=self._checkpoint_crashes_on(3, crash_flag)), \
              patch.object(pp, '_chat', side_effect=self._fake_chat_factory(calls)):
             output = pp.compose_remaining_beats({}, state)
 

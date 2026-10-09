@@ -7,19 +7,33 @@
         failed: '精剪失败', cancelled: '已取消', interrupted: '精剪已中断' };
     const STAGES = { queued: '等待开始', preparing: '准备原片', reviewing_source: '审阅原片',
         rendering: '导出精剪视频', reviewing_output: '复核剪切边界', verifying: '校验成片和音轨',
-        cancelling: '正在停止精剪' };
+        burning_cta: '烧录片尾引导', cancelling: '正在停止精剪' };
     const DEFAULT_MODEL = 'gpt-6.1-sol', LEGACY_DEFAULT_MODEL = 'gpt-6-sol', DEFAULT_EFFORT = 'high';
+    const DEFAULT_ENGINE = 'codex';
+    const ENGINE_LABELS = { codex: 'Codex', claude: 'Claude Code' };
     const MODEL_LABELS = { 'gpt-6.1-sol': 'GPT-6.1 Sol', 'gpt-6-astra': 'GPT-6 Astra',
         'gpt-6-sol': 'GPT-6 Sol', 'gpt-6-luna': 'GPT-6 Luna' };
+    const CLAUDE_MODEL_LABELS = { 'claude-opus-5-5': 'Claude Opus 5.5', 'claude-sonnet-5-5': 'Claude Sonnet 5.5',
+        'claude-fable-5-1': 'Claude Fable 5.1', 'claude-haiku-5-5': 'Claude Haiku 5.5' };
+    const MODEL_LABELS_BY_ENGINE = { codex: MODEL_LABELS, claude: CLAUDE_MODEL_LABELS };
+    const DEFAULT_MODELS = { codex: DEFAULT_MODEL, claude: 'claude-opus-5-5' };
     const EFFORT_LABELS = { low: '低', medium: '中', high: '高', xhigh: '较高', max: '很高', ultra: '最高' };
     const effortValues = Object.keys(EFFORT_LABELS);
-    const normalizeModel = model => Object.prototype.hasOwnProperty.call(MODEL_LABELS, model) ? model : DEFAULT_MODEL;
-    const normalizeEffort = (effort, model) => {
-        if (model === 'gpt-6-luna' && effort === 'ultra') return 'max';
+    const has = (object, key) => Object.prototype.hasOwnProperty.call(object, key);
+    const normalizeEngine = engine => has(ENGINE_LABELS, engine) ? engine : DEFAULT_ENGINE;
+    const normalizeModel = (model, engine = DEFAULT_ENGINE) =>
+        has(MODEL_LABELS_BY_ENGINE[normalizeEngine(engine)], model) ? model : DEFAULT_MODELS[normalizeEngine(engine)];
+    // Claude Code 的 --effort 只有 low 到 max 五档；Codex 的 ultra 在 Luna 上不可用。
+    const effortsFor = (engine, model) => normalizeEngine(engine) === 'claude'
+        ? effortValues.filter(value => value !== 'ultra')
+        : effortValues.filter(value => model !== 'gpt-6-luna' || value !== 'ultra');
+    const normalizeEffort = (effort, model, engine = DEFAULT_ENGINE) => {
+        if (effort === 'ultra' && (normalizeEngine(engine) === 'claude' || model === 'gpt-6-luna')) return 'max';
         return effortValues.includes(effort) ? effort : DEFAULT_EFFORT;
     };
     const jobSettings = job => [
-        job?.model ? MODEL_LABELS[job.model] || String(job.model) : '',
+        job?.engine === 'claude' ? ENGINE_LABELS.claude : '',
+        job?.model ? MODEL_LABELS_BY_ENGINE[normalizeEngine(job.engine)][job.model] || String(job.model) : '',
         job?.reasoning_effort ? `思考强度：${EFFORT_LABELS[job.reasoning_effort] || String(job.reasoning_effort)}` : '',
     ].filter(Boolean).join(' · ');
     const states = new Map();
@@ -69,13 +83,18 @@
         try {
             const data = JSON.parse(sessionStorage.getItem(requestKey(state)) || 'null');
             if (data && sourceKey(data.source) === state.key && data.request_id && ['trim', 'trim_speed'].includes(data.mode)) {
-                const savedModel = data.model == null ? LEGACY_DEFAULT_MODEL : data.model;
+                // Requests saved before the engine option were all Codex requests.
+                const savedEngine = normalizeEngine(data.engine);
+                const savedModel = data.model == null
+                    ? (savedEngine === DEFAULT_ENGINE ? LEGACY_DEFAULT_MODEL : DEFAULT_MODELS[savedEngine]) : data.model;
                 const savedEffort = data.reasoning_effort == null ? DEFAULT_EFFORT : data.reasoning_effort;
-                state.model = normalizeModel(savedModel);
-                state.effort = normalizeEffort(savedEffort, state.model);
+                state.engine = savedEngine;
+                state.model = normalizeModel(savedModel, savedEngine);
+                state.effort = normalizeEffort(savedEffort, state.model, savedEngine);
                 // Keep supported requests identical for a safe retry. Removed models
                 // become a fresh draft instead of reusing an old request identity.
                 state.pending = savedModel === state.model && savedEffort === state.effort
+                    && (data.engine == null || data.engine === savedEngine)
                     ? { ...data, model: state.model, reasoning_effort: state.effort } : null;
                 state.mode = data.mode;
                 state.notes = String(data.notes || '');
@@ -140,8 +159,9 @@
                 const recent = selectedJob(state);
                 if (recent && ['trim', 'trim_speed'].includes(recent.mode)) state.mode = recent.mode;
                 if (recent?.notes) state.notes = String(recent.notes);
-                if (recent?.model) state.model = normalizeModel(recent.model);
-                if (recent?.reasoning_effort) state.effort = normalizeEffort(recent.reasoning_effort, state.model);
+                if (recent?.engine) state.engine = normalizeEngine(recent.engine);
+                if (recent?.model) state.model = normalizeModel(recent.model, state.engine);
+                if (recent?.reasoning_effort) state.effort = normalizeEffort(recent.reasoning_effort, state.model, state.engine);
             }
             state.error = '';
             state.loaded = true;
@@ -159,41 +179,61 @@
         if (force) capabilities = null;
         if (!capabilities && !capabilityRequest) {
             capabilityRequest = request('/capabilities')
-                .then(data => { capabilities = { available: !!data.available, message: data.message || '' }; })
+                .then(data => { capabilities = { available: !!data.available, message: data.message || '', engines: data.engines || null }; })
                 .catch(error => { capabilities = { available: false, message: error.message }; })
                 .finally(() => { capabilityRequest = null; if (current) render(); });
         }
         return capabilityRequest;
     }
+    // 当前引擎能不能跑。旧服务端只报告 Codex；它不认识 Claude 引擎时明确说出来，而不是静默当作 Codex。
+    const engineCapability = engine => {
+        if (!capabilities) return null;
+        const row = capabilities.engines && capabilities.engines[engine];
+        if (row) return { available: !!row.available, message: row.message || '' };
+        return engine === DEFAULT_ENGINE ? { available: capabilities.available, message: capabilities.message }
+            : { available: false, message: '服务端还不支持 Claude Code 精剪引擎，请重启服务后再试。' };
+    };
     function render() {
         const state = current;
         if (!state || !el('root')) return;
         const job = selectedJob(state), active = activeJob(state);
         const busy = state.submitting || !!active;
         const locked = busy || !!state.pending;
+        const capability = engineCapability(state.engine), engineLabel = ENGINE_LABELS[state.engine];
+        el('engine').disabled = locked;
         el('mode').disabled = locked;
         el('model').disabled = locked;
         el('effort').disabled = locked;
         el('notes').disabled = locked;
+        if (el('engine').value !== state.engine) el('engine').value = state.engine;
         if (el('mode').value !== state.mode) el('mode').value = state.mode;
-        if (el('model').value !== state.model) el('model').value = state.model;
+        const modelSelect = el('model');
+        if (modelSelect.dataset.engine !== state.engine) {
+            modelSelect.innerHTML = Object.entries(MODEL_LABELS_BY_ENGINE[state.engine])
+                .map(([value, label]) => `<option value="${value}">${label}</option>`).join('');
+            modelSelect.dataset.engine = state.engine;
+        }
+        if (modelSelect.value !== state.model) modelSelect.value = state.model;
         const effortSelect = el('effort');
-        if (effortSelect.dataset.model !== state.model) {
-            effortSelect.innerHTML = effortValues.filter(value => state.model !== 'gpt-6-luna' || value !== 'ultra')
+        if (effortSelect.dataset.model !== state.model || effortSelect.dataset.engine !== state.engine) {
+            effortSelect.innerHTML = effortsFor(state.engine, state.model)
                 .map(value => `<option value="${value}">${EFFORT_LABELS[value]} · ${value}</option>`).join('');
             effortSelect.dataset.model = state.model;
+            effortSelect.dataset.engine = state.engine;
         }
         if (effortSelect.value !== state.effort) effortSelect.value = state.effort;
+        el('engine-hint').hidden = state.engine !== 'claude';
         if (el('notes').value !== state.notes) el('notes').value = state.notes;
         el('mode-hint').textContent = state.mode === 'trim_speed'
             ? '施工段在当前成片基础上提速至 1.25 倍，成品展示保持当前速度。'
             : '只精剪停顿、重复和穿帮，保持当前成片速度。';
-        el('capability').textContent = !capabilities ? '正在检查后台 Codex…'
-            : capabilities.available ? '' : capabilities.message || '后台 Codex 暂不可用，请在运行项目的电脑上检查登录后重试。';
+        el('capability').textContent = !capability ? `正在检查后台 ${engineLabel}…`
+            : capability.available ? '' : capability.message || `后台 ${engineLabel} 暂不可用，请在运行项目的电脑上检查登录后重试。`;
         if (el('capability').textContent === state.error) el('capability').textContent = '';
-        el('check').hidden = !capabilities || capabilities.available;
+        el('check').hidden = !capability || capability.available;
+        el('check').textContent = `重新检查 ${engineLabel}`;
         const start = el('start');
-        start.disabled = !capabilities?.available || busy || !state.loaded;
+        start.disabled = !capability?.available || busy || !state.loaded;
         start.textContent = state.submitting ? '正在提交…' : active ? '精剪进行中' : state.pending ? '重试连接'
             : job && ['failed', 'cancelled', 'interrupted'].includes(job.status) ? '重试精剪'
             : job?.status === 'completed' ? '再剪一个版本' : '开始精剪';
@@ -208,11 +248,11 @@
             : active ? `精剪中 · ${STAGES[active.stage] || LABELS[active.status]}` : '';
         el('progress-elapsed').textContent = active ? elapsedLabel(active) : '';
         el('progress-message').textContent = active ? active.message || LABELS[active.status]
-            : state.submitting ? '正在交给后台 Codex…' : '';
+            : state.submitting ? `正在交给后台 ${engineLabel}…` : '';
         const status = el('status');
         status.dataset.state = state.error ? 'failed' : job?.status || '';
         status.textContent = state.error || (state.pending && !busy ? '上次提交尚未确认。重试连接会找回同一次精剪，不会重复提交。'
-            : state.submitting ? '正在交给后台 Codex…'
+            : state.submitting ? `正在交给后台 ${engineLabel}…`
             : active ? active.message || LABELS[active.status]
             : job ? job.error || job.message || LABELS[job.status] || ''
             : state.loading ? '正在读取精剪记录…' : '选择方式后开始，剪辑结果会另存为新文件。');
@@ -224,7 +264,7 @@
         const recent = state.jobs.slice(0, 8);
         if (job && !recent.some(item => item.id === job.id)) recent.push(job);
         const historySignature = recent.map(item => JSON.stringify([
-            item.id, item.status, item.output_missing, item.mode, item.model, item.reasoning_effort, item.created_at,
+            item.id, item.status, item.output_missing, item.mode, item.engine, item.model, item.reasoning_effort, item.created_at,
         ])).join('|');
         if (history.dataset.signature !== historySignature) {
             history.innerHTML = recent.map(item => {
@@ -248,15 +288,28 @@
         const player = el('player');
         if (url) {
             // Repeated polls must not restart a preview the user is watching.
-            if (player.dataset.source !== url) { player.src = url; player.dataset.source = url; }
+            if (player.dataset.source !== url) {
+                if (typeof MediaPreview !== 'undefined') MediaPreview.setSource(player, url);
+                else player.src = url;
+                player.dataset.source = url;
+            }
             const info = [];
             if (Number(output.duration_seconds) > 0) info.push(`${Number(output.duration_seconds).toFixed(1)} 秒`);
             if (Number(output.size_bytes) > 0) info.push(`${(Number(output.size_bytes) / 1048576).toFixed(1)} MB`);
+            if (output.cta) info.push(`已烧录片尾引导（最后 ${Number(output.cta.seconds) || 5} 秒）`);
             el('output-info').textContent = info.join(' · ');
             el('download').href = url;
             el('download').download = url.split('/').pop();
+            // 烧录了引导动画的成片同时保留无引导版本
+            const cleanUrl = output.clean && mediaUrl(output.clean.url || output.clean.file);
+            el('download-clean').hidden = !cleanUrl;
+            if (cleanUrl) {
+                el('download-clean').href = cleanUrl;
+                el('download-clean').download = cleanUrl.split('/').pop();
+            }
             el('reveal').dataset.path = url;
         } else if (player.dataset.source) {
+            if (typeof MediaPreview !== 'undefined') MediaPreview.setSource(player, '');
             player.pause(); player.removeAttribute('src'); player.load(); delete player.dataset.source;
         }
         const logs = Array.isArray(job?.logs) ? job.logs.slice(-50) : [];
@@ -269,12 +322,14 @@
     }
     async function start() {
         const state = current, version = epoch;
-        if (!state || state.submitting || activeJob(state) || !capabilities?.available || !state.loaded) return;
+        if (!state || state.submitting || activeJob(state) || !engineCapability(state.engine)?.available || !state.loaded) return;
         if (!state.pending) {
             const requestId = typeof crypto !== 'undefined' && crypto.randomUUID
                 ? crypto.randomUUID() : `edit-${Date.now()}-${Math.random().toString(36).slice(2)}`;
             state.pending = { source: state.source, mode: state.mode, notes: state.notes.trim(),
                 model: state.model, reasoning_effort: state.effort, request_id: requestId };
+            // Codex requests keep the exact shape older servers and saved retries know.
+            if (state.engine !== DEFAULT_ENGINE) state.pending.engine = state.engine;
             savePending(state);
         }
         state.submitting = true;
@@ -325,17 +380,26 @@
         if (bound) return;
         bound = true;
         el('mode').addEventListener('change', event => { if (current) { current.mode = event.target.value; current.draftTouched = true; render(); } });
+        el('engine').addEventListener('change', event => {
+            if (current) {
+                current.engine = normalizeEngine(event.target.value);
+                current.model = normalizeModel(current.model, current.engine);
+                current.effort = normalizeEffort(current.effort, current.model, current.engine);
+                current.draftTouched = true;
+                render();
+            }
+        });
         el('model').addEventListener('change', event => {
             if (current) {
-                current.model = normalizeModel(event.target.value);
-                current.effort = normalizeEffort(current.effort, current.model);
+                current.model = normalizeModel(event.target.value, current.engine);
+                current.effort = normalizeEffort(current.effort, current.model, current.engine);
                 current.draftTouched = true;
                 render();
             }
         });
         el('effort').addEventListener('change', event => {
             if (current) {
-                current.effort = normalizeEffort(event.target.value, current.model);
+                current.effort = normalizeEffort(event.target.value, current.model, current.engine);
                 current.draftTouched = true;
                 render();
             }
@@ -363,6 +427,7 @@
         if (!source) {
             current = null; ++epoch; clearTimeout(timer); timer = null;
             const player = el('player');
+            if (typeof MediaPreview !== 'undefined') MediaPreview.setSource(player, '');
             if (player.dataset.source) { player.pause(); player.removeAttribute('src'); player.load(); delete player.dataset.source; }
             return;
         }
@@ -378,7 +443,7 @@
         }
         ++epoch; clearTimeout(timer); timer = null;
         if (!states.has(key)) {
-            const state = { key, source, title: idea?.title || '', mode: 'trim', model: DEFAULT_MODEL,
+            const state = { key, source, title: idea?.title || '', mode: 'trim', engine: DEFAULT_ENGINE, model: DEFAULT_MODEL,
                 effort: DEFAULT_EFFORT, notes: '', jobs: [],
                 selectedId: null, loaded: false, loading: false, loadSerial: 0, submitting: false,
                 cancelling: false, pending: null, error: '' };

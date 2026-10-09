@@ -9,7 +9,7 @@
  *  - 单行 JSON 解析失败只跳过该行，绝不杀死整个流；
  *  - 服务端 'error' 事件才是任务失败；连接断开本身不是；
  *  - 流断开且任务仍在运行时，按指数退避自动重连（成功连上即重置计数）；
- *  - 流结束但没读到终态事件时，用 /api/compose-status 仲裁真实状态；
+ *  - 连接期间也独立查询 /api/compose-status，心跳或卡住的 read 不能掩盖真实终态；
  *  - 重连次数耗尽 ≠ 任务失败：这时后端的生成线程完全不知道客户端已经放弃——
  *    它是独立线程，会继续跑到底。返回一个专门的
  *    'disconnected' 状态，让调用方既不误报"生成失败"，也不清掉任务登记——
@@ -20,7 +20,7 @@
  *          AbortError（用户取消）原样抛出，由调用方处理。
  */
 async function watchTaskUntilTerminal(taskId, opts = {}) {
-    const { onEvent, signal, label = 'task', maxReconnects = 8 } = opts;
+    const { onEvent, signal, label = 'task', maxReconnects = 8, statusPollIntervalMs = 5000 } = opts;
     let reconnects = 0;
     let resultData = null;
     let lastEventId = null;
@@ -36,127 +36,212 @@ async function watchTaskUntilTerminal(taskId, opts = {}) {
         }
     };
 
+    const connection = new AbortController();
+    let statusTimer = null;
+    let reconnectTimer = null;
+    let streamReader = null;
+    let finished = false;
+    let statusTerminal = false;
+    let resolveStatus, rejectStatus;
+    const terminalStatus = new Promise((resolve, reject) => { resolveStatus = resolve; rejectStatus = reject; });
+    const cancelReader = reader => {
+        if (!reader || typeof reader.cancel !== 'function') return;
+        try { Promise.resolve(reader.cancel()).catch(() => {}); } catch (_) { /* already closed */ }
+    };
+    const cancelledError = () => Object.assign(new Error('已取消'), { name: 'AbortError' });
+    const onAbort = () => { connection.abort(); rejectStatus(cancelledError()); };
+    if (signal && signal.aborted) throw cancelledError();
+    if (signal) signal.addEventListener('abort', onAbort, { once: true });
+
     const checkStatus = async () => {
-        const res = await fetch(`/api/compose-status?task_id=${encodeURIComponent(taskId)}`, { signal });
+        const res = await fetch(`/api/compose-status?task_id=${encodeURIComponent(taskId)}`, {
+            signal: connection.signal, cache: 'no-store'
+        });
         if (!res.ok) return null;
         return res.json();
     };
-
-    while (true) {
-        if (signal && signal.aborted) {
-            throw Object.assign(new Error('已取消'), { name: 'AbortError' });
-        }
-
-        let sawTerminal = null;
+    const statusOutcome = st => {
+        if (!st) return null;
+        if (st.status === 'completed') return { status: 'completed', result: st.result };
+        if (st.status === 'cancelled') return { status: 'cancelled', result: st.result };
+        if (st.status === 'failed') return { status: 'failed', error: st.error || '任务失败', result: st.result };
+        if (st.status === 'not_found') return { status: 'failed', error: '任务不存在（服务可能已重启）' };
+        return null;
+    };
+    const receiveStatusOutcome = outcome => {
+        if (outcome.status === 'completed') emit('result', outcome.result);
+        else if (outcome.status === 'failed') emit('error', { message: outcome.error });
+        return outcome;
+    };
+    const pollStatus = async () => {
         try {
-            const connectedAt = Date.now();
-            const response = await fetch(`/api/compose-stream?task_id=${encodeURIComponent(taskId)}`, {
-                signal, ...(lastEventId !== null ? { headers: { 'Last-Event-ID': String(lastEventId) } } : {})
-            });
-            if (response.status === 404) {
-                // 任务不在内存中（服务可能重启过）——用状态接口做最终仲裁
-                let st = null;
-                try { st = await checkStatus(); } catch (e) { if (e.name === 'AbortError') throw e; }
-                if (st && st.status === 'completed') return { status: 'completed', result: st.result };
-                if (st && st.status === 'cancelled') return { status: 'cancelled' };
-                return { status: 'failed', error: (st && st.error) || '任务不存在（服务可能已重启）' };
+            const st = await checkStatus();
+            if (finished) return;
+            const outcome = statusOutcome(st);
+            if (outcome) {
+                statusTerminal = true;
+                const handoff = st.auto_video || (st.result && st.result.auto_video);
+                if (handoff) emit('auto_video_updated', handoff);
+                resolveStatus({ outcome });
+                return;
             }
-            if (!response.ok) {
-                const errText = await response.text().catch(() => '');
-                throw new Error(`HTTP ${response.status}: ${errText}`);
+        } catch (error) {
+            // 离线/认证失败/查询错误不能把仍在后台运行的任务宣判失败。
+            if (signal && signal.aborted) rejectStatus(cancelledError());
+        }
+        if (!finished && !statusTerminal && Number(statusPollIntervalMs) > 0) {
+            statusTimer = setTimeout(pollStatus, Number(statusPollIntervalMs));
+        }
+    };
+    // 恢复缓存登记时立即核对；后续核对与 SSE read 独立，不必等待连接关闭。
+    pollStatus();
+
+    const consumeStream = async () => {
+        while (true) {
+            if (signal && signal.aborted) {
+                throw Object.assign(new Error('已取消'), { name: 'AbortError' });
             }
-            const reader = response.body.getReader();
-            const decoder = new TextDecoder('utf-8');
-            let buffer = '';
-            let streamTerminal = false;
-            let eventId = null;
-            while (true) {
-                const { done, value } = await reader.read();
-                if (done) break;
-                buffer += decoder.decode(value, { stream: true });
-                const lines = buffer.split('\n');
-                buffer = lines.pop();
-                for (const line of lines) {
-                    const trimmed = line.trim();
-                    if (trimmed.startsWith('id:')) {
-                        const parsedId = Number(trimmed.slice(3).trim());
-                        eventId = Number.isSafeInteger(parsedId) && parsedId >= 0 ? parsedId : null;
-                        continue;
+
+            let sawTerminal = null;
+            try {
+                const connectedAt = Date.now();
+                const connectionResult = await Promise.race([
+                    fetch(`/api/compose-stream?task_id=${encodeURIComponent(taskId)}`, {
+                        signal: connection.signal, cache: 'no-store', ...(lastEventId !== null ? { headers: { 'Last-Event-ID': String(lastEventId) } } : {})
+                    }).then(response => ({ response })),
+                    terminalStatus
+                ]);
+                if (connectionResult.outcome) return receiveStatusOutcome(connectionResult.outcome);
+                const response = connectionResult.response;
+                if (response.status === 404) {
+                    // 任务不在内存中（服务可能重启过）——用状态接口做最终仲裁
+                    let st = null;
+                    try { st = await checkStatus(); } catch (e) { if (e.name === 'AbortError') throw e; }
+                    if (st && st.status === 'completed') return { status: 'completed', result: st.result };
+                    if (st && st.status === 'cancelled') return { status: 'cancelled' };
+                    if (st && ['failed', 'not_found'].includes(st.status)) {
+                        return { status: 'failed', error: st.error || '任务不存在（服务可能已重启）' };
                     }
-                    if (!trimmed || !trimmed.startsWith('data: ')) continue;
-                    let parsed;
-                    try {
-                        parsed = JSON.parse(trimmed.substring(6));
-                    } catch (parseErr) {
-                        console.warn(`[watchTask:${label}] 跳过无法解析的事件行`, parseErr);
-                        continue;
+                    // 流接口暂不可达或仍在运行时保留登记；一次 404 不代表后台结束。
+                    throw new Error('任务事件流暂不可用，正在核对原任务');
+                }
+                if (!response.ok) {
+                    const errText = await response.text().catch(() => '');
+                    throw new Error(`HTTP ${response.status}: ${errText}`);
+                }
+                const reader = response.body.getReader();
+                streamReader = reader;
+                const decoder = new TextDecoder('utf-8');
+                let buffer = '';
+                let streamTerminal = false;
+                let eventId = null;
+                while (true) {
+                    const next = await Promise.race([reader.read().then(read => ({ read })), terminalStatus]);
+                    if (next.outcome) return receiveStatusOutcome(next.outcome);
+                    const { done, value } = next.read;
+                    if (done) break;
+                    buffer += decoder.decode(value, { stream: true });
+                    const lines = buffer.split('\n');
+                    buffer = lines.pop();
+                    for (const line of lines) {
+                        const trimmed = line.trim();
+                        if (trimmed.startsWith('id:')) {
+                            const parsedId = Number(trimmed.slice(3).trim());
+                            eventId = Number.isSafeInteger(parsedId) && parsedId >= 0 ? parsedId : null;
+                            continue;
+                        }
+                        if (!trimmed || !trimmed.startsWith('data: ')) continue;
+                        let parsed;
+                        try {
+                            parsed = JSON.parse(trimmed.substring(6));
+                        } catch (parseErr) {
+                            console.warn(`[watchTask:${label}] 跳过无法解析的事件行`, parseErr);
+                            continue;
+                        }
+                        if (!parsed || !parsed.type) continue;
+                        if (eventId !== null) {
+                            if (lastEventId !== null && eventId <= lastEventId) { eventId = null; continue; }
+                            lastEventId = eventId;
+                            eventId = null;
+                        } else {
+                            // 兼容旧服务：重放过的相同事件不能把重连预算重新清零。
+                            const key = JSON.stringify(parsed);
+                            if (legacyEvents.has(key)) continue;
+                            legacyEvents.add(key);
+                        }
+                        reconnects = 0;
+                        if (parsed.type === 'result') resultData = parsed.data;
+                        emit(parsed.type, parsed.data, parsed);
+                        if (parsed.type === 'error') {
+                            sawTerminal = { status: 'failed', error: (parsed.data && parsed.data.message) || '未知错误' };
+                        }
+                        if (parsed.type === 'result' || parsed.type === 'error') {
+                            // 终态事件已经送达：不再等底层连接真正关闭（done）才收尾——
+                            // 服务端虽然会在发完终态事件后立刻关连接，但客户端这边
+                            // 探测到 TCP 连接真正断开可能被本机杀软/代理/系统层面
+                            // 延迟甚至卡住（本机日志里能看到反复的 WinError 10053/10054），
+                            // 那样帧/视频明明已经全部生成完，进度条却会空转到连接
+                            // 被判定断开为止。收到事件本身就是终态的权威来源，直接
+                            // 结束读取即可。
+                            streamTerminal = true;
+                            break;
+                        }
                     }
-                    if (!parsed || !parsed.type) continue;
-                    if (eventId !== null) {
-                        if (lastEventId !== null && eventId <= lastEventId) { eventId = null; continue; }
-                        lastEventId = eventId;
-                        eventId = null;
-                    } else {
-                        // 兼容旧服务：重放过的相同事件不能把重连预算重新清零。
-                        const key = JSON.stringify(parsed);
-                        if (legacyEvents.has(key)) continue;
-                        legacyEvents.add(key);
-                    }
-                    reconnects = 0;
-                    if (parsed.type === 'result') resultData = parsed.data;
-                    emit(parsed.type, parsed.data, parsed);
-                    if (parsed.type === 'error') {
-                        sawTerminal = { status: 'failed', error: (parsed.data && parsed.data.message) || '未知错误' };
-                    }
-                    if (parsed.type === 'result' || parsed.type === 'error') {
-                        // 终态事件已经送达：不再等底层连接真正关闭（done）才收尾——
-                        // 服务端虽然会在发完终态事件后立刻关连接，但客户端这边
-                        // 探测到 TCP 连接真正断开可能被本机杀软/代理/系统层面
-                        // 延迟甚至卡住（本机日志里能看到反复的 WinError 10053/10054），
-                        // 那样帧/视频明明已经全部生成完，进度条却会空转到连接
-                        // 被判定断开为止。收到事件本身就是终态的权威来源，直接
-                        // 结束读取即可。
-                        streamTerminal = true;
+                    if (streamTerminal) {
+                        cancelReader(reader);
                         break;
                     }
                 }
-                if (streamTerminal) {
-                    try { await reader.cancel(); } catch (_) { /* noop：连接可能已经关闭 */ }
-                    break;
-                }
+                if (Date.now() - connectedAt >= 10000) reconnects = 0;
+            } catch (e) {
+                if (e.name === 'AbortError') throw e;
+                console.warn(`[watchTask:${label}] 事件流中断:`, e.message || e);
             }
-            if (Date.now() - connectedAt >= 10000) reconnects = 0;
-        } catch (e) {
-            if (e.name === 'AbortError') throw e;
-            console.warn(`[watchTask:${label}] 事件流中断:`, e.message || e);
-        }
 
-        if (sawTerminal) {
-            try {
-                const status = await checkStatus();
-                if (status && status.status === 'cancelled') return { status: 'cancelled', result: resultData };
-            } catch (e) { if (e.name === 'AbortError') throw e; }
-            return { ...sawTerminal, result: resultData };
-        }
-        if (resultData) return { status: 'completed', result: resultData };
+            if (sawTerminal) {
+                try {
+                    const status = await checkStatus();
+                    if (status && status.status === 'cancelled') return { status: 'cancelled', result: resultData };
+                } catch (e) { if (e.name === 'AbortError') throw e; }
+                return { ...sawTerminal, result: resultData };
+            }
+            if (resultData) return { status: 'completed', result: resultData };
 
-        // 流结束但没有终态事件：先问状态接口，任务真的还在跑才重连
-        let st = null;
-        try { st = await checkStatus(); } catch (e) { if (e.name === 'AbortError') throw e; }
-        if (st) {
-            if (st.status === 'completed') return { status: 'completed', result: st.result };
-            if (st.status === 'failed') return { status: 'failed', error: st.error || '任务失败' };
-            if (st.status === 'cancelled') return { status: 'cancelled' };
-            if (st.status === 'not_found') return { status: 'failed', error: '任务不存在（服务可能已重启）' };
-        }
+            // 流结束但没有终态事件：先问状态接口，任务真的还在跑才重连
+            let st = null;
+            try { st = await checkStatus(); } catch (e) { if (e.name === 'AbortError') throw e; }
+            if (st) {
+                if (st.status === 'completed') return { status: 'completed', result: st.result };
+                if (st.status === 'failed') return { status: 'failed', error: st.error || '任务失败' };
+                if (st.status === 'cancelled') return { status: 'cancelled' };
+                if (st.status === 'not_found') return { status: 'failed', error: '任务不存在（服务可能已重启）' };
+            }
 
-        reconnects += 1;
-        if (reconnects > maxReconnects) {
-            return { status: 'disconnected', error: '与服务的连接反复中断，已停止重连。任务可能仍在后台继续运行，请稍后重新打开本创意或刷新页面查看结果。' };
+            reconnects += 1;
+            if (reconnects > maxReconnects) {
+                return { status: 'disconnected', error: '与服务的连接反复中断，已停止重连。任务可能仍在后台继续运行，请稍后重新打开本创意或刷新页面查看结果。' };
+            }
+            const delay = Math.min(15000, 1000 * Math.pow(2, reconnects - 1));
+            emit('reconnecting', { attempt: reconnects, delay });
+            const reconnectWait = await Promise.race([
+                new Promise(resolve => {
+                    reconnectTimer = setTimeout(() => { reconnectTimer = null; resolve({ retry: true }); }, delay);
+                }),
+                terminalStatus
+            ]);
+            if (reconnectWait.outcome) return receiveStatusOutcome(reconnectWait.outcome);
         }
-        const delay = Math.min(15000, 1000 * Math.pow(2, reconnects - 1));
-        emit('reconnecting', { attempt: reconnects, delay });
-        await new Promise(r => setTimeout(r, delay));
+    };
+    try {
+        return await consumeStream();
+    } finally {
+        finished = true;
+        if (statusTimer !== null && typeof clearTimeout === 'function') clearTimeout(statusTimer);
+        if (reconnectTimer !== null && typeof clearTimeout === 'function') clearTimeout(reconnectTimer);
+        if (signal) signal.removeEventListener('abort', onAbort);
+        cancelReader(streamReader);
+        // 只关闭本 watcher 的 HTTP 连接，绝不请求取消服务器作业。
+        connection.abort();
     }
 }
 
@@ -167,6 +252,101 @@ function newVideoRequestId() {
         return 'video-' + Array.from(crypto.getRandomValues(new Uint8Array(16)), n => n.toString(16).padStart(2, '0')).join('');
     }
     throw new Error('浏览器无法创建可靠的请求编号，请使用本机地址或安全连接后重试。');
+}
+
+async function videoApiError(response) {
+    const raw = await response.text();
+    let payload;
+    try { payload = JSON.parse(raw); } catch (_) { payload = null; }
+    const message = payload && (typeof payload.message === 'string' ? payload.message
+        : typeof payload.error === 'string' ? payload.error : '');
+    const error = new Error(message || `HTTP ${response.status}${payload ? '' : ': ' + raw}`);
+    error.httpStatus = response.status;
+    error.failureCode = payload && payload.failure_code;
+    error.pendingSubmissions = payload && Array.isArray(payload.pending_submissions)
+        ? payload.pending_submissions.filter(p => p && Number.isInteger(Number(p.slot)) && Number(p.slot) > 0) : [];
+    error.submissionPending = error.failureCode === 'SUBMISSION_PENDING';
+    error.definitive = response.status >= 400 && response.status < 500 && response.status !== 408;
+    return error;
+}
+
+function videoAllowsDirectRetry(video) {
+    const videoProvider = typeof config !== 'undefined' && config ? config.videoProvider : undefined;
+    if (typeof slotVideoAllowsDirectRetry === 'function') return slotVideoAllowsDirectRetry(video, videoProvider);
+    if (videoProvider === 'flow2api') return true;
+    const attempt = video && video.last_attempt || {};
+    if (attempt.fixed_video_account === true) return false;
+    const provider = attempt.provider || (video && video.provider);
+    return provider ? provider === 'flow2api' : !!attempt.submission_id;
+}
+
+function videoSubmissionPendingMessage(pending) {
+    const slots = Array.from(new Set((pending || []).map(p => Number(p.slot)))).sort((a, b) => a - b);
+    const label = slots.length ? `第 ${slots.join('、')} 段视频的` : '视频的';
+    if ((pending || []).length && pending.every(p => videoAllowsDirectRetry(p.last_attempt ? p : { last_attempt: p }))) {
+        return `${label}原提交结果待确认，请先核对原提交。`;
+    }
+    return `${label}原提交结果待确认。请在原生成服务核对原任务；确认前不会重复生成。`;
+}
+
+async function handleVideoSubmissionPending(ownerIdea, error) {
+    await reloadManifestIntoIdea(ownerIdea);
+    // 日志可能比 manifest 新：保留服务器返回的槽位身份，让用户始终有核对入口。
+    if (!ownerIdea.frameRun) ownerIdea.frameRun = { title: ownerIdea.title, frames: [], videos: [] };
+    if (!Array.isArray(ownerIdea.frameRun.videos)) ownerIdea.frameRun.videos = [];
+    for (const pending of error.pendingSubmissions || []) {
+        const slot = Number(pending.slot);
+        let video = ownerIdea.frameRun.videos.find(v => Number(v.slot) === slot);
+        if (!video) { video = { slot, status: 'pending' }; ownerIdea.frameRun.videos.push(video); }
+        video.last_attempt = { ...(video.last_attempt || {}), submission_pending: true,
+            ...(pending.provider ? { provider: pending.provider } : {}),
+            ...(typeof pending.fixed_video_account === 'boolean' ? { fixed_video_account: pending.fixed_video_account } : {}),
+            ...(pending.task_id ? { task_id: pending.task_id } : {}),
+            ...(pending.submission_id ? { submission_id: pending.submission_id } : {}),
+            ...(pending.request_id ? { request_id: pending.request_id } : {}) };
+    }
+    const message = videoSubmissionPendingMessage(error.pendingSubmissions);
+    showToast(message, 'warning');
+    return message;
+}
+
+// 核对只查询原提交并取回原视频；显式重新生成继续使用 retryVideoSlots。
+async function reconcileVideoSubmission(slot, { ownerIdea = currentIdea } = {}) {
+    slot = Number(slot);
+    if (!ownerIdea || !Number.isInteger(slot) || slot <= 0) return { status: 'skipped' };
+    if (isIdeaTaskActive(ownerIdea.id, 'videos')) {
+        showToast('原视频任务正在处理，请稍候再核对。', 'warning');
+        return { status: 'skipped' };
+    }
+    const rec = beginIdeaTask(ownerIdea.id, 'videos', null, new AbortController());
+    rec.targetSlots = [slot];
+    rec.meta = `正在核对第 ${slot} 段视频的原任务...`;
+    refreshSlotGridBusy('video');
+    if (isViewingIdea(ownerIdea.id)) {
+        const meta = document.getElementById('videos-meta');
+        if (meta) meta.textContent = rec.meta;
+    }
+    try {
+        const response = await fetch('/api/video-operation/reconcile', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ title: getIdeaSaveTitle(ownerIdea), target_slots: [slot] })
+        });
+        if (!response.ok) throw await videoApiError(response);
+        const data = await response.json();
+        await reloadManifestIntoIdea(ownerIdea);
+        const outcome = (data.outcomes || []).find(p => Number(p.slot) === slot);
+        const state = outcome && outcome.state;
+        const message = outcome && outcome.message || '原任务尚未核实，请稍后再次核对。';
+        showToast(message, state === 'recovered' ? 'success' : 'warning');
+        return { ...data, message };
+    } catch (error) {
+        if (error.submissionPending) await handleVideoSubmissionPending(ownerIdea, error);
+        else showToast(`核对原任务未完成：${error.message}。请稍后再次核对。`, 'warning');
+        return { status: 'pending', error: error.message };
+    } finally {
+        if (getIdeaTaskRecord(ownerIdea.id, 'videos') === rec) endIdeaTask(ownerIdea.id, 'videos');
+        settleVideoOperationView(ownerIdea);
+    }
 }
 
 function beginVideoOperation(ownerIdea, targetSlots) {
@@ -212,9 +392,7 @@ async function submitVideoOperation(rec, endpoint, body) {
                 body: JSON.stringify(rec.requestBody)
             });
             if (!response.ok) {
-                const error = new Error(`HTTP ${response.status}: ${await response.text()}`);
-                error.definitive = response.status >= 400 && response.status < 500 && response.status !== 408;
-                throw error;
+                throw await videoApiError(response);
             }
             const data = await response.json();
             if (data.status === 'cancelled') { rec.cancelRequested = true; return data; }
@@ -246,7 +424,7 @@ function scheduleVideoOperationRecovery(ownerIdea, rec) {
         try {
             if (rec.cancelRequested) { await cancelVideoOperation(ownerIdea, rec); return; }
             let data = await resolveVideoOperation(rec);
-            if (!data && rec.requestBody && !rec.cancelRequested) {
+            if (!data && rec.requestBody && !rec.cancelRequested && !rec.readOnlyRecovery) {
                 data = await submitVideoOperation(rec, rec.requestEndpoint, rec.requestBody);
             }
             if (!data) { scheduleVideoOperationRecovery(ownerIdea, rec); return; }
@@ -257,8 +435,9 @@ function scheduleVideoOperationRecovery(ownerIdea, rec) {
             }
         } catch (error) {
             if (error.definitive) {
+                if (error.submissionPending) await handleVideoSubmissionPending(ownerIdea, error);
                 endIdeaTask(ownerIdea.id, 'videos');
-                showToast(error.message, 'error');
+                if (!error.submissionPending) showToast(error.message, 'error');
                 settleVideoOperationView(ownerIdea);
             } else scheduleVideoOperationRecovery(ownerIdea, rec);
         }
@@ -293,6 +472,9 @@ async function cancelVideoOperation(ownerIdea, rec = getIdeaTaskRecord(ownerIdea
         if (rec.controller) rec.controller.abort();
         if (getIdeaTaskRecord(ownerIdea.id, 'videos') === rec) endIdeaTask(ownerIdea.id, 'videos');
         await reloadManifestIntoIdea(ownerIdea);
+        if (rec.taskId && typeof settleAutoVideoHandoff === 'function') {
+            settleAutoVideoHandoff(ownerIdea, rec.taskId, 'cancelled', '视频生成已取消');
+        }
         settleVideoOperationView(ownerIdea);
         showToast('已取消视频生成，已完成的片段会保留。', 'info');
     } catch (_) {
@@ -436,15 +618,108 @@ function ensureFrameRunForStart(ownerIdea) {
     return ownerIdea.frameRun;
 }
 
+// 异步清单读取期间 SSE 可继续交付。只保护读取开始后改变的槽位，服务端删除仍有权威性。
+function captureManifestReadState(ownerIdea) {
+    const run = (ownerIdea && ownerIdea.frameRun) || {};
+    const state = { active: !!(ownerIdea && typeof isIdeaTaskActive === 'function'
+        && (isIdeaTaskActive(ownerIdea.id, 'frames') || isIdeaTaskActive(ownerIdea.id, 'videos'))) };
+    for (const name of ['frames', 'videos']) {
+        state[name] = new Map((run[name] || []).filter(item => item && (item.slot || item.sequence))
+            .map(item => [Number(item.slot || item.sequence), JSON.stringify(item)]));
+    }
+    state.topLevel = manifestReadTopLevel(run);
+    state.ownerPrompt = new Map(['prompt_block', 'prompt_slots']
+        .filter(key => Object.prototype.hasOwnProperty.call(ownerIdea || {}, key))
+        .map(key => [key, JSON.stringify(ownerIdea[key])]));
+    state.preference = JSON.stringify([ownerIdea && ownerIdea.auto_generate_videos,
+        ownerIdea && ownerIdea.auto_generate_videos_preference_explicit]);
+    state.runPreference = JSON.stringify([run.auto_generate_videos, run.auto_generate_videos_preference_explicit]);
+    return state;
+}
+
+function manifestReadTopLevel(run) {
+    return new Map(Object.entries(run || {}).filter(([key]) => key !== 'frames' && key !== 'videos')
+        .map(([key, value]) => [key, JSON.stringify(value)]));
+}
+
+function manifestReadMapsDiffer(current, before) {
+    return current.size !== before.size
+        || Array.from(current).some(([key, value]) => !before.has(key) || before.get(key) !== value);
+}
+
+function manifestChangedDuringRead(ownerIdea, readState) {
+    if (!ownerIdea || !readState) return false;
+    const current = ownerIdea.frameRun || {};
+    if (manifestReadMapsDiffer(manifestReadTopLevel(current), readState.topLevel)) return true;
+    const ownerPrompt = new Map(['prompt_block', 'prompt_slots']
+        .filter(key => Object.prototype.hasOwnProperty.call(ownerIdea, key))
+        .map(key => [key, JSON.stringify(ownerIdea[key])]));
+    if (manifestReadMapsDiffer(ownerPrompt, readState.ownerPrompt)) return true;
+    return ['frames', 'videos'].some(name => {
+        const live = new Map((current[name] || []).filter(item => item && (item.slot || item.sequence))
+            .map(item => [Number(item.slot || item.sequence), JSON.stringify(item)]));
+        return live.size !== readState[name].size
+            || Array.from(live).some(([slot, item]) => readState[name].get(slot) !== item);
+    });
+}
+
+function mergeManifestReadIntoIdea(manifest, ownerIdea, readState) {
+    if (!manifest || !ownerIdea || !readState) return manifest;
+    const current = ownerIdea.frameRun || {};
+    const merged = { ...manifest };
+    if (ownerIdea.auto_generate_videos_preference_explicit === true && readState.preference
+        !== JSON.stringify([ownerIdea.auto_generate_videos, ownerIdea.auto_generate_videos_preference_explicit])) {
+        merged.auto_generate_videos = ownerIdea.auto_generate_videos;
+        merged.auto_generate_videos_preference_explicit = true;
+    } else if (current.auto_generate_videos_preference_explicit === true && readState.runPreference
+        !== JSON.stringify([current.auto_generate_videos, current.auto_generate_videos_preference_explicit])) {
+        merged.auto_generate_videos = current.auto_generate_videos;
+        merged.auto_generate_videos_preference_explicit = true;
+    }
+    // 发现任务和终态都可能发生在 GET 期间；是否仍 running 不能判断新交付需不需要保护。
+    if (!manifestChangedDuringRead(ownerIdea, readState)) {
+        return Object.keys(merged).some(key => merged[key] !== manifest[key]) ? merged : manifest;
+    }
+    for (const name of ['frames', 'videos']) {
+        const incoming = new Map((manifest[name] || []).filter(item => item && (item.slot || item.sequence))
+            .map(item => [Number(item.slot || item.sequence), item]));
+        const live = new Map((current[name] || []).filter(item => item && (item.slot || item.sequence))
+            .map(item => [Number(item.slot || item.sequence), item]));
+        for (const [slot, item] of live) {
+            if (readState[name].get(slot) !== JSON.stringify(item)) incoming.set(slot, item);
+        }
+        for (const slot of readState[name].keys()) {
+            if (!live.has(slot)) incoming.delete(slot); // 请求之后本地明确删除的槽位不得复活。
+        }
+        merged[name] = Array.from(incoming.values()).sort((a, b) =>
+            Number(a.slot || a.sequence) - Number(b.slot || b.sequence));
+    }
+    const currentTop = manifestReadTopLevel(current);
+    for (const [key, value] of currentTop) {
+        if (!readState.topLevel.has(key) || readState.topLevel.get(key) !== value) merged[key] = current[key];
+    }
+    for (const key of readState.topLevel.keys()) {
+        if (!currentTop.has(key)) delete merged[key];
+    }
+    for (const key of ['prompt_block', 'prompt_slots']) {
+        const exists = Object.prototype.hasOwnProperty.call(ownerIdea, key);
+        if (exists && (!readState.ownerPrompt.has(key)
+            || readState.ownerPrompt.get(key) !== JSON.stringify(ownerIdea[key]))) merged[key] = ownerIdea[key];
+        else if (!exists && readState.ownerPrompt.has(key)) delete merged[key];
+    }
+    return merged;
+}
+
 /** 任务终态时把 manifest 同步进 ownerIdea 与创意库（含服务端持久化）。
  *
  * 这里写进去的是服务端 manifest 原件——删除一拍之后它就是比库里那份少一帧的
  * 权威结果。老实现走整表回写，必须额外向缩量闸门"声明"这次缩量是有意为之，
  * 否则 409；2026-07-31（P1）改成单条写之后，一次写入只碰这一条创意自己的文件，
  * 缩量闸门那条路径根本不经过，声明也就不需要了。 */
-async function syncFrameRunToLibrary(manifestData, ownerIdea) {
+async function syncFrameRunToLibrary(manifestData, ownerIdea, readState) {
     ownerIdea = ownerIdea || currentIdea;
     if (!ownerIdea || !manifestData) return;
+    manifestData = mergeManifestReadIntoIdea(manifestData, ownerIdea, readState);
     ownerIdea.frameRun = manifestData;
     if (manifestData.prompt_block && manifestData.prompt_block !== ownerIdea.prompt_block) {
         ownerIdea.prompt_block = manifestData.prompt_block;
@@ -475,6 +750,7 @@ async function syncFrameRunToLibrary(manifestData, ownerIdea) {
 async function reloadManifestIntoIdea(ownerIdea) {
     ownerIdea = ownerIdea || currentIdea;
     if (!ownerIdea) return;
+    const readState = captureManifestReadState(ownerIdea);
     try {
         // no-store：这个请求要的就是"服务端此刻的状态"。上传/换位刚落盘就来读，
         // 拿到浏览器启发式缓存里的上一份清单会让界面停在改动前的样子。
@@ -482,7 +758,7 @@ async function reloadManifestIntoIdea(ownerIdea) {
             `/api/get_manifest?title=${encodeURIComponent(getIdeaSaveTitle(ownerIdea))}`,
             { cache: 'no-store' });
         if (resp.ok) {
-            await syncFrameRunToLibrary(await resp.json(), ownerIdea);
+            await syncFrameRunToLibrary(await resp.json(), ownerIdea, readState);
         }
     } catch (err) {
         console.error('Failed to load partial manifest after failure:', err);
@@ -513,7 +789,8 @@ function renderVideoSlotDone(idx, video, ownerIdea = currentIdea) {
         ownerIdea.frameRun.videos.sort((a, b) => (Number(a && a.slot) || 0) - (Number(b && b.slot) || 0));
     }
     if (!ownerIdea || !isViewingIdea(ownerIdea.id)) return;
-    renderSlotById('video', idx, videoSlotState(video, { seq: Number(video.slot) || idx, busy }));
+    renderSlotById('video', idx, videoSlotState(video, { seq: Number(video.slot) || idx, busy,
+        videoProvider: typeof config !== 'undefined' && config ? config.videoProvider : undefined }));
 }
 
 // busy=true：该创意的视频序列任务仍在跑（批量重试里其它槽位还没处理完）——
@@ -522,7 +799,8 @@ function renderVideoSlotDone(idx, video, ownerIdea = currentIdea) {
 // 免得各调用点各自记得传。
 function renderVideoSlotFailed(idx, message, labelText = '生成失败', busy) {
     if (busy === undefined) busy = isIdeaTaskActive(currentIdea && currentIdea.id, 'videos');
-    const st = videoSlotState({ slot: idx, status: 'failed', error: message }, { seq: idx, busy });
+    const st = videoSlotState({ slot: idx, status: 'failed', error: message }, { seq: idx, busy,
+        videoProvider: typeof config !== 'undefined' && config ? config.videoProvider : undefined });
     st.statusText = labelText;
     st.title = message || labelText;
     renderSlotById('video', idx, st);
@@ -532,66 +810,250 @@ function renderVideoSlotFailed(idx, message, labelText = '生成失败', busy) {
 // 成片在此处直接硬切拼接——画中性卡片而不是失败卡（无重试按钮，重试它没有意义）
 function renderVideoSlotSkippedCut(idx, message) {
     renderSlotById('video', idx, videoSlotState(
-        { slot: idx, status: 'skipped_cut', message }, { seq: idx }));
+        { slot: idx, status: 'skipped_cut', message }, { seq: idx,
+            videoProvider: typeof config !== 'undefined' && config ? config.videoProvider : undefined }));
 }
 
 // startTasksPolling / stopTasksPolling 已于 2026-07-31（P4）随「激发任务列表」
 // 抽屉一并删除。任务进度现在由项目工作台自适应轮询（js/projects.js：有任务在跑
 // 时 4s，静止时 30s，且离开标签页就停表），不再是恒定 2.5s 的全量轮询。
 
+// 只读发现其它入口已启动的视频任务；连接原事件流，不提交新的生成请求。
+const videoTaskDiscoveries = new Map();
+const mediaTaskLookups = new Map();
+
+async function reconnectRunningVideoTaskForIdea(ownerIdea) {
+    return reconnectRunningMediaTaskForIdea(ownerIdea, 'videos');
+}
+
+async function reconnectRunningFrameTaskForIdea(ownerIdea) {
+    return reconnectRunningMediaTaskForIdea(ownerIdea, 'frames');
+}
+
+function normalizedTaskSlots(slots) {
+    return Array.isArray(slots) ? Array.from(new Set(slots.map(Number)
+        .filter(index => Number.isInteger(index) && index > 0))).sort((a, b) => a - b) : undefined;
+}
+
+async function runningMediaTaskList(projectKey, ownerIdea) {
+    if (mediaTaskLookups.has(projectKey)) return mediaTaskLookups.get(projectKey);
+    const lookup = (async () => {
+        const params = new URLSearchParams({ limit: '0', project_key: projectKey });
+        const includedIds = new Set();
+        for (const type of ['frames', 'videos']) {
+            const record = ownerIdea && getIdeaTaskRecord(ownerIdea.id, type);
+            if (record && record.taskId) includedIds.add(String(record.taskId));
+        }
+        includedIds.forEach(id => params.append('include_id', id));
+        const response = await fetch(`/api/tasks?${params.toString()}`, { cache: 'no-store' });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const data = await response.json();
+        return { tasks: Array.isArray(data) ? data : data.tasks || [], includedIds };
+    })();
+    mediaTaskLookups.set(projectKey, lookup);
+    try { return await lookup; }
+    finally { if (mediaTaskLookups.get(projectKey) === lookup) mediaTaskLookups.delete(projectKey); }
+}
+
+async function reconnectRunningMediaTaskForIdea(ownerIdea, type) {
+    if (!ownerIdea || !ownerIdea.id || ownerIdea.archived || !isViewingIdea(ownerIdea.id)) return null;
+    if (typeof resumeActiveBackgroundTasksIfExists === 'function') resumeActiveBackgroundTasksIfExists();
+    const existing = getIdeaTaskRecord(ownerIdea.id, type);
+    if (existing && existing.streaming !== false) return existing;
+    const discoveryKey = `${ownerIdea.id}:${type}`;
+    if (videoTaskDiscoveries.has(discoveryKey)) return videoTaskDiscoveries.get(discoveryKey);
+    const projectKey = String(getIdeaSaveTitle(ownerIdea) || '');
+    if (!projectKey) return null;
+
+    const discovery = (async () => {
+        try {
+            let snapshot = await runningMediaTaskList(projectKey, ownerIdea);
+            // 查询期间自动恢复或用户提交可能已经获得任务登记，不能另建连接覆盖它。
+            let restored = getIdeaTaskRecord(ownerIdea.id, type);
+            if (restored && restored.streaming !== false) return restored;
+            if (!isViewingIdea(ownerIdea.id) || String(getIdeaSaveTitle(ownerIdea) || '') !== projectKey) return null;
+            // 登记可能在查询期间才恢复；再次按原编号取回元数据，不能把被筛掉的
+            // 异项目任务当成“服务端不存在”，继而用当前项目的合成登记去接它。
+            if (restored && restored.taskId && !snapshot.includedIds.has(String(restored.taskId)) &&
+                !snapshot.tasks.some(item => item && item.id === restored.taskId)) {
+                snapshot = await runningMediaTaskList(projectKey, ownerIdea);
+                restored = getIdeaTaskRecord(ownerIdea.id, type);
+                if (restored && restored.streaming !== false) return restored;
+                if (!isViewingIdea(ownerIdea.id) || String(getIdeaSaveTitle(ownerIdea) || '') !== projectKey) return null;
+                if (restored && restored.taskId && !snapshot.includedIds.has(String(restored.taskId))) return null;
+            }
+            const tasks = snapshot.tasks;
+            let task = tasks.find(item => {
+                if (!item || !item.id || item.status !== 'running') return false;
+                const dimensions = item.dimensions || {};
+                if (!(type === 'frames' ? dimensions.type === 'frames'
+                    : ['videos', 'video_chain'].includes(dimensions.type))) return false;
+                // 主键存在时绝不退到显示标题、前缀或模糊匹配，避免连接另一版同名项目。
+                if (dimensions.project_key) return String(dimensions.project_key) === projectKey;
+                return !ownerIdea.project_key && String(dimensions.title || '') === projectKey;
+            });
+            if (!task && restored && restored.taskId) {
+                // 重连耗尽后的登记仍需核对终态；只找 running 会让已失败旧任务永久占 busy。
+                // 按原编号接只读 watcher，compose-status 会确认 completed/failed/cancelled/not_found。
+                const original = tasks.find(item => item && item.id === restored.taskId);
+                const originalProject = original && ((original.dimensions || {}).project_key ||
+                    (original.result || {}).project_key);
+                if (originalProject && String(originalProject) !== projectKey) return null;
+                task = original || {
+                    id: restored.taskId, dimensions: { project_key: projectKey,
+                        target_sequences: restored.targetSequences, target_slots: restored.targetSlots }
+                };
+            }
+            if (!task) return null;
+            const dimensions = task.dimensions || {};
+            const targets = normalizedTaskSlots(type === 'frames' ? dimensions.target_sequences : dimensions.target_slots);
+            const metadata = { projectKey, requestId: dimensions.request_id,
+                progress: task.progress, autoVideo: task.auto_video,
+                ...(restored && restored.taskId === task.id ? { resumeSnapshot: restored } : {}) };
+            const stream = type === 'frames'
+                ? streamFramesProgress(task.id, ownerIdea, targets, metadata)
+                : streamVideosProgress(task.id, ownerIdea, targets, metadata);
+            // 任务流可能持续数小时；发现请求只等到同步登记完成。
+            if (stream && typeof stream.catch === 'function') {
+                stream.catch(error => console.warn('恢复原媒体任务事件流失败', error));
+            }
+            return getIdeaTaskRecord(ownerIdea.id, type);
+        } catch (error) {
+            console.warn('查询项目已有媒体任务失败', error);
+            return null;
+        }
+    })();
+    videoTaskDiscoveries.set(discoveryKey, discovery);
+    try {
+        return await discovery;
+    } finally {
+        if (videoTaskDiscoveries.get(discoveryKey) === discovery) videoTaskDiscoveries.delete(discoveryKey);
+    }
+}
+
 /** 持久化"当前挂着哪些后台任务"，供刷新页面后重连。改为一份按创意 id 登记的列表
  *（旧格式每种任务只有一个全局槽位，无法区分任务属于哪个创意）。 */
 function saveActiveBackgroundTasksToLocalStorage() {
-    const tasks = [];
+    const recovery = backgroundTaskRecoveryState();
+    const active = [];
     Object.keys(ideaTasksById).forEach(ideaId => {
         const slot = ideaTasksById[ideaId];
         ['frames', 'videos', 'cover'].forEach(type => {
-            if (slot[type]) tasks.push({ ideaId, type, taskId: slot[type].taskId,
-                ...(slot[type].requestId ? { requestId: slot[type].requestId, requestBody: slot[type].requestBody,
-                    requestEndpoint: slot[type].requestEndpoint, cancelRequested: !!slot[type].cancelRequested } : {}),
-                ...(Array.isArray(slot[type].targetSlots) ? { targetSlots: slot[type].targetSlots } : {}) });
+            const rec = slot[type];
+            if (!rec) return;
+            const idea = typeof findIdeaObjectById === 'function' ? findIdeaObjectById(ideaId) : null;
+            const projectKey = rec.projectKey || (idea && (idea.project_key || idea.title)) || '';
+            const snapshot = { ideaId, type, taskId: rec.taskId, projectKey,
+                title: (idea && idea.title) || rec.title || '' };
+            ['requestId', 'requestBody', 'requestEndpoint', 'cancelRequested', 'targetSlots',
+                'targetSequences', 'total', 'current', 'meta', 'progressState', 'progressInfo', 'autoVideo',
+                'readOnlyRecovery'].forEach(key => { if (rec[key] !== undefined) snapshot[key] = rec[key]; });
+            if (Array.isArray(rec.feedLines)) snapshot.feedLines = rec.feedLines.slice(-100);
+            active.push(snapshot);
+            // 已接回的原任务由活动登记负责；找不到 owner 的缓存继续保存。
+            for (const [key, pending] of recovery.pending) {
+                if (sameBackgroundTask(snapshot, pending)) recovery.pending.delete(key);
+            }
         });
     });
     try {
-        localStorage.setItem('spark_active_background_tasks', JSON.stringify({ tasks }));
+        localStorage.setItem('spark_active_background_tasks', JSON.stringify({
+            tasks: [...recovery.pending.values(), ...active] }));
     } catch (_) {}
 }
 
-function resumeActiveBackgroundTasksIfExists() {
-    const saved = localStorage.getItem('spark_active_background_tasks');
-    if (!saved) return;
+function sameBackgroundTask(a, b) {
+    if (a.type !== b.type) return false;
+    if (a.taskId && b.taskId) return a.taskId === b.taskId;
+    if (a.requestId && b.requestId) return a.requestId === b.requestId;
+    return false;
+}
+
+function backgroundTaskRecoveryState() {
+    if (backgroundTaskRecoveryState.state) return backgroundTaskRecoveryState.state;
+    const state = { pending: new Map() };
+    backgroundTaskRecoveryState.state = state;
     try {
-        const parsed = JSON.parse(saved);
+        const parsed = JSON.parse(localStorage.getItem('spark_active_background_tasks') || '{}');
         let tasks = Array.isArray(parsed.tasks) ? parsed.tasks : [];
         if (!Array.isArray(parsed.tasks)) {
             // 兼容旧的单槽位格式（无 ideaId）：只能把它归给当时的 currentIdea，最好努力。
-            const legacyOwner = currentIdea && currentIdea.id;
+            const legacyOwner = typeof currentIdea !== 'undefined' && currentIdea && currentIdea.id;
             if (legacyOwner) {
                 if (parsed.framesTaskId) tasks.push({ ideaId: legacyOwner, type: 'frames', taskId: parsed.framesTaskId });
                 if (parsed.videosTaskId) tasks.push({ ideaId: legacyOwner, type: 'videos', taskId: parsed.videosTaskId });
                 if (parsed.coverTaskId) tasks.push({ ideaId: legacyOwner, type: 'cover', taskId: parsed.coverTaskId });
             }
         }
-        tasks.forEach(t => {
-            if (!t || !t.ideaId || (!t.taskId && !t.requestId)) return;
-            const idea = findIdeaObjectById(t.ideaId);
-            if (!idea) {
-                console.warn('恢复后台任务失败：本地找不到所属创意', t);
-                return;
+        tasks.forEach((task, index) => {
+            if (task && ['frames', 'videos', 'cover'].includes(task.type)
+                && (task.taskId || task.requestId)) {
+                state.pending.set(`${task.type}:${task.taskId || task.requestId}:${index}`, task);
             }
-            if (t.type === 'videos' && t.requestId) {
-                const rec = beginIdeaTask(idea.id, 'videos', t.taskId || null, new AbortController());
-                Object.assign(rec, { requestId: t.requestId, requestBody: t.requestBody,
-                    requestEndpoint: t.requestEndpoint, targetSlots: t.targetSlots, cancelRequested: !!t.cancelRequested });
-                saveActiveBackgroundTasksToLocalStorage();
-                if (!t.taskId || t.cancelRequested) { scheduleVideoOperationRecovery(idea, rec); return; }
-            }
-            if (t.type === 'frames') streamFramesProgress(t.taskId, idea);
-            else if (t.type === 'videos') streamVideosProgress(t.taskId, idea, t.targetSlots);
-            else if (t.type === 'cover') streamCoverProgress(t.taskId, idea);
         });
     } catch (e) {
-        console.error("Failed to resume active background tasks:", e);
+        console.warn('后台任务恢复缓存暂不可用', e);
+    }
+    return state;
+}
+
+function backgroundTaskOwner(task) {
+    const projectKey = String(task.projectKey || task.project_key || '');
+    const viewed = typeof currentIdea !== 'undefined' ? currentIdea : null;
+    if (projectKey && viewed && !viewed.archived
+        && String(viewed.project_key || viewed.title || '') === projectKey) return viewed;
+    const byId = typeof findIdeaObjectById === 'function' ? findIdeaObjectById(task.ideaId) : null;
+    if (byId && (!projectKey || String(byId.project_key || byId.title || '') === projectKey)) return byId;
+    if (!projectKey) return null;
+    const ideas = [viewed,
+        ...(typeof savedIdeas !== 'undefined' && Array.isArray(savedIdeas) ? savedIdeas : [])];
+    return ideas.find(idea => idea && !idea.archived
+        && String(idea.project_key || idea.title || '') === projectKey) || null;
+}
+
+async function resumeActiveBackgroundTasksIfExists() {
+    const recovery = backgroundTaskRecoveryState();
+    for (const [key, task] of Array.from(recovery.pending)) {
+        if (!recovery.pending.has(key)) continue; // 前一父任务接回时可能已顺便接回这个视频子任务。
+        let idea = backgroundTaskOwner(task);
+        if (!idea && typeof libraryEntries === 'function' && typeof ensureLibraryIdea === 'function') {
+            const projectKey = String(task.projectKey || task.project_key || '');
+            const entries = libraryEntries();
+            const entry = (projectKey && entries.find(item => !item.archived
+                && String(item.project_key || item.title || '') === projectKey))
+                || entries.find(item => !item.archived && String(item.id) === String(task.ideaId));
+            if (entry) {
+                await ensureLibraryIdea(entry.id);
+                if (!recovery.pending.has(key)) continue;
+                idea = backgroundTaskOwner(task);
+            }
+        }
+        if (!idea || idea.archived) continue; // 离线/旧客户端 id 不可见时保留原任务，随后按项目主键找回。
+        const existing = typeof getIdeaTaskRecord === 'function' ? getIdeaTaskRecord(idea.id, task.type) : null;
+        if (existing && existing.streaming !== false) continue;
+        const metadata = { requestId: task.requestId, projectKey: task.projectKey || task.project_key,
+            autoVideo: task.autoVideo, resumeSnapshot: task };
+        let stream;
+        if (task.type === 'videos' && (!task.taskId || task.cancelRequested)) {
+            const rec = beginIdeaTask(idea.id, 'videos', task.taskId || null, new AbortController());
+            Object.assign(rec, task, { ideaId: idea.id, readOnlyRecovery: true });
+            saveActiveBackgroundTasksToLocalStorage();
+            scheduleVideoOperationRecovery(idea, rec);
+        } else if (task.type === 'frames') {
+            stream = streamFramesProgress(task.taskId, idea, task.targetSequences, metadata);
+        } else if (task.type === 'videos') {
+            stream = streamVideosProgress(task.taskId, idea, task.targetSlots, metadata);
+        } else if (task.type === 'cover') {
+            stream = streamCoverProgress(task.taskId, idea);
+        }
+        if (stream && typeof stream.catch === 'function') {
+            stream.catch(error => console.warn('恢复原后台任务事件流失败', error));
+        }
+        // 只有成功登记才移交缓存，缺少 DOM 等暂时无法监听的路径不得丢任务。
+        if (typeof getIdeaTaskRecord === 'function' && getIdeaTaskRecord(idea.id, task.type)) {
+            recovery.pending.delete(key);
+            saveActiveBackgroundTasksToLocalStorage();
+        }
     }
 }
 
@@ -631,13 +1093,21 @@ function initLocalServiceLogs() {
     if (!drawer || !header || !linesEl) return;
 
     let logConnected = false;
+    // 恢复上次展开态会立即连接：这些变量必须在 setLogDockOpen 首次调用前初始化。
+    let eventSource = null;
+    let logRetryTimer = null;
+    let logPaused = true;
     let logTasks = {};
+
+    function logConnectionText() {
+        return logPaused ? '日志同步已暂停' : '日志同步中断，正在重连…';
+    }
 
     function setConnected(ok) {
         logConnected = ok;
         if (pill) {
             pill.dataset.connected = String(ok);
-            pill.title = ok ? '打开生成日志' : '日志同步中断，正在重连';
+            pill.title = ok ? '打开生成日志' : logConnectionText();
         }
         statusDots.forEach(dot => {
             dot.className = ok ? 'log-panel-status-dot connected' : 'log-panel-status-dot';
@@ -645,15 +1115,14 @@ function initLocalServiceLogs() {
         // 断线时状态条不能继续挂着"运行正常"——那时候我们其实什么都不知道。
         if (!ok) {
             const headline = document.getElementById('log-headline');
-            if (headline) headline.textContent = '日志同步中断，正在重连…';
-            drawer.dataset.tone = 'offline';
+            if (headline) headline.textContent = logConnectionText();
+            drawer.dataset.tone = logPaused ? 'paused' : 'offline';
         }
     }
 
     // ── 静息态未读计数 ────────────────────────────────────────────────
-    // dock 收起期间攒下的 ERROR/WARN 数顶到胶囊徽标上。这是把 45px 全宽横栏
-    // 换掉之后仍然保住的那个信号：占位小了，但"出事了"反而更显眼——旧版这个
-    // 信息只体现为横栏里一颗不带计数的小圆点。
+    // 已同步的未读 ERROR/WARN 数显示在胶囊徽标上。折叠后暂停日志流并保留已有
+    // 计数，任务状态快照仍能清除已解决事项；恢复连接的历史回灌不新增未读。
     let unreadError = 0;
     let unreadWarn = 0;
     // 首次连接时服务端会回灌最近 100 行历史，那是"以前发生过的事"，不该在页面
@@ -665,7 +1134,7 @@ function initLocalServiceLogs() {
         const total = unreadError + unreadWarn;
         if (total <= 0) {
             pillBadge.hidden = true;
-            if (pill) pill.title = logConnected ? '打开生成日志' : '日志同步中断，正在重连';
+            if (pill) pill.title = logConnected ? '打开生成日志' : logConnectionText();
             return;
         }
         pillBadge.hidden = false;
@@ -673,7 +1142,7 @@ function initLocalServiceLogs() {
         // 只有 WARN 没有 ERROR 时降一档配色，不用红色虚张声势
         pillBadge.classList.toggle('warn-only', unreadError === 0);
         if (pill) {
-            pill.title = `${logConnected ? '生成日志' : '日志同步中断'}：${unreadError} 项待处理、${unreadWarn} 项提醒未查看`;
+            pill.title = `${logConnected ? '生成日志' : logConnectionText()}：${unreadError} 项待处理、${unreadWarn} 项提醒未查看`;
         }
     }
 
@@ -692,7 +1161,7 @@ function initLocalServiceLogs() {
         unreadError = 0;
         unreadWarn = 0;
         renderPillBadge();
-        if (pill) pill.title = logConnected ? '打开生成日志' : '日志同步中断，正在重连';
+        if (pill) pill.title = logConnected ? '打开生成日志' : logConnectionText();
     }
 
     const MAX_LINES = 3000;
@@ -976,8 +1445,8 @@ function initLocalServiceLogs() {
         const stat = sem.summarize(entries, events);
         updateUnread(allEvents);
 
-        if (headlineEl) headlineEl.textContent = logConnected ? stat.headline : '日志同步中断，正在重连…';
-        drawer.dataset.tone = logConnected ? stat.tone : 'offline';
+        if (headlineEl) headlineEl.textContent = logConnected ? stat.headline : logConnectionText();
+        drawer.dataset.tone = logConnected ? stat.tone : logPaused ? 'paused' : 'offline';
         if (footEl) {
             footEl.textContent =
                 `${logScope === 'project' && projectTaskIds !== null ? '当前项目' : '全部日志'} · 需处理 ${stat.error} · 提醒 ${stat.warn} · 历史过程见明细`;
@@ -989,7 +1458,7 @@ function initLocalServiceLogs() {
             empty.className = 'log-event-empty';
             empty.innerHTML =
                 '<div class="log-event-empty-mark">✓</div>' +
-                `<div class="log-event-empty-title">${logConnected ? '暂无待处理事项，历史过程可在明细中查看' : '等待日志重新同步；任务状态请查看项目进度'}</div>` +
+                `<div class="log-event-empty-title">${logConnected ? '暂无待处理事项，历史过程可在明细中查看' : logPaused ? '日志同步已暂停；展开后恢复同步' : '等待日志重新同步；任务状态请查看项目进度'}</div>` +
                 '<button type="button" class="log-event-link" data-act="detail-all">查看完整日志 ›</button>';
             eventListEl.appendChild(empty);
             return;
@@ -1268,6 +1737,7 @@ function initLocalServiceLogs() {
         } else {
             suspendDetailDom();
         }
+        syncLogStream();
     }
 
     function toggleLog() {
@@ -1373,20 +1843,42 @@ function initLocalServiceLogs() {
         }
     }
 
-    // Connect to SSE Log Stream
-    let eventSource = null;
-    function connectLogStream() {
-        if (eventSource) {
-            eventSource.close();
+    // 普通日志只在可见、展开时同步；任务专属事件流仍由各任务 watcher 独立维护。
+    function logsVisible() {
+        return !document.hidden && drawer.classList.contains('expanded');
+    }
+
+    function syncLogStream() {
+        if (!logsVisible()) {
+            if (logRetryTimer) clearTimeout(logRetryTimer);
+            logRetryTimer = null;
+            if (eventSource) eventSource.close();
+            eventSource = null;
+            logPaused = true;
+            setConnected(false);
+            renderPillBadge();
+            scheduleOverviewRender();
+        } else if (!eventSource && !logRetryTimer) {
+            connectLogStream();
         }
+    }
+
+    function connectLogStream() {
+        if (!logsVisible()) return syncLogStream();
+        if (eventSource) return;
+        logRetryTimer = null;
+        logPaused = false;
 
         setConnected(false); // Reset to disconnected
         // EventSource 无法携带自定义请求头：托管模式下用 query 参数传访问码
         const code = (typeof ACCESS_CODE !== 'undefined' && ACCESS_CODE) ? ACCESS_CODE : (localStorage.getItem('spark_access_code') || '');
         const streamUrl = code ? `/api/logs/stream?access_code=${encodeURIComponent(code)}` : '/api/logs/stream';
-        eventSource = new EventSource(streamUrl);
+        const stream = new EventSource(streamUrl);
+        eventSource = stream;
+        const isCurrentStream = () => eventSource === stream && logsVisible();
 
-        eventSource.addEventListener('open', () => {
+        stream.addEventListener('open', () => {
+            if (!isCurrentStream()) return;
             setConnected(true);
             clearAll();
             scheduleOverviewRender();
@@ -1397,7 +1889,8 @@ function initLocalServiceLogs() {
             scrollToBottom();
         });
 
-        eventSource.addEventListener('history', (e) => {
+        stream.addEventListener('history', (e) => {
+            if (!isCurrentStream()) return;
             try {
                 const parsed = JSON.parse(e.data);
                 // Server sends {type, data} wrapper via _open_sse_stream
@@ -1418,7 +1911,8 @@ function initLocalServiceLogs() {
             }
         });
 
-        eventSource.addEventListener('log', (e) => {
+        stream.addEventListener('log', (e) => {
+            if (!isCurrentStream()) return;
             try {
                 const parsed = JSON.parse(e.data);
                 // Server sends {type, data} wrapper via _open_sse_stream
@@ -1434,18 +1928,21 @@ function initLocalServiceLogs() {
             }
         });
 
-        eventSource.addEventListener('error', (e) => {
+        stream.addEventListener('error', (e) => {
+            if (!isCurrentStream()) return;
             setConnected(false);
             appendLine('[日志] 同步中断，正在重连；任务状态请查看项目进度。');
             scheduleOverviewRender();
             scrollToBottom();
-            eventSource.close();
+            stream.close();
+            eventSource = null;
             // Reconnect after 3 seconds
-            setTimeout(connectLogStream, 3000);
+            logRetryTimer = setTimeout(connectLogStream, 3000);
         });
     }
 
-    connectLogStream();
+    document.addEventListener('visibilitychange', syncLogStream);
+    syncLogStream();
 }
 
 
@@ -2129,199 +2626,9 @@ async function fixFrameIssue(seq, manualReason, cascadeDownstream) {
     }
 }
 
-// 「运行一致性审查」——2026-07-24 起一致性审查不再随帧序列渲染自动触发，用户
-// 确认整套序列（含视频提示词描述的施工顺序/空间关系）已经全部渲染完成后，手动
-// 点这个按钮才会跑（/api/sequence_review -> pipeline_orchestrator.
-// run_sequence_consistency_review）。纯粹是可选的人工检查工具，不阻塞视频生成：
-// 结果只把 manifest 里对应帧的 quality_gate 标记成 sequence_review_flagged /
-// sequence_reviewed_pass，真正的改写要等用户看过原因后点「修复此帧问题」
-// （fixFrameIssue）。整套序列还没渲完时后端会直接跳过并说明原因，不算错误。
-// scope：'incremental'（默认，只重审帧图变过、结论已失效的那几拍）或 'full'
-// （全量重审，不复用任何既有结论）。增量是常态——修完几帧再审一遍此前要把已经
-// 审干净的十来拍连同跨帧窗口整批重烧，于是"修完就重审"这个动作没人愿意做。
-async function runSequenceReview(scope) {
-    if (typeof gateReviewsDisabled === 'function' && gateReviewsDisabled()) {
-        showToast('所有审查已关闭，可在「质量门禁」中关闭总开关后再运行审查。', 'info');
-        return;
-    }
-    if (!currentIdea || !currentIdea.prompt_block) {
-        showToast("请先激发一个创意点子！", "error");
-        return;
-    }
-    const ownerIdea = currentIdea;
-    if (isIdeaTaskActive(ownerIdea.id, 'frames')) {
-        showToast("该创意的帧序列已在生成/重试中，请稍候", "error");
-        return;
-    }
-
-    const full = scope === 'full';
-    const progress = document.getElementById('frames-progress');
-    const meta = document.getElementById('frames-meta');
-    const reviewBtn = document.getElementById('run-sequence-review-btn');
-    const fullBtn = document.getElementById('run-full-sequence-review-btn');
-    if (!progress || !meta) return;
-
-    progress.style.display = 'flex';
-    meta.textContent = full ? '正在全量重审整套序列...' : '正在对整套序列做一致性审查...';
-
-    const controller = new AbortController();
-    beginIdeaTask(ownerIdea.id, 'frames', null, controller);
-    setFrameGridButtonsBusy(true);
-    if (reviewBtn) reviewBtn.disabled = true;
-    if (fullBtn) fullBtn.disabled = true;
-
-    const feedLine = (text, cls) => { if (typeof framesFeedLine === 'function') framesFeedLine(ownerIdea.id, text, cls); };
-    if (typeof framesFeedSetLive === 'function') framesFeedSetLive(ownerIdea.id, true);
-    feedLine(full ? '🔍 开始全量重审整套序列（不复用既有结论）…'
-                  : '🔍 开始整套序列一致性审查（只重审结论已失效的拍）…');
-
-    let disconnected = false;
-
-    try {
-        const response = await fetch('/api/sequence_review', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                config,
-                title: getIdeaSaveTitle(ownerIdea),
-                display_title: ownerIdea.title,
-                prompt_block: ownerIdea.prompt_block,
-                scope: full ? 'full' : 'incremental'
-            }),
-            signal: controller.signal
-        });
-
-        if (!response.ok) {
-            const errText = await response.text();
-            throw new Error(`HTTP ${response.status}: ${errText}`);
-        }
-
-        const data = await response.json();
-        const taskId = data.task_id;
-        const rec2 = getIdeaTaskRecord(ownerIdea.id, 'frames');
-        if (rec2) rec2.taskId = taskId;
-
-        let reviewedBeats = 0;
-        let flaggedBeats = 0;
-        let reviewSummary = null;
-        const watch = await watchTaskUntilTerminal(taskId, {
-            label: 'sequence-review',
-            signal: controller.signal,
-            onEvent: (type, evData) => {
-                if (type === 'sequence_review') {
-                    meta.textContent = (evData && evData.message) || '正在对整套序列做一致性审查...';
-                    feedLine(`🔍 ${(evData && evData.message) || '正在对整套序列做一致性审查...'}`);
-                } else if (type === 'sequence_review_beat') {
-                    // 逐拍进度（2026-07-25 并发化后逐拍回报）：审查此前是几分钟的
-                    // 静默黑洞，只有开始/结束两条消息，看着像卡死
-                    reviewedBeats += 1;
-                    const total = (evData && evData.total) || 0;
-                    if (total) meta.textContent = `一致性审查中… 已完成 ${reviewedBeats}/${total} 拍`;
-                    // 审干净的拍收进一条就地刷新的计数条：它们没有任何单独占一行的
-                    // 价值，十几拍灌下来只会把真正要读的结论顶出可视区。有发现的
-                    // 拍与没跑成的拍照旧各占一行——那才是要留下来的信息。
-                    const issues = (evData && evData.issues) || [];
-                    const failed = evData && evData.reviewed === false;
-                    if (!failed && !issues.length) {
-                        feedLine(`　逐拍审查 ${reviewedBeats}${total ? '/' + total : ''} 拍`
-                            + (flaggedBeats ? `，其中 ${flaggedBeats} 拍有发现` : '，暂无发现'),
-                            'ok', 'review-beat');
-                    } else {
-                        if (issues.length) flaggedBeats += 1;
-                        feedLine(`　${(evData && evData.message) || '逐拍审查进行中…'}`, 'warn');
-                    }
-                } else if (type === 'review_invalidated') {
-                    // 上一轮审查之后有帧被重渲，那些结论已经作废（帧内容哈希对不上）
-                    feedLine(`♻️ ${(evData && evData.message) || '部分帧的旧审查结论已作废'}`, 'warn');
-                } else if (type === 'sequence_review_result') {
-                    // 结构化播报优先：后端把「几帧有问题 / 每帧原因 / 未审完 /
-                    // 只覆盖前缀 / 复用了几拍」拆成了 lines，各占一行按语义着色。
-                    // message 是同样内容拼成的一句话，留给老服务端做兜底——一行里
-                    // 塞进五件事正是"审查数据读着吃力"的来源。
-                    const lines = (evData && Array.isArray(evData.lines)) ? evData.lines : null;
-                    if (lines && lines.length) {
-                        feedLine(`${evData.passed ? '✅' : '🛠️'} 一致性审查完成`,
-                                 evData.passed ? 'ok' : 'warn');
-                        lines.forEach(l => feedLine(`　${l.text}`, l.cls || ''));
-                    } else if (evData && evData.message) {
-                        feedLine(`${evData.passed ? '✅' : '🛠️'} ${evData.message}`, evData.passed ? 'ok' : 'warn');
-                    } else if (evData && evData.passed) {
-                        feedLine('✅ 整套序列一致性审查通过', 'ok');
-                    }
-                    reviewSummary = evData || null;
-                } else if (type === 'upstream_retry') {
-                    const a = (evData && evData.attempt) || '?';
-                    const m = (evData && evData.max_attempts) || '?';
-                    const tail = evData && evData.retry_in
-                        ? `，${evData.retry_in}s 后自动重试（第 ${a}/${m} 次）`
-                        : `（第 ${a}/${m} 次，此路终止，任务即将报错结束）`;
-                    feedLine(`⚠️ 上游报错：${(evData && evData.error) || '未知错误'}${tail}`, 'warn');
-                } else if (type === 'reconnecting') {
-                    meta.textContent = `连接中断，正在重连（第 ${evData.attempt} 次）...`;
-                    feedLine(`⚠️ 连接中断，正在重连（第 ${evData.attempt} 次）…`, 'warn');
-                }
-            }
-        });
-
-        if (watch.status === 'disconnected') {
-            disconnected = true;
-            feedLine(`⚠️ ${watch.error}`, 'warn');
-            showToast(`一致性审查：${watch.error}`, "warning");
-            return;
-        }
-        if (watch.status === 'cancelled') throw Object.assign(new Error('已取消'), { name: 'AbortError' });
-        if (watch.status === 'failed') throw new Error(watch.error || '未知错误');
-
-        // 结果只改了 manifest 里各帧的 quality_gate 标记，prompt_block 未变——
-        // 从服务端重新拉一次 manifest 让帧网格的徽标反映最新审查结果。
-        await reloadManifestIntoIdea(ownerIdea);
-        if (isViewingIdea(ownerIdea.id)) renderFramesForIdea(ownerIdea);
-        // 复用了多少拍要说出来：跑得快不是因为"这次没查出问题"，而是那几拍的帧图
-        // 自上次审查后压根没变、结论直接沿用（全量重审入口在 ⚙ 里）。
-        // 后端给了结构化 lines 时这句已经在里面了，不再重复播一遍。
-        const reused = (reviewSummary && reviewSummary.reused_beats) || 0;
-        const hadLines = !!(reviewSummary && Array.isArray(reviewSummary.lines)
-            && reviewSummary.lines.length);
-        if (!hadLines) {
-            feedLine('✅ 一致性审查已完成', 'ok');
-            if (reused) feedLine(`♻️ 其中 ${reused} 拍的帧图未变化，沿用了上一轮的结论`, 'ok');
-        }
-        // 只审了已渲染前缀、或有帧没审成时给一条明确 toast——这两种情况下"审查完成"
-        // 不等于"整单都查过了"，光看绿色徽标会误判
-        if (reviewSummary && reviewSummary.partial) {
-            // rendered_count＝已渲染前缀的帧数；不能拿本轮 reviewed_sequences 的长度
-            // 顶替它——增量审查下那只是"本轮重审到的几帧"
-            const n = reviewSummary.rendered_count
-                || (reviewSummary.reviewed_sequences || []).length;
-            showToast(`一致性审查只覆盖了已渲染的前 ${n} 帧，其余帧渲完后请再跑一次。`, "warning");
-        } else if (reviewSummary && (reviewSummary.unreviewed_sequences || []).length) {
-            showToast(`有 ${reviewSummary.unreviewed_sequences.length} 帧未审完，已标记为「未审查」。`, "warning");
-        }
-    } catch (e) {
-        if (e.name === 'AbortError') {
-            feedLine('⏹️ 一致性审查已取消', 'warn');
-        } else {
-            console.error('Failed to run sequence review:', e);
-            feedLine(`❌ 一致性审查失败：${e.message}`, 'err');
-            showToast(`一致性审查失败: ${e.message}`, "error");
-        }
-    } finally {
-        if (isViewingIdea(ownerIdea.id) && typeof framesFeedSetLive === 'function') framesFeedSetLive(ownerIdea.id, false);
-        if (!disconnected) {
-            endIdeaTask(ownerIdea.id, 'frames');
-        }
-        refreshSlotGridBusy('image');
-        if (isViewingIdea(ownerIdea.id) && !disconnected) {
-            progress.style.display = 'none';
-            // 与重试/修复两条路径同款收尾：审查过程中那次重渲（上面拉完 manifest 那句）
-            // 发生在任务登记还在的时候，画出来的是一整格禁用按钮；不在清掉登记之后
-            // 再重渲一次，审查跑完的网格就一直点不动——hover 上去还写着"正在生成/
-            // 重试中，请稍候"，而实际上什么都没在跑（2026-07-28 实机截图）。
-            renderFramesForIdea(ownerIdea);
-        }
-        if (reviewBtn) reviewBtn.disabled = false;
-        if (fullBtn) fullBtn.disabled = false;
-    }
+// 兼容旧审查入口：规则已退役，不再提交新审查任务。
+async function runSequenceReview() {
+    showToast('所有审查规则已永久退役，历史审查记录仍可查看。', 'info');
 }
 
 // 与 setFrameGridButtonsBusy 同理：视频序列同一创意同时只能有一个任务在跑，
@@ -2330,65 +2637,10 @@ function setVideoGridButtonsBusy(busy) {
     setSlotGridButtonsBusy('video', busy);
 }
 
-// 一致性审查确认风险后放行：提交视频生成/重试请求前，检查涉及的锚点帧是否带
-// 'vlm_qa_failed'/'sequence_review_flagged' 标记；若有则弹窗确认，确认后必须把
-// override_flagged 一并带给后端——否则后端 plan_video_slots 仍会照旧按 quality_gate
-// 拦截该槽位，前端"确认风险"只是白问了一遍（2026-07-23 修复：此前三处调用点里
-// 只有 generateVideos 弹了确认框，但确认结果从未传给后端，等于白确认）。
-// slots=null 表示不按槽位收窄，检查整套 frameRun.frames（整单生成场景）；传入槽位
-// 数组时只检查这些槽位涉及的锚点帧对（slot 与 slot+1，与 plan_video_slots 的判断
-// 范围一致）。返回 {proceed, override}：proceed=false 表示用户取消，调用方应直接
-// return，不要发起请求。
-// 2026-07-30 补：血统过期（stale_lineage）也进这道确认框。后端已把它升级为除 off 档
-// 一律硬拦（见 video_generator.plan_video_slots），前端如果还只按 quality_gate 弹窗，
-// 用户点了「生成视频」只会收到一串"已拦截"——确认框问不到点子上，人只能去翻日志。
-// 两类风险合并成一次确认：确认后统一带 override_flagged，后端三道门一起豁免。
-async function confirmSequenceReviewOverride(ownerIdea, slots) {
-    if (typeof gateReviewsDisabled === 'function' && gateReviewsDisabled()) {
-        return { proceed: true, override: true };
-    }
-    const frames = (ownerIdea.frameRun && ownerIdea.frameRun.frames) || [];
-    if (!frames.length) return { proceed: true, override: false };
-    let candidates;
-    if (slots && slots.length) {
-        const relevantSeqs = new Set();
-        slots.forEach(slot => { relevantSeqs.add(slot); relevantSeqs.add(slot + 1); });
-        candidates = frames.filter(f => relevantSeqs.has(f.sequence));
-    } else {
-        candidates = frames;
-    }
-    const failedFrames = candidates.filter(f => f.quality_gate === 'vlm_qa_failed'
-        || f.quality_gate === 'sequence_review_flagged'
-        || f.quality_gate === 'frame_continuity_failed');
-    // slotIsStale 认三种写法（stale_lineage 是后端现在唯一会写的，另两个是旧 manifest）
-    const staleFrames = candidates.filter(f => typeof slotIsStale === 'function'
-        ? slotIsStale(f) : !!f.stale_lineage);
-    if (!failedFrames.length && !staleFrames.length) {
-        return { proceed: true, override: false };
-    }
-
-    // customConfirm 把文案塞进 <p> 的 innerHTML：换行必须是 <br>，'\n' 会被渲染成
-    // 一个空格（历史遗留：原本那句 '\n\n' 从来没换过行）。这里的内容全部由帧号与
-    // 固定文案拼成，不含用户/模型文本，可以安全走 innerHTML。
-    const risks = [];
-    if (failedFrames.length) {
-        risks.push(`· 第 <b>${failedFrames.map(f => f.sequence).join(', ')}</b> 帧未通过一致性审查`);
-    }
-    if (staleFrames.length) {
-        risks.push(
-            `· 第 <b>${staleFrames.map(f => f.sequence).join(', ')}</b> 帧血统过期：`
-            + '上游帧被单独重渲过，这些帧仍派生自旧的 i2i 链');
-    }
-    // 血统过期不是"可能有问题"，是确定性事实——话要说到位，否则用户会把它当成
-    // 又一条随手点掉的警告（这正是它此前在 lenient 档形同虚设的原因）。
-    const consequence = staleFrames.length
-        ? '血统过期的帧与其相邻帧来自两条不同的 i2i 链，送去生成视频<b>必然</b>出现跨链的'
-          + '色彩/内容漂移。正确做法是从最早那一帧起顺序重渲，而不是强推。'
-        : '强行生成的话，对应视频分段可能存在跳变、无动作或动作不一致的缺陷。';
-    const confirmed = await customConfirm(
-        ['⚠️ 这单在生成视频前有以下风险：', '', ...risks, '', consequence, '',
-         '确定要确认风险并强制继续生成视频吗？'].join('<br>'));
-    return { proceed: confirmed, override: confirmed };
+// 兼容旧生成调用：历史质量标记不再要求确认或阻塞任务。
+async function confirmSequenceReviewOverride() {
+    // 历史审查标记仅供查阅，不再拦截生成或弹出风险确认。
+    return { proceed: true, override: true };
 }
 
 async function retrySingleVideo(slot) {
@@ -2405,6 +2657,13 @@ async function retryVideoSlots(slots, { ownerIdea = currentIdea } = {}) {
         return { status: 'skipped', succeeded: 0, failed: 0 };
     }
     if (!slots.length) return { status: 'skipped', succeeded: 0, failed: 0 };
+    const pending = ((ownerIdea.frameRun || {}).videos || []).filter(v => slots.includes(Number(v.slot))
+        && v.last_attempt && v.last_attempt.submission_pending === true && !videoAllowsDirectRetry(v));
+    if (pending.length) {
+        const message = videoSubmissionPendingMessage(pending);
+        showToast(message, 'warning');
+        return { status: 'submission_pending', succeeded: 0, failed: 0, message };
+    }
     const busy = () => isIdeaTaskActive(ownerIdea.id, 'videos');
     if (busy()) {
         showToast("该创意的视频序列已在生成/重试中，请稍候", "error");
@@ -2423,13 +2682,28 @@ async function retryVideoSlots(slots, { ownerIdea = currentIdea } = {}) {
     const meta = document.getElementById('videos-meta');
     const label = slots.length === 1 ? `视频第 ${slots[0]} 段` : `${slots.length} 段视频`;
     if (isViewingIdea(ownerIdea.id)) {
-        slots.forEach(slot => renderSlotPending('video', slot, '重试中...'));
+        slots.forEach(slot => renderSlotPending('video', slot, '等待中'));
         if (progress) progress.style.display = 'flex';
         if (meta) meta.textContent = `正在重试${label}...`;
     }
 
     const rec = beginVideoOperation(ownerIdea, slots);
     const controller = rec.controller;
+    rec.total = slots.length;
+    const applyVideoProgress = (type, data) => {
+        if (typeof ProgressModel === 'undefined') return null;
+        const info = ProgressModel.normalizeGenerationProgress(type, data, 'videos', rec.progressState);
+        rec.progressState = info.state;
+        rec.progressInfo = info;
+        rec.current = info.current;
+        rec.meta = info.label;
+        if (isViewingIdea(ownerIdea.id)) {
+            if (meta) meta.textContent = info.label;
+            if (typeof setProgressBar === 'function') setProgressBar('videos', info);
+        }
+        return info;
+    };
+    applyVideoProgress('start', { total: slots.length, slots });
     saveActiveBackgroundTasksToLocalStorage();
     refreshSlotGridBusy('video');
     // 断线后保留登记，让恢复机制继续追踪服务端任务，防止用户重复付费提交。
@@ -2441,7 +2715,8 @@ async function retryVideoSlots(slots, { ownerIdea = currentIdea } = {}) {
 
     try {
         const data = await submitVideoOperation(rec, '/api/generate_videos', {
-            config, title: getIdeaSaveTitle(ownerIdea), display_title: ownerIdea.title,
+            config: typeof videoConfigForIdea === 'function' ? videoConfigForIdea(config, ownerIdea) : config,
+            title: getIdeaSaveTitle(ownerIdea), display_title: ownerIdea.title,
             prompt_block: ownerIdea.prompt_block, target_slots: slots,
             override_flagged: reviewCheck.override,
             merge_speed: typeof getMergeSpeed === 'function' ? getMergeSpeed() : 4
@@ -2455,6 +2730,11 @@ async function retryVideoSlots(slots, { ownerIdea = currentIdea } = {}) {
             label: `retry-videos-${slots.join('-')}`,
             signal: controller.signal,
             onEvent: (type, evData) => {
+                if (getIdeaTaskRecord(ownerIdea.id, 'videos') !== rec) return;
+                const info = ['start', 'video_start', 'video_done', 'video_error', 'video_warning', 'video_recovery', 'queue',
+                    'ip_rotating', 'ip_rotated', 'ip_rotation_failed', 'merge_start', 'merge_done',
+                    'merge_skip', 'merge_error', 'result', 'error'].includes(type)
+                    ? applyVideoProgress(type, evData) : null;
                 if (type === 'video_done') {
                     completedSlots.add(Number(evData.index));
                     failedSlots.delete(Number(evData.index));
@@ -2465,8 +2745,21 @@ async function retryVideoSlots(slots, { ownerIdea = currentIdea } = {}) {
                     handleManualInterventionEvent(type, evData);
                     return;
                 }
+                if (type === 'video_recovery') {
+                    for (const slot of (evData && evData.completed_slots) || []) {
+                        completedSlots.add(Number(slot));
+                        failedSlots.delete(Number(slot));
+                    }
+                    rec.meta = (info && info.label) || (evData && evData.message) || '正在自动恢复未完成的视频';
+                    saveActiveBackgroundTasksToLocalStorage();
+                    if (isViewingIdea(ownerIdea.id)) {
+                        renderVideosForIdea(ownerIdea);
+                        if (meta) meta.textContent = rec.meta;
+                    }
+                    return;
+                }
                 if (type === 'video_warning') {
-                    rec.meta = (evData && evData.message) || '正在处理视频生成状态';
+                    rec.meta = (info && info.label) || (evData && evData.message) || '正在处理视频生成状态';
                     if (isViewingIdea(ownerIdea.id) && meta) meta.textContent = rec.meta;
                     return;
                 }
@@ -2475,9 +2768,9 @@ async function retryVideoSlots(slots, { ownerIdea = currentIdea } = {}) {
                         ? '换 IP 失败，已停止重试' : type === 'ip_rotated'
                             ? '出口 IP 已更换，继续未完成视频' : '正在更换并验证出口 IP…');
                     rec.lastIpRotation = { ...evData, stage: type };
-                    rec.meta = message;
+                    rec.meta = (info && info.label) || message;
                     if (isViewingIdea(ownerIdea.id)) {
-                        if (meta) meta.textContent = message;
+                        if (meta) meta.textContent = rec.meta;
                         if (type !== 'ip_rotating') showToast(message, type === 'ip_rotation_failed' ? 'error' : 'info');
                     }
                     return;
@@ -2485,8 +2778,9 @@ async function retryVideoSlots(slots, { ownerIdea = currentIdea } = {}) {
                 if (type === 'video_error') { failedSlots.add(Number(evData.index)); completedSlots.delete(Number(evData.index)); }
                 if (type === 'merge_error') mergeError = (evData && evData.message) || '自动合并视频失败';
                 if (!isViewingIdea(ownerIdea.id)) return;
-                if (type === 'video_start' && meta) {
-                    meta.textContent = `正在生成视频: 正在处理第 ${evData.index} 段视频...`;
+                if (type === 'video_start') {
+                    if (meta) meta.textContent = (info && info.label) || `正在处理 VID ${padSlot(evData.index)}...`;
+                    renderSlotPending('video', evData.index, '生成中...');
                 } else if (type === 'video_error') {
                     renderVideoSlotFailed(evData.index, evData.message || '生成失败');
                 } else if (type === 'queue' && meta) {
@@ -2545,6 +2839,11 @@ async function retryVideoSlots(slots, { ownerIdea = currentIdea } = {}) {
         return { status: partial ? 'partial_failed' : 'completed', succeeded, failed,
             message, mergeError, result: watch.result };
     } catch (e) {
+        if (e.submissionPending) {
+            const message = await handleVideoSubmissionPending(ownerIdea, e);
+            if (isViewingIdea(ownerIdea.id) && meta) meta.textContent = message;
+            return { status: 'submission_pending', succeeded: completedSlots.size, failed: 0, message };
+        }
         if (e.uncertain) {
             disconnected = true;
             if (isViewingIdea(ownerIdea.id) && meta) meta.textContent = e.message;
@@ -2553,6 +2852,7 @@ async function retryVideoSlots(slots, { ownerIdea = currentIdea } = {}) {
             return { status: 'disconnected', succeeded: completedSlots.size, failed: failedSlots.size, error: e.message };
         }
         const cancelled = e.name === 'AbortError';
+        applyVideoProgress('error', { message: cancelled ? `${label}重试已取消` : `${label}重试失败: ${e.message}` });
         if (!cancelled) console.error("Failed to retry videos:", e);
         await reloadManifestIntoIdea(ownerIdea);
         terminalError = { message: e.message || '生成失败', cancelled };

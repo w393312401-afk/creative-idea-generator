@@ -82,6 +82,29 @@ def test_post_click_cancel_is_marked_as_uncertain_for_receipt(monkeypatch):
     assert caught.value.click_time > 0
 
 
+@pytest.mark.parametrize('probe_error', [False, True])
+def test_post_click_missing_tile_credit_check_always_keeps_submission_uncertain(monkeypatch, probe_error):
+    from integrations.google_fx.models import VideoRequest
+    page, editor = MagicMock(), MagicMock()
+    for name in ('random_sleep', '_clear_prompt_reference_chips_video', '_check_cancelled',
+                 'fx_pacing_wait', 'note_fx_submit', '_verify_video_prompt_before_send'):
+        monkeypatch.setattr(H, name, lambda *a, **k: None)
+    monkeypatch.setattr(H, '_find_fx_prompt_input', lambda *a, **k: editor)
+    monkeypatch.setattr(H, '_fill_prompt_text', lambda *a, **k: True)
+    monkeypatch.setattr(H, 'click_fx_send_button', lambda *a, **k: True)
+    monkeypatch.setattr(H, '_wait_for_new_tile_id', lambda *a, **k: None)
+    monkeypatch.setattr(H, 'last_credit_reading', lambda: (20, None))
+    def credit(*a, **k):
+        if probe_error:
+            raise RuntimeError('read failed')
+        return 'out of credits'
+    monkeypatch.setattr(H, 'detect_page_credit_exhaustion', credit)
+    with pytest.raises(RuntimeError) as caught:
+        H._submit_video_to_canvas(page, VideoRequest(prompt='p'), [])
+    assert caught.value.submission_started is True
+    assert caught.value.click_time > 0
+
+
 @pytest.mark.parametrize("fail_at", ["before_mount", "after_mount", "before_send"])
 def test_existing_failure_stops_before_paid_click_even_without_pacing(monkeypatch, fail_at):
     from integrations.google_fx.models import VideoRequest

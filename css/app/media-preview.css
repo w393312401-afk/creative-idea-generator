@@ -1,0 +1,107 @@
+/* 视频进入原生全屏后，元素会撑满整块（通常是横向的）屏幕。卡片/成片缩略图为了填满
+   9:16 盒子用的是 object-fit: cover，带进全屏就会把竖屏画面放大到铺满宽度、上下被裁掉。
+   全屏时一律完整显示画面，留黑边。 */
+video:fullscreen,
+video:-webkit-full-screen {
+    object-fit: contain !important;
+    background: #000;
+}
+
+.media-preview-toggle {
+    white-space: nowrap;
+    font-size: 12px;
+}
+.media-preview-toggle[aria-pressed="true"] {
+    color: var(--text-primary);
+    border-color: var(--neon-cyan);
+    background: rgba(var(--ink-rgb), 0.08);
+}
+.media-count-placeholder {
+    display: none;
+    border: 1px solid var(--border-color);
+    border-radius: 6px;
+    background: transparent;
+    color: var(--text-secondary);
+    font: inherit;
+    font-size: 12px;
+    line-height: 1.5;
+    padding: 7px 10px;
+    cursor: pointer;
+}
+.media-count-placeholder:hover,
+.media-count-placeholder:focus-visible { color: var(--text-primary); border-color: var(--neon-cyan); }
+html[data-media-preview="counts"] .media-count-placeholder:not([hidden]) { display: inline-block; }
+html[data-media-preview="counts"] :is(img, video)[data-media-preview-src] { display: none !important; }
+html[data-media-preview="counts"] .slot-card .video-play-overlay,
+html[data-media-preview="counts"] #panel-gallery .gallery-play-badge { display: none; }
+
+html[data-media-preview="counts"] :is(.slot-card, .slot-card .video-preview-wrapper) {
+    aspect-ratio: auto !important;
+    min-height: 0;
+}
+html[data-media-preview="counts"] .slot-card[data-kind="ready"] { padding-top: 28px; }
+html[data-media-preview="counts"] .slot-card .video-preview-wrapper { overflow: visible; }
+html[data-media-preview="counts"] .slot-card .slot-actions {
+    position: relative;
+    inset: auto;
+    opacity: 1;
+    justify-content: center;
+    margin: 6px 0;
+}
+html[data-media-preview="counts"] .slot-card .slot-badges { position: static; margin: 4px 0; }
+html[data-media-preview="counts"] .slot-card .media-count-placeholder { margin: 8px; }
+
+html[data-media-preview="counts"] #panel-gallery .gallery-thumb {
+    aspect-ratio: auto;
+    min-height: 60px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+html[data-media-preview="counts"] #panel-gallery .gallery-card-actions {
+    margin-top: 0;
+    opacity: 1;
+    background: transparent;
+}
+html[data-media-preview="counts"] #panel-projects .project-thumb {
+    width: 96px;
+    height: auto;
+    min-height: 56px;
+    aspect-ratio: auto;
+}
+html[data-media-preview="counts"] #panel-projects .projects-list.view-grid .project-thumb {
+    width: 100%;
+    height: 76px;
+}
+html[data-media-preview="counts"] #panel-projects .project-thumb .media-count-placeholder {
+    position: relative;
+    z-index: 3;
+    font-size: 11px;
+    padding: 6px;
+}
+html[data-media-preview="counts"] :is(.cover-phone-frame, .cover-thumb, .history-card, .candidate-thumb-wrap) {
+    aspect-ratio: auto !important;
+    height: auto;
+    min-height: 70px;
+}
+html[data-media-preview="counts"] .cover-phone-frame {
+    padding: 12px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+html[data-media-preview="counts"] .cover-phone-frame:has([data-media-preview-src]:not([data-media-preview-src=""])) #cover-image-placeholder {
+    display: none !important;
+}
+html[data-media-preview="counts"] .cover-thumb { width: auto; padding: 4px; }
+html[data-media-preview="counts"] #panel-image-studio :is(.spotlight-card, .spotlight-image-wrapper) {
+    aspect-ratio: auto;
+    height: auto;
+    min-height: 90px;
+}
+html[data-media-preview="counts"] #panel-image-studio .spotlight-image-wrapper { flex-direction: column; }
+html[data-media-preview="counts"] #panel-image-studio .spotlight-info-overlay {
+    position: static;
+    opacity: 1;
+    transform: none;
+}

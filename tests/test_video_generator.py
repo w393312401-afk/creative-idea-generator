@@ -346,6 +346,18 @@ class TestStaleLineage(_TmpDirCase):
         self.assertEqual(manifest['videos'], [])
         self.assertTrue(all('stale_lineage' not in f for f in manifest['frames']))
 
+    def test_reused_frames_keep_delivered_videos(self):
+        """整轮都复用磁盘现成帧（frames_changed=False）时，视频清单与合并视频不能被清空。"""
+        from frame_generator import update_manifest_stale_status
+        manifest = dict(self._manifest(3), merged_video='x', videos=[{'slot': 1, 'status': 'success'}])
+        update_manifest_stale_status(manifest, self.tmp, frames_changed=False)
+        update_manifest_stale_status(manifest, self.tmp, regenerated_sequences=None,
+                                     finalize=True, frames_changed=False)
+        self.assertEqual(manifest['merged_video'], 'x')
+        self.assertEqual(manifest['videos'], [{'slot': 1, 'status': 'success'}])
+        update_manifest_stale_status(manifest, self.tmp, finalize=True, frames_changed=True)
+        self.assertEqual(manifest['videos'], [])
+
 
 class TestManifestWriter(_TmpDirCase):
     def test_incremental_merge_keeps_other_slots_and_orders(self):

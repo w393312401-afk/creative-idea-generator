@@ -68,3 +68,6 @@ scratch_*
 # Mac/Win 双机同步时互不可用。用 requirements.txt / pyproject.toml 重建。──
 .venv/
 venv/
+
+# ── Claude 提示词包生成任务（beat_pack）：每个任务一个目录，含中间产物与交付文件 ──
+beat_packs/

@@ -16,15 +16,27 @@ utils/account_pool.switch_to_next_account 的旧注释）。这是进程级副�
 1. 调用方显式传入的 user_id；
 2. 本上下文的换号结果（set_task_account）；
 3. 宿主安装的定向绑定解析器（SPARK 控制台给排队任务钉的账号）；
-4. 进程默认值（ADSPOWER_DEFAULT_USER_ID / config.DEFAULT_USER_ID）。
+4. 当前已独占的租约环境（防止并行任务改变进程默认值后串号）；
+5. 进程默认值（ADSPOWER_DEFAULT_USER_ID / config.DEFAULT_USER_ID）。
 """
 
 import contextlib
 import contextvars
 
+from . import lease_registry
+
 _TASK_ACCOUNT = contextvars.ContextVar("google_fx_task_account", default=None)
+_FIXED_TASK_ACCOUNT = contextvars.ContextVar("google_fx_fixed_task_account", default=None)
 _PIN_RESOLVER = None
 _ACCOUNT_OBSERVER = None
+
+
+class FixedAccountStopError(RuntimeError):
+    """A strict video task must stop instead of changing its account/session."""
+
+
+def current_fixed_task_account():
+    return _FIXED_TASK_ACCOUNT.get()
 
 
 def install_account_observer(observer):
@@ -48,6 +60,10 @@ def _observe(user_id):
 def set_task_account(user_id):
     """把当前执行上下文绑定到某个 AdsPower user_id，返回可用于还原的 token。"""
     value = str(user_id).strip() if user_id else ""
+    fixed = current_fixed_task_account()
+    if fixed and value != fixed:
+        raise FixedAccountStopError("固定视频账号任务禁止切换账号，已停止提交")
+    lease_registry.require_claim(value)
     _observe(value)
     return _TASK_ACCOUNT.set(value or None)
 
@@ -79,6 +95,25 @@ def current_task_account():
     return _TASK_ACCOUNT.get()
 
 
+@contextlib.contextmanager
+def bound_fixed_task_account(user_id):
+    """Pin one video task without changing the process default or other tasks."""
+    value = str(user_id).strip() if user_id else ""
+    if not value:
+        raise ValueError("固定视频账号不能为空")
+    if current_fixed_task_account() not in (None, value):
+        raise FixedAccountStopError("固定视频账号任务禁止嵌套切换账号")
+    fixed_token = _FIXED_TASK_ACCOUNT.set(value)
+    token = None
+    try:
+        token = set_task_account(value)
+        yield value
+    finally:
+        if token is not None:
+            reset_task_account(token)
+        _FIXED_TASK_ACCOUNT.reset(fixed_token)
+
+
 def install_pin_resolver(resolver):
     """宿主注入"读取队列定向绑定"的函数；传 None 卸载。
 
@@ -100,12 +135,22 @@ def pinned_account():
 
 def resolve_account(explicit=None, fallback=None):
     """按优先级解析本次要用的 AdsPower user_id。"""
-    for candidate in (explicit, current_task_account(), pinned_account(), fallback):
+    fixed = current_fixed_task_account()
+    if fixed:
+        if explicit and str(explicit).strip() != fixed:
+            raise FixedAccountStopError("固定视频账号任务禁止连接其他账号")
+        lease_registry.require_claim(fixed)
+        _observe(fixed)
+        return fixed
+    # A leg that used the process default already claimed its real profile.
+    # Keep that lease binding when a parallel task changes the global default.
+    for candidate in (explicit, current_task_account(), pinned_account(), lease_registry.current_claim(), fallback):
         if candidate:
             value = str(candidate).strip()
             if value:
                 # 显式传入的账号可能是嵌套探针探别的号，不代表本任务占用的账号，不上报。
                 if not explicit:
+                    lease_registry.require_claim(value)
                     _observe(value)
                 return value
     return ""

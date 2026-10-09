@@ -931,7 +931,7 @@ class OmniComposer(BaseComposer):
         if not parts:
             # 契约整段读空时不静默降级：镜头梯仍由下面的 override 正文与审计兜住，
             # 但这件事必须在日志里看得见（load_reference_file 只按文件名提示一次）。
-            if sys.stdout:
+            if sys.stdout and not pp.reviews_disabled(self.config):
                 print("[WARN] omni composer 一个必读契约都没读到，VIDEO 只能靠内置的镜头"
                       "规则兜底；检查 skills/gemini-omni-restoration-composer/references/")
             return ''
@@ -997,6 +997,8 @@ class OmniComposer(BaseComposer):
         return pp.omni_user_shot_mode(theme=state.get('theme', '')) == 'single_take'
 
     def video_contract_errors(self, video_prompt, beat=None, ladder=None, duration=None):
+        if pp.reviews_disabled(self.config):
+            return []
         return omni_video_violations(
             video_prompt, ladder=ladder, duration=duration,
             allow_single_take=self.allows_single_take(beat))
@@ -1037,6 +1039,8 @@ class OmniComposer(BaseComposer):
 
         文案取自类属性（pacing_phrase / inshot_phrase），子 profile 换皮即可——注入点、
         判定口径与「过门拍/兑现拍免除」的分流仍然只有这一处实现。"""
+        if pp.reviews_disabled(self.config):
+            return video_prompt
         text = video_prompt or ''
         low = text.lower()
 
@@ -1068,6 +1072,8 @@ class OmniComposer(BaseComposer):
     @staticmethod
     def deduplicate_boilerplate_phrases(text):
         """清理提示词中因多次拼接或回炉产生的重复套话（如重复开场白、重复连续性声明、重复节奏声明）。"""
+        if pp.reviews_disabled(None):
+            return text
         if not text or not isinstance(text, str):
             return text
 
@@ -1126,6 +1132,8 @@ class OmniComposer(BaseComposer):
         默认是 omni 的实景工人口径。世界观不同的子 profile（微缩线的施工主体是从画幅
         边缘伸入的巨人手，本来就自带进出画）必须覆写这一处，否则会被塞进一句写实工人的
         入画/出画措辞。"""
+        if pp.reviews_disabled(self.config):
+            return video_prompt
         return ensure_ladder_out_and_in(
             video_prompt, ladder, packet=packet, beat=beat,
             is_threshold_or_reveal=is_threshold_or_reveal)
@@ -1257,6 +1265,8 @@ single continuous take、one continuous take、single take、unbroken take 或�
         VIDEO 不能借道 base：base 会把正文压到 270 词（多镜头文本会被腰斩）、注入含
         continuous 的节奏声明（在多镜头包里等于叫模型去拍一镜到底）、并塞进按 8 秒写死
         的工人进出时间戳。"""
+        if pp.reviews_disabled(config if config is not None else self.config):
+            return video_prompt, image_prompt
         _discarded_video, fixed_image = pp.apply_proactive_fixes(
             i, video_prompt, image_prompt, packet, mode, is_last, is_threshold_or_reveal,
             beat=beat, config=config, family=family, beat_ladder=beat_ladder)
@@ -1277,6 +1287,8 @@ single continuous take、one continuous take、single take、unbroken take 或�
                               is_threshold_or_reveal, prev_video=None, prev_image=None,
                               beat=None, family=None, is_pre_bridge=False,
                               is_post_reveal_cleanup=False):
+        if pp.reviews_disabled(self.config):
+            return []
         ladder = self.ladder_for_beat(beat, is_threshold_or_reveal)
         # 字数硬顶按本 profile 的镜头梯算，不用 base 的一镜到底档 380
         # （见 pp.validate_beat_prompts 的 video_word_limit 说明）。拍型不明时按施工梯。
@@ -1298,6 +1310,8 @@ single continuous take、one continuous take、single take、unbroken take 或�
         """omni 的镜头语法违规算结构性硬伤：镜头梯缺失时 Omni 会退回一条平淡的长镜头，
         和"VIDEO 无动作正文"一样属于 i2v 无画面可拍的那一类，必须回炉而不是仅留痕。
         记号类瑕疵（OMNI_VIDEO_STYLE_PREFIX）不在此列，自动落进 remainder 只留痕。"""
+        if pp.reviews_disabled(self.config):
+            return ([], [])
         structural, rest = super().split_structural_video_errors(errs)
         omni_errs = [e for e in rest if e.startswith(OMNI_VIDEO_ERROR_PREFIX)]
         remainder = [e for e in rest if not e.startswith(OMNI_VIDEO_ERROR_PREFIX)]
@@ -1305,6 +1319,8 @@ single continuous take、one continuous take、single take、unbroken take 或�
 
     def rework_structural_video_beat(self, config, i, video_prompt, structural_errs, packet, beat=None):
         """先让 base 处理它自己那些硬伤，再对 omni 的镜头语法违规回炉一轮。"""
+        if pp.reviews_disabled(config):
+            return (video_prompt, None)
         omni_errs = [e for e in (structural_errs or []) if e.startswith(OMNI_VIDEO_ERROR_PREFIX)]
         base_errs = [e for e in (structural_errs or []) if not e.startswith(OMNI_VIDEO_ERROR_PREFIX)]
         ladder = self.ladder_for_beat(beat) if beat else None
@@ -1327,10 +1343,14 @@ single continuous take、one continuous take、single take、unbroken take 或�
 
     def normalize_reworked_video(self, video_prompt, beat=None):
         """里程碑回炉后按实际用户模式归一并交回上游复验，默认多镜与用户单镜不互相改写。"""
+        if pp.reviews_disabled(self.config):
+            return video_prompt
         return self.normalize_omni_video(video_prompt, beat=beat)
 
     def video_profile_violations(self, video_prompt, beat=None):
         """omni 的镜头语法硬伤（记号类瑕疵不算）。"""
+        if pp.reviews_disabled(self.config):
+            return []
         ladder = self.ladder_for_beat(beat) if beat else None
         residual = self.video_contract_errors(
             video_prompt, beat=beat, ladder=ladder,
@@ -1340,6 +1360,8 @@ single continuous take、one continuous take、single take、unbroken take 或�
     def finalize_fallback_video(self, video_prompt, contract):
         """占位符兜底稿：base 的兜底文案是照一镜到底写的（"One unbroken take..."、
         "one continuous coaxial move"），在 omni 下必须先清干净，再补一句镜头梯声明。"""
+        if pp.reviews_disabled(self.config):
+            return video_prompt
         is_crossing = bool(contract.get('is_bridge') or contract.get('is_cut'))
         beat = contract.get('beat')
         is_threshold_or_reveal = contract.get('is_threshold_or_reveal')
@@ -1362,6 +1384,8 @@ single continuous take、one continuous take、single take、unbroken take 或�
         """omni 版的 VIDEO 确定性修复链。字数预算按镜头数缩放并在注入后复裁，
         节奏声明换成多镜头版、删除机械时间线，不走 base 的
         out-and-in 兜底（那句会塞进按 8 秒写死的时间戳与 Grid 记号，见模块 docstring）。"""
+        if pp.reviews_disabled(config if config is not None else self.config):
+            return video_prompt
         ladder = self.ladder_for_beat(beat, is_threshold_or_reveal)
         shot_count = max(3, len(ladder or _DEFAULT_CONSTRUCTION_LADDER))
         _target, ceiling = video_word_targets(shot_count)
@@ -1402,6 +1426,8 @@ single continuous take、one continuous take、single take、unbroken take 或�
 
         拍型未知（回炉通路只拿到一段文本）时只做前三步：过门拍/兑现拍本来就免除节奏声明，
         不猜未知拍型的结构。"""
+        if pp.reviews_disabled(self.config):
+            return video_prompt
         user_single = self.allows_single_take(beat)
         text = (video_prompt or '') if user_single else strip_one_take_language(video_prompt)
         text = _strip_base_even_rate(text)
@@ -1495,6 +1521,8 @@ Rewrite rules (additive — do not lose content):
         与 base 的结构性回炉同款契约——加法式修改、锚定开场句逐字保留、重写稿必须真的
         通过 omni_video_violations 复验，否则保留原稿（只留痕）。返回
         (video_prompt, 是否采用重写稿)。"""
+        if pp.reviews_disabled(config):
+            return (video_prompt, None)
         duration = self.clip_duration()
         ladder = self.ladder_for_beat(beat) or self.ladder_for_kind(duration, 'construction')
         system = self.multishot_rework_system(ladder, duration)

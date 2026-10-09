@@ -33,6 +33,7 @@ PROJECT_MUTATIONS = frozenset((
     '/api/library/delete_item', '/api/compose', '/api/auto_run',
     '/api/generate_frames', '/api/generate_frames_selection', '/api/render_staged',
     '/api/render_anchor', '/api/generate_videos', '/api/generate_video_chain',
+    '/api/video-operation/reconcile',
     '/api/stepped/start', '/api/stepped/advance', '/api/merge_videos', '/api/generate_cover',
     '/api/switch_candidate', '/api/fix_frame_issue', '/api/undo_frame_fix',
     '/api/adopt_rejected_fix', '/api/flag_frame_issue', '/api/sequence_review',

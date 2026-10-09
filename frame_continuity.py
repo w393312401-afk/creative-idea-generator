@@ -70,9 +70,16 @@ def continuity_mode(config: dict[str, Any] | None) -> str:
     resolved = _gate("frameContinuityMode", config)
     if resolved is not None:
         return resolved
-    raw = (config or {}).get("frameContinuityMode", "balanced")
-    mode = str(raw or "balanced").strip().lower()
-    return mode if mode in MODES else "balanced"
+    # A missing config service must not revive a retired gate from request values.
+    return "off"
+
+
+def _reviews_retired() -> bool:
+    try:
+        from server_common import reviews_disabled
+        return reviews_disabled()
+    except Exception:
+        return True
 
 
 def continuity_max_retries(config: dict[str, Any] | None) -> int:
@@ -80,6 +87,8 @@ def continuity_max_retries(config: dict[str, Any] | None) -> int:
     # 独有的（GATE_SETTINGS 里 frameContinuityMaxRetries 的 default=1 只在没有档位
     # 上下文时用），所以显式配了才走总表，没配就按档位推。
     mode = continuity_mode(config)
+    if _reviews_retired():
+        return 0
     if mode == "off":
         return 0
     default = 2 if mode == "strict" else 1
@@ -319,6 +328,9 @@ def analyze_frame(reference_path: str, candidate_path: str, *, prompt: str = "",
     必须用**同一块**稳定区掩膜才可比，而定向修复恰恰会改写候选帧自己的正文——推断出来
     的 cells 前后不同，比较的就是两个不同口径的读数，档位差异可能纯粹来自掩膜位移。
     """
+    if _reviews_retired():
+        return {"version": CONTRACT_VERSION, "status": "retired", "retired": True,
+                "reason": "Quality review rules are retired"}
     if mode == "off":
         return {"version": CONTRACT_VERSION, "status": "skipped", "reason": "continuity mode is off"}
     mode = mode if mode in THRESHOLDS else "balanced"
@@ -470,7 +482,7 @@ def measure_seam(reference_path: str | None, candidate_path: str | None, *,
     `cells` 显式给定时直接用它，不再从 prompt/beat 推断——修前 / 修后两次读数必须用同一
     块掩膜才可比（见 analyze_frame 的同名参数）。读数里带回 `cells`，供第二次调用复用。
     """
-    if mode == "off":
+    if _reviews_retired() or mode == "off":
         return None
     if not reference_path or not candidate_path:
         return None

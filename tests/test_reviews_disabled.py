@@ -1,4 +1,4 @@
-"""The master review switch skips real work without overwriting saved preferences."""
+"""Quality reviews are permanently retired, including legacy explicit false requests."""
 from unittest.mock import patch
 from types import SimpleNamespace
 import json
@@ -34,20 +34,21 @@ def test_master_overrides_all_gates_and_restores_preferences(managed):
             continue
         expected = {'bool': False, 'enum': 'off', 'int': 0}[spec['type']]
         assert common.gate_setting(key, merged) == expected, key
-        assert merged[key] == configured[key]
+        assert merged[key] == expected
     assert continuity_mode(merged) == 'off'
     assert continuity_max_retries(merged) == 0
     merged['reviewsDisabled'] = False
     for spec in common.GATE_SETTINGS:
         if spec['key'] != 'reviewsDisabled':
-            assert common.gate_setting(spec['key'], merged) == configured[spec['key']]
+            expected = {'bool': False, 'enum': 'off', 'int': 0}[spec['type']]
+            assert common.gate_setting(spec['key'], merged) == expected
 
 
 def test_server_master_can_be_explicitly_disabled_for_one_request():
     with patch.dict(common.SERVER_CONFIG, {'reviewsDisabled': True}):
         assert common.qa_gate_level({}) == 'off'
-        assert common.qa_gate_level({'reviewsDisabled': False}) == 'standard'
-        assert not common.reviews_disabled({'reviewsDisabled': 'false'})
+        assert common.qa_gate_level({'reviewsDisabled': False}) == 'off'
+        assert common.reviews_disabled({'reviewsDisabled': 'false'})
 
 
 def test_registry_report_retains_preferences_while_master_is_on():
@@ -56,8 +57,9 @@ def test_registry_report_retains_preferences_while_master_is_on():
     }):
         report = {row['key']: row for row in common.gate_settings_report()}
     assert report['reviewsDisabled']['server_value'] is True
-    assert report['chainGuardMode']['server_value'] == 'halt'
-    assert report['videoAnchorVerify']['server_value'] is True
+    assert report['chainGuardMode']['server_value'] == 'off'
+    assert report['videoAnchorVerify']['server_value'] is False
+    assert all(row['retired'] and not row['editable'] for row in report.values())
 
 
 def test_video_checks_skip_local_probes_and_vlm():
@@ -146,7 +148,7 @@ def test_legacy_prompt_quality_metadata_does_not_block_disabled_reviews():
                'config': {'reviewsDisabled': True}}
     assert prompt_delivery_block_reason(payload) is None
     payload['config']['reviewsDisabled'] = False
-    assert prompt_delivery_block_reason(payload)
+    assert prompt_delivery_block_reason(payload) is None
 
 
 @pytest.mark.parametrize('partial', [False, True])

@@ -31,6 +31,10 @@ const STAGE_ICONS = {
 
 const STAGE_ORDER = Object.keys(STAGE_LABELS);
 
+function steppedMediaAttrs(url) {
+    return typeof MediaPreview !== 'undefined' ? MediaPreview.attrs(url) : `src="${url}"`;
+}
+
 /* --- API Functions --- */
 function getAccessHeaders() {
     const accessCode = typeof ACCESS_CODE !== 'undefined' ? ACCESS_CODE : '';
@@ -123,11 +127,31 @@ function startSteppedSSE(taskId) {
         try {
             const data = JSON.parse(e.data);
             if (data.pipeline_state) {
+                const recovery = steppedState && steppedState.video_recovery;
                 steppedState = data.pipeline_state;
+                if (steppedState.stage === 'render_videos' && recovery && !steppedState.video_recovery) {
+                    steppedState.video_recovery = recovery;
+                }
                 updateSteppedUI(steppedState);
             }
         } catch (err) {
             console.error('Error parsing stepped_stage', err);
+        }
+    });
+
+    steppedSSE.addEventListener('video_recovery', (e) => {
+        try {
+            const data = JSON.parse(e.data);
+            if (!steppedState || ['completed', 'failed', 'cancelled'].includes(steppedState.stage)) return;
+            steppedState.stage = 'render_videos';
+            steppedState.status = 'running';
+            const previous = steppedState.video_recovery || {};
+            steppedState.video_recovery = { ...data,
+                completed_slots: Array.from(new Set([...(previous.completed_slots || []), ...(data.completed_slots || [])]))
+            };
+            updateSteppedUI(steppedState);
+        } catch (err) {
+            console.error('Error parsing video_recovery', err);
         }
     });
     
@@ -139,6 +163,24 @@ function startSteppedSSE(taskId) {
     });
     
     steppedSSE.addEventListener('result', (e) => {
+        try {
+            const result = JSON.parse(e.data);
+            if (result.pipeline_state) steppedState = result.pipeline_state;
+            if (steppedState) {
+                for (const key of ['completion_state', 'has_failures', 'has_quality_warnings']) {
+                    if (key in result) steppedState[key] = result[key];
+                }
+            }
+            // 视频恢复过程仍归属同一运行任务；中间快照不能冒充最终完成。
+            if (steppedState && (steppedState.stage === 'render_videos' || result.status === 'running')) {
+                steppedState.status = 'running';
+                updateSteppedUI(steppedState);
+                return;
+            }
+        } catch (err) {
+            console.error('Error parsing stepped result', err);
+            return;
+        }
         steppedSSE.close();
         if (steppedState) {
             steppedState.stage = 'completed';
@@ -242,14 +284,14 @@ function renderSteppedReviewPanel(container, state) {
                     <div class="stepped-dual-preview-col">
                         <span class="stepped-dual-preview-badge gen-badge">🌟 生成锚点帧 (IMG 001)</span>
                         <div class="review-image-wrapper" onclick="typeof openLightbox === 'function' ? openLightbox('${imgUrl}') : null" title="点击单独放大查看生成锚点帧">
-                            <img src="${imgUrl}" alt="Generated Anchor Frame" onerror="this.src='${STEPPED_FRAME_PLACEHOLDER}'" />
+                            <img ${steppedMediaAttrs(imgUrl)} alt="Generated Anchor Frame" onerror="this.src='${STEPPED_FRAME_PLACEHOLDER}'" />
                             <span class="stepped-thumb-zoom-badge">🔍 放大生成帧</span>
                         </div>
                     </div>
                     <div class="stepped-dual-preview-col">
                         <span class="stepped-dual-preview-badge ref-badge">🎯 原片基准抽帧 (REF 001)</span>
                         <div class="review-image-wrapper ref-wrapper" onclick="typeof openLightbox === 'function' ? openLightbox('${refUrl}') : null" title="点击单独放大查看原片基准抽帧">
-                            <img src="${refUrl}" alt="Benchmark Ref Frame" onerror="this.src='${STEPPED_FRAME_PLACEHOLDER}'" />
+                            <img ${steppedMediaAttrs(refUrl)} alt="Benchmark Ref Frame" onerror="this.src='${STEPPED_FRAME_PLACEHOLDER}'" />
                             <span class="stepped-thumb-zoom-badge" style="color: #f59e0b; border-color: rgba(245, 158, 11, 0.4);">🎯 放大原片帧</span>
                         </div>
                     </div>
@@ -261,7 +303,7 @@ function renderSteppedReviewPanel(container, state) {
         } else {
             previewHtml = `
                 <div class="review-image-wrapper" onclick="typeof openLightbox === 'function' ? openLightbox('${imgUrl}') : null" title="点击单独放大查看锚点帧">
-                    <img src="${imgUrl}" alt="Anchor Frame" onerror="this.src='${STEPPED_FRAME_PLACEHOLDER}'" />
+                    <img ${steppedMediaAttrs(imgUrl)} alt="Anchor Frame" onerror="this.src='${STEPPED_FRAME_PLACEHOLDER}'" />
                     <span class="stepped-thumb-zoom-badge">🔍 放大锚点帧</span>
                 </div>
             `;
@@ -299,7 +341,7 @@ function renderSteppedReviewPanel(container, state) {
                     <div class="batch-counter-badge">批次 ${currentBatch + 1}/${totalBatches}</div>
                 </div>
                 <div class="review-image-wrapper" onclick="typeof openLightbox === 'function' ? openLightbox('${imgUrl}') : null" title="点击放大多宫格拼图大图">
-                    <img src="${imgUrl}" alt="Batch Collage" />
+                    <img ${steppedMediaAttrs(imgUrl)} alt="Batch Collage" />
                     <span class="stepped-thumb-zoom-badge">🔍 放大批次拼图</span>
                 </div>
                 <div class="stepped-toolbar-actions">
@@ -332,7 +374,7 @@ function renderSteppedReviewPanel(container, state) {
                     <h3 class="review-title">最终审查 · 全局连贯性与单帧快检${hasRefs ? ' (全量原片对标)' : ''}</h3>
                 </div>
                 <div class="review-image-wrapper" onclick="typeof openLightbox === 'function' ? openLightbox('${imgUrl}') : null" title="点击放大完整 5 列多宫格大图">
-                    <img src="${imgUrl}" alt="Final Collage" />
+                    <img ${steppedMediaAttrs(imgUrl)} alt="Final Collage" />
                     <span class="stepped-thumb-zoom-badge">🔍 放大 5 列大图</span>
                 </div>
                 <div class="stepped-toolbar-actions">
@@ -352,14 +394,23 @@ function renderSteppedReviewPanel(container, state) {
             </div>
         `;
     } else if (stage === 'completed') {
+        const partial = state.has_failures || state.completion_state === 'partial_failed';
         container.innerHTML = `
             <div class="review-panel-glass stepped-review-container">
                 <div class="review-header">
-                    <h3 class="review-title" style="color: var(--color-success)">🎉 流程已完成</h3>
+                    <h3 class="review-title" style="color: var(${partial ? '--color-warning' : '--color-success'})">${partial ? '视频需要处理' : '🎉 流程已完成'}</h3>
                 </div>
-                <p style="color: var(--text-secondary)">所有的帧和视频均已生成并审核完毕。</p>
+                <p style="color: var(--text-secondary)">${partial ? '存在失败或结果未决的视频片段。请先核对任务状态，再手动补跑。' : '所有的帧和视频均已生成并审核完毕。'}</p>
             </div>
         `;
+    } else if (stage === 'render_videos' && state.video_recovery) {
+        const recovery = state.video_recovery;
+        const successful = (recovery.completed_slots || []).length;
+        const total = successful + (recovery.slots || []).length;
+        const phaseText = recovery.phase === 'querying' ? '正在自动核对原视频'
+            : recovery.phase === 'retrying' ? '正在自动补跑未完成片段' : '等待自动恢复后继续生成';
+        renderSteppedLoading(container, (total ? `已生成 ${successful}/${total} 段视频 · ` : '')
+            + (recovery.message || phaseText));
     } else {
         renderSteppedLoading(container, STAGE_LABELS[stage] + ' 中...');
     }
@@ -367,9 +418,10 @@ function renderSteppedReviewPanel(container, state) {
 
 function renderSteppedLoading(container, text) {
     if (!container) return;
+    const safeText = String(text || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
     container.innerHTML = `
         <div class="review-panel-glass stepped-loading stepped-review-container">
-            <div>${text}</div>
+            <div>${safeText}</div>
             <div class="stepped-loading-bar">
                 <div class="stepped-loading-fill"></div>
             </div>
@@ -409,11 +461,11 @@ function renderSteppedBatchFrameThumbsHtml(state, batchInfo) {
                             <div class="stepped-paired-thumb-card" onclick="openSteppedSequencesLightbox(${steppedAttrArg(title)}, ${steppedAttrArg(sequences)}, ${idx})" title="点击单独放大查看第 ${seq} 拍 (含原片对照)">
                                 <div class="stepped-paired-thumb-split">
                                     <div class="stepped-paired-box gen-box">
-                                        <img src="${frameUrl}" alt="IMG ${seq}" onerror="this.src='${STEPPED_FRAME_PLACEHOLDER}'" />
+                                        <img ${steppedMediaAttrs(frameUrl)} alt="IMG ${seq}" onerror="this.src='${STEPPED_FRAME_PLACEHOLDER}'" />
                                         <span class="stepped-paired-tag tag-gen">IMG ${seq}</span>
                                     </div>
                                     <div class="stepped-paired-box ref-box">
-                                        <img src="${refUrl}" alt="REF ${seq}" onerror="this.src='${STEPPED_FRAME_PLACEHOLDER}'" />
+                                        <img ${steppedMediaAttrs(refUrl)} alt="REF ${seq}" onerror="this.src='${STEPPED_FRAME_PLACEHOLDER}'" />
                                         <span class="stepped-paired-tag tag-ref">REF ${seq}</span>
                                     </div>
                                 </div>
@@ -428,7 +480,7 @@ function renderSteppedBatchFrameThumbsHtml(state, batchInfo) {
                     return `
                         <div class="stepped-frame-thumb-card" onclick="openSteppedSequencesLightbox(${steppedAttrArg(title)}, ${steppedAttrArg(sequences)}, ${idx})" title="点击单独放大查看第 ${seq} 帧">
                             <div class="stepped-frame-thumb-box">
-                                <img src="${frameUrl}" alt="Frame ${seq}" onerror="this.src='${STEPPED_FRAME_PLACEHOLDER}'" />
+                                <img ${steppedMediaAttrs(frameUrl)} alt="Frame ${seq}" onerror="this.src='${STEPPED_FRAME_PLACEHOLDER}'" />
                                 <span class="stepped-frame-zoom-tag">🔍</span>
                             </div>
                             <span class="stepped-frame-seq-name" onclick="event.stopPropagation(); openSteppedTriptychModal('${title}', ${seq}, ${state.total_beats || 12})" title="点击打开三联屏审查">IMG ${String(seq).padStart(3, '0')} 📐</span>
@@ -468,11 +520,11 @@ function renderSteppedFinalAllFramesThumbsHtml(state) {
                             <div class="stepped-paired-thumb-card" onclick="openSteppedSequencesLightbox(${steppedAttrArg(title)}, ${steppedAttrArg(sequences)}, ${idx})" title="点击单独放大查看第 ${seq} 拍 (含原片对照)">
                                 <div class="stepped-paired-thumb-split">
                                     <div class="stepped-paired-box gen-box">
-                                        <img src="${frameUrl}" alt="IMG ${seq}" onerror="this.src='${STEPPED_FRAME_PLACEHOLDER}'" />
+                                        <img ${steppedMediaAttrs(frameUrl)} alt="IMG ${seq}" onerror="this.src='${STEPPED_FRAME_PLACEHOLDER}'" />
                                         <span class="stepped-paired-tag tag-gen">IMG ${seq}</span>
                                     </div>
                                     <div class="stepped-paired-box ref-box">
-                                        <img src="${refUrl}" alt="REF ${seq}" onerror="this.src='${STEPPED_FRAME_PLACEHOLDER}'" />
+                                        <img ${steppedMediaAttrs(refUrl)} alt="REF ${seq}" onerror="this.src='${STEPPED_FRAME_PLACEHOLDER}'" />
                                         <span class="stepped-paired-tag tag-ref">REF ${seq}</span>
                                     </div>
                                 </div>
@@ -487,7 +539,7 @@ function renderSteppedFinalAllFramesThumbsHtml(state) {
                     return `
                         <div class="stepped-frame-thumb-card" onclick="openSteppedSequencesLightbox(${steppedAttrArg(title)}, ${steppedAttrArg(sequences)}, ${idx})" title="点击单独放大查看第 ${seq} 帧">
                             <div class="stepped-frame-thumb-box">
-                                <img src="${frameUrl}" alt="Frame ${seq}" onerror="this.src='${STEPPED_FRAME_PLACEHOLDER}'" />
+                                <img ${steppedMediaAttrs(frameUrl)} alt="Frame ${seq}" onerror="this.src='${STEPPED_FRAME_PLACEHOLDER}'" />
                                 <span class="stepped-frame-zoom-tag">🔍</span>
                             </div>
                             <span class="stepped-frame-seq-name" onclick="event.stopPropagation(); openSteppedTriptychModal('${title}', ${seq}, ${state.total_beats || 12})" title="点击打开三联屏审查">IMG ${String(seq).padStart(3, '0')} 📐</span>
@@ -815,10 +867,11 @@ function updateSteppedUI(state) {
                     message: '全套关键帧已生成完毕，请进行最终连贯性审查'
                 });
             } else if (state.stage === 'completed') {
+                const partial = state.has_failures || state.completion_state === 'partial_failed';
                 NotificationCenter.notify({
-                    type: 'success',
-                    title: '分步管线全流程完成',
-                    message: '所有的关键帧与视频序列已全部生成完毕！'
+                    type: partial ? 'action_required' : 'success',
+                    title: partial ? '视频存在失败或未决片段' : '分步管线全流程完成',
+                    message: partial ? '请先核对任务状态，再手动补跑。' : '所有的关键帧与视频序列已全部生成完毕！'
                 });
             } else if (state.stage === 'failed') {
                 NotificationCenter.notify({

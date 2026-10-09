@@ -23,8 +23,8 @@ if _REPO_ROOT not in sys.path:
 # 这里在进程级审计钩子上兜底：任何测试往仓库的运行数据目录或根目录状态文件里写、删、
 # 改名，一律当场 PermissionError 拦下，并在该测试 teardown 时判失败——业务代码即使
 # except Exception 吞掉了异常，也逃不过 teardown 的检查。只读不受影响。
-_PROTECTED_DIRS = ('runtime', 'logs', 'outputs', 'tasks', 'library')
-_PROTECTED_ROOT_SUFFIXES = ('.json', '.bak', '.log', '.pid')
+_PROTECTED_DIRS = ('runtime', 'logs', 'outputs', 'tasks', 'library', 'beat_packs')
+_PROTECTED_ROOT_SUFFIXES = ('.json', '.bak', '.log', '.pid', '.pre-split')
 # 有意写进真实 outputs 的用例：真服务只从仓库 outputs/ 出图，fixture 自带清理。
 _ALLOWED_STATE_PATHS = ('outputs/e2e_restore_demo',)
 _REAL_ROOT = os.path.normcase(os.path.realpath(_REPO_ROOT))
@@ -79,6 +79,40 @@ def _guard_real_state(event, args):
 
 
 sys.addaudithook(_guard_real_state)
+
+
+_fx_import_runtime = None
+
+
+def pytest_sessionstart(session):
+    """Isolate the FX singleton before collection imports server or fx_control.
+
+    Its constructor reads the previous process's lease and audits recovery before
+    any autouse fixture can redirect paths. The session baseline also keeps late
+    callbacks isolated after a per-test monkeypatch restores those paths.
+    """
+    import builtins
+    import tempfile
+    from unittest.mock import patch
+
+    global _fx_import_runtime
+    _fx_import_runtime = tempfile.TemporaryDirectory(prefix='spark-pytest-fx-import-')
+    state_path = os.path.join(_fx_import_runtime.name, 'fx_control_state.json')
+    audit_path = os.path.join(_fx_import_runtime.name, 'fx_audit.jsonl')
+    original_open = builtins.open
+
+    def isolated_first_open(path, *args, **kwargs):
+        # Redirect only this known singleton input. All other paths still pass
+        # through the unchanged real-state write guard above.
+        if _real_state_path(path) == 'runtime/fx_control_state.json':
+            path = state_path
+        return original_open(path, *args, **kwargs)
+
+    with patch('builtins.open', isolated_first_open):
+        import fx_control
+    fx_control.FX_CONTROL.state_path = state_path
+    fx_control.FX_CONTROL.audit_path = audit_path
+    fx_control.FX_CONTROL.recovered = None
 
 
 @pytest.fixture(autouse=True)
@@ -205,6 +239,11 @@ def _isolate_library_dir(tmp_path_factory, monkeypatch):
     import server_common
     monkeypatch.setattr(server_common, 'LIBRARY_DIR',
                         str(tmp_path_factory.mktemp('library')), raising=True)
+    # 旧的整表 library.json 也要一起隔离：拆分库首次访问会就地迁移它，并把它**复制**成
+    # library.json.pre-split。LIBRARY_DIR 指向临时目录而 DB_FILE 还指向真实文件时，
+    # 每个碰创意库的测试都会把开发机上真实的老库灌进临时库，并覆盖掉那份迁移前备份。
+    monkeypatch.setattr(server_common, 'DB_FILE',
+                        str(tmp_path_factory.mktemp('legacy_library') / 'library.json'), raising=True)
 
 
 @pytest.fixture(autouse=True)
@@ -263,6 +302,8 @@ def _isolate_tasks_dir(tmp_path_factory, monkeypatch):
         monkeypatch.setattr(server, 'TASKS_DIR', tasks_dir, raising=False)
     orig_tasks = dict(server_common.ACTIVE_TASKS)
     server_common.ACTIVE_TASKS.clear()
+    monkeypatch.setattr(server_common, '_ACTIVE_FRAME_RUNS', {})
+    monkeypatch.setattr(server_common, '_FRAME_RUNS_UNTIL_RELEASED', set())
     monkeypatch.setattr(server_common, 'TASKS_LOADED_FROM_DISK', False)
     monkeypatch.setattr(server_common, '_TASK_FLUSHED_EVENTS', {})
     yield

@@ -1574,6 +1574,9 @@ def switch_to_next_account(exclude=(), min_credit: Optional[int] = None,
     返回 None 的两种情况都交由调用方原地重试（保持旧的"重试还是要跑"语义）：
     号池为空 / 没配账号，或池子里的号都被排除、禁用、冷却、额度不足。
     """
+    if account_binding.current_fixed_task_account():
+        # Must precede pool probes and closing the current profile.
+        raise account_binding.FixedAccountStopError("固定视频账号不可用，已停止提交，不切换账号")
     if min_credit is None:
         min_credit = _get_min_credit_threshold()
     try:

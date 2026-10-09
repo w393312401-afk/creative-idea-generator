@@ -42,6 +42,25 @@ def test_restart_endpoint_calls_restart_process(monkeypatch):
     assert len(restarted) == 1
 
 
+def test_restart_endpoint_refuses_while_tasks_run_unless_forced(monkeypatch):
+    restarted = []
+    monkeypatch.setattr(server, 'restart_server_process', lambda: restarted.append(True))
+    monkeypatch.setattr(server, 'access_ok', lambda h: True)
+    monkeypatch.setattr(server, 'ACTIVE_TASKS', {'videos_x': {'status': 'running'},
+                                                 'videos_done': {'status': 'completed'}})
+
+    h, sent = _post('/api/restart', {})
+    server.SparkRequestHandler.do_POST(h)
+    assert sent[0][1] == 409
+    assert sent[0][0]['running_tasks'] == ['videos_x']
+
+    h, sent = _post('/api/restart', {'force': True})
+    server.SparkRequestHandler.do_POST(h)
+    assert sent[0][1] == 200
+    time.sleep(0.1)
+    assert restarted == [True]
+
+
 def test_restart_endpoint_enforces_access_code(monkeypatch):
     monkeypatch.setattr(server, 'access_ok', lambda h: False)
 

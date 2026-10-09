@@ -18,6 +18,10 @@ let imgStudioReferenceRetryTaskId = null;
 let imgStudioReferenceRetryVersion = 0;
 let imgStudioTaskList = []; // Array of { id, type, prompt, model, ratio, quality, status, error, image, timestamp, controller, extraData }
 
+function imgStudioMediaAttrs(url) {
+    return typeof MediaPreview !== 'undefined' ? MediaPreview.attrs(url) : `src="${url}"`;
+}
+
 // Mobile Subview Switch (P4: 创作 / 结果 互斥切换)
 window.switchImageStudioMobileView = function (view) {
     imgStudioMobileView = view;
@@ -711,7 +715,7 @@ function imgStudioUpdateFeedEntry(node, task) {
         const box = node.querySelector('.feed-entry-result');
         if (box) {
             box.style.display = 'flex';
-            box.innerHTML = `<img src="${task.image}" alt="生成结果" onclick="viewImageStudioTaskItem('${task.id}')" title="点击在渲染室大屏查看">`;
+            box.innerHTML = `<img ${imgStudioMediaAttrs(task.image)} alt="生成结果" onclick="viewImageStudioTaskItem('${task.id}')" title="点击在渲染室大屏查看">`;
         }
     }
 }
@@ -1198,7 +1202,9 @@ function imgStudioDisplaySpotlight(imgDataUrl, prompt, model, ratio, quality) {
     document.getElementById('spotlight-placeholder').style.display = 'none';
     document.getElementById('spotlight-image-wrapper').style.display = 'flex';
 
-    document.getElementById('spotlight-img').src = imgDataUrl;
+    const spotlightImg = document.getElementById('spotlight-img');
+    if (typeof MediaPreview !== 'undefined') MediaPreview.setSource(spotlightImg, imgDataUrl);
+    else spotlightImg.src = imgDataUrl;
     document.getElementById('spotlight-info-model').textContent = model;
     document.getElementById('spotlight-info-prompt').textContent = prompt;
 
@@ -1206,6 +1212,7 @@ function imgStudioDisplaySpotlight(imgDataUrl, prompt, model, ratio, quality) {
 }
 
 function imgStudioResetSpotlightUI() {
+    if (typeof MediaPreview !== 'undefined') MediaPreview.setSource(document.getElementById('spotlight-img'), '');
     document.getElementById('spotlight-skeleton').style.display = 'none';
     document.getElementById('spotlight-image-wrapper').style.display = 'none';
     document.getElementById('spotlight-placeholder').style.display = 'flex';
@@ -1223,7 +1230,7 @@ function imgStudioCaptionFor(item) {
 function imgStudioSetupSpotlightActions(imgDataUrl, prompt, model, ratio, quality) {
     document.getElementById('spotlight-zoom-btn').onclick = () => {
         const spotlightImg = document.getElementById('spotlight-img');
-        const currentSrc = spotlightImg ? spotlightImg.src : imgDataUrl;
+        const currentSrc = (spotlightImg && (spotlightImg.getAttribute('data-media-preview-src') || spotlightImg.src)) || imgDataUrl;
 
         const clickedIndex = imgStudioHistory.findIndex(item => item.image === currentSrc);
         if (clickedIndex === -1) {
@@ -1439,6 +1446,12 @@ async function imgStudioLoadHistory() {
         } catch (e) {}
     }
 
+    // Count-only pages do not need one remote HEAD request per saved image.
+    if (typeof MediaPreview !== 'undefined' && MediaPreview.countsOnly()) {
+        imgStudioRenderHistoryGrid();
+        return;
+    }
+
     // Filter out history items whose images no longer exist on the server (non-data URLs only)
     const filteredHistory = [];
     let needCleanSave = false;
@@ -1478,7 +1491,7 @@ function imgStudioRenderHistoryGrid() {
             imgStudioDisplaySpotlight(item.image, item.prompt, item.model, item.ratio, item.quality);
         };
         card.innerHTML = `
-            <img src="${item.image}" alt="History Item" loading="lazy">
+            <img ${imgStudioMediaAttrs(item.image)} alt="History Item" loading="lazy">
             <div class="history-card-overlay">
                 <button class="history-card-btn" title="查看" onclick="viewImageStudioHistoryItem('${item.id}', 'zoom')">🔍</button>
                 <button class="history-card-btn" title="下载" onclick="viewImageStudioHistoryItem('${item.id}', 'download')">📥</button>

@@ -13,6 +13,7 @@ import time
 import pytest
 
 import codex_video_editor as editor
+import cta_burn
 
 
 FAKE_CLI = r'''
@@ -31,6 +32,12 @@ if '[fixture:cancel]' in prompt:
     (workspace / '.child.pid').write_text(str(child.pid))
     while True: time.sleep(1)
 if '[fixture:wait]' in prompt: time.sleep(1)
+if '[fixture:idle]' in prompt:
+    while True: time.sleep(1)
+if '[fixture:quiet-command]' in prompt:
+    print(json.dumps({'type':'item.started','item':{'id':'quiet','type':'command_execution','command':'ffmpeg input.mp4'}}), flush=True)
+    time.sleep(1)
+    print(json.dumps({'type':'item.completed','item':{'id':'quiet','type':'command_execution','command':'ffmpeg input.mp4','exit_code':0}}), flush=True)
 if '[fixture:barrier]' in prompt:
     (workspace / '.barrier-ready').touch()
     deadline = time.monotonic() + 10
@@ -67,7 +74,14 @@ for name, media in [('evidence',source), ('qa',output)]:
 result = {'status':'completed', 'message':'fixture complete', 'output_file':str(output), 'review_file':str(workspace/'review.md'),
           'plan_file':str(planpath), 'qa_evidence_file':str(workspace/'qa/evidence.json'), 'source_reviewed':True,
           'qa_reviewed':'[fixture:qa_fail]' not in prompt, 'visual_reviewed_ranges':[{'start':0,'end':1}], 'audio_reviewed':'no_audio', 'error':''}
+if '[fixture:checkpoint-hang]' in prompt or '[fixture:unreviewed-hang]' in prompt:
+    if '[fixture:unreviewed-hang]' in prompt: result['qa_reviewed'] = False
+    (workspace / 'completion.json').write_text(json.dumps(result))
+    while True: time.sleep(1)
 output_json.write_text(json.dumps(result))
+if '[fixture:result-hang]' in prompt:
+    sys.stdout.close()
+    while True: time.sleep(1)
 '''
 
 
@@ -87,6 +101,8 @@ def local_editor(tmp_path, monkeypatch):
     monkeypatch.setattr(editor, 'OUTPUTS_DIR', root)
     monkeypatch.setattr(editor, '_STOP_REQUESTED', False)
     monkeypatch.setenv('CODEX_VIDEO_EDITOR_BIN', str(cli))
+    # 片尾引导默认开启且内置动画要起 Chromium 渲染；精剪主流程用例关掉它，烧录另有专门用例
+    cta_burn.save_settings({'enabled': False}, root / 'engagement_cta')
     yield root, source
     # Terminate only workers created by this fixture, including assertion failures.
     for directory in editor._job_dirs():
@@ -220,6 +236,111 @@ def test_legacy_queued_request_keeps_original_model_when_run_after_upgrade(local
     received = editor._read_json(directory / 'work/.received.json')
     assert received['args'][received['args'].index('--model') + 1] == 'gpt-6-sol'
     assert received['args'][received['args'].index('-c') + 1] == 'model_reasoning_effort=high'
+
+
+def run_inline_editor(source, notes):
+    directory = source.parent / 'codex_edits' / ('a' * 32)
+    directory.mkdir(parents=True)
+    shutil.copyfile(source, directory / 'input.mp4')
+    editor._write_json(directory / '.state.json', {'id': directory.name,
+        'source': str(source), 'status': 'running', 'logs': []})
+    request = {'mode': 'trim', 'notes': notes, 'tools': editor._tools()}
+    return directory, request
+
+
+@pytest.mark.parametrize('marker', ['checkpoint-hang', 'result-hang'])
+def test_reviewed_checkpoint_recovers_silent_cli_and_still_validates(local_editor, monkeypatch, marker):
+    _, source = local_editor
+    monkeypatch.setattr(editor, 'HANDOFF_SECONDS', 0.35)
+    monkeypatch.setattr(editor, 'IDLE_SECONDS', 2)
+    directory, request = run_inline_editor(source, f'[fixture:{marker}]')
+    fingerprint = hashlib.sha256((directory / 'input.mp4').read_bytes()).hexdigest()
+    final = editor._run_codex(directory, request)
+    editor._assert_input_unchanged(directory, fingerprint)
+    output = editor._validate_result(directory, request, final)
+    assert output['duration_seconds'] == pytest.approx(1)
+    registered = editor._read_json(directory / '.active-child.json')
+    # _validate_result registers its own ffprobe/ffmpeg, all of which must have exited.
+    assert not editor._birth(editor._process_info(registered['pid']))
+    messages = editor._read_json(directory / '.state.json')['logs']
+    assert any('收尾未返回' in row['message'] for row in messages)
+
+
+@pytest.mark.parametrize('marker', ['idle', 'unreviewed-hang'])
+def test_silent_cli_without_reviewed_checkpoint_times_out(local_editor, monkeypatch, marker):
+    _, source = local_editor
+    monkeypatch.setattr(editor, 'HANDOFF_SECONDS', 0.2)
+    monkeypatch.setattr(editor, 'IDLE_SECONDS', 0.5)
+    directory, request = run_inline_editor(source, f'[fixture:{marker}]')
+    with pytest.raises(TimeoutError, match='完整的完成记录'):
+        editor._run_codex(directory, request)
+    child = editor._read_json(directory / '.active-child.json')
+    assert not editor._birth(editor._process_info(child['pid']))
+
+
+def test_quiet_running_command_is_not_model_idle(local_editor, monkeypatch):
+    _, source = local_editor
+    monkeypatch.setattr(editor, 'HANDOFF_SECONDS', 0.2)
+    monkeypatch.setattr(editor, 'IDLE_SECONDS', 0.5)
+    directory, request = run_inline_editor(source, '[fixture:quiet-command]')
+    final = editor._run_codex(directory, request)
+    assert editor._validate_result(directory, request, final)['duration_seconds'] == pytest.approx(1)
+
+
+def test_cancellation_wins_during_checkpoint_handoff(local_editor, monkeypatch):
+    _, source = local_editor
+    monkeypatch.setattr(editor, 'HANDOFF_SECONDS', 0.2)
+    directory, request = run_inline_editor(source, '[fixture:checkpoint-hang]')
+    stop = editor._stop_process
+    def cancel_after_stop(process):
+        stop(process)
+        (directory / '.cancel').touch()
+    monkeypatch.setattr(editor, '_stop_process', cancel_after_stop)
+    with pytest.raises(InterruptedError, match='已取消'):
+        editor._run_codex(directory, request)
+    assert not editor._read_json(directory / '.state.json').get('output')
+
+
+def test_handoff_rechecks_review_after_stopping_writers(local_editor, monkeypatch):
+    _, source = local_editor
+    monkeypatch.setattr(editor, 'HANDOFF_SECONDS', 0.2)
+    directory, request = run_inline_editor(source, '[fixture:checkpoint-hang]')
+    stop = editor._stop_process
+    def late_output_write(process):
+        stop(process)
+        output = directory / 'work/edited.mp4'
+        stamp = time.time_ns() + 10_000_000_000
+        os.utime(output, ns=(stamp, stamp))
+    monkeypatch.setattr(editor, '_stop_process', late_output_write)
+    with pytest.raises(RuntimeError, match='完成记录不再匹配'):
+        editor._run_codex(directory, request)
+
+
+@pytest.mark.parametrize('invalid', ['partial_qa', 'stale_qa', 'wrong_shape', 'explicit_failure'])
+def test_completion_checkpoint_rejects_incomplete_or_stale_review(local_editor, invalid):
+    _, source = local_editor
+    directory, request = run_inline_editor(source, '')
+    final = editor._run_codex(directory, request)
+    workspace = directory / 'work'
+    (directory / '.result.json').unlink()
+    if invalid in ('partial_qa', 'stale_qa'):
+        report = editor._read_json(workspace / 'edited.report.json')
+        report['expected_duration'] = 1
+        editor._write_json(workspace / 'edited.report.json', report)
+        review = {'source_reviewed': True, 'qa_reviewed': True,
+                  'source_visual_reviewed_ranges': [{'start': 0, 'end': 1}],
+                  'qa_visual_reviewed_ranges': [{'start': 0, 'end': 0.5 if invalid == 'partial_qa' else 1}],
+                  'audio_reviewed': 'no_audio', 'render_report': str(workspace / 'edited.report.json')}
+        editor._write_json(workspace / 'qa/review.json', review)
+        if invalid == 'stale_qa':
+            output = workspace / 'edited.mp4'
+            stamp = output.stat().st_mtime_ns + 10_000_000_000
+            os.utime(output, ns=(stamp, stamp))
+    else:
+        if invalid == 'wrong_shape': final['qa_reviewed'] = 'true'
+        editor._write_json(workspace / 'completion.json', final)
+        if invalid == 'explicit_failure': editor._write_json(directory / '.result.json', {'status': 'failed'})
+    assert editor._completion_result(directory) is None
 
 
 def test_cancel_kills_descendant_with_its_own_session(local_editor):
@@ -364,3 +485,56 @@ def test_percent_in_project_directory_is_rejected_but_source_basename_is_support
     job = editor.start(str(good_source))
     assert '%25' in job['source']
     wait_job(good_source, 'completed')
+
+
+def _enable_custom_cta(root, tmp_path):
+    """用一段 2 秒半透明白色的 ProRes 4444 当自定义引导视频，避免起 Chromium。"""
+    overlay = tmp_path / 'cta.mov'
+    subprocess.run([shutil.which('ffmpeg'), '-hide_banner', '-loglevel', 'error', '-f', 'lavfi',
+                    '-i', 'color=c=white@0.5:s=90x160:r=30:d=2,format=yuva444p',
+                    '-c:v', 'prores_ks', '-profile:v', '4444', '-pix_fmt', 'yuva444p10le', str(overlay)], check=True)
+    cta_burn.store_custom(overlay.read_bytes(), 'cta.mov', root / 'engagement_cta')
+    cta_burn.save_settings({'enabled': True}, root / 'engagement_cta')
+
+
+def _red_at(video, tmp_path, x, y):
+    from PIL import Image
+    frame = tmp_path / f'{Path(video).stem}.png'
+    subprocess.run([shutil.which('ffmpeg'), '-y', '-v', 'error', '-ss', '0.5', '-i', str(video),
+                    '-frames:v', '1', str(frame)], check=True)
+    return Image.open(frame).convert('RGB').getpixel((x, y))[0]
+
+
+def test_completed_edit_burns_cta_into_last_seconds_and_keeps_clean_version(local_editor, tmp_path):
+    root, source = local_editor
+    _enable_custom_cta(root, tmp_path)
+    editor.start('outputs/中文 项目/合并 成片.mp4')
+    complete = wait_job(source, 'completed', timeout=30)
+    output = complete['output']
+    burned, clean = Path(output['file']), Path(output['clean']['file'])
+    assert output['url'].endswith('_cta.mp4') and burned.is_file() and clean.is_file()
+    assert burned.parent == clean.parent and burned != clean
+    assert output['cta']['source'] == 'custom' and output['cta']['seconds'] == 5
+    # 1 秒的成片比 5 秒片尾时长更短：从开头叠到结尾
+    assert (output['cta']['start_seconds'], output['cta']['end_seconds']) == (0, pytest.approx(1, abs=0.05))
+    assert output['duration_seconds'] == pytest.approx(output['clean']['duration_seconds'], abs=0.05)
+    assert '已在最后 5 秒烧录引导动画' in complete['message']
+    # 64×64 蓝底；90×160 叠加层等比缩到 36×64 贴右侧 → (50, 32) 处叠上了半透明白色
+    assert _red_at(burned, tmp_path, 50, 32) > 90
+    assert _red_at(clean, tmp_path, 50, 32) < 30
+    assert _red_at(burned, tmp_path, 10, 32) < 30, '叠加层之外的画面不变'
+
+
+def test_cta_failure_still_publishes_verified_clean_edit(local_editor, tmp_path):
+    root, source = local_editor
+    _enable_custom_cta(root, tmp_path)
+    for overlay in (root / 'engagement_cta' / 'custom').glob('*.mov'):
+        overlay.write_bytes(b'broken overlay')
+    editor.start('outputs/中文 项目/合并 成片.mp4')
+    complete = wait_job(source, 'completed', timeout=30)
+    output = complete['output']
+    assert 'cta' not in output and not output['url'].endswith('_cta.mp4')
+    assert Path(output['file']).is_file()
+    assert '引导动画未烧录' in complete['message'] and '已发布无引导版本' in complete['message']
+    assert not list(Path(output['file']).parent.glob('*_cta.mp4'))
+

@@ -46,6 +46,9 @@ function cacheBustedUrl(url) {
 function safeSetImageSrc(imgEl, url, bust = false) {
     if (!imgEl) return;
     if (!url) {
+        if (typeof MediaPreview !== 'undefined' && imgEl.id !== 'lightbox-img') {
+            MediaPreview.setSource(imgEl, '');
+        }
         imgEl.removeAttribute('src');
         return;
     }
@@ -57,11 +60,18 @@ function safeSetImageSrc(imgEl, url, bust = false) {
                    lower.startsWith('outputs/');
     if (!isSafe) {
         console.warn("Blocked potentially unsafe image URL:", url);
+        if (typeof MediaPreview !== 'undefined' && imgEl.id !== 'lightbox-img') {
+            MediaPreview.setSource(imgEl, '');
+        }
         imgEl.removeAttribute('src');
         return;
     }
     if (bust) bustImageCache(url);
-    imgEl.src = cacheBustedUrl(url);
+    if (typeof MediaPreview !== 'undefined' && imgEl.id !== 'lightbox-img') {
+        MediaPreview.setSource(imgEl, cacheBustedUrl(url));
+    } else {
+        imgEl.src = cacheBustedUrl(url);
+    }
 }
 
 // 任务终态质量风险汇总（2026-07-15 事故复盘：各门禁告警散落在日志/单帧徽标里，
@@ -204,7 +214,7 @@ function renderIdea(result) {
     const collageDownload = document.getElementById('collage-download-link');
     if (collageWrapper && collageImg) {
         if (result.collage_url) {
-            collageImg.src = result.collage_url;
+            safeSetImageSrc(collageImg, result.collage_url);
             if (collageDownload) collageDownload.href = result.collage_url;
             collageWrapper.style.display = 'block';
             
@@ -221,7 +231,7 @@ function renderIdea(result) {
             };
         } else {
             collageWrapper.style.display = 'none';
-            collageImg.src = '';
+            safeSetImageSrc(collageImg, '');
             collageImg.onclick = null;
         }
     }
@@ -241,7 +251,9 @@ function renderIdea(result) {
     if (typeof syncCoverPanelToCurrentIdea === 'function') syncCoverPanelToCurrentIdea();
 
     // Asynchronously fetch latest manifest (frames & videos) from server if it exists
-    fetch(`/api/get_manifest?title=${encodeURIComponent(getIdeaSaveTitle(result))}`)
+    const manifestReadState = typeof captureManifestReadState === 'function'
+        ? captureManifestReadState(result) : null;
+    fetch(`/api/get_manifest?title=${encodeURIComponent(getIdeaSaveTitle(result))}`, { cache: 'no-store' })
         .then(resp => {
             if (resp.ok) {
                 return resp.json();
@@ -257,9 +269,21 @@ function renderIdea(result) {
             // 刷新是按 manifest 原件覆盖），帧记录变少都属于有意为之。走单条写
             // （persistIdeaItem）之后不再经过整表缩量闸门，无需声明意图。
             if (manifest === null) {
+                const taskActive = manifestReadState && manifestReadState.active
+                    || (typeof isIdeaTaskActive === 'function'
+                        && (isIdeaTaskActive(result.id, 'frames') || isIdeaTaskActive(result.id, 'videos')))
+                    || (typeof manifestChangedDuringRead === 'function'
+                        && manifestChangedDuringRead(result, manifestReadState));
+                if (taskActive) {
+                    if (typeof isViewingIdea !== 'function' || isViewingIdea(result.id)) {
+                        hydrateFramesPanel(result);
+                        hydrateVideosPanel(result);
+                    }
+                    return; // 运行中的项目可能尚未首次写盘，404 不能清空已交付的本地结果。
+                }
                 if (result.frameRun) {
                     delete result.frameRun;
-                    saveCurrentIdeaState();
+                    if (typeof isViewingIdea !== 'function' || isViewingIdea(result.id)) saveCurrentIdeaState();
                     const existingIdx = savedIdeas.findIndex(item => item.id === result.id);
                     if (existingIdx !== -1 && savedIdeas[existingIdx].frameRun) {
                         delete savedIdeas[existingIdx].frameRun;
@@ -267,8 +291,11 @@ function renderIdea(result) {
                     }
                 }
             } else {
+                if (typeof mergeManifestReadIntoIdea === 'function') {
+                    manifest = mergeManifestReadIntoIdea(manifest, result, manifestReadState);
+                }
                 result.frameRun = manifest;
-                saveCurrentIdeaState();
+                if (typeof isViewingIdea !== 'function' || isViewingIdea(result.id)) saveCurrentIdeaState();
                 const existingIdx = savedIdeas.findIndex(item => item.id === result.id);
                 if (existingIdx !== -1) {
                     savedIdeas[existingIdx].frameRun = manifest;
@@ -300,6 +327,7 @@ function renderIdea(result) {
  */
 function hydrateFramesPanel(idea) {
     if (!idea) return;
+    if (typeof syncAutoVideoToggleFromIdea === 'function') syncAutoVideoToggleFromIdea(idea);
     const rec = (typeof getIdeaTaskRecord === 'function') ? getIdeaTaskRecord(idea.id, 'frames') : null;
     const btn = document.getElementById('generate-frames-btn');
     const selBtn = document.getElementById('generate-frames-selection-btn');
@@ -330,6 +358,7 @@ function hydrateFramesPanel(idea) {
         if (wrap) wrap.style.display = 'none';
         if (lines) lines.innerHTML = ''; // 别让上一个查看过的创意的动态行残留在隐藏 DOM 里
     }
+    if (typeof reconnectRunningFrameTaskForIdea === 'function') reconnectRunningFrameTaskForIdea(idea);
     if (typeof updatePipelineBar === 'function') updatePipelineBar();
 }
 
@@ -350,12 +379,16 @@ function hydrateVideosPanel(idea) {
         if (rec.progressInfo && typeof setProgressBar === 'function') setProgressBar('videos', rec.progressInfo);
         // renderVideosForIdea 只画 manifest 里已有结果的槽位；补上还没轮到的槽位占位卡
         if (grid && rec.total) {
-            for (let i = 1; i <= rec.total; i++) {
+            const slots = rec.targetSlots || Array.from({ length: rec.total }, (_, index) => index + 1);
+            for (const i of slots) {
                 if (!document.getElementById(`video-slot-${i}`)) {
                     const placeholderCard = document.createElement('div');
                     placeholderCard.id = `video-slot-${i}`;
                     enableVideoSlotDnd(placeholderCard, i);
-                    renderSlotCard(placeholderCard, slotPendingState('video', i, '等待中'));
+                    const status = (rec.progressState || {}).slotStatus?.[i];
+                    const activity = status === 'active' ? 'active' : !status || status === 'queued' ? 'queued' : '';
+                    renderSlotCard(placeholderCard, videoSlotState(status === 'failed'
+                        ? { slot: i, status: 'failed' } : null, { seq: i, busy: true, activity }));
                     placeSlotCard(placeholderCard, 'video', i);
                     grid.appendChild(placeholderCard);
                 }
@@ -366,6 +399,7 @@ function hydrateVideosPanel(idea) {
         if (chainBtn) chainBtn.disabled = false;
         if (progress) progress.style.display = 'none';
     }
+    if (typeof reconnectRunningVideoTaskForIdea === 'function') reconnectRunningVideoTaskForIdea(idea);
     if (typeof updatePipelineBar === 'function') updatePipelineBar();
 }
 
@@ -772,7 +806,8 @@ function renderVideosForIdea(idea) {
             }
             if (mergedPlayer) {
                 // 重新合成会原地覆盖同一个成片文件，同样要带版本号才看得到新的
-                mergedPlayer.src = cacheBustedUrl(videoUrl);
+                if (typeof MediaPreview !== 'undefined') MediaPreview.setSource(mergedPlayer, cacheBustedUrl(videoUrl));
+                else mergedPlayer.src = cacheBustedUrl(videoUrl);
             }
             if (mergedDownload) {
                 mergedDownload.href = videoUrl;
@@ -799,6 +834,7 @@ function renderVideosForIdea(idea) {
         } else {
             mergedContainer.style.display = 'none';
             if (mergedPlayer) {
+                if (typeof MediaPreview !== 'undefined') MediaPreview.setSource(mergedPlayer, '');
                 mergedPlayer.removeAttribute('src');
                 mergedPlayer.load();
             }
@@ -847,8 +883,17 @@ function renderVideosForIdea(idea) {
     // 画"未生成"+生成/上传出口。同 renderFramesForIdea 的同款判断。
     const videosRec = (typeof getIdeaTaskRecord === 'function' && idea)
         ? getIdeaTaskRecord(idea.id, 'videos') : null;
+    const slotStatuses = (videosRec && videosRec.progressState && videosRec.progressState.slotStatus) || {};
+    const recoveryState = videosRec && videosRec.progressState || {};
+    const recoverySlots = new Set((recoveryState.recoverySlots || []).map(Number));
+    const recoveryLabel = recoveryState.recoveryPhase === 'querying' ? '自动核对中…'
+        : recoveryState.recoveryPhase === 'retrying' ? '自动补跑中…' : '等待自动重试…';
+    if (videosRec && recoveryState.recoveryActive) {
+        meta.textContent = videosRec.meta || recoveryState.label || '正在自动恢复未完成的视频';
+    }
     const isVideoPending = (slotNum) =>
-        !!(videosRec && (!videosRec.targetSlots || videosRec.targetSlots.includes(slotNum)));
+        !!(videosRec && (!videosRec.targetSlots || videosRec.targetSlots.includes(slotNum))
+            && (!slotStatuses[slotNum] || ['queued', 'active', 'recovering'].includes(slotStatuses[slotNum])));
 
     itemsToRender.forEach(item => {
         const slotNum = item.slotNum;
@@ -857,10 +902,18 @@ function renderVideosForIdea(idea) {
         // 拖拽：卡片本身既是放置区（接文件上传 / 接别的槽位换位过来），有内容时
         // 也是拖拽源。监听绑在卡片元素上，renderSlotCard 重写 innerHTML 不会丢。
         enableVideoSlotDnd(card, slotNum);
-        renderSlotCard(card, videoSlotState(item.video, {
+        const activity = slotStatuses[slotNum] === 'active' ? 'active'
+            : isVideoPending(slotNum) ? 'queued' : '';
+        const recovering = slotStatuses[slotNum] === 'recovering'
+            || (recoveryState.recoveryActive && recoverySlots.has(slotNum)
+                && (!slotStatuses[slotNum] || slotStatuses[slotNum] === 'queued'));
+        renderSlotCard(card, recovering ? slotPendingState('video', slotNum, recoveryLabel, 'recovering') : videoSlotState(item.video
+            || (slotStatuses[slotNum] === 'failed' ? { slot: slotNum, status: 'failed' } : null), {
             seq: slotNum,
             busy: videosBusy,
             pending: isVideoPending(slotNum),
+            activity,
+            videoProvider: typeof config !== 'undefined' && config ? config.videoProvider : undefined,
         }));
         placeSlotCard(card, 'video', slotNum);
         grid.appendChild(card);
@@ -965,6 +1018,30 @@ function renderCoverRoleControls(idea, container) {
     });
 }
 
+function setCoverImageSource(img, url, onLoad, onError) {
+    // 旧版本可能把生成中暂时为空的封面缓存成 200。只重取一次，避免坏文件
+    // 导致无限请求；同 URL 已成功加载时则直接恢复显示，不等待另一次 load。
+    let retried = false;
+    img.onload = onLoad;
+    img.onerror = () => {
+        if (!img.getAttribute('src')) return;
+        if (typeof MediaPreview !== 'undefined' && MediaPreview.countsOnly()) return;
+        if (!retried) {
+            retried = true;
+            safeSetImageSrc(img, url, true);
+            return;
+        }
+        onError();
+    };
+    const previousSource = img.getAttribute('src');
+    safeSetImageSrc(img, url);
+    if (img.complete && img.naturalWidth > 0) {
+        if (onLoad) onLoad();
+    } else if (previousSource && previousSource === img.getAttribute('src') && img.complete) {
+        img.onerror();
+    }
+}
+
 // activeIndex 传 null/省略时按「已选中的主封面」还原，而不是无脑回到第 0 张——
 // 否则任何一次重渲染（切页、任务回调）都会把用户选过的主封面悄悄改掉。
 function renderCoversForIdea(idea, activeIndex = null) {
@@ -989,6 +1066,11 @@ function renderCoversForIdea(idea, activeIndex = null) {
     const covers = idea.covers || [];
     
     if (covers.length === 0) {
+        displayEl.onload = null;
+        displayEl.onerror = null;
+        displayEl.onclick = null;
+        safeSetImageSrc(displayEl, '');
+        thumbnailsEl.innerHTML = '';
         placeholderEl.style.display = 'flex';
         displayEl.style.display = 'none';
         historyContainer.style.display = 'none';
@@ -1004,21 +1086,17 @@ function renderCoversForIdea(idea, activeIndex = null) {
         activeIndex = covers.length - 1;
     }
     
-    // Set up displayEl load/error handlers before setting src
-    displayEl.onload = () => {
-        displayEl.style.display = 'block';
-        placeholderEl.style.display = 'none';
-    };
-    displayEl.onerror = () => {
-        displayEl.style.display = 'none';
-        placeholderEl.style.display = 'flex';
-    };
-
     // 图片 1 图生图时只把当前封面作为视觉参考；文本提示词仍取“图片 1”。
     idea.activeCoverUrl = covers[activeIndex];
     
     // Update main image display
-    safeSetImageSrc(displayEl, covers[activeIndex]);
+    setCoverImageSource(displayEl, covers[activeIndex], () => {
+        displayEl.style.display = 'block';
+        placeholderEl.style.display = 'none';
+    }, () => {
+        displayEl.style.display = 'none';
+        placeholderEl.style.display = 'flex';
+    });
     
     // Set up click on main image to open in lightbox on the current page
     displayEl.onclick = () => {
@@ -1054,15 +1132,13 @@ function renderCoversForIdea(idea, activeIndex = null) {
         thumb.innerHTML = `<img src="" alt="Thumbnail ${idx + 1}" loading="lazy">${badges}`;
 
         const img = thumb.querySelector('img');
-        img.onerror = () => {
+        setCoverImageSource(img, coverUrl, null, () => {
             thumb.remove();
             // If all thumbnails are removed/hidden, hide the history container
             if (thumbnailsEl.children.length === 0) {
                 historyContainer.style.display = 'none';
             }
-        };
-        
-        safeSetImageSrc(img, coverUrl);
+        });
         
         thumb.addEventListener('click', async () => {
             renderCoversForIdea(idea, idx);

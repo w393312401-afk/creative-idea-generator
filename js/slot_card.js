@@ -22,8 +22,9 @@
 
 /** 卡片外壳的 class：既有的 frame-card 系列全部保留（CSS 与移动端补丁依赖它们）。 */
 function slotCardClass(state) {
-    if (state.kind === 'pending') return 'slot-card frame-card placeholder-frame-card';
-    if (state.kind === 'missing' || state.kind === 'failed' || state.kind === 'cut') {
+    if (state.kind === 'pending') return 'slot-card frame-card placeholder-frame-card'
+        + (state.type === 'video' ? ` slot-video-${state.activity || 'queued'}` : '');
+    if (state.kind === 'missing' || state.kind === 'failed' || state.kind === 'cut' || state.kind === 'submission-pending') {
         return 'slot-card frame-card video-failed-card';
     }
     return ('slot-card frame-card ' + (state.cardCls || '')).trim();
@@ -71,6 +72,7 @@ function renderSlotCard(cardEl, state) {
     cardEl.dataset.kind = state.kind;
     cardEl.dataset.type = state.type;
     cardEl.dataset.seq = String(state.seq);
+    cardEl.dataset.activity = state.activity || '';
     cardEl.dataset.url = state.url || '';
     // 工具条按这些 data-* 做筛选与计数，不必自己再推一遍状态（见 js/slot_toolbar.js）。
     // fixable＝这一格有待修复的问题（审查未过或人工标记），也就是画着「修复此帧
@@ -79,6 +81,8 @@ function renderSlotCard(cardEl, state) {
     cardEl.dataset.issueBadges = String((state.badges || []).filter(b => b.isIssue !== false).length);
     cardEl.dataset.fixable = (state.flags && state.flags.fixable) ? '1' : '0';
     cardEl.dataset.promptDirty = (state.badges || []).some(b => b.id === 'prompt-dirty') ? '1' : '0';
+    cardEl.dataset.submissionPending = (state.flags && state.flags.submissionPending) ? '1' : '0';
+    cardEl.dataset.recoveryFailed = (state.flags && state.flags.originalDownloadFailed) ? '1' : '0';
     // 拖出能力随状态走：只有真的有内容的格子能当换位的源。
     // （旧实现只在首次 enable 时按当时有没有内容设一次，重渲后就失灵了）
     cardEl.draggable = !!state.draggable;
@@ -87,14 +91,17 @@ function renderSlotCard(cardEl, state) {
     let body;
     if (state.kind === 'pending') {
         body = `<div class="frame-placeholder-spinner">`
-            + `<div class="cover-spinner slot-spinner"></div></div>`
+            + (state.type === 'video' && state.activity !== 'active'
+                ? `<span class="slot-queue-icon" aria-label="等待执行">⌛</span>`
+                : `<div class="cover-spinner slot-spinner"></div>`)
+            + `</div>`
             + `<span class="slot-label"></span>`;
     } else if (state.kind === 'cut') {
         body = `<div class="video-failed-placeholder">`
             + `<span class="error-icon">✂️</span>`
             + `<span class="error-text"></span></div>`
             + `<span class="slot-label"></span>`;
-    } else if (state.kind === 'missing' || state.kind === 'failed') {
+    } else if (state.kind === 'missing' || state.kind === 'failed' || state.kind === 'submission-pending') {
         body = `<div class="video-failed-placeholder">`
             + `<span class="error-icon">⚠️</span>`
             + `<span class="error-text"></span>`
@@ -114,7 +121,7 @@ function renderSlotCard(cardEl, state) {
             + `<span class="slot-label"></span>`;
     }
     // 多选勾选框：等待中的格子还没有内容可操作，不给选
-    if (state.kind !== 'pending') {
+    if (state.kind !== 'pending' && !(state.flags && state.flags.submissionPending && !state.flags.directRetry)) {
         body += `<label class="slot-select" title="选中这一拍，用于批量重试/删除（支持鼠标拖拽框选，按住 Shift 累加选/连选）">`
             + `<input type="checkbox" class="slot-select-box"></label>`;
     }
@@ -159,7 +166,10 @@ function renderSlotCard(cardEl, state) {
         cardEl.title = state.title || '';
         if (state.type === 'video') {
             const v = cardEl.querySelector('video');
-            if (v) v.src = cacheBustedUrl(state.url);
+            if (v) {
+                if (typeof MediaPreview !== 'undefined') MediaPreview.setSource(v, cacheBustedUrl(state.url));
+                else v.src = cacheBustedUrl(state.url);
+            }
         } else {
             const img = cardEl.querySelector('img');
             if (img) {
@@ -244,6 +254,7 @@ const SLOT_ACTION_HANDLERS = {
     },
     'upload-frame': seq => triggerFrameUpload(seq),
     'retry-video': seq => retrySingleVideo(seq),
+    'query-video-submission': seq => reconcileVideoSubmission(seq),
     'upload-video': seq => triggerVideoUpload(seq),
     'delete-slot': seq => deleteSlotBeat(seq),
     'jump-prompt': (seq, type) => {

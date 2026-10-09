@@ -112,6 +112,79 @@ def _click_filter(page, which, type_="image"):
 
 
 class TestFilter:
+    def test_continuous_video_recovery_keeps_the_task_running(self, page):
+        page.evaluate("""() => {
+            currentIdea.frameRun.videos = [];
+            window.watchTaskUntilTerminal = async (_task, opts) => new Promise(resolve => {
+                window.__recoveryEmit = opts.onEvent;
+                window.__recoveryFinish = resolve;
+            });
+            window.syncFrameRunToLibrary = async (result, idea) => { idea.frameRun = {...idea.frameRun, ...result}; };
+            streamVideosProgress('mock-recovery-task', currentIdea, [1, 2, 3, 4, 5]);
+            __recoveryEmit('start', {total: 5, slots: [1, 2, 3, 4, 5]});
+            for (const index of [1, 2]) __recoveryEmit('video_done', {index, total: 5,
+                video: {slot: index, status: 'success', url: `/outputs/t/videos/vid_${index}.mp4`}});
+            for (const index of [3, 4, 5]) __recoveryEmit('video_error', {index, total: 5, message: 'temporary failure'});
+            __recoveryEmit('video_recovery', {phase: 'waiting', slots: [3, 4, 5], completed_slots: [1, 2],
+                retry_round: 2, next_retry_at: 2000000000, message: '等待自动恢复后继续生成'});
+        }""")
+        assert page.evaluate("() => isIdeaTaskActive(currentIdea.id, 'videos')")
+        assert page.evaluate("() => getIdeaTaskRecord(currentIdea.id, 'videos').current") == 2
+        assert page.evaluate("() => getIdeaTaskRecord(currentIdea.id, 'videos').progressInfo.percent") < 100
+        assert page.locator('#generate-videos-btn').is_disabled()
+        assert page.locator('#video-slot-1').get_attribute('data-kind') == 'ready'
+        for slot in [3, 4, 5]:
+            card = page.locator('#video-slot-%d' % slot)
+            assert card.get_attribute('data-kind') == 'pending'
+            assert card.get_attribute('data-activity') == 'recovering'
+            assert '等待自动重试' in card.locator('.slot-label').text_content()
+        assert '2/5' in page.locator('#videos-meta').text_content()
+        assert '等待自动恢复' in page.locator('#videos-meta').text_content()
+        page.evaluate("""() => {
+            for (const index of [3, 4, 5]) __recoveryEmit('video_done', {index, total: 5,
+                video: {slot: index, status: 'success', url: `/outputs/t/videos/vid_${index}.mp4`}});
+            __recoveryFinish({status: 'completed', result: {
+                videos: currentIdea.frameRun.videos, completion_state: 'completed', has_failures: false,
+            }});
+        }""")
+        page.wait_for_function("() => !isIdeaTaskActive(currentIdea.id, 'videos')")
+        assert not page.locator('#generate-videos-btn').is_disabled()
+        assert page.locator('#videos-grid [data-kind="ready"]').count() == 5
+
+    def test_video_pending_and_recovery_states_stay_visible_as_issues(self, page):
+        page.evaluate("""() => {
+            config.videoProvider = 'flow2api';
+            currentIdea.frameRun.videos = [
+                {slot: 1, status: 'success', url: '/outputs/t/videos/vid_001.mp4'},
+                {slot: 2, provider: 'flow2api', status: 'failed',
+                    last_attempt: {submission_pending: true}},
+                {slot: 3, provider: 'google_fx', status: 'failed',
+                    last_attempt: {provider: 'google_fx', fixed_video_account: true, submission_pending: true}},
+                {slot: 4, provider: 'flow2api', status: 'failed',
+                    last_attempt: {confirmed: true, submission_pending: false, recovery_state: 'recovery_failed'}},
+                {slot: 5, provider: 'flow2api', status: 'success', url: '/outputs/t/videos/vid_005.mp4',
+                    last_attempt: {status: 'failed', submission_pending: true}},
+            ];
+            renderVideosForIdea(currentIdea);
+        }""")
+        text = page.eval_on_selector(
+            '.slot-toolbar[data-slot-type="video"] .slot-count', "el => el.textContent")
+        assert "VID 2/5" in text, text
+        assert "缺 3" in text, text
+        assert "待确认 3" in text, text
+        assert "取回未完成 1" in text, text
+        assert "⚠ 4" in text, text
+        assert page.locator('#video-slot-2 .error-text').inner_text() == '原提交结果待确认'
+        assert page.locator('#video-slot-2 [data-primary="1"]').inner_text() == '核对原提交'
+        assert page.locator('#video-slot-2 [data-act="retry-video"]').text_content() == '重新生成'
+        assert page.locator('#video-slot-3 [data-act="query-video-submission"]').count() == 0
+        assert page.locator('#video-slot-4 .error-text').inner_text() == '原视频取回未完成'
+        assert page.locator('#video-slot-4 [data-primary="1"]').inner_text() == '取回原视频'
+        _click_filter(page, "flagged", "video")
+        assert _visible(page, "videos-grid") == [2, 3, 4, 5]
+        _click_filter(page, "missing", "video")
+        assert _visible(page, "videos-grid") == [2, 3, 4]
+
     def test_counts_come_from_the_rendered_cards(self, page):
         text = page.eval_on_selector(
             '.slot-toolbar[data-slot-type="image"] .slot-count', "el => el.textContent")
@@ -598,6 +671,3 @@ class TestMarqueeSelection:
 
         page.eval_on_selector("#test-click-line", "el => el.dispatchEvent(new MouseEvent('click', { bubbles: true }))")
         assert page.evaluate("() => Array.from(slotToolbarState.image.selected)") == [1], "点击日志文本不应清空已选卡片"
-
-
-

@@ -16,11 +16,16 @@ provider 需要实现：
     claim_account(user_id) -> bool       当前租约改占某账号；与别的租约撞号/撞出口返回 False
     current_claim() / restore_claim(u)   选号失败时把租约账号恢复成选号前的样子
     max_concurrent() -> int              当前并发上限
+    protected_from_cleanup(user_id) -> bool  账号维护系统管理或未知的环境不得自动清理
 这些方法都必须是廉价的纯内存操作（claim_account 在 N>1 时可能查一次出口，但不持锁），
 且绝不抛错（这里仍会兜底吞掉异常）。没有 provider / 方法缺失一律退回"没有并发"的旧行为。
 """
 
 _PROVIDER = None
+
+
+class AccountLeaseConflict(RuntimeError):
+    """A requested browser cannot be exclusively claimed by this task."""
 
 
 def install(provider):
@@ -41,6 +46,20 @@ def leased_by_others():
         return {str(uid) for uid in (_PROVIDER.leased_user_ids(exclude_current=True) or ()) if uid}
     except Exception:
         return set()
+
+
+def protected_from_cleanup(user_id):
+    """Protect managed/unknown profiles while preserving standalone behavior."""
+    if _PROVIDER is None:
+        return False
+    try:
+        query = getattr(_PROVIDER, 'protected_from_cleanup', None)
+        if not callable(query):
+            return getattr(_PROVIDER, 'account_admission_factory', None) is not None
+        protected = query(user_id)
+        return protected if type(protected) is bool else True
+    except Exception:
+        return True
 
 
 def touch():
@@ -65,6 +84,28 @@ def claim(user_id):
         return bool(_PROVIDER.claim_account(user_id))
     except Exception:
         return True
+
+
+def require_claim(user_id):
+    """Claim before binding/connecting; uncertainty must not open another task's profile.
+
+    Standalone clients without a host retain their existing behavior. Hosted
+    parallel generation must use a successful atomic claim, including manual
+    accounts and empty-pool fallback accounts that bypass account selection.
+    """
+    if not user_id or _PROVIDER is None:
+        return
+    claim_account = getattr(_PROVIDER, 'claim_account', None)
+    if not callable(claim_account):
+        if concurrency() > 1:
+            raise AccountLeaseConflict('无法确认浏览器独占租约，已停止连接')
+        return
+    try:
+        claimed = bool(claim_account(user_id))
+    except Exception as error:
+        raise AccountLeaseConflict('浏览器租约核对失败，已停止连接') from error
+    if not claimed:
+        raise AccountLeaseConflict('浏览器环境或其出口正被其他任务占用，已停止连接')
 
 
 def current_claim():

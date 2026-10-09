@@ -170,6 +170,9 @@ def named_cast_lock_violations(prompt, label='VIDEO', cast_id=None, profile=None
     cast, empty prompt. Callers merge the result into the existing per-beat error list; in
     直出模式 that list is logged, not enforced.
     """
+    from server_common import reviews_disabled
+    if reviews_disabled():
+        return []
     if not prompt or not cast_id:
         return []
     core = cast_lock_core()
@@ -200,6 +203,9 @@ def named_cast_beat_violations(image_prompt, video_prompt, packet, config=None, 
     the same frame twice under two names. `named_cast_lock_violations` applies that rule via
     `judged_kinds_for`.
     """
+    from server_common import reviews_disabled
+    if reviews_disabled(config):
+        return []
     mode, cast_id = named_cast_settings(packet, config)
     if mode != NAMED_CAST_MODE or not cast_id:
         return []

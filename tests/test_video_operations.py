@@ -114,6 +114,127 @@ def test_existing_request_recovers_while_admission_closed(dispatch, monkeypatch)
     assert first[0][0]['task_id'] == second[0][0]['task_id']
 
 
+def test_flow2api_dispatch_bypasses_ads_admission_and_account(dispatch, monkeypatch):
+    monkeypatch.setattr(server, '_require_fx_admission', lambda h: pytest.fail('Flow2API uses its own service'))
+    h, sent = handler('/api/generate_videos', {**BODY, 'config': {
+        'videoProvider': 'flow2api', 'googleFxUserId': 'must-not-close-ads'}})
+    h.do_POST()
+    assert sent[0][1] == 200
+    assert len(dispatch) == 1
+    assert server.ACTIVE_TASKS[sent[0][0]['task_id']]['dimensions']['userId'] is None
+    assert server.ACTIVE_TASKS[sent[0][0]['task_id']]['dimensions']['video_provider'] == 'flow2api'
+
+
+def test_new_flow_request_retries_pending_slot_and_original_request_still_recovers(dispatch, monkeypatch):
+    body = {**BODY, 'config': {'videoProvider': 'flow2api'}}
+    h, first = handler('/api/generate_videos', body); h.do_POST()
+    task_id = first[0][0]['task_id']
+    receipt = {'slot': 1, 'submission_id': 'pending-submission',
+               'submission_pending': True, 'confirmed': False}
+    VideoOperationStore().record_submission(task_id, receipt)
+    # An older successful artifact does not settle its latest pending attempt.
+    monkeypatch.setattr(server, 'read_manifest', lambda p: {'videos': [
+        {'slot': 1, 'status': 'success', 'provider': 'flow2api', 'last_attempt': receipt}]})
+    # A finished worker releases its project claim even if the receipt is pending.
+    server.ACTIVE_TASKS[task_id]['status'] = 'failed'
+    server._release_flow_project_run(dispatch[0][1][1], task_id)
+    h, retry = handler('/api/generate_videos', {**body, 'request_id': 'new-request-123'}); h.do_POST()
+    assert retry[0][1] == 200
+    assert retry[0][0]['task_id'] != task_id
+    assert server._VIDEO_OPERATIONS.lookup('new-request-123')['task_id'] == retry[0][0]['task_id']
+    assert VideoOperationStore().submissions(task_id)[0]['submission_pending'] is True
+    h, recovered = handler('/api/generate_videos', body); h.do_POST()
+    assert recovered[0][1] == 200 and recovered[0][0]['task_id'] == task_id
+    assert len(dispatch) == 2
+
+
+@pytest.mark.parametrize('route', ['/api/generate_videos', '/api/generate_video_chain'])
+@pytest.mark.parametrize('receipt_kind', ['flow2api', 'legacy_adapter', 'fixed_native'])
+def test_journal_pending_policy_without_manifest(dispatch, route, receipt_kind):
+    task_id = 'videos_previous_paid_task'
+    provider = 'google_fx' if receipt_kind == 'fixed_native' else 'flow2api'
+    server.get_or_create_task(task_id, {'project_key': BODY['title'],
+        'video_provider': provider, 'request_id': 'previous-request-123'})
+    receipt = {'slot': 1, 'submission_id': 'pending-submission', 'submission_pending': True}
+    if receipt_kind == 'fixed_native':
+        receipt.update(provider=provider, fixed_video_account=True, account_id='only-profile')
+    elif receipt_kind == 'flow2api':
+        receipt['provider'] = provider
+    VideoOperationStore().record_submission(task_id, receipt)
+    h, sent = handler(route, {**BODY, 'config': {'videoProvider': provider}}); h.do_POST()
+    if receipt_kind == 'fixed_native':
+        assert sent[0][1] == 409
+        assert sent[0][0]['failure_code'] == 'SUBMISSION_PENDING'
+        assert sent[0][0]['pending_submissions'][0]['task_id'] == task_id
+        assert sent[0][0]['pending_submissions'][0]['provider'] == 'google_fx'
+        assert not dispatch
+    else:
+        assert sent[0][1] == 200
+        assert len(dispatch) == 1
+    assert VideoOperationStore().submissions(task_id)[0]['submission_pending'] is True
+
+
+def test_flow_direct_retry_waits_for_current_worker_to_exit(dispatch):
+    body = {**BODY, 'config': {'videoProvider': 'flow2api'}}
+    h, first = handler('/api/generate_videos', body); h.do_POST()
+    task_id = first[0][0]['task_id']
+    VideoOperationStore().record_submission(task_id, {
+        'slot': 1, 'provider': 'flow2api', 'submission_id': 'pending-submission',
+        'submission_pending': True})
+    h, retry = handler('/api/generate_videos', {**body, 'request_id': 'new-request-123'}); h.do_POST()
+    assert retry[0][1] == 409
+    assert retry[0][0]['failure_code'] == 'PROJECT_BUSY'
+    assert retry[0][0]['task_id'] == task_id
+    assert len(dispatch) == 1
+
+
+@pytest.mark.parametrize('provider,expected', [('flow2api', False), ('google_fx', True)])
+def test_flow_cancel_does_not_change_google_fx_global(dispatch, monkeypatch, provider, expected):
+    import builtins
+    monkeypatch.setattr(builtins, 'google_fx_cancelled', False, raising=False)
+    monkeypatch.setattr(server, 'get_fx_cancel_flag', lambda: SimpleNamespace(cancel_request=lambda _: False))
+    monkeypatch.setattr(server.FX_CONTROL, 'audit', lambda *a, **kw: None)
+    h, sent = handler('/api/generate_videos', {**BODY, 'config': {'videoProvider': provider}}); h.do_POST()
+    task_id = sent[0][0]['task_id']
+    h, cancelled = handler('/api/compose-cancel', {'task_id': task_id}); h.do_POST()
+    assert cancelled[0][1] == 200
+    assert server.ACTIVE_TASKS[task_id]['cancel_event'].is_set()
+    assert builtins.google_fx_cancelled is expected
+
+
+def test_progress_journals_project_scope_before_cancellation(dispatch):
+    h, sent = handler('/api/generate_videos', {**BODY, 'config': {'videoProvider': 'flow2api'}}); h.do_POST()
+    task_id = sent[0][0]['task_id']
+    task = server.ACTIVE_TASKS[task_id]
+    task['cancel_event'].set()
+    with pytest.raises(ConnectionError):
+        server._video_progress(task_id, task, 'request_submitting', {
+            'index': 1, 'submission_id': 'submission-123', 'submission_pending': True})
+    receipt, = VideoOperationStore().submissions(task_id)
+    assert receipt['project_key'] == BODY['title']
+    assert receipt['provider'] == 'flow2api'
+    assert receipt['request_id'] == BODY['request_id']
+
+
+@pytest.mark.parametrize('terminal', ['request_resolved', 'video_done', 'video_error'])
+def test_flow2api_terminal_receipt_replaces_pending_even_after_cancel(monkeypatch, terminal):
+    task = server.get_or_create_task('receipt-terminal-' + terminal)
+    receipt = {'index': 1, 'submission_id': 'same-submission', 'prompt_hash': 'same-prompt',
+               'confirmed': False, 'submission_pending': True}
+    server._video_progress(task['id'], task, 'request_submitting', receipt)
+    task['cancel_event'].set()
+    resolved = {**receipt, 'confirmed': True, 'submission_pending': False}
+    details = resolved if terminal == 'request_resolved' else {
+        'index': 1, **({'video': {'last_attempt': resolved}} if terminal == 'video_done'
+                     else {'last_attempt': resolved})}
+    with pytest.raises(ConnectionError):
+        server._video_progress(task['id'], task, terminal, details)
+    saved, = VideoOperationStore().submissions(task['id'])
+    assert saved['submission_id'] == 'same-submission'
+    assert saved['confirmed'] is True
+    assert saved['submission_pending'] is False
+
+
 def test_submission_receipt_persists_even_if_cancelled(monkeypatch):
     task = server.get_or_create_task('videos_receipt_test')
     task['cancel_event'].set()

@@ -833,11 +833,12 @@ function resolvePromptSlots(source) {
     return parsePromptBlock(source ? source.prompt_block : '');
 }
 
-function updateTasksBadge(tasksList) {
+function updateTasksBadge(tasksList, exactRunningCount) {
     const badge = document.getElementById('active-task-count');
     if (!badge) return;
     
-    const runningTasksCount = tasksList.filter(t => t.status === 'running').length;
+    const runningTasksCount = Number.isInteger(exactRunningCount) && exactRunningCount >= 0
+        ? exactRunningCount : tasksList.filter(t => t.status === 'running').length;
     if (runningTasksCount > 0) {
         badge.textContent = runningTasksCount;
         badge.style.display = 'flex';

@@ -73,7 +73,7 @@ def test_same_origin_dispatch_and_cancel(editor):
     _, (status, payload) = request('/api/codex-video-editor/jobs', 'POST', body,
                                    {'Origin': 'http://127.0.0.1:8085', 'Sec-Fetch-Site': 'same-origin'})
     assert status == 200 and payload['job']['status'] == 'queued'
-    assert calls == [body]
+    assert calls == [{**body, 'engine': None}]          # 未选引擎时默认 Codex，由 codex_video_editor 归一
     assert request('/api/codex-video-editor/cancel', 'POST', {'id': 'edit-1'})[1][1]['job']['status'] == 'cancelled'
 
 
@@ -229,4 +229,4 @@ def test_public_dispatch_preserves_existing_no_access_code_preference(public_edi
                                    public_headers(), real_gate=True)
     assert status == 200 and payload['job']['status'] == 'queued'
     assert public_editor[1] == [{**body, 'mode': 'trim', 'notes': '',
-                                 'model': None, 'reasoning_effort': None}]
+                                 'model': None, 'reasoning_effort': None, 'engine': None}]

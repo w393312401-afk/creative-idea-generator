@@ -80,6 +80,76 @@ def test_window_replenishes_without_waiting_for_slowest_clip(rig):
     assert all(data["start_uuid"] != data["end_uuid"] and len(data["prompt_hash"]) == 64 for data in submitted)
 
 
+def test_fixed_window_waits_for_each_result_and_uses_stable_receipts(rig):
+    with V.account_binding.bound_fixed_task_account('actual-account'):
+        assert rig.runner.max_inflight == 1
+        tasks = rig.runner._submit_tasks(object(), list(enumerate(rig.reqs)), [], {}, prepare_references=True)
+        rig.runner._await_generation(object(), tasks)
+    assert rig.sends[1][1] >= 31
+    submitted = [data for _, stage, data in rig.events if stage == 'request_submitted']
+    completed = [data for _, stage, data in rig.events if stage == 'video_done']
+    assert len(submitted) == len(completed) == 8
+    assert len({d['submission_id'] for d in submitted}) == 8
+    assert all(d['fixed_video_account'] and d['submission_pending'] for d in submitted)
+    assert [d['submission_id'] for d in completed] == [d['submission_id'] for d in submitted]
+    assert all(d['submission_pending'] is False for d in completed)
+    assert rig.runner.max_inflight == V.VIDEO_CHUNK_SIZE == 5
+
+
+def test_fixed_cancel_after_confirmation_preserves_initial_pending_event(rig):
+    captured = []
+    def cancel(idx, stage, data):
+        if stage == 'request_submitted':
+            captured.append(data)
+            raise ConnectionError('cancelled')
+    rig.runner.on_progress = cancel
+    with V.account_binding.bound_fixed_task_account('actual-account'):
+        with pytest.raises(ConnectionError):
+            rig.runner._submit_tasks(object(), [(0, rig.reqs[0])], [], {}, prepare_references=True)
+    assert len(rig.sends) == 1
+    assert captured[0]['submission_pending'] is True
+    assert captured[0]['fixed_video_account'] is True
+    assert captured[0]['submission_id'] == rig.runner._submitted_tasks[0]['submission_id']
+
+
+def test_fixed_started_probe_error_is_journaled_without_a_second_deep_probe(rig, monkeypatch):
+    from integrations.google_fx.utils.browser import BrowserSessionClosedError
+    attempts, probes = [], []
+
+    def submit(*args, **kwargs):
+        attempts.append(True)
+        error = BrowserSessionClosedError('browser closed after Generate during credit probe')
+        error.submission_started = True
+        error.click_time = 12.5
+        raise error
+
+    def credit(page, deep=False):
+        if deep:
+            probes.append(True)
+            raise BrowserSessionClosedError('second probe has no browser')
+        return None
+
+    monkeypatch.setattr(V, '_submit_video_to_canvas', submit)
+    monkeypatch.setattr(V, 'detect_page_credit_exhaustion', credit)
+    with V.account_binding.bound_fixed_task_account('actual-account'):
+        rig.runner._submit_tasks(object(), list(enumerate(rig.reqs)), [], {}, prepare_references=True)
+    assert attempts == [True]
+    assert probes == []
+    assert rig.uploads == [[0]]
+    receipt = rig.runner.results[0]
+    assert receipt['submission_pending'] is True
+    assert receipt['confirmed'] is False
+    assert receipt['fixed_video_account'] is True
+    assert receipt['submitted_at'] == 12.5
+    assert receipt['submission_id'].startswith('fx-')
+    assert rig.runner._unresolved_identity_subs == {0}
+    assert isinstance(rig.runner._deferred_stop, V.account_binding.FixedAccountStopError)
+    events = [d for _, event, d in rig.events if event == 'request_submitted']
+    assert len(events) == 1
+    assert events[0]['submission_id'] == receipt['submission_id']
+    assert events[0]['confirmed'] is False and events[0]['submission_pending'] is True
+
+
 def test_normal_run_uses_one_browser_session_for_more_than_five_clips(rig, monkeypatch):
     connections, closes = [], []
     page = SimpleNamespace(bring_to_front=lambda: None)
@@ -643,9 +713,10 @@ def test_missing_paid_video_has_bounded_drain_then_rotates_and_recovers_or_resub
         for key in ("account_id", "project_url", "tile_id", "prompt_hash", "start_uuid", "end_uuid"):
             assert result[0][key] == receipt[key]
     else:
-        assert sends.count(0) == 2  # Not on the canvas: resubmitted exactly once.
-    assert all(item["status"] == "success" for item in result)
-    assert not any(item.get("submission_pending") for item in result)
+        assert sends.count(0) == 1  # Unknown result keeps its original paid receipt.
+        assert result[0]['status'] == 'failed' and result[0]['submission_pending'] is True
+    assert all(item["status"] == "success" for item in result[1:])
+    assert not any(item.get("submission_pending") for item in result[1:])
     assert len([event for idx, event, _ in rig.events if idx == 0 and event == "video_error"]) == 1
 
 
@@ -702,7 +773,7 @@ def test_cancellation_during_security_drain_keeps_paid_receipt_without_resubmitt
     assert not rig.runner._unresolved_identity_subs
 
 
-def test_one_missing_card_after_generate_is_retried_and_batch_completes(rig, monkeypatch):
+def test_one_missing_card_after_generate_is_not_repeated_without_terminal_evidence(rig, monkeypatch):
     _offline_round(monkeypatch, rig.runner)
     monkeypatch.setattr("integrations.google_fx.services.flow_video_identity.recover_project_videos",
                         lambda *a, **k: {})
@@ -721,14 +792,14 @@ def test_one_missing_card_after_generate_is_retried_and_batch_completes(rig, mon
     monkeypatch.setattr(V, "_submit_video_to_canvas", flaky)
     result = rig.runner.run()
 
-    # Paused after the ambiguous click, then resumed with clip 2 retried once.
-    assert calls == [0, 1, 2, 2, 3, 4, 5, 6, 7]
-    assert all(item["status"] == "success" for item in result)
-    assert not rig.runner._unresolved_identity_subs
+    assert calls == [0, 1, 2]
+    assert all(item["status"] == "success" for item in result[:2])
+    assert result[2]['submission_pending'] is True
+    assert rig.runner._unresolved_identity_subs == {2}
     assert rig.runner.gen_retry_used == 0  # Unstarted clips did not spend the retry budget.
 
 
-def test_uncertain_submissions_are_recovered_or_retried_once_then_stop(rig, monkeypatch):
+def test_uncertain_submissions_only_recover_originals_then_stop(rig, monkeypatch):
     _offline_round(monkeypatch, rig.runner)
     tasks = rig.runner._submit_tasks(object(), [(0, rig.reqs[0])], [], {}, prepare_references=True)
     tasks[0].update(status="failed", submission_pending=True, message="awaiting original paid request")
@@ -755,14 +826,50 @@ def test_uncertain_submissions_are_recovered_or_retried_once_then_stop(rig, monk
     result = rig.runner.run()
 
     assert lookups == ["uncertain-0", "uncertain-1"]
-    # Clip 1 is retried once; a second ambiguous click stops further charges.
-    assert attempted == ["clip 1", "clip 1"]
+    assert attempted == ["clip 1"]
     assert len(rig.receipts) == 1
     assert result[0]["status"] == "success"
     assert result[1]["submission_pending"] is True
     assert rig.runner._unresolved_identity_subs == {1} and rig.runner._uncertain_retried == {0, 1}
-    assert all(item["status"] == "failed" and "补救后仍未确认" in item["message"] for item in result[2:])
+    assert all(item["status"] == "failed" and "结果仍未确认" in item["message"] for item in result[2:])
     assert rig.runner.ip_retry == 0 and rig.runner.gen_retry_used == 0
+
+
+@pytest.mark.parametrize('retries', [0, 2, 5])
+@pytest.mark.parametrize('fixed_account', [False, True])
+def test_confirmed_native_failure_retries_per_slot_with_configured_budget(
+        rig, monkeypatch, retries, fixed_account):
+    _offline_round(monkeypatch, rig.runner)
+    rig.runner.retry_limits = {index: retries for index in range(8)}
+    original_inspect = rig.inspect
+    def inspect(page, ids, *args, **kwargs):
+        states = original_inspect(page, ids, *args, **kwargs)
+        for tile in ids:
+            if tile == 'tile-7':
+                states[tile] = {'status': 'failed', 'failedText': 'video generation failed'}
+        return states
+    monkeypatch.setattr(V, '_inspect_all_pending_tiles', inspect)
+    with (V.account_binding.bound_fixed_task_account('actual-account')
+          if fixed_account else nullcontext()):
+        result = rig.runner.run()
+    assert sum(index == 7 for index, _ in rig.sends) == retries + 1
+    assert all(item['status'] == 'success' for item in result[:7])
+    assert result[7]['status'] == 'failed' and not result[7].get('submission_pending')
+    warnings = [data for index, stage, data in rig.events
+                if index == 7 and stage == 'video_warning' and data.get('code') == 'video_auto_retry']
+    assert [warning['retry'] for warning in warnings] == list(range(1, retries + 1))
+
+
+def test_cancellation_at_native_retry_warning_prevents_next_generate(rig, monkeypatch):
+    rig.runner.submission_attempts[0] = 1
+    def cancel(index, stage, details):
+        if stage == 'video_warning':
+            raise ConnectionError('cancel retry')
+    rig.runner.on_progress = cancel
+    with pytest.raises(ConnectionError, match='cancel retry'):
+        rig.runner._prepare_paid_submission(0)
+    assert rig.runner.submission_attempts[0] == 1
+    assert rig.sends == []
 
 
 @pytest.mark.parametrize("timeout", ["per_task", "batch"])

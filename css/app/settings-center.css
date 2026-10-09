@@ -783,6 +783,51 @@
 }
 
 /* ── 移动端：左栏折成顶部横向芯片行 ─────────────────────────────────── */
+/* ── 成片引导：9:16 透明预览窗（深色棋盘格 = 透明区域） ───────────────── */
+.cta-preview {
+    display: flex;
+    align-items: flex-end;
+    gap: 14px;
+}
+
+.cta-preview-frame {
+    position: relative;
+    flex-shrink: 0;
+    width: 150px;
+    aspect-ratio: 9 / 16;
+    overflow: hidden;
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-md);
+    background: repeating-conic-gradient(#4a4d57 0 25%, #3a3d46 0 50%) 0 0 / 12px 12px;
+    transition: opacity 0.15s ease;
+}
+
+.cta-preview-frame iframe,
+.cta-preview-frame video {
+    position: absolute;
+    inset: 0;
+    display: block;
+    width: 100%;
+    height: 100%;
+    border: 0;
+    object-fit: contain;
+    pointer-events: none;
+}
+
+.cta-preview.is-off .cta-preview-frame { opacity: 0.45; }
+
+.cta-preview-empty {
+    margin: 0;
+    padding: 10px;
+    font-size: var(--fs-xs);
+    line-height: 1.5;
+    color: #e6e7ea;
+}
+
+.cta-status[hidden] { display: none; }
+.cta-status[data-state="error"] { color: var(--error-color, #b45309); }
+.cta-status[data-state="warn"] { color: var(--warning-color, #b45309); }
+
 @media (max-width: 768px) {
     .modal-content.settings-center {
         height: auto !important;

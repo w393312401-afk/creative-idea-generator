@@ -8,6 +8,15 @@ from unittest.mock import patch, MagicMock
 import candidate_selection_pipeline as csp
 
 
+@pytest.fixture(autouse=True)
+def legacy_candidate_parser_unit_tests(monkeypatch):
+    """Exercise historical parsers with fake model responses, never production policy.
+
+    The permanent disabled runtime is covered separately in test_runtime_review_retirement.
+    """
+    monkeypatch.setattr(csp, 'reviews_disabled', lambda config=None: False)
+
+
 def _full_subscores(**overrides):
     scores = {key: maximum for _, key, maximum in csp._CANDIDATE_SCORE_FIELDS}
     scores.update(overrides)
@@ -356,7 +365,7 @@ def test_api_generate_frames_selection_routing(monkeypatch, temp_project):
     monkeypatch.setattr(server, 'prompt_delivery_block_reason', lambda body: None)
     monkeypatch.setattr(server, '_require_fx_admission', lambda self, is_fx: True)
     monkeypatch.setattr(server, 'resolve_cover_reference', lambda c, t, k: True)
-    monkeypatch.setattr(server, 'claim_frame_run', lambda p, tid: None)
+    monkeypatch.setattr(server, 'claim_frame_run', lambda p, tid, **kwargs: None)
     monkeypatch.setattr(server, 'cleanup_old_tasks', lambda: None)
     monkeypatch.setattr(server, 'get_or_create_task', lambda tid, meta=None: {'cancel_event': MagicMock()})
 
@@ -395,6 +404,7 @@ def test_api_generate_frames_standard_routing_ignores_old_manifest(monkeypatch, 
         'title': temp_project['project_name'],
         'prompt_block': 'IMAGE 1:\nPrompt: test\n',
         'generation_mode': 'standard',
+        'generation_mode_explicit': True,
         'candidate_selection': False,
         'config': {'candidateSelectionMode': False}
     }
@@ -404,7 +414,7 @@ def test_api_generate_frames_standard_routing_ignores_old_manifest(monkeypatch, 
     monkeypatch.setattr(server, 'prompt_delivery_block_reason', lambda body: None)
     monkeypatch.setattr(server, '_require_fx_admission', lambda self, is_fx: True)
     monkeypatch.setattr(server, 'resolve_cover_reference', lambda c, t, k: True)
-    monkeypatch.setattr(server, 'claim_frame_run', lambda p, tid: None)
+    monkeypatch.setattr(server, 'claim_frame_run', lambda p, tid, **kwargs: None)
     monkeypatch.setattr(server, 'cleanup_old_tasks', lambda: None)
     monkeypatch.setattr(server, 'get_or_create_task', lambda tid, meta=None: {'cancel_event': MagicMock()})
 
@@ -444,7 +454,7 @@ def test_api_generate_frames_candidate_selection_routing(monkeypatch, temp_proje
     monkeypatch.setattr(server, 'prompt_delivery_block_reason', lambda body: None)
     monkeypatch.setattr(server, '_require_fx_admission', lambda self, is_fx: True)
     monkeypatch.setattr(server, 'resolve_cover_reference', lambda c, t, k: True)
-    monkeypatch.setattr(server, 'claim_frame_run', lambda p, tid: None)
+    monkeypatch.setattr(server, 'claim_frame_run', lambda p, tid, **kwargs: None)
     monkeypatch.setattr(server, 'cleanup_old_tasks', lambda: None)
     monkeypatch.setattr(server, 'get_or_create_task', lambda tid, meta=None: {'cancel_event': MagicMock()})
 
@@ -1144,7 +1154,7 @@ def test_empty_fx_batch_still_falls_back_to_api(temp_project):
     assert len(cands) == 4
 
 
-def test_frame_1_never_uses_history_as_reference_in_candidate_selection(temp_project):
+def test_frame_1_never_uses_history_as_reference_in_candidate_selection(monkeypatch, temp_project):
     """验证当 img_001.webp 已存在且重渲第1帧时，绝不能把历史 img_001.webp 误作为参考图传入。"""
     from PIL import Image
     frames_dir = temp_project["frames_dir"]
@@ -1153,6 +1163,10 @@ def test_frame_1_never_uses_history_as_reference_in_candidate_selection(temp_pro
     assert os.path.exists(img_1_path) and os.path.getsize(img_1_path) > 0
 
     prompt_block = "IMAGE 1:\nPrompt: Fresh frame 1 prompt.\nNegative: blur."
+
+    # 本测试只验证参考图选择，账号调度和锚点审查不得触及真实服务。
+    monkeypatch.setattr(csp, "_get_account_pool_service", lambda: None)
+    monkeypatch.setattr(csp, "apply_google_fx_runtime_overrides", lambda config: None)
 
     passed_references = []
     def fake_gen_candidates(config, title, item, reference, seq, candidate_count=4, **kwargs):
@@ -1178,7 +1192,7 @@ def test_frame_1_never_uses_history_as_reference_in_candidate_selection(temp_pro
          patch.object(csp, "evaluate_and_select_best_candidate", side_effect=fake_eval), \
          patch.object(csp, "_generate_full_collage_from_frames", return_value="frames/collage.jpg"):
         csp.run_candidate_selection_frame_sequence(
-            config={"imageBackend": "api"},
+            config={"imageBackend": "api", "chainGuardMode": "off"},
             title=temp_project["project_name"],
             prompt_block=prompt_block,
             target_sequences=[1]
@@ -1194,7 +1208,7 @@ def test_frame_1_never_uses_history_as_reference_in_candidate_selection(temp_pro
          patch.object(csp, "evaluate_and_select_best_candidate", side_effect=fake_eval), \
          patch.object(csp, "_generate_full_collage_from_frames", return_value="frames/collage.jpg"):
         csp.run_candidate_selection_frame_sequence(
-            config={"imageBackend": "google_fx"},
+            config={"imageBackend": "google_fx", "chainGuardMode": "off"},
             title=temp_project["project_name"],
             prompt_block=prompt_block,
             target_sequences=[1]

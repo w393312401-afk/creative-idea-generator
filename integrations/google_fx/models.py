@@ -50,6 +50,7 @@ class VideoRequest(BrowserEnvLockedRequest):
     resolution: Optional[str] = None  # 可选: "360p" | "720p"
     output_path: str = ""
     project_url: Optional[str] = None  # Bound Flow canvas for the local project.
+    retry_count: int = Field(default=5, ge=0, le=10)  # Extra attempts after failure.
 
 
 class VideoBatchItem(BaseModel):
@@ -62,6 +63,7 @@ class VideoBatchItem(BaseModel):
     duration: Optional[str] = None
     resolution: Optional[str] = None  # 可选: "360p" | "720p"
     output_path: str = "" # 为空时继承批量请求级别的 output_path
+    retry_count: Optional[int] = Field(default=None, ge=0, le=10)
 
 
 class VideoBatchRequest(BrowserEnvLockedRequest):
@@ -74,6 +76,7 @@ class VideoBatchRequest(BrowserEnvLockedRequest):
     output_path: str = ""
     concurrent: bool = True       # 并行提交模式 (同一画布快速连续提交后统一监听)
     max_concurrent: int = 5       # 单次批量最大任务数 (画布同时生成上限)
+    retry_count: int = Field(default=5, ge=0, le=10)
 
 
 class MergeRequest(BaseModel):

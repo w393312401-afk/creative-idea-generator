@@ -31,6 +31,7 @@ from frame_generator import (
     _fx_extract_uuid, _fx_store_frame, _fx_find_ref_for, _fx_src_dir,
     _fx_clear_frame_reference, _fx_cover_ref_jpg, _fx_local_frame_ref_jpg, _fx_heal_frame_uuid,
     update_manifest_stale_status,
+    write_frame_manifest, refresh_committed_frame_records, emit_frame_ready,
     current_thread_sinks, set_upstream_event_sink, set_cancel_check_sink,
 )
 from prompt_pipeline import (
@@ -993,11 +994,13 @@ def evaluate_and_select_best_candidate(config, prompt_text, reference_path, cand
     """
     if reviews_disabled(config):
         return {
-            'candidates': [{'index': i, 'score': None, 'score_source': 'review_skipped',
+            'candidates': [{'index': i, 'score': None, 'score_source': 'review_retired',
                             'strengths': '', 'defects': ''}
                            for i in range(1, len(candidate_paths) + 1)],
-            'best_index': 1, 'review_skipped': True,
-            'selection_reason': '全部审查已关闭，默认使用首个候选；其他候选保留供手动选择。',
+            'best_index': 1 if candidate_paths else None,
+            'review_skipped': True, 'retired': True,
+            'reason_code': 'quality_reviews_retired',
+            'selection_reason': '质量门禁已退役，默认使用首个候选；其他候选保留供手动选择。',
         }
     if not candidate_paths:
         return {
@@ -1304,6 +1307,7 @@ def run_candidate_selection_frame_sequence(config, title, prompt_block, on_progr
     workspace_root = os.path.dirname(os.path.abspath(__file__))
 
     for item in prompts:
+        prompt_before_frame = prompt_block
         seq = int(item['index'])
         _check_cancel()
 
@@ -1332,12 +1336,14 @@ def run_candidate_selection_frame_sequence(config, title, prompt_block, on_progr
                     'url': '/' + rel_target_path if not rel_target_path.startswith('/') else rel_target_path,
                     'prompt': item.get('prompt', ''),
                     'meta': item.get('meta', ''),
-                    'quality_gate': 'auto_approved',
+                    'quality_gate': 'retired',
+                    'quality_review_retired': True,
                     'selection_mode': 'candidate_selection',
                     'updated_at': time.strftime('%Y-%m-%d %H:%M:%S'),
                 }
                 manifest_frames_by_seq[seq] = existing_frame
                 manifest['frames'] = [manifest_frames_by_seq[s] for s in sorted(manifest_frames_by_seq.keys())]
+            write_frame_manifest(project_dir, manifest, preserve_video_state=bool(config.get('_auto_generate_videos')))
             if on_progress:
                 on_progress('frame', {
                     'sequence': seq,
@@ -1348,6 +1354,12 @@ def run_candidate_selection_frame_sequence(config, title, prompt_block, on_progr
                     'skipped': True,
                     'message': f"IMG {seq:03d} 已存在，跳过重新生成",
                 })
+            if chain_guard_review:
+                emit_frame_ready(project_dir, seq, on_progress,
+                                 len([f for f in manifest.get('frames', []) if f.get('file')]),
+                                 total_to_generate, skipped=True,
+                                 prompt_block=prompt_block if config.get('_auto_generate_videos') else None,
+                                 previous_prompt_block=prompt_before_frame)
             continue
 
         incoming_video = videos.get(seq - 1)
@@ -1581,9 +1593,12 @@ def run_candidate_selection_frame_sequence(config, title, prompt_block, on_progr
             'fx_project_url': project_url,
             'prompt': item.get('prompt', ''),
             'reference': os.path.relpath(reference, workspace_root).replace('\\', '/') if reference else None,
-            'quality_gate': ('pending_manual_review' if eval_result.get('review_skipped')
+            'quality_gate': ('retired' if eval_result.get('retired') else
+                             'pending_manual_review' if eval_result.get('review_skipped')
                              else 'auto_approved'),
-            'vlm_qa_reason': (selection_reason if eval_result.get('review_skipped') else
+            'quality_review_retired': bool(eval_result.get('retired')),
+            'vlm_qa_reason': (None if eval_result.get('retired') else
+                              selection_reason if eval_result.get('review_skipped') else
                               f"AI 4选1 鉴别优选 (候选 #{best_actual_idx}): {selection_reason}"),
             'selection_mode': 'candidate_selection',
             'chosen_candidate_index': best_actual_idx,
@@ -1608,8 +1623,7 @@ def run_candidate_selection_frame_sequence(config, title, prompt_block, on_progr
         except Exception as stale_err:
             log('WARN', 'CANDIDATE_GEN', f"更新 manifest stale 状态异常: {stale_err}")
 
-        with open(manifest_path, 'w', encoding='utf-8') as f:
-            json.dump(manifest, f, ensure_ascii=False, indent=2)
+        write_frame_manifest(project_dir, manifest, preserve_video_state=bool(config.get('_auto_generate_videos')))
 
         if on_progress:
             on_progress('candidate_ai_evaluation', {
@@ -1618,7 +1632,8 @@ def run_candidate_selection_frame_sequence(config, title, prompt_block, on_progr
                 'selection_reason': selection_reason,
                 'scores': [c.get('score') for c in full_candidates],
                 'review_skipped': bool(eval_result.get('review_skipped')),
-                'message': (f"IMG {seq:03d} 审查已跳过，使用候选 #{best_actual_idx}"
+                'retired': bool(eval_result.get('retired')),
+                'message': (f"IMG {seq:03d} 质量门禁已退役，使用候选 #{best_actual_idx}"
                             if eval_result.get('review_skipped') else
                             f"IMG {seq:03d} AI 鉴别选中候选 #{best_actual_idx}：{selection_reason}"),
             })
@@ -1824,6 +1839,14 @@ def run_candidate_selection_frame_sequence(config, title, prompt_block, on_progr
                     except Exception as guard_err:
                         log('WARN', 'CHAIN_GUARD', f"拍 {beat} 链上守卫执行异常: {guard_err}")
 
+        refresh_committed_frame_records(project_dir, manifest, manifest_frames_by_seq)
+        if chain_guard_review:
+            emit_frame_ready(project_dir, seq, on_progress,
+                             len([f for f in manifest.get('frames', []) if f.get('file')]),
+                             total_to_generate,
+                             prompt_block=prompt_block if config.get('_auto_generate_videos') else None,
+                             previous_prompt_block=prompt_before_frame)
+
     # Finalize stale status & capability stamping
     try:
         update_manifest_stale_status(
@@ -1837,15 +1860,14 @@ def run_candidate_selection_frame_sequence(config, title, prompt_block, on_progr
     # Generate full collage and update manifest collage_url
     _generate_full_collage_from_frames(frames_dir, project_dir=project_dir, manifest=manifest)
 
-    with open(manifest_path, 'w', encoding='utf-8') as f:
-        json.dump(manifest, f, ensure_ascii=False, indent=2)
+    write_frame_manifest(project_dir, manifest, preserve_video_state=bool(config.get('_auto_generate_videos')))
 
     manifest['project_dir'] = project_dir
     manifest['manifest'] = manifest_path
     # 只放进返回值、**不落盘**（写盘在上面已经做完了）：manifest 的未知键会被下一趟
     # 原样继承（见本函数开头读盘合并那段），落盘的话 syncFrameRunToLibrary 之后每趟
     # 都会拿这份陈旧正文回写创意，跟 halted_at_beat 是同一个坑。
-    if autofixed_prompt_block:
+    if autofixed_prompt_block and not config.get('_auto_generate_videos'):
         manifest['prompt_block'] = autofixed_prompt_block
     return manifest
 

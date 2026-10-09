@@ -88,17 +88,17 @@
     <link rel="stylesheet" href="css/tokens.css?v=1.3.0">
     <!-- style.css split into ordered contiguous slices (concatenation == original); load order = cascade order -->
     <link rel="stylesheet" href="css/app/base.css?v=1.5.0">
-    <link rel="stylesheet" href="css/app/skill-output.css?v=1.6.0">
+    <link rel="stylesheet" href="css/app/skill-output.css?v=1.6.1">
     <link rel="stylesheet" href="css/app/efficiency.css?v=1.4.0">
     <link rel="stylesheet" href="css/app/panels-tabs.css?v=1.8.1">
     <!-- 激发结果页的极简布局（管线条 / 折叠标题 / section 弹层 / 宽屏分栏）。
          必须排在 panels-tabs.css 之后：它要覆盖那里的桌面端 .content-header 与
          移动端 .action-row 规则。见 docs/plans/spark_result_minimal_layout_plan.md -->
-    <link rel="stylesheet" href="css/app/result-minimal.css?v=1.0.3">
+    <link rel="stylesheet" href="css/app/result-minimal.css?v=1.0.4">
     <!-- API 配置中心的极简两栏布局（左分区导航 + 右单区表单，号池并入同一窗口）。
          必须排在 base.css 之后：要覆盖那里的 .form-group 竖排规则与 .modal-content 宽度。
          见 docs/plans/spark_settings_center_layout_plan.md -->
-    <link rel="stylesheet" href="css/app/settings-center.css?v=1.1.0">
+    <link rel="stylesheet" href="css/app/settings-center.css?v=1.2.0">
     <link rel="stylesheet" href="css/image_studio.css?v=1.3.0">
     <link rel="stylesheet" href="css/gallery.css?v=1.5.0">
     <!-- 项目工作台（任务列表 + 点子库合并后的主页面）。刻意排在 gallery 之后：
@@ -111,6 +111,7 @@
     <link rel="stylesheet" href="css/app/nav-customize.css?v=1.0.1">
     <link rel="stylesheet" href="css/shared/lightbox.css?v=1.2.1">
     <link rel="stylesheet" href="css/app/utilities.css?v=1.0.0">
+    <link rel="stylesheet" href="css/app/media-preview.css?v=1.0.1">
 </head>
 <body>
     <!-- Background Canvas for Interactive Particles -->
@@ -143,6 +144,7 @@
                     <span class="icon-always" aria-hidden="true">💻</span>
                     <span>控制台</span>
                 </a>
+                <button id="media-preview-toggle" class="icon-btn media-preview-toggle" type="button" aria-pressed="false" title="仅显示媒体计数，节省带宽">仅计数</button>
                 <button id="theme-toggle-btn" class="icon-btn" title="切换暗夜模式"><span id="theme-toggle-icon" style="font-size:18px;line-height:1;">🌙</span></button>
                 <button id="open-settings-btn" class="icon-btn" title="配置中心">
                     <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>
@@ -439,21 +441,24 @@
                                         <video id="codex-edit-player" controls preload="metadata" aria-label="Codex 精剪结果"></video>
                                         <div><h5 id="codex-edit-output-title">精剪结果</h5><p id="codex-edit-output-info" class="codex-edit-note"></p><div class="codex-edit-actions">
                                                 <a id="codex-edit-download" class="codex-edit-btn" download>下载精剪版</a>
+                                                <a id="codex-edit-download-clean" class="codex-edit-btn" download hidden>下载无引导版</a>
                                                 <button type="button" id="codex-edit-reveal" class="codex-edit-btn">定位文件</button>
                                             </div></div>
                                             <p id="codex-edit-source-note" class="codex-edit-note" hidden></p>
                                         </div>
                                         <details id="codex-edit-panel">
-                                            <summary><span>交给 Codex 精剪</span><span id="codex-edit-summary-state" class="codex-edit-summary-state"></span></summary>
+                                            <summary><span>交给 Codex 或 Claude 精剪</span><span id="codex-edit-summary-state" class="codex-edit-summary-state"></span></summary>
                                             <div class="codex-edit-body">
                                                 <p class="codex-edit-note">在运行项目的电脑上使用当前 Codex 登录与额度后台剪辑，公网访问也由这台电脑执行，并按下方所选模型和思考强度运行。原片保留，精剪结果另存。</p>
                                                 <div class="codex-edit-form">
+                                                    <label>精剪引擎<select id="codex-edit-engine"><option value="codex" selected>Codex</option><option value="claude">Claude Code</option></select></label>
                                                     <label>剪辑方式<select id="codex-edit-mode"><option value="trim" selected>只精剪</option><option value="trim_speed">精剪并提速</option></select></label>
                                                     <p id="codex-edit-mode-hint" class="codex-edit-note">只精剪停顿、重复和穿帮，保持当前成片速度。</p>
                                                     <div class="codex-edit-model-settings">
                                                         <label>精剪模型<select id="codex-edit-model"><option value="gpt-6.1-sol" selected>GPT-6.1 Sol</option><option value="gpt-6-astra">GPT-6 Astra</option><option value="gpt-6-sol">GPT-6 Sol</option><option value="gpt-6-luna">GPT-6 Luna</option></select></label>
                                                         <label>思考强度<select id="codex-edit-effort" aria-label="精剪思考强度"><option value="low">低 · low</option><option value="medium">中 · medium</option><option value="high" selected>高 · high</option><option value="xhigh">较高 · xhigh</option><option value="max">很高 · max</option><option value="ultra">最高 · ultra</option></select></label>
                                                     </div>
+                                                    <p id="codex-edit-engine-hint" class="codex-edit-note" hidden>Claude Code 引擎使用运行项目的电脑上当前的 Claude Code 登录与额度；命令在系统沙箱里执行、只能写本次任务的工作区，技能会复制进任务目录使用，估算花费会写进剪辑记录。</p>
                                                     <label class="codex-edit-notes-label">补充要求（可选）<textarea id="codex-edit-notes" rows="2" maxlength="600" placeholder="例如：保留施工关键动作，结尾多留一点成品展示"></textarea></label>
                                                 </div>
                                                 <div class="codex-edit-actions">
@@ -543,7 +548,7 @@
                                     <span class="section-icon">🎞️</span>
                                     <h3>图片序列</h3>
                                     <div class="section-tools">
-                                        <button type="button" class="section-tool-btn section-settings-btn" data-pop="frames-settings-pop" aria-expanded="false" aria-controls="frames-settings-pop" title="图片生成与审查设置">设置</button>
+                                        <button type="button" class="section-tool-btn section-settings-btn" data-pop="frames-settings-pop" aria-expanded="false" aria-controls="frames-settings-pop" title="图片生成设置">设置</button>
                                         <button type="button" class="section-tool-btn" data-pop="frames-info-pop" title="说明">ⓘ</button>
                                     </div>
                                 </div>
@@ -571,11 +576,11 @@
                                         </label>
                                     </div>
                                     <button id="generate-frames-selection-btn" class="action-btn text-btn mini-btn tone-warn" title="4选1 智能生成：每帧一次性制作4张候选图，AI模型鉴别最好的一张作为后续参考，依次迭代生成">🎯 4选1 智能生成</button>
-                                    <button id="run-sequence-review-btn" class="action-btn text-btn mini-btn" title="整套序列渲染完成后，手动检查跨帧施工顺序/空间一致性（不会自动运行，也不会阻塞视频生成）。增量：帧图自上次审查后没变的拍直接沿用结论，只重审变过的那几拍">🔍 一致性审查</button>
+                                    <button id="run-sequence-review-btn" hidden disabled class="action-btn text-btn mini-btn" title="整套序列渲染完成后，手动检查跨帧施工顺序/空间一致性（不会自动运行，也不会阻塞视频生成）。增量：帧图自上次审查后没变的拍直接沿用结论，只重审变过的那几拍">🔍 一致性审查</button>
                                     <!-- 全量重审：跨帧层是按窗口切的，某一帧的改动理论上可能影响别的
                                          窗口里的判断；增量只重跑覆盖失效拍的那几个窗口，这个入口留给
                                          "想让整链重新互相比一遍"的时候。 -->
-                                    <button id="run-full-sequence-review-btn" class="action-btn text-btn mini-btn secondary" title="不复用任何既有结论，把每一拍与跨帧层整个重审一遍（慢、调用多；一般用增量的那个按钮就够）">🔁 全量重审</button>
+                                    <button id="run-full-sequence-review-btn" hidden disabled class="action-btn text-btn mini-btn secondary" title="不复用任何既有结论，把每一拍与跨帧层整个重审一遍（慢、调用多；一般用增量的那个按钮就够）">🔁 全量重审</button>
                                     <!-- 删除整拍时服务端会落一份完整快照；删除后的一次性「撤销」
                                          在 toast 上（30 秒），过了窗口从这里恢复。见
                                          docs/plans/spark_result_slots_plan.md 与 /api/restore_slot -->
@@ -586,6 +591,13 @@
                                     <p class="frames-desc frames-dnd-hint">拖拽：格子之间互拖＝两帧换位（拖到空格＝搬过去，按住 Alt/⌥ 放手＝复制一份）；把本地图片拖进某一格＝替换该帧（按本单画幅裁剪），一次拖多张＝从落点起按文件名顺序依次填（不便拖拽时用卡片上的「上传」按钮，可多选，语义相同）；把格子拖到桌面＝导出这张图。帧号始终不变，换位后其后各帧会标记为血统过期。</p>
                                 </div>
                                 <div class="frames-wrapper card-dark">
+                                    <div class="frames-auto-video-controls">
+                                        <label class="frames-auto-video-toggle" title="首尾帧就绪后立即后台生成视频，无需等待全部图片；图片持续生成，无需等待视频完成">
+                                            <input type="checkbox" id="frames-auto-video-toggle" aria-describedby="frames-auto-video-status" checked>
+                                            <span>出图后自动生成视频</span>
+                                        </label>
+                                        <p id="frames-auto-video-status" class="frames-auto-video-status" hidden></p>
+                                    </div>
                                     <div class="frames-controls">
                                         <p class="frames-meta" id="frames-meta">尚未生成任何帧序列。</p>
                                     </div>
@@ -630,7 +642,7 @@
                                             <div class="review-panel-gap" hidden>
                                                 <span class="review-gap-tag">未审查</span>
                                                 <span class="review-gap-frames"></span>
-                                                <span class="review-gap-hint">这些帧没有审查结论（从没审过，或结论因重渲作废、审查服务不可用）——重跑一次「🔍 一致性审查」补齐。</span>
+                                                <span class="review-gap-hint">历史记录没有这些帧的审查结论。审查规则已退役，不再补跑。</span>
                                             </div>
                                         </div>
                                     </div>
@@ -724,7 +736,7 @@
                                         </label>
                                 </div>
                                 <div class="section-pop" id="videos-info-pop" hidden>
-                                    <p class="frames-desc">利用本地 UI 自动化 (Playwright + Adspower)，将图片帧序列与对应的视频提示词结合，插值生成连续的视频剪辑。</p>
+                                    <p class="frames-desc">使用配置中心选择的视频服务，将图片帧序列与对应的视频提示词结合，生成连续的视频剪辑。</p>
                                     <p class="frames-desc frames-dnd-hint">拖拽：卡片之间互拖＝两段视频换位（拖到空槽位＝搬过去，按住 Alt/⌥ 放手＝复制一份）；把本地视频文件拖进某一格＝上传覆盖该槽位。槽位编号始终不变。</p>
                                 </div>
                                 <div class="frames-wrapper card-dark">
@@ -1348,6 +1360,9 @@
                     <button type="button" class="settings-nav-item" data-section="ideation">
                         <span class="settings-nav-icon">🌐</span><span class="settings-nav-label">联网参考</span>
                     </button>
+                    <button type="button" class="settings-nav-item" data-section="cta">
+                        <span class="settings-nav-icon">🎯</span><span class="settings-nav-label">成片引导</span>
+                    </button>
                     <button type="button" class="settings-nav-item" data-section="system">
                         <span class="settings-nav-icon">🧩</span><span class="settings-nav-label">系统</span>
                     </button>
@@ -1366,7 +1381,7 @@
                         <div class="form-group settings-field" id="settings-llm-model-group">
                             <label for="settings-llm-model">文字模型</label>
                             <select id="settings-llm-model"></select>
-                            <small class="settings-hint">用于提示词合成和内容审查。</small>
+                            <small class="settings-hint">用于提示词合成。</small>
                         </div>
                         <div class="form-group settings-field">
                             <label for="settings-image-backend">图片生成方式</label>
@@ -1407,8 +1422,32 @@
                                 <option value="4K">4K (高清画质)</option>
                             </select>
                         </div>
+                        <div class="form-group settings-field" id="video-provider-group">
+                            <label for="settings-video-provider">视频生成服务</label>
+                            <select id="settings-video-provider">
+                                <option value="google_fx">Google FX（AdsPower）</option>
+                                <option value="flow2api">Flow2API</option>
+                            </select>
+                            <small class="settings-hint" id="video-provider-status" role="status"></small>
+                        </div>
+                        <div class="form-group settings-field" id="flow2api-video-concurrency-group" style="display: none;">
+                            <label for="settings-flow2api-video-concurrency">Flow2API 视频并发数</label>
+                            <select id="settings-flow2api-video-concurrency">
+                                <option value="1">1（串行）</option>
+                                <option value="2">2</option>
+                                <option value="3" selected>3（默认）</option>
+                                <option value="4">4</option>
+                                <option value="5">5</option>
+                                <option value="6">6</option>
+                                <option value="7">7</option>
+                                <option value="8">8</option>
+                                <option value="9">9</option>
+                                <option value="10">10</option>
+                            </select>
+                            <small class="settings-hint">同时生成的视频段数。改动即存，下次生成生效；账号与额度由 Flow2API 管理。</small>
+                        </div>
                         <div class="form-group settings-field" id="fx-video-model-group">
-                            <label for="settings-fx-video-model">FX 视频模型</label>
+                            <label for="settings-fx-video-model">视频模型</label>
                             <select id="settings-fx-video-model">
                                 <option value="Veo 3.1 - Lite">Veo 3.1 - Lite</option>
                                 <option value="Veo 3.1 - Fast">Veo 3.1 - Fast</option>
@@ -1416,6 +1455,31 @@
                                 <option value="Omni Flash">Omni Flash</option>
                                 <option value="Veo 3.1 - Lite [Lower Priority]" selected>Veo 3.1 - Lite [Lower Priority]</option>
                             </select>
+                        </div>
+                        <div class="form-group settings-field" id="video-retry-count-group">
+                            <label for="settings-video-retry-count">每轮视频失败重试次数</label>
+                            <select id="settings-video-retry-count">
+                                <option value="0">0（本轮不额外重试）</option>
+                                <option value="1">1 次</option>
+                                <option value="2">2 次</option>
+                                <option value="3">3 次</option>
+                                <option value="4">4 次</option>
+                                <option value="5" selected>5 次（默认）</option>
+                                <option value="6">6 次</option>
+                                <option value="7">7 次</option>
+                                <option value="8">8 次</option>
+                                <option value="9">9 次</option>
+                                <option value="10">10 次</option>
+                            </select>
+                            <small class="settings-hint">每段视频在一轮内额外尝试的次数。持续完成开启时，10 次仅是每轮上限；用完后自动核对、等待恢复并补跑，不设总轮数上限。</small>
+                        </div>
+                        <div class="form-group settings-field">
+                            <label for="settings-video-continuous-generation">视频自动接续</label>
+                            <select id="settings-video-continuous-generation">
+                                <option value="true" selected>持续完成（默认）</option>
+                                <option value="false">仅执行一轮</option>
+                            </select>
+                            <small class="settings-hint">一次启动后自动恢复未完成片段，全部完成再结束；可随时取消，已完成的视频保留。</small>
                         </div>
                         <div class="form-group settings-field" id="fx-video-duration-group" style="display: none;">
                             <label for="settings-fx-video-duration">Omni Flash 视频时长</label>
@@ -1477,13 +1541,10 @@
                         </details>
                     </section>
 
-                    <!-- ② 生成号池 — 这里只管理池子成员。
-                         视频生成始终走 AdsPower/google_fx（跟「帧序列生成方式」的 api/google_fx
-                         切换无关，那个开关只管生图路径）。默认环境与复用策略统一在
-                         Google FX 服务管理中心配置，避免两个入口互相覆盖。 -->
+                    <!-- ② Google FX 生成号池。Flow2API 的账号由其独立服务管理。 -->
                     <section class="settings-section" data-section="pool">
                         <h4 class="settings-section-title">生成号池</h4>
-                        <p class="settings-section-desc">帧序列 / 视频生成共用的 AdsPower + Flow 账号池，发起生成前自动挑一个还有积分的账号。</p>
+                        <p class="settings-section-desc">Google FX 图片与视频使用的 AdsPower + Flow 账号池。Flow2API 视频使用独立服务中的账号配置。</p>
 
                         <div class="account-pool-manage-body">
                             <!-- 概览统计条：每格既是仪表也是筛选器（点一下只看这一类账号）。
@@ -1579,43 +1640,17 @@
                         </div>
                     </section>
 
-                    <!-- ③ 质量门禁 — 控件由 js/gate_settings.js 按 /api/mode 下发的
-                         gate_settings 表动态渲染，这里只留容器。刻意不在 HTML 里写死
-                         选项/默认值：那等于把服务端 GATE_SETTINGS 抄第二份，
-                         正是「配了但从未生效」那一类 bug 的来源。 -->
+                    <!-- ③ 质量门禁 — 永久退役状态；历史审查数据继续保留。 -->
                     <section class="settings-section" data-section="gates">
-                        <h4 class="settings-section-title">质量门禁</h4>
+                        <h4 class="settings-section-title">质量门禁 · 已退役</h4>
                         <p class="settings-section-desc">
-                            按需调整各阶段检查，或用总开关一次关闭全部审查。修改自动保存，对之后发起的任务生效。
+                            所有审查规则已永久退役。生成任务直接执行，不再审查、自动质检、因审查重试或拦截。
                         </p>
-                        <div class="gate-setting-card gate-settings-master" id="gate-reviews-master" data-gate-key="reviewsDisabled">
-                            <div class="gate-setting-header-row">
-                                <label class="gate-settings-master-label" for="gate-setting-reviewsDisabled">一键关闭所有审查</label>
-                                <label class="gate-review-switch">
-                                    <input type="checkbox" role="switch" id="gate-setting-reviewsDisabled" aria-describedby="gate-reviews-hint gate-reviews-status" disabled>
-                                    <span class="gate-review-switch-track" aria-hidden="true"></span>
-                                </label>
-                            </div>
-                            <p class="gate-reviews-status" id="gate-reviews-status" role="status" aria-live="polite">正在读取审查总开关…</p>
-                            <small class="gate-setting-hint" id="gate-reviews-hint">开启后关闭各阶段审查、自动质检及本地告警检查。下方单项设置会保留，关闭此开关即可恢复。</small>
+                        <div class="gate-setting-card gate-settings-master is-active" id="gate-reviews-master" data-gate-key="reviewsDisabled">
+                            <p class="gate-reviews-status" id="gate-reviews-status" role="status" aria-live="polite">所有审查规则已永久退役</p>
+                            <small class="gate-setting-hint">历史审查记录保留供查阅；旧浏览器设置、恢复默认和导入旧配置都不会重新启用规则。</small>
                         </div>
-                        <div class="gate-settings-toolbar" id="gate-settings-toolbar">
-                            <div class="gate-search-wrap">
-                                <span class="gate-search-icon">🔍</span>
-                                <input type="text" id="gate-settings-search" data-settings-navigation class="gate-settings-search-input" placeholder="快速查找门禁开关（如：差量、优化、质检、连续性、锚点）..." autocomplete="off">
-                                <button type="button" id="gate-settings-search-clear" class="gate-search-clear-btn" title="清空搜索" style="display: none;">&times;</button>
-                            </div>
-                            <div class="gate-filter-chips" id="gate-filter-chips">
-                                <button type="button" class="gate-filter-chip active" data-filter="all">🌟 全部阶段</button>
-                                <button type="button" class="gate-filter-chip" data-filter="video">🎬 阶段3·视频与差量优化</button>
-                                <button type="button" class="gate-filter-chip" data-filter="frame">🖼️ 阶段2·帧渲染与连续性</button>
-                                <button type="button" class="gate-filter-chip" data-filter="prompt">📝 阶段1·提示词契约</button>
-                                <button type="button" class="gate-filter-chip" data-filter="env">🛡️ 全局环境兜底</button>
-                            </div>
-                        </div>
-                        <div id="gate-settings-list" class="gate-settings-list">
-                            <p class="settings-hint" id="gate-settings-loading">正在读取服务端门禁配置…</p>
-                        </div>
+                        <div id="gate-settings-list" class="gate-settings-list" data-status="retired"></div>
                     </section>
 
                     <!-- ④ 联网参考 -->
@@ -1694,6 +1729,56 @@
                                 </div>
                             </div>
                         </details>
+                    </section>
+
+                    <!-- 成片引导：Codex 精剪完成后把透明引导动画烧进成片最后几秒。设置存在服务端
+                         （cta_burn.py，烧录发生在服务端的精剪 worker 里），由 js/engagement_cta_settings.js
+                         读写；data-own-save 让右栏通用的「改动即存」跳过这一区。 -->
+                    <section class="settings-section" data-section="cta" data-own-save>
+                        <h4 class="settings-section-title">成片引导动画</h4>
+                        <p class="settings-section-desc">Codex 精剪完成后，把透明引导动画烧录到成片最后几秒，同时保留一份无引导版本。设置保存在运行项目的电脑上，对之后完成的精剪生效。</p>
+
+                        <div class="form-group settings-field">
+                            <label for="settings-cta-enabled">自动烧录</label>
+                            <div>
+                                <label class="settings-checkbox-label">
+                                    <input type="checkbox" id="settings-cta-enabled" checked disabled>
+                                    <span>精剪成片自动加入引导动画</span>
+                                </label>
+                            </div>
+                        </div>
+                        <div class="form-group settings-field">
+                            <label for="settings-cta-seconds">片尾时长</label>
+                            <select id="settings-cta-seconds" disabled>
+                                <option value="5" selected>最后 5 秒</option>
+                            </select>
+                            <small class="settings-hint">动画占用成片最后几秒；成片比这更短时从开头播放。</small>
+                        </div>
+                        <div class="form-group settings-field">
+                            <label for="settings-cta-source">引导视频</label>
+                            <select id="settings-cta-source" disabled>
+                                <option value="builtin" selected>内置无文字互动动画</option>
+                                <option value="custom">自定义透明视频</option>
+                            </select>
+                            <small class="settings-hint" id="settings-cta-source-hint">关注、点赞、评论、收藏、分享依次点亮；按 TikTok 右侧操作栏定位，无文字，背景全透明。</small>
+                        </div>
+                        <div class="form-group settings-field">
+                            <label for="settings-cta-upload-btn">自定义视频</label>
+                            <div class="settings-field-inline">
+                                <input type="file" id="settings-cta-file" accept=".mov,.webm,.mkv,video/quicktime,video/webm" hidden>
+                                <button type="button" class="ledger-tool-btn" id="settings-cta-upload-btn" disabled>上传透明视频</button>
+                                <button type="button" class="ledger-tool-btn" id="settings-cta-remove-btn" hidden>移除</button>
+                            </div>
+                            <small class="settings-hint" id="settings-cta-custom-info">需要带透明通道：ProRes 4444（含 Alpha）MOV 或 VP9 透明 WebM，60 秒、300 MB 以内。从片尾时长的起点开始播放，超出成片结尾的部分不显示。</small>
+                        </div>
+                        <div class="form-group settings-field">
+                            <label>预览</label>
+                            <div class="cta-preview" id="settings-cta-preview">
+                                <div class="cta-preview-frame" id="settings-cta-preview-frame"></div>
+                                <small class="settings-hint" id="settings-cta-preview-caption">格子表示透明区域。</small>
+                            </div>
+                        </div>
+                        <p class="settings-inline-note cta-status" id="settings-cta-status" role="status" aria-live="polite">正在读取成片引导设置…</p>
                     </section>
 
                     <!-- ⑤ 任务提醒 -->
@@ -1912,44 +1997,45 @@
     </div>
 
     <!-- Modular JS: defer so they never block HTML parsing. Order preserved. -->
-    <script src="js/state.js?v=1.1.15" defer></script>
+    <script src="js/media_preview.js?v=1.0.0" defer></script>
+    <script src="js/state.js?v=1.1.17" defer></script>
     <script src="js/utils.js?v=1.6.0" defer></script>
     <script src="js/notification_center.js?v=1.1.0" defer></script>
     <script src="js/theme_toggle.js?v=1.1.0" defer></script>
-    <script src="js/config.js?v=1.4.1" defer></script>
-    <!-- 质量门禁开关面板：按 /api/mode 下发的 gate_settings 表动态渲染配置中心的
-         「质量门禁」分区。必须排在 config.js 之后（读写同一个 config 对象）。 -->
-    <script src="js/gate_settings.js?v=1.0.0" defer></script>
+    <script src="js/config.js?v=1.4.4" defer></script>
+    <script src="js/engagement_cta_settings.js?v=1.0.1" defer></script>
+    <!-- 质量门禁永久退役状态；保留历史设置导航与旧配置迁移接口。 -->
+    <script src="js/gate_settings.js?v=2.0.0" defer></script>
     <!-- 联网参考案例库：项目工具栏打开，保留搜索、归档与管理功能。 -->
     <script src="js/trend_refs.js?v=1.3.2" defer></script>
     <script src="js/account_pool.js?v=1.2.1" defer></script>
-    <script src="js/progress_model.js?v=1.2.3" defer></script>
+    <script src="js/progress_model.js?v=1.3.1" defer></script>
     <!-- 槽位状态模型（纯函数）与卡片渲染器：必须排在 api_client / media_renderer /
          app.js 之前——那三处的槽位渲染全部转调这里。见 docs/plans/spark_result_slots_plan.md -->
-    <script src="js/slot_model.js?v=1.4.0" defer></script>
-    <script src="js/slot_card.js?v=1.5.1" defer></script>
-    <script src="js/slot_toolbar.js?v=1.1.0" defer></script>
+    <script src="js/slot_model.js?v=1.4.2" defer></script>
+    <script src="js/slot_card.js?v=1.5.4" defer></script>
+    <script src="js/slot_toolbar.js?v=1.1.1" defer></script>
     <!-- 审查结论面板 + 单帧违规详情弹层（消费 manifest 里既有的 review_issues） -->
-    <script src="js/review_report.js?v=1.0.0" defer></script>
+    <script src="js/review_report.js?v=1.0.1" defer></script>
     <!-- 日志语义规则表（纯函数）：必须排在 api_client 之前——日志面板的概览模式
          转调这里把日志行归成人话事件。见 docs/plans/spark_log_panel_layout_plan.md -->
     <script src="js/log_semantics.js?v=1.0.0" defer></script>
-    <script src="js/api_client.js?v=1.9.1" defer></script>
+    <script src="js/api_client.js?v=1.9.6" defer></script>
     <script src="js/prompt_pipeline.js?v=1.3.0" defer></script>
-    <script src="js/stepped_pipeline.js?v=1.1.0" defer></script>
+    <script src="js/stepped_pipeline.js?v=1.1.2" defer></script>
     <script src="js/prompt_history.js?v=1.0.0" defer></script>
     <script src="js/collage_viewer.js?v=1.1.0" defer></script>
     <script src="js/prompt_import.js?v=1.0.1" defer></script>
     <script src="js/prompt_editor.js?v=1.1.0" defer></script>
-    <script src="js/lightbox.js?v=1.1.0" defer></script>
-    <script src="js/codex_video_editor.js?v=1.0.3" defer></script>
-    <script src="js/media_renderer.js?v=1.12.3" defer></script>
-    <script src="app.js?v=1.7.2" defer></script>
-    <script src="js/image_studio.js?v=1.1.0" defer></script>
-    <script src="js/gallery.js?v=1.4.0" defer></script>
+    <script src="js/lightbox.js?v=1.1.1" defer></script>
+    <script src="js/codex_video_editor.js?v=1.0.6" defer></script>
+    <script src="js/media_renderer.js?v=1.12.7" defer></script>
+    <script src="app.js?v=1.7.6" defer></script>
+    <script src="js/image_studio.js?v=1.1.1" defer></script>
+    <script src="js/gallery.js?v=1.4.1" defer></script>
     <!-- 项目工作台：必须排在 app.js 之后（依赖它的 openSparkProject / viewTask /
          retryTask / deleteFromLibrary 等宿主函数） -->
-    <script src="js/projects.js?v=1.3.5" defer></script>
+    <script src="js/projects.js?v=1.3.6" defer></script>
     <!-- 顶部标签栏自定义（排序 / 隐藏）。纯 DOM 层改造，不依赖任何业务模块，
          只要求 .mobile-nav-tabs 已经在文档里 -->
     <script src="js/nav_customize.js?v=1.0.1" defer></script>

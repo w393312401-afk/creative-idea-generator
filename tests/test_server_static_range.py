@@ -2,6 +2,7 @@
 import io
 import os
 import datetime
+from email.utils import format_datetime
 import pytest
 
 import server
@@ -43,22 +44,14 @@ def _make_handler(path, headers=None, is_head=False):
         sent_headers[keyword.lower()] = str(value)
 
     def fake_end_headers():
-        # 调用 SparkRequestHandler 自身的 end_headers 逻辑
-        h.send_header('Access-Control-Allow-Origin', '*')
-        h.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
-        h.send_header('Access-Control-Allow-Headers', 'Content-Type, Authorization, Range')
-        h.send_header('Access-Control-Expose-Headers', 'Content-Range, Accept-Ranges, Content-Length')
-        p = (h.path or '').split('?')[0]
-        if p.endswith(('.html', '.css', '.js')) or p.endswith('/'):
-            h.send_header('Cache-Control', 'no-store')
-        elif getattr(h, '_spark_status_code', 200) >= 400:
-            h.send_header('Cache-Control', 'no-store')
-        elif p.startswith('/outputs/'):
-            h.send_header('Cache-Control', 'no-cache')
+        # Exercise the real cache/CORS policy, suppressing only socket I/O.
+        h.flush_headers = lambda: None
+        server.SparkRequestHandler.end_headers(h)
 
     def fake_send_error(code, message=None, explain=None):
         sent_status[0] = code
         h._spark_status_code = code
+        fake_end_headers()
 
     h.send_response = fake_send_response
     h.send_header = fake_send_header
@@ -107,6 +100,8 @@ def test_full_get_without_range(sample_video_file):
     assert headers['content-type'] == 'video/mp4'
     assert headers['content-length'] == '1000'
     assert headers['accept-ranges'] == 'bytes'
+    assert headers['etag'].startswith('"')
+    assert headers['cache-control'] == 'no-cache'
     assert headers['access-control-allow-origin'] == '*'
     assert 'range' in headers['access-control-allow-headers'].lower()
     assert 'content-range' in headers['access-control-expose-headers'].lower()
@@ -184,6 +179,164 @@ def test_head_without_range(sample_video_file):
     assert headers['content-length'] == '1000'
     assert headers['accept-ranges'] == 'bytes'
     assert wfile.getvalue() == b''
+
+
+@pytest.mark.parametrize('is_head', [False, True], ids=['get', 'head'])
+@pytest.mark.parametrize('validator', [
+    'strong', 'weak', 'list', 'weak-list', 'wildcard',
+])
+def test_output_media_etag_not_modified(sample_video_file, is_head, validator):
+    h, _, first_headers, _ = _make_handler('/outputs/test_video.mp4')
+    h.do_GET()
+    etag = first_headers['etag']
+    requested = {
+        'strong': etag,
+        'weak': 'W/' + etag,
+        'list': '"different", ' + etag,
+        'weak-list': ' W/"different", W/' + etag + ' ',
+        'wildcard': '*',
+    }[validator]
+    h, status, headers, body = _make_handler('/outputs/test_video.mp4', {
+        'If-None-Match': requested,
+        'If-Modified-Since': 'Thu, 01 Jan 1970 00:00:00 GMT',
+    }, is_head=is_head)
+    h.do_HEAD() if is_head else h.do_GET()
+    assert status[0] == 304
+    assert headers['etag'] == etag
+    assert headers['last-modified'] == first_headers['last-modified']
+    assert headers['cache-control'] == 'no-cache'
+    assert 'content-length' not in headers
+    assert body.getvalue() == b''
+
+
+@pytest.mark.parametrize('validator', ['"different"', 'W/"different"', '"one", W/"two"', ''])
+def test_output_media_etag_takes_precedence_over_ims(sample_video_file, validator):
+    _, data = sample_video_file
+    h, _, first_headers, _ = _make_handler('/outputs/test_video.mp4')
+    h.do_GET()
+    h, status, headers, body = _make_handler('/outputs/test_video.mp4', {
+        'If-None-Match': validator,
+        'If-Modified-Since': first_headers['last-modified'],
+    })
+    h.do_GET()
+    assert status[0] == 200
+    assert headers['etag'] == first_headers['etag']
+    assert body.getvalue() == data
+
+
+def test_output_media_legacy_ims_returns_completed_body(sample_video_file):
+    _, data = sample_video_file
+    h, _, first_headers, _ = _make_handler('/outputs/test_video.mp4')
+    h.do_GET()
+    h, status, headers, body = _make_handler('/outputs/test_video.mp4', {
+        'If-Modified-Since': first_headers['last-modified'],
+    })
+    h.do_GET()
+    assert status[0] == 200
+    assert headers['etag'] == first_headers['etag']
+    assert body.getvalue() == data
+
+
+@pytest.mark.parametrize('updated,elapsed_ns', [
+    (b'new image', 100_000_000), (b'longer new image', 0),
+], ids=['same-size-new-nanosecond', 'changed-size-same-timestamp'])
+def test_output_image_rewrite_within_same_second_invalidates_etag(tmp_path, monkeypatch, updated, elapsed_ns):
+    path = tmp_path / 'cover.webp'
+    path.write_bytes(b'old image')
+    base_ns = 1_700_000_000_100_000_000
+    os.utime(path, ns=(base_ns, base_ns))
+    monkeypatch.setattr(server.SparkRequestHandler, 'translate_path', lambda self, url: str(path))
+    h, _, first_headers, _ = _make_handler('/outputs/project/cover.webp')
+    h.do_GET()
+    path.write_bytes(updated)
+    new_ns = base_ns + elapsed_ns
+    os.utime(path, ns=(new_ns, new_ns))
+    h, status, headers, body = _make_handler('/outputs/project/cover.webp', {
+        'If-None-Match': first_headers['etag'],
+        'If-Modified-Since': first_headers['last-modified'],
+    })
+    h.do_GET()
+    assert status[0] == 200
+    assert headers['last-modified'] == first_headers['last-modified']
+    assert headers['etag'] != first_headers['etag']
+    assert body.getvalue() == updated
+
+
+@pytest.mark.parametrize('is_head', [False, True], ids=['get', 'head'])
+def test_empty_output_media_is_not_cacheable_then_filled_in_same_second(tmp_path, monkeypatch, is_head):
+    path = tmp_path / 'cover.webp'
+    path.touch()
+    base_ns = 1_700_000_000_100_000_000
+    os.utime(path, ns=(base_ns, base_ns))
+    monkeypatch.setattr(server.SparkRequestHandler, 'translate_path', lambda self, url: str(path))
+    h, status, headers, body = _make_handler('/outputs/project/cover.webp', is_head=is_head)
+    h.do_HEAD() if is_head else h.do_GET()
+    assert status[0] == 404
+    assert headers['cache-control'] == 'no-store'
+    assert 'etag' not in headers
+    assert body.getvalue() == b''
+    path.write_bytes(b'completed image')
+    new_ns = base_ns + 100_000_000
+    os.utime(path, ns=(new_ns, new_ns))
+    legacy_date = datetime.datetime.fromtimestamp(base_ns // 1_000_000_000,
+                                                 datetime.timezone.utc)
+    h, status, headers, body = _make_handler('/outputs/project/cover.webp', {
+        'If-Modified-Since': format_datetime(legacy_date, usegmt=True),
+    })
+    h.do_GET()
+    assert status[0] == 200
+    assert headers['content-length'] == str(len(b'completed image'))
+    assert 'etag' in headers
+    assert body.getvalue() == b'completed image'
+
+
+def test_empty_ordinary_static_file_remains_servable(tmp_path, monkeypatch):
+    path = tmp_path / 'empty.txt'
+    path.touch()
+    monkeypatch.setattr(server.SparkRequestHandler, 'translate_path', lambda self, url: str(path))
+    h, status, headers, body = _make_handler('/empty.txt')
+    h.do_GET()
+    assert status[0] == 200
+    assert headers['content-length'] == '0'
+    assert body.getvalue() == b''
+
+
+def test_output_media_range_still_serves_bytes_with_matching_etag(sample_video_file):
+    _, data = sample_video_file
+    h, _, first_headers, _ = _make_handler('/outputs/test_video.mp4')
+    h.do_GET()
+    h, status, headers, body = _make_handler('/outputs/test_video.mp4', {
+        'Range': 'bytes=0-99', 'If-None-Match': first_headers['etag'],
+    })
+    h.do_GET()
+    assert status[0] == 206
+    assert headers['etag'] == first_headers['etag']
+    assert headers['content-range'] == 'bytes 0-99/1000'
+    assert body.getvalue() == data[:100]
+
+
+def test_generated_svg_etag_distinguishes_gzip_representation(tmp_path, monkeypatch):
+    path = tmp_path / 'generated.svg'
+    data = b'<svg><!-- generated graphic --></svg>' * 100
+    path.write_bytes(data)
+    monkeypatch.setattr(server.SparkRequestHandler, 'translate_path', lambda self, url: str(path))
+    h, _, identity_headers, _ = _make_handler('/outputs/project/generated.svg')
+    h.do_GET()
+    h, status, gzip_headers, _ = _make_handler('/outputs/project/generated.svg', {
+        'Accept-Encoding': 'gzip', 'If-None-Match': identity_headers['etag'],
+    })
+    h.do_GET()
+    assert status[0] == 200
+    assert gzip_headers['etag'] != identity_headers['etag']
+    assert gzip_headers['content-encoding'] == 'gzip'
+    h, status, headers, body = _make_handler('/outputs/project/generated.svg', {
+        'Accept-Encoding': 'gzip', 'If-None-Match': gzip_headers['etag'],
+    })
+    h.do_GET()
+    assert status[0] == 304
+    assert headers['etag'] == gzip_headers['etag']
+    assert headers['vary'] == 'Accept-Encoding'
+    assert body.getvalue() == b''
 
 
 def test_blocked_static_path():

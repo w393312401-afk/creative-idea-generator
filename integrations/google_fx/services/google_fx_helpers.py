@@ -2725,23 +2725,18 @@ def _submit_video_to_canvas(page, req, before_tile_ids, expect_slice=None, on_id
 
     try:
         new_tile_id = _wait_for_new_tile_id(page, before_tile_ids, timeout=20, expect_slice=expect_slice)
+        if not new_tile_id:
+            credit_before, _ = last_credit_reading()
+            page_credit_err = detect_page_credit_exhaustion(page, deep=True)
+            if page_credit_err:
+                raise RuntimeError(f"INSUFFICIENT_CREDITS: {page_credit_err}")
+            raise RuntimeError(_no_tile_error_message(page, credit_before))
     except Exception as exc:
+        # Generate was already clicked. Even a new zero-credit reading or a
+        # failed diagnostic cannot prove that the request was never accepted.
         exc.submission_started = True
         exc.click_time = click_time
         raise
-    if not new_tile_id:
-        # 拿不到新卡片时，先记下"上一次实读余额"是多少。下面的 deep 探测会再读
-        # 一次真实余额并覆盖它，两个读数一比就知道这段时间积分有没有在掉。
-        credit_before, _ = last_credit_reading()
-        # deep=True：这一条正是 2026-08-24 漏判的现场——积分跑干时 Flow 点了
-        # Generate 不给 tile，页面上却不一定有任何耗尽文案，非得去头像菜单实读。
-        page_credit_err = detect_page_credit_exhaustion(page, deep=True)
-        if page_credit_err:
-            raise RuntimeError(f"INSUFFICIENT_CREDITS: {page_credit_err}")
-        exc = RuntimeError(_no_tile_error_message(page, credit_before))
-        exc.submission_started = True
-        exc.click_time = click_time
-        raise exc
     log(f"🎯 新 tile: {new_tile_id[:16]}...", "GoogleFX")
 
     # 立即为新 tile 设置 data-original-tile-id，防止后续生成过程中 React/UI 更新其 ID 后丢失匹配
@@ -4471,6 +4466,11 @@ def wait_out_manual_intervention(page, context_label="Google FX", cancel_check=N
 
     code, reason = state
 
+    from ..utils import account_binding
+    if account_binding.current_fixed_task_account():
+        raise account_binding.FixedAccountStopError(
+            f"固定视频账号需要人工处理 ({code})，已停止本任务: {reason}")
+
     def _emit(phase):
         if not on_event:
             return
@@ -5321,7 +5321,8 @@ def _connect_fx_page(playwright_ctx, cancel_check=None, on_event=None,
        没有 on_event 的调用方（图片批量 / 单条视频，没有进度事件通道）维持
        原样直接抛错——宁可让上层报一个明确的错，也不要静默干等 20 分钟。
     """
-    max_conn_attempts = 3
+    from ..utils import account_binding
+    max_conn_attempts = 1 if account_binding.current_fixed_task_account() else 3
     browser = None
 
     for attempt in range(1, max_conn_attempts + 1):
@@ -6019,6 +6020,9 @@ def _switch_account_on_failure(reason=None, force_switch=False, exclude=()):
             log(f"⏭️ 跳过换号：{verdict}；生成过程未出现风控相关报错", "GoogleFX")
             return None
         log(f"🚨 换号判定：{verdict}", "GoogleFX")
+    from ..utils import account_binding
+    if account_binding.current_fixed_task_account():
+        raise account_binding.FixedAccountStopError("固定视频账号发生生成拦截，已停止提交，不切换账号")
     try:
         from ..utils.account_pool import switch_to_next_account
         log("🔁 检测到生成报错/卡片异常，正在切换号池账号...", "GoogleFX")

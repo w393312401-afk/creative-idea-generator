@@ -45,6 +45,20 @@ FX_CONFIG_SPEC = {
         'env': 'SPARK_FX_MAX_CONCURRENT',
         'group': '并发', 'label': '浏览器并发数（1=串行；>1 时不同项目可同时出片，每个任务独占一个环境）',
     },
+    'flow2apiVideoConcurrency': {
+        'type': 'integer', 'min': 1, 'max': 10, 'default': 3, 'hot': True,
+        'env': 'SPARK_FLOW2API_VIDEO_CONCURRENCY',
+        'group': '并发', 'label': 'Flow2API 视频并发数（1=串行；账号与额度由 Flow2API 管理）',
+    },
+    'videoRetryCount': {
+        'type': 'integer', 'min': 0, 'max': 10, 'default': 5, 'hot': True,
+        'env': 'SPARK_VIDEO_RETRY_COUNT',
+        'group': '视频', 'label': '每轮视频失败重试次数（持续生成开启后，轮次用完会等待恢复并继续）',
+    },
+    'videoContinuousGeneration': {
+        'type': 'bool', 'default': True, 'hot': True,
+        'group': '视频', 'label': '持续完成视频（自动核对、退避补跑，全部完成后再结束）',
+    },
     'fxEgressPolicy': {
         'type': 'enum', 'options': ['hard', 'warn'], 'default': 'hard', 'hot': True,
         'env': 'SPARK_FX_EGRESS_POLICY',
@@ -60,6 +74,10 @@ FX_CONFIG_SPEC = {
                     'Veo 3.1 - Lite [Lower Priority]'],
         'default': 'Veo 3.1 - Lite [Lower Priority]', 'hot': True,
         'group': '模型', 'label': '视频模型',
+    },
+    'videoProvider': {
+        'type': 'enum', 'options': ['google_fx', 'flow2api'], 'default': 'google_fx',
+        'hot': True, 'group': '模型', 'label': '视频生成服务',
     },
     'videoDuration': {
         'type': 'enum', 'options': ['4', '6', '8', '10'], 'default': '10', 'hot': True,
@@ -184,6 +202,30 @@ FX_CONFIG_SPEC = {
 _DIRECT_ENV_KEYS = {key: spec['env'] for key, spec in FX_CONFIG_SPEC.items() if spec.get('env')}
 
 
+def normalize_flow2api_video_concurrency(value):
+    """Normalize file/environment values using the public concurrency limits."""
+    spec = FX_CONFIG_SPEC['flow2apiVideoConcurrency']
+    if isinstance(value, bool) or isinstance(value, float) and not value.is_integer():
+        return spec['default']
+    try:
+        count = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return spec['default']
+    return max(spec['min'], min(spec['max'], count))
+
+
+def normalize_video_retry_count(value):
+    """Extra attempts after a settled video failure; zero disables resubmission."""
+    spec = FX_CONFIG_SPEC['videoRetryCount']
+    if isinstance(value, bool) or isinstance(value, float) and not value.is_integer():
+        return spec['default']
+    try:
+        count = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return spec['default']
+    return max(spec['min'], min(spec['max'], count))
+
+
 def bool_to_env(value):
     return '1' if value else '0'
 
@@ -218,6 +260,9 @@ def validate_patch(patch):
         if key == 'googleFxImageModel' and is_legacy_google_fx_image_model(value):
             value = normalize_google_fx_image_model(value)
         if spec['type'] == 'integer':
+            if key in {'flow2apiVideoConcurrency', 'videoRetryCount'} and (
+                    isinstance(value, bool) or isinstance(value, float) and not value.is_integer()):
+                raise ValueError(f'{key} 必须是整数')
             try:
                 value = int(value)
             except (TypeError, ValueError):
@@ -286,6 +331,9 @@ class FxConfigStore:
                    for key, spec in FX_CONFIG_SPEC.items()}
         current['googleFxImageModel'] = normalize_google_fx_image_model(
             current.get('googleFxImageModel'))
+        current['flow2apiVideoConcurrency'] = normalize_flow2api_video_concurrency(
+            current.get('flow2apiVideoConcurrency'))
+        current['videoRetryCount'] = normalize_video_retry_count(current.get('videoRetryCount'))
         return current
 
     def migrate_deprecated_values(self, actor='system'):

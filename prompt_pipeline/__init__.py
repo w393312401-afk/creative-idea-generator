@@ -22,6 +22,7 @@ from datetime import datetime
 
 from server_common import (
     SERVER_CONFIG, resolve_gateway, resolve_chat_model, effective_config,
+    is_claude_model, shape_chat_payload,
     OUTPUT_ROOT, SKILL_DIR, skill_dir, skill_reference_path, skill_contract_report,
     skill_reference_fallback,
     DEFAULT_SKILL_PROFILE, active_skill_profile, ensure_used_topic_ledger,
@@ -929,6 +930,12 @@ def _chat(config, system, user, temperature=0.85, max_tokens=65536, timeout=240,
         # "web_search"——"web_search_preview"(Responses API 的旧名字)在这个网关上
         # 会 400 Unsupported tool type。
         payload['tools'] = [{'type': 'web_search'}]
+    elif enable_search and is_claude_model(m_lower) and sys.stdout:
+        # Claude 经 OpenAI 兼容网关时没有统一的联网工具声明，不凭猜测附加：
+        # 这一次调用按不联网处理，调用方拿到的是模型自己的知识。
+        print(f"[DEBUG] {model} 经 claudeBaseUrl 网关调用，已跳过联网搜索工具。")
+    # Claude：去掉自定义采样参数并按型号限制 max_tokens（见 server_common.shape_chat_payload）。
+    shape_chat_payload(model, payload)
 
     if on_chunk is not None:
         payload['stream'] = True
@@ -1040,7 +1047,7 @@ def _chat(config, system, user, temperature=0.85, max_tokens=65536, timeout=240,
             raise RuntimeError(
                 f"无法连接本地 LLM 代理（{base_url}）：{reason}。"
                 f"请确认该地址对应的代理服务正在运行，并检查模型 {model} 的网关配置"
-                "（GPT/Codex 使用 codexBaseUrl / codexApiKey；其他模型使用 Base URL / API Key）。"
+                "（GPT/Codex 使用 codexBaseUrl / codexApiKey；Claude 使用 claudeBaseUrl / claudeApiKey，未填则沿用 Base URL / API Key；其他模型使用 Base URL / API Key）。"
             )
     try:
         return body['choices'][0]['message'].get('content') or ''
@@ -1090,6 +1097,7 @@ def _multimodal_chat(config, system, user_text, image_paths, model=None, max_tok
         'temperature': 0.1,
         'max_tokens': max_tokens,
     }
+    shape_chat_payload(model, payload)
 
     data = json.dumps(payload).encode('utf-8')
     req = urllib.request.Request(
@@ -1500,6 +1508,8 @@ def cover_reference_is_same_layer(config, cover_path, declared_family):
     - 层一致（都 exterior / 都 interior）→ 可用；
     - 判不出来（unknown / 判定关闭 / 服务异常）→ 可用（fail-open，维持既有行为）；
     - 拼接图（composite）或层不一致 → 不可用，首帧改走纯文本生成。"""
+    if reviews_disabled(config):
+        return True, 'retired', ''
     layer = classify_image_space_layer(config, cover_path)
     declared = (declared_family or '').strip().lower()
     if layer == 'unknown' or declared not in ('interior', 'exterior'):
@@ -1525,6 +1535,8 @@ def refine_packet_from_accepted_anchor(config, image_path, packet, parsed_brief=
     it is legitimately absent from IMAGE 1, and "reconcile against what is visible" must
     not be read as "delete the carrier from the ledger".
     """
+    if reviews_disabled(config):
+        return packet
     _delivered_note = (
         "\n\nIMPORTANT CONTEXT: in this project the carrier is hauled onto the site by machinery "
         "during Beat 1, so IMAGE 1 deliberately shows the empty receiving ground with no carrier in "
@@ -3420,6 +3432,8 @@ def _checkpoint_is_failed_terminal(checkpoint, total_beats):
     resuming it would mark the flagged beats 'done', skip regenerating them, and instantly
     re-trip the gate — turning every retry into a zero-work no-op ('出错任务重试不了'). Callers
     should discard its beat-level resume state and regenerate fresh instead."""
+    if reviews_disabled():
+        return False
     if not isinstance(checkpoint, dict):
         return False
     return int(checkpoint.get('fallback_count') or 0) > 0
@@ -7175,6 +7189,8 @@ def compress_prompt_to_budget(prompt, target_max_words, config, is_video=True):
 def apply_proactive_fixes(i, video_prompt, image_prompt, packet, mode, is_last, is_threshold_or_reveal,
                           beat=None, config=None, family=None, beat_ladder=None):
     # 1. Clean initial prompt text
+    if reviews_disabled(config):
+        return video_prompt, image_prompt
     image_prompt = clean_prompt_text(image_prompt)
     video_prompt = clean_prompt_text(video_prompt)
 
@@ -10745,6 +10761,8 @@ def validate_beat_prompts(i, video_prompt, image_prompt, packet, mode, is_last, 
     用户明确指定的一镜到底为400词；不用 base 的380词预算替代它。
 
     IMAGE 硬顶不走参数：它只由 family 决定（image_word_limit_for），所有 profile 同规则。"""
+    if reviews_disabled():
+        return []
     errors = []
     video_word_limit = int(video_word_limit or BASE_VIDEO_WORD_LIMIT)
 
@@ -11598,7 +11616,7 @@ Space Type: {space_type}
     # 文本的根因);诊断模式保留旧的宽松行为,供对照排查。口径与 composers/base.py
     # 的 allow_placeholders 完全一致,只是这里管的是规划期而不是逐拍生成期。
     _diagnostic_mode = bool((config or {}).get('diagnostic_mode') or (config or {}).get('diagnosticMode'))
-    _strict_v2 = (config or {}).get('strictPromptPipelineV2', True) is not False
+    _strict_v2 = not reviews_disabled(config) and (config or {}).get('strictPromptPipelineV2', True) is not False
     _allow_generic_fallback_ladder = (
         (_diagnostic_mode and bool((config or {}).get('allowPlaceholderPrompts', False)))
         or not _strict_v2)
@@ -12585,38 +12603,8 @@ Hard Rules:
             image_1_prompt = _chat(config, image_1_system, image_1_user, temperature=0.8, timeout=60)
             image_1_prompt = _strip_markdown_fences_only(image_1_prompt).strip()
             image_1_prompt = clean_prompt_text(image_1_prompt)
-            image_1_prompt = fix_image_clean_frame_proactive(image_1_prompt)
-            camera_dna = packet.get('camera_dna', '')
-            if camera_dna:
-                image_1_prompt = fix_camera_dna(image_1_prompt, camera_dna)
-                image_1_prompt = dedupe_camera_declaration(image_1_prompt, camera_dna)
-            # 拍摄质感子句：IMAGE 1 在 Phase 1 生成，而 profile 的拍摄质感契约挂在
-            # Phase 2 的 VIDEO OVERRIDE 段上——2026-08-02 那单里 slot1 因此成了 17 帧
-            # 里唯一没有 UGC 手机质感的一张，风格和后面 16 帧不是一套。
-            image_1_prompt = ensure_capture_style(image_1_prompt, config, parsed_brief, theme)
+            # 质量规则和自动内容修正已退役；仅保留非空正文与传输重试。
             if image_1_prompt:
-                errs = check_image_clean_frame(image_1_prompt)
-                errs.extend(check_grid_coordinates(image_1_prompt))
-                errs.extend(check_primary_landmarks_exact_match(image_1_prompt, packet))
-                errs.extend(check_anchor_scale_lock(image_1_prompt, packet))
-                if _img1_is_pre_bridge:
-                    errs.extend(check_closed_entry_before_crossing(image_1_prompt, packet))
-                # 唯一一条在直出模式下仍然重生成的首帧硬伤：载体提前入镜。
-                # 其余校验是「画面质量瑕疵」，改不改都还是同一场戏；而载体入镜会让
-                # Beat 1（把载体运到现场）没有任何可交付的状态变化，整条叙事从第一
-                # 帧就散了。把违规原文回喂进 user 消息重来，三次都不行才带伤放行。
-                carrier_errs = check_image_1_carrier_absent(image_1_prompt, parsed_brief)
-                if carrier_errs and attempt < 2:
-                    if sys.stdout:
-                        print(f"[DEBUG] IMAGE 1 载体提前入镜，重生成（第 {attempt + 1} 次）: {carrier_errs}")
-                    image_1_user += (
-                        f"\n\nThe previous attempt was rejected: {carrier_errs[0]}. "
-                        f"Rewrite it describing the empty ground and landscape only."
-                    )
-                    continue
-                errs.extend(carrier_errs)
-                if errs and sys.stdout:
-                    print(f"[DIRECT] IMAGE 1 校验有瑕疵（直出模式仅记录，不重生成）: {errs}")
                 break
         except GenerationCancelled:
             raise
@@ -19579,6 +19567,7 @@ def ideation_topic_violations(idea, burned_roots=None):
 
 def run_ideate(config, count=5, theme=None, theme_label=None, trend_ref_ids=None,
                 remix_seed=None, pacing_skeleton_ids=None):
+    _skip_ideation_reviews = reviews_disabled(config)
     # 形态矩阵按本次激活的技能 profile 现读（做哪个模型的提示词就用哪个包的形态矩阵：
     # 两个包各带一份 idea-engine.md）；历史台账反过来是**全局共享**的一份，不按 profile
     # 分裂——同一个选题换个分镜语法重做一遍不是新选题，去重记忆劈成两半等于没有。
@@ -19741,9 +19730,9 @@ def run_ideate(config, count=5, theme=None, theme_label=None, trend_ref_ids=None
                             # 两包分别验收、分别降级：事实源（en/mat）与拍属性
                             # （zone/scope/trace）互不牵连，一包写歪不该连累另一包。
                             for errors, fields in (
-                                    (_outline_rich_entry_violations(normalized, previous_mat),
+                                    ([] if _skip_ideation_reviews else _outline_rich_entry_violations(normalized, previous_mat),
                                      _OUTLINE_FACT_FIELDS),
-                                    (_outline_beat_property_violations(normalized, zone_map),
+                                    ([] if _skip_ideation_reviews else _outline_beat_property_violations(normalized, zone_map),
                                      _OUTLINE_PROPERTY_FIELDS)):
                                 if not errors:
                                     continue
@@ -19769,7 +19758,7 @@ def run_ideate(config, count=5, theme=None, theme_label=None, trend_ref_ids=None
                         all_enriched = False
             # 跨条目那三条（分区抖动 / 覆盖度分布 / 痕迹链）只有拿到整份清单才判得了，
             # 全部属于拍属性包 —— 降级只剥 zone/scope/trace，事实源 en/mat 原样留着。
-            for pos, errors in sorted(_outline_rich_list_violations(items, zone_map).items()):
+            for pos, errors in sorted(({} if _skip_ideation_reviews else _outline_rich_list_violations(items, zone_map)).items()):
                 all_enriched = False
                 if sys.stdout:
                     action = ('剥掉 zone/scope/trace' if _OUTLINE_RICH_GATE_ENFORCING
@@ -20228,7 +20217,7 @@ Each object in the JSON array must have EXACTLY these keys:
                     # 选题门禁（归宿/twist 根/旧物再生）与家族配额一律算硬失败：降级
                     # 只能改节拍标签，改不掉「这条选题本身不该出现」。theme_label 是用户
                     # 在 GUI 里钉死的载体，钉了就不再拿家族配额去否决他的选择。
-                    quota_failures = ({} if theme_label else ideation_family_quota_violations(
+                    quota_failures = ({} if _skip_ideation_reviews or theme_label else ideation_family_quota_violations(
                         novel_ideas, count=count, already=accumulated_ideas + downgraded_ideas))
                     failures = {}
                     hard_failures = {}
@@ -20236,8 +20225,8 @@ Each object in the JSON array must have EXACTLY these keys:
                         # 条目重量门禁与通用骨架门禁同属「硬失败」：一条塞三族的清单
                         # 没有任何标签能让它变诚实，降级救不了（同 outline_skeleton_
                         # violations 的理由），所以共用 _OUTLINE_GATE_ENFORCING 开关。
-                        hard_errs = outline_skeleton_violations(idea) + outline_weight_violations(idea)
-                        soft_errs = pacing_skeleton_outline_violations(idea)
+                        hard_errs = [] if _skip_ideation_reviews else outline_skeleton_violations(idea) + outline_weight_violations(idea)
+                        soft_errs = [] if _skip_ideation_reviews else pacing_skeleton_outline_violations(idea)
                         if hard_errs and not _OUTLINE_GATE_ENFORCING:
                             if sys.stdout:
                                 print(f"[DEBUG] run_ideate: 通用骨架门禁（未强制）命中 "
@@ -20245,7 +20234,7 @@ Each object in the JSON array must have EXACTLY these keys:
                             hard_errs = []
                         # 选题门禁走自己的开关：清单门禁关掉时不该顺手把「这条选题本身
                         # 不该出现」也一起放行，两者治的完全不是一回事。
-                        topic_errs = (ideation_topic_violations(idea, ledger_burned_roots)
+                        topic_errs = ([] if _skip_ideation_reviews else ideation_topic_violations(idea, ledger_burned_roots)
                                       + quota_failures.get(idea_idx, []))
                         if topic_errs:
                             if sys.stdout:
@@ -20546,6 +20535,8 @@ Each object in the JSON array must have EXACTLY these keys:
 
 
 def check_adjacent_frame_semantics_batch(config, images):
+    if reviews_disabled(config):
+        return {}
     import json
     import sys
     formatted = []

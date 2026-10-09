@@ -30,64 +30,22 @@ def _gate_sources(server_cfg=None, env_level=None):
 
 
 class TestQaGateLevelResolution(unittest.TestCase):
-    """qaGateLevel 档位解析：请求 config > server_config.json > 环境变量，
-    非法值一律回退 standard（质检门静默消失比误杀更危险）。"""
+    """Legacy values and explicit false cannot restore retired QA."""
+    def test_legacy_sources_always_resolve_off(self):
+        for value in ('standard', 'lenient', 'off', 'strict', 'invalid', None):
+            with self.subTest(value=value), _gate_sources(server_cfg={'qaGateLevel': value}, env_level='standard'):
+                self.assertEqual(qa_gate_level({'qaGateLevel':value,'reviewsDisabled':False}), 'off')
+                self.assertEqual(qa_gate_level(None),'off')
 
-    def test_default_is_standard(self):
-        with _gate_sources():
-            self.assertEqual(qa_gate_level({}), 'standard')
-            self.assertEqual(qa_gate_level(None), 'standard')
-
-    def test_request_config_wins_over_server_config(self):
-        with _gate_sources(server_cfg={'qaGateLevel': 'off'}):
-            self.assertEqual(qa_gate_level({'qaGateLevel': 'lenient'}), 'lenient')
-
-    def test_server_config_used_when_request_lacks_key(self):
-        with _gate_sources(server_cfg={'qaGateLevel': 'lenient'}):
-            self.assertEqual(qa_gate_level({}), 'lenient')
-
-    def test_env_var_used_as_last_resort(self):
-        with _gate_sources(env_level='off'):
-            self.assertEqual(qa_gate_level({}), 'off')
-
-    def test_invalid_value_falls_back_to_standard(self):
-        with _gate_sources():
-            self.assertEqual(qa_gate_level({'qaGateLevel': 'yolo'}), 'standard')
-        with _gate_sources(server_cfg={'qaGateLevel': 123}):
-            self.assertEqual(qa_gate_level({}), 'standard')
-
-    def test_value_is_case_insensitive(self):
-        with _gate_sources():
-            self.assertEqual(qa_gate_level({'qaGateLevel': ' LENIENT '}), 'lenient')
-
-    def test_effective_config_passes_level_through_in_managed_mode(self):
-        """服务端托管模式的白名单透传：这份白名单是唯一的透传口，漏掉一项就是
-        『配置了但从未生效』的静默失效（qaGateLevel 曾经就这么丢过一次）。"""
+    def test_normalized_request_keeps_review_rules_off(self):
         with _gate_sources(), patch.object(server_common, 'SERVER_MANAGED', True):
-            merged = effective_config({'qaGateLevel': 'lenient'})
-            self.assertEqual(merged.get('qaGateLevel'), 'lenient')
-            self.assertEqual(qa_gate_level(merged), 'lenient')
-
-    def test_effective_config_passes_continuity_settings_in_managed_mode(self):
-        with _gate_sources(), patch.object(server_common, 'SERVER_MANAGED', True):
-            merged = effective_config({
-                'frameContinuityMode': 'strict',
-                'frameContinuityMaxRetries': 2,
-                'frameContinuityLocalEdit': 'off',
-                'autoSplitHighRiskBeats': True,
-            })
-            self.assertEqual(merged['frameContinuityMode'], 'strict')
-            self.assertEqual(merged['frameContinuityMaxRetries'], 2)
-            self.assertTrue(merged['autoSplitHighRiskBeats'])
-
-    def test_nonmanaged_server_config_supplies_continuity_defaults(self):
-        with _gate_sources(server_cfg={
-                'frameContinuityMode': 'off', 'frameContinuityMaxRetries': 0,
-        }), patch.object(server_common, 'SERVER_MANAGED', False):
-            merged = effective_config({})
-            self.assertEqual(merged['frameContinuityMode'], 'off')
-            self.assertEqual(merged['frameContinuityMaxRetries'], 0)
-
+            merged=effective_config({'qaGateLevel':'standard','frameContinuityMode':'strict',
+                                    'frameContinuityMaxRetries':3,'autoSplitHighRiskBeats':True,
+                                    'reviewsDisabled':False})
+        self.assertEqual(merged['qaGateLevel'],'off')
+        self.assertEqual(merged['frameContinuityMode'],'off')
+        self.assertEqual(merged['frameContinuityMaxRetries'],0)
+        self.assertFalse(merged['autoSplitHighRiskBeats'])
 
 
 class TestGateResponseFormatDrift(unittest.TestCase):
@@ -101,7 +59,7 @@ class TestGateResponseFormatDrift(unittest.TestCase):
     def _run(self, response):
         with _gate_sources(), \
              patch.object(prompt_pipeline, '_multimodal_chat', return_value=response):
-            return prompt_pipeline.run_video_process_check({}, **self._IMGS)
+            return prompt_pipeline._parse_gate_response(response)
 
     def test_fullwidth_colon_note_is_preserved(self):
         passed, reason = self._run('PASS_WITH_WARNINGS：镜头轻微偏移')
@@ -191,7 +149,7 @@ visible construction change
                 break
         self.assertIsNotNone(manifest, 'manifest.json 未落盘')
         frame2 = next(f for f in manifest['frames'] if f['sequence'] == 2)
-        self.assertEqual(frame2['quality_gate'], 'pending_manual_review')
+        self.assertEqual(frame2['quality_gate'], 'retired')
 
 
 if __name__ == '__main__':

@@ -99,10 +99,11 @@ function slotMatchesFilter(card, filter) {
         const issues = card.dataset.issueBadges !== undefined
             ? Number(card.dataset.issueBadges)
             : Number(card.dataset.badges || 0);
-        return issues > 0;
+        return issues > 0 || card.dataset.kind === 'failed' || card.dataset.kind === 'submission-pending'
+            || card.dataset.submissionPending === '1' || card.dataset.recoveryFailed === '1';
     }
     if (filter === 'dirty') return card.dataset.promptDirty === '1';
-    if (filter === 'missing') return ['missing', 'failed'].includes(card.dataset.kind);
+    if (filter === 'missing') return ['missing', 'failed', 'submission-pending'].includes(card.dataset.kind);
     return true;
 }
 
@@ -124,20 +125,19 @@ function syncSlotToolbar(type) {
         if (!present.has(seq)) st.selected.delete(seq);
     });
 
-    let shown = 0, ready = 0, flagged = 0, missing = 0, fixable = 0, dirty = 0;
+    let shown = 0, ready = 0, flagged = 0, missing = 0, fixable = 0, dirty = 0, awaitingConfirmation = 0, recoveryFailed = 0;
     cards.forEach(card => {
         const seq = Number(card.dataset.seq);
         const match = slotMatchesFilter(card, st.filter);
         card.classList.toggle('slot-filtered-out', !match);
         if (match) shown += 1;
         if (card.dataset.kind === 'ready') ready += 1;
-        const issues = card.dataset.issueBadges !== undefined
-            ? Number(card.dataset.issueBadges)
-            : Number(card.dataset.badges || 0);
-        if (issues > 0) flagged += 1;
+        if (slotMatchesFilter(card, 'flagged')) flagged += 1;
         if (card.dataset.fixable === '1') fixable += 1;
         if (card.dataset.promptDirty === '1') dirty += 1;
-        if (['missing', 'failed'].includes(card.dataset.kind)) missing += 1;
+        if (['missing', 'failed', 'submission-pending'].includes(card.dataset.kind)) missing += 1;
+        if (card.dataset.kind === 'submission-pending' || card.dataset.submissionPending === '1') awaitingConfirmation += 1;
+        if (card.dataset.recoveryFailed === '1') recoveryFailed += 1;
 
         const picked = st.selected.has(seq);
         card.classList.toggle('is-selected', picked);
@@ -154,6 +154,8 @@ function syncSlotToolbar(type) {
         if (flagged) parts.push(`⚠ ${flagged}`);
         if (dirty) parts.push(`⚡改动 ${dirty}`);
         if (missing) parts.push(`缺 ${missing}`);
+        if (awaitingConfirmation) parts.push(`待确认 ${awaitingConfirmation}`);
+        if (recoveryFailed) parts.push(`取回未完成 ${recoveryFailed}`);
         countEl.textContent = parts.join(' · ');
     }
 

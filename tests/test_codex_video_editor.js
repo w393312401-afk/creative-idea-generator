@@ -81,6 +81,8 @@ function testMarkupLivesInsideFinishedResult() {
     assert.match(html, /在运行项目的电脑上使用当前 Codex 登录与额度后台剪辑，公网访问也由这台电脑执行/);
     assert.match(html, /id="codex-edit-model"[^>]*>[^<]*<option value="gpt-6\.1-sol" selected>/);
     assert.match(html, /id="codex-edit-effort"[^>]*>[\s\S]*?<option value="high" selected>/);
+    assert.match(html, /id="codex-edit-engine"[^>]*><option value="codex" selected>Codex<\/option><option value="claude">Claude Code<\/option>/);
+    assert.ok(ids.includes('codex-edit-engine-hint'));
 }
 
 async function testDefaultAndUnavailableAndCanonicalSource() {
@@ -502,6 +504,108 @@ async function testLiveProgressStaysVisibleWithFoldedPanelAndOlderSelection() {
     assert.equal(h.element('root').hidden, true);
 }
 
+
+const bothEngines = { available: true, message: '', default_engine: 'codex', engines: {
+    codex: { available: true, message: '已找到本机 Codex 和剪辑依赖，执行时检查登录' },
+    claude: { available: true, message: '已找到本机 Claude Code 和剪辑依赖，执行时检查登录' } } };
+
+async function testClaudeEngineSwitchesModelsEffortsAndSubmitsEngine() {
+    const submitted = [];
+    const h = harness((url, options) => {
+        if (url.endsWith('/capabilities')) return response(bothEngines);
+        if (options.method === 'POST') { submitted.push(readBody(options)); return response({ job: job('one', '/outputs/a/final.mp4', 'queued', { engine: 'claude' }) }); }
+        return response({ jobs: [] });
+    });
+    h.sync(); await settle();
+    assert.equal(h.element('engine').value, 'codex');
+    assert.equal(h.element('engine-hint').hidden, true);
+    h.event('effort', 'change', 'ultra');
+    h.event('engine', 'change', 'claude');
+    // 切换引擎：型号回到该引擎的默认，Claude 没有 ultra，原来的 ultra 降为 max。
+    assert.equal(h.element('model').value, 'claude-opus-5-5');
+    assert.match(h.element('model').innerHTML, /value="claude-sonnet-5-5">Claude Sonnet 5\.5<\/option>/);
+    assert.doesNotMatch(h.element('model').innerHTML, /gpt-6/);
+    assert.equal(h.element('effort').value, 'max');
+    assert.doesNotMatch(h.element('effort').innerHTML, /value="ultra"/);
+    assert.equal(h.element('engine-hint').hidden, false);
+    h.event('model', 'change', 'claude-haiku-5-5');
+    h.event('effort', 'change', 'low');
+    assert.equal(h.element('start').disabled, false);
+    await h.event('start');
+    assert.deepEqual(submitted[0], { source: '/outputs/a/final.mp4', mode: 'trim', notes: '', model: 'claude-haiku-5-5',
+        reasoning_effort: 'low', request_id: submitted[0].request_id, engine: 'claude' });
+    // 切回 Codex：模型清单恢复，Codex 请求不带 engine 字段，保持历史请求的形状。
+    await h.tick();
+    h.sync('/outputs/b/final.mp4'); await settle();
+    assert.equal(h.element('engine').value, 'codex');
+    assert.match(h.element('model').innerHTML, /gpt-6\.1-sol/);
+}
+
+async function testEngineWithoutCapabilityIsExplainedAndOtherEngineStillWorks() {
+    const h = harness(url => response(url.endsWith('/capabilities')
+        ? { available: true, message: '', default_engine: 'codex', engines: {
+            codex: { available: true, message: '' }, claude: { available: false, message: '暂不可用，缺少：claude' } } }
+        : { jobs: [] }));
+    h.sync(); await settle();
+    assert.equal(h.element('start').disabled, false, 'Codex remains usable');
+    h.event('engine', 'change', 'claude');
+    assert.equal(h.element('start').disabled, true);
+    assert.equal(h.element('capability').textContent, '暂不可用，缺少：claude');
+    assert.equal(h.element('check').textContent, '重新检查 Claude Code');
+    await h.event('start');
+    assert.equal(h.calls.filter(call => call.options.method === 'POST').length, 0);
+    h.event('engine', 'change', 'codex');
+    assert.equal(h.element('start').disabled, false);
+    assert.equal(h.element('capability').textContent, '');
+}
+
+async function testOldServerWithoutEngineListNeverRunsClaudeAsCodex() {
+    const h = harness(url => response(url.endsWith('/capabilities') ? { available: true } : { jobs: [] }));
+    h.sync(); await settle();
+    h.event('engine', 'change', 'claude');
+    assert.equal(h.element('start').disabled, true);
+    assert.match(h.element('capability').textContent, /还不支持 Claude Code 精剪引擎/);
+}
+
+async function testClaudeHistoryAndPendingRetryKeepEngine() {
+    const storage = new Map();
+    const first = harness((url, options) => {
+        if (options.method === 'POST') throw new Error('connection lost');
+        return response(url.endsWith('/capabilities') ? bothEngines : { jobs: [] });
+    }, storage);
+    first.sync(); await settle();
+    first.event('engine', 'change', 'claude');
+    first.event('model', 'change', 'claude-fable-5-1');
+    first.event('effort', 'change', 'xhigh');
+    await first.event('start');
+    const saved = JSON.parse([...storage.values()][0]);
+    assert.deepEqual([saved.engine, saved.model, saved.reasoning_effort], ['claude', 'claude-fable-5-1', 'xhigh']);
+    const submitted = [];
+    const restored = harness((url, options) => {
+        if (options.method === 'POST') { submitted.push(readBody(options)); return response({ job: job('retried', saved.source, 'queued', { engine: 'claude', request_id: saved.request_id }) }); }
+        return response(url.endsWith('/capabilities') ? bothEngines : { jobs: [] });
+    }, storage);
+    restored.sync(); await settle();
+    assert.equal(restored.element('engine').value, 'claude');
+    assert.equal(restored.element('model').value, 'claude-fable-5-1');
+    assert.equal(restored.element('effort').value, 'xhigh');
+    await restored.event('start');
+    assert.equal(submitted[0].request_id, saved.request_id, 'the retry keeps the unconfirmed request identity');
+    assert.equal(submitted[0].engine, 'claude');
+
+    const history = harness(url => response(url.endsWith('/capabilities') ? bothEngines : { jobs: [
+        job('claude-job', '/outputs/a/final.mp4', 'completed', { engine: 'claude', model: 'claude-sonnet-5-5', reasoning_effort: 'high' }),
+        job('codex-job', '/outputs/a/final.mp4', 'completed', { model: 'gpt-6-astra', reasoning_effort: 'max', created_at: '2026-09-26T10:00:00Z' }),
+    ] }));
+    history.sync(); await settle();
+    // 新草稿跟随最近一次精剪的引擎、型号和强度。
+    assert.equal(history.element('engine').value, 'claude');
+    assert.equal(history.element('model').value, 'claude-sonnet-5-5');
+    assert.equal(history.element('job-config').textContent, '所选记录：Claude Code · Claude Sonnet 5.5 · 思考强度：高');
+    history.event('history', 'change', 'codex-job');
+    assert.equal(history.element('job-config').textContent, '所选记录：GPT-6 Astra · 思考强度：很高');
+}
+
 (async () => {
     testMarkupLivesInsideFinishedResult();
     await testDefaultAndUnavailableAndCanonicalSource();
@@ -523,5 +627,9 @@ async function testLiveProgressStaysVisibleWithFoldedPanelAndOlderSelection() {
     await testRepeatedConnectionErrorIsShownOnce();
     await testDeletedGalleryResultHasNoBrokenPreview();
     await testLiveProgressStaysVisibleWithFoldedPanelAndOlderSelection();
+    await testClaudeEngineSwitchesModelsEffortsAndSubmitsEngine();
+    await testEngineWithoutCapabilityIsExplainedAndOtherEngineStillWorks();
+    await testOldServerWithoutEngineListNeverRunsClaudeAsCodex();
+    await testClaudeHistoryAndPendingRetryKeepEngine();
     console.log('Codex video editor UI regression tests passed');
 })().catch(error => { console.error(error); process.exitCode = 1; });

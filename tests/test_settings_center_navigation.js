@@ -104,7 +104,7 @@ const stored = [];
 const ctx = vm.createContext({
     document: { getElementById: get, createElement: tag => new Element(tag) },
     localStorage: { setItem: (key, value) => stored.push([key, value]), getItem: () => null },
-    autoSaveConfig: () => saves++, initNotificationSettingsEvents() {},
+    autoSaveConfig: () => saves++, initNotificationSettingsEvents() {}, updateVideoProviderStatus() {},
 });
 vm.runInContext(settings, ctx);
 ctx.initSettingsCenter();
@@ -154,9 +154,9 @@ first.focus();
 first.dispatch('keydown', { key: 'Escape' });
 assert.equal(results.hidden, true, 'Escape closes results without reopening on input focus');
 assert.equal(activeElement, search);
-get('gate-settings-search').dispatch('change');
+assert.equal(get('gate-settings-search'), null, 'retired quality gates have no editable search controls');
 search.dispatch('change');
-assert.equal(saves, 0, 'neither global nor gate search can trigger autosave');
+assert.equal(saves, 0, 'global search cannot trigger autosave');
 get('settings-candidate-concurrency').dispatch('change');
 assert.equal(saves, 1, 'changing a folded field still saves exactly once');
 assert.equal(get('settings-generation-advanced').open, true);

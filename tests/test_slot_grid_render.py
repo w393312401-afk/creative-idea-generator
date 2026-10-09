@@ -209,7 +209,8 @@ def test_slot_grid_renders_states_badges_and_delegated_actions():
             c.querySelector('.slot-actions').style.opacity = 1;
             const r = c.getBoundingClientRect();
             return { card: { l: r.left, w: r.width },
-                     btns: Array.from(c.querySelectorAll('.slot-action-btn')).filter(b => b.getClientRects().length).map(b => {
+                     btns: Array.from(c.querySelectorAll('.slot-action-btn')).filter(b =>
+                         !b.closest('details:not([open])') && b.getClientRects().length).map(b => {
                          const q = b.getBoundingClientRect();
                          return { act: b.dataset.act, l: q.left, w: q.width };
                      }) };

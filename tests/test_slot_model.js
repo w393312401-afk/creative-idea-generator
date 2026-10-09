@@ -246,6 +246,102 @@ assert.strictEqual(v.title, 'FX 队列超时');
 assert.deepStrictEqual(acts(v), ['retry-video', 'upload-video', 'delete-slot']);
 assert.ok(!v.draggable, '失败的格子不能当换位的源');
 
+v = videoSlotState({ slot: 37, provider: 'flow2api', status: 'failed', error: '查询超时',
+    last_attempt: { status: 'failed', submission_pending: true } }, { seq: 37 });
+assert.strictEqual(v.kind, 'submission-pending', '手动重试权限不改变原提交待确认的事实');
+assert.strictEqual(v.statusText, '原提交结果待确认');
+assert.deepStrictEqual(acts(v), ['query-video-submission', 'retry-video', 'upload-video', 'delete-slot']);
+assert.ok(v.actions[0].primary);
+assert.strictEqual(v.actions[0].label, '核对原提交');
+assert.strictEqual(v.actions[1].label, '重新生成');
+assert.ok(v.flags.submissionPending && v.flags.directRetry);
+assert(v.title.includes('先核对原提交'));
+assert.ok(!v.draggable);
+assert.strictEqual(summarizeSlotStates([v]).pending, 1);
+assert.strictEqual(summarizeSlotStates([v]).missing, 1, '尚未交付的待确认片段仍计入缺数');
+
+v = videoSlotState({ slot: 37, provider: 'flow2api', status: 'success', url: '/old.mp4',
+    last_attempt: { status: 'failed', submission_pending: true } }, { seq: 37 });
+assert.strictEqual(v.kind, 'ready', 'Flow2API重试仍保留可播放的原片');
+assert.deepStrictEqual(badges(v), ['submission-pending']);
+assert.deepStrictEqual(acts(v), ['preview-slot', 'query-video-submission', 'retry-video', 'upload-video', 'delete-slot']);
+assert.strictEqual(v.actions.find(a => a.primary).act, 'preview-slot');
+assert.ok(v.draggable, '旧Flow2API待确认标记不再限制换位');
+
+v = videoSlotState({ slot: 37, provider: 'flow2api', status: 'failed', error: 'download unavailable',
+    last_attempt: { confirmed: true, submission_pending: false, recovery_state: 'recovery_failed' } }, { seq: 37 });
+assert.strictEqual(v.statusText, '原视频取回未完成');
+assert.strictEqual(v.actions.find(a => a.primary).act, 'query-video-submission', '已生成的视频优先取回');
+assert.strictEqual(v.actions.find(a => a.primary).label, '取回原视频');
+assert.ok(acts(v).includes('retry-video'), '仍保留显式重新生成权限');
+
+v = videoSlotState({ slot: 37, provider: 'flow2api', status: 'success', url: '/old.mp4',
+    last_attempt: { status: 'failed', confirmed: true, submission_pending: false,
+        recovery_state: 'recovery_failed' } }, { seq: 37 });
+assert.deepStrictEqual(badges(v), ['recovery-failed']);
+assert.strictEqual(v.actions.find(a => a.primary).act, 'preview-slot', '取回失败继续保留原片播放');
+assert.ok(acts(v).includes('query-video-submission'));
+
+for (const record of [
+    { provider: 'flow2api', last_attempt: { submission_pending: true } },
+    { last_attempt: { provider: 'flow2api', submission_pending: true } },
+    { last_attempt: { submission_id: 'legacy-flow', submission_pending: true } },
+]) {
+    v = videoSlotState({ slot: 37, status: 'failed', ...record }, { seq: 37 });
+    assert.strictEqual(v.kind, 'submission-pending', '兼容provider与旧submission_id两种Flow2API标识');
+    assert.strictEqual(v.actions.find(a => a.primary).act, 'query-video-submission');
+    assert.ok(v.flags.submissionPending && v.flags.directRetry);
+}
+
+for (const record of [
+    { provider: 'flow2api', last_attempt: { provider: 'google_fx', submission_pending: true } },
+    { last_attempt: { provider: 'other_provider', submission_id: 'other', submission_pending: true } },
+]) {
+    v = videoSlotState({ slot: 37, status: 'failed', ...record }, { seq: 37 });
+    assert.strictEqual(v.kind, 'submission-pending', '最新回执provider优先，不放开其它通道');
+    assert.deepStrictEqual(acts(v), []);
+}
+
+v = videoSlotState({ slot: 37, provider: 'flow2api', status: 'failed',
+    last_attempt: { fixed_video_account: true, provider: 'google_fx', submission_pending: true } }, { seq: 37 });
+assert.strictEqual(v.kind, 'submission-pending');
+assert.deepStrictEqual(acts(v), [], '原生账号未决记录不能调用Flow2API恢复接口');
+assert(v.title.includes('原生成服务'));
+
+const fixedNativePending = { slot: 37, provider: 'google_fx', status: 'failed',
+    last_attempt: { provider: 'google_fx', fixed_video_account: true, submission_id: 'native-pending',
+        status: 'failed', submission_pending: true } };
+v = videoSlotState(fixedNativePending, { seq: 37, videoProvider: 'flow2api' });
+assert.strictEqual(v.kind, 'submission-pending', '切换生成通道仍如实显示旧原生提交的待确认状态');
+assert.strictEqual(v.actions.find(a => a.primary).act, 'retry-video');
+assert.ok(v.flags.submissionPending && v.flags.directRetry);
+assert.ok(!acts(v).includes('query-video-submission'), 'Flow2API核对接口不能查询旧固定原生账号');
+v = videoSlotState({ ...fixedNativePending, status: 'success', url: '/old.mp4' },
+    { seq: 37, videoProvider: 'flow2api' });
+assert.deepStrictEqual(badges(v), ['submission-pending'], '手动换通道重试权限与未决回执状态分别保留');
+assert.ok(acts(v).includes('retry-video'));
+assert.ok(v.title.includes('待确认'));
+v = videoSlotState(fixedNativePending, { seq: 37, videoProvider: 'google_fx' });
+assert.strictEqual(v.kind, 'submission-pending', '当前原生账号仍保留pending保护');
+assert.deepStrictEqual(acts(v), []);
+v = videoSlotState({ ...fixedNativePending, status: 'success', url: '/old.mp4' },
+    { seq: 37, videoProvider: 'google_fx' });
+assert.deepStrictEqual(badges(v), ['submission-pending']);
+assert.deepStrictEqual(acts(v), ['preview-slot']);
+
+v = videoSlotState({ slot: 37, status: 'failed',
+    last_attempt: { submission_pending: false } }, { seq: 37 });
+assert.strictEqual(v.kind, 'failed');
+assert.ok(acts(v).includes('retry-video'), '核实已结束后恢复正常重试入口');
+
+for (const state of ['refused', 'failed']) {
+    v = videoSlotState({ slot: 37, provider: 'flow2api', status: 'failed',
+        last_attempt: { submission_pending: false, recovery_state: state } }, { seq: 37 });
+    assert.strictEqual(v.kind, 'failed', '上游核对确认的失败按正常失败显示');
+    assert.strictEqual(v.actions.find(a => a.primary).act, 'retry-video');
+    assert.ok(!acts(v).includes('query-video-submission'));
+}
+
 v = videoSlotState(null, { seq: 8, pending: false });
 assert.strictEqual(v.kind, 'missing');
 assert.strictEqual(v.actions[0].label, '生成');

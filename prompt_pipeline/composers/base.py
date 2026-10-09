@@ -317,6 +317,8 @@ Instructions:
 
         beat_ladder 供只有"看得见在先各拍"才判得了的收口用（末帧继承句、末帧镜面地是否
         有工序背书）。缺省 None 时那两条一律保持改动前的行为，不删不改。"""
+        if pp.reviews_disabled(config if config is not None else self.config):
+            return video_prompt, image_prompt
         return pp.apply_proactive_fixes(
             i, video_prompt, image_prompt, packet, mode, is_last, is_threshold_or_reveal,
             beat=beat, config=config, family=family, beat_ladder=beat_ladder)
@@ -326,6 +328,8 @@ Instructions:
                               beat=None, family=None, is_pre_bridge=False,
                               is_post_reveal_cleanup=False, video_word_limit=None):
         """单拍校验。video_word_limit 缺省 = base 的一镜到底档硬顶（见 pp 侧说明）。"""
+        if pp.reviews_disabled(self.config):
+            return []
         return pp.validate_beat_prompts(
             i, video_prompt, image_prompt, packet, mode, is_last, is_threshold_or_reveal,
             prev_video, prev_image, beat=beat, family=family, is_pre_bridge=is_pre_bridge,
@@ -333,10 +337,14 @@ Instructions:
 
     def split_structural_video_errors(self, errs):
         """把校验结果分成（结构性硬伤, 其余瑕疵）——前者触发定向回炉。"""
+        if pp.reviews_disabled(self.config):
+            return [], []
         return pp.split_structural_video_errors(errs)
 
     def rework_structural_video_beat(self, config, i, video_prompt, structural_errs, packet, beat=None):
         """结构性硬伤的定向回炉（只重写 VIDEO）。"""
+        if pp.reviews_disabled(config):
+            return video_prompt, None
         return pp.rework_structural_video_beat(config, i, video_prompt, structural_errs, packet, beat=beat)
 
     def finalize_fallback_video(self, video_prompt, contract):
@@ -357,6 +365,8 @@ Instructions:
     def patch_milestone_video_prompt(video_prompt, beat):
         """确定性补齐 VIDEO 里程碑骨架中缺失的起首动作、进度线与物料流向。
         避免因细微关键词遗漏触发沉重的多轮网络回炉或退回单拍重试。"""
+        if pp.reviews_disabled(None):
+            return video_prompt
         if not isinstance(beat, dict) or beat.get('operation') in ('threshold', 'reward') \
                 or beat.get('bridge_stage') or beat.get('hard_cut'):
             return video_prompt
@@ -391,6 +401,8 @@ Instructions:
     @staticmethod
     def patch_milestone_image_prompt(image_prompt, beat):
         """确定性补齐 IMAGE 里程碑骨架中缺失的产品锚点、收工状态、全域覆盖及持久痕迹。"""
+        if pp.reviews_disabled(None):
+            return image_prompt
         if not isinstance(beat, dict) or beat.get('operation') in ('threshold', 'reward') \
                 or beat.get('bridge_stage') or beat.get('hard_cut'):
             return image_prompt
@@ -501,12 +513,8 @@ Instructions:
         against an accepted rendered IMAGE 1, beats 2+ are written against that confirmed
         packet instead of the pre-visualized one.
 
-        skill 直出模式：文本阶段不做任何拦截式审查。批量直出的每拍结果经确定性修复
-        （apply_proactive_fixes）后直接采纳；validate_beat_prompts 只以日志形式留痕，
-        不触发重写。整套序列的施工顺序/SCUP 一致性审查移到帧渲染完成后，对着真实画面跑
-        （见 pipeline_orchestrator._sequence_consistency_review /
-        prompt_pipeline.check_full_sequence_consistency），因为凭空文本判断"这套提示词
-        会不会渲出违反工序逻辑的画面"既慢又不准。
+        审查规则退役后，完整 VIDEO/IMAGE 响应直接采纳，不调用任何内容质量检查、
+        自动修正文或回炉钩子。传输重试、响应缺段和槽位编号校验照常运行。
 
         断点续传:每完成一拍(beat)就把进度存盘(见 _save_checkpoint),按
         state['brief_fingerprint'] 存取——同一份 dimensions 中断/失败后重试时，已经成功生成
@@ -544,9 +552,8 @@ Instructions:
         for i in range(1, total_beats + 1):
             slot_states[str(i)] = 'validated' if i in pass_beats_done else 'pending'
         diagnostic_mode = bool(config.get('diagnostic_mode') or config.get('diagnosticMode'))
-        strict_v2 = config.get('strictPromptPipelineV2', True) is not False
-        allow_placeholders = (
-            diagnostic_mode and bool(config.get('allowPlaceholderPrompts', False))) or not strict_v2
+        # strictPromptPipelineV2 已退役；缺段/网络失败仍不能伪造生产正文。
+        allow_placeholders = diagnostic_mode and bool(config.get('allowPlaceholderPrompts', False))
         if isinstance(config, dict):
             config['_compose_slot_states'] = slot_states
 
@@ -554,7 +561,7 @@ Instructions:
         # (而非可续的中断)——继续按它续传只会把那几拍当"已完成"跳过、fallback_count 一进门禁就再挂,
         # 使每次重试都变成"零工作量瞬间再失败"(用户侧就是"出错任务重试不了")。此时丢弃拍级续传状态,
         # 从头全量重生成所有拍(Phase 1 的 packet/beat_ladder/IMAGE 1 仍从 state 复用)。
-        if pp._checkpoint_is_failed_terminal(_checkpoint, total_beats):
+        if not skip_reviews and pp._checkpoint_is_failed_terminal(_checkpoint, total_beats):
             if sys.stdout:
                 print(f"[RESUME] Checkpoint fallback_count={fallback_count} 已超门禁上限 {max(2, total_beats // 3)}，"
                       f"判定为失败终态存档而非可续中断；丢弃拍级续传状态，全量重生成所有拍。")
@@ -635,10 +642,11 @@ Instructions:
                             print(f"[DEBUG] Beat {i} attempt {attempt+1}: response missing VIDEO/IMAGE sections, retrying.")
                         continue
 
-                    # Apply proactive fixes
-                    v_p, i_p = self.apply_proactive_fixes(i, v_p, i_p, beat_packet, mode, is_last, is_threshold_or_reveal,
-                                                         beat=beat, config=config, family=family,
-                                                         beat_ladder=beat_ladder)
+                    # 退役审查时绕过所有父类/子类质量修正文钩子，直接保留模型稿。
+                    if not skip_reviews:
+                        v_p, i_p = self.apply_proactive_fixes(
+                            i, v_p, i_p, beat_packet, mode, is_last, is_threshold_or_reveal,
+                            beat=beat, config=config, family=family, beat_ladder=beat_ladder)
                     # 2026-07-30：声明式切入拍的 VIDEO 不再被占位声明覆盖——它和单一过门拍
                     # 一样是真实可见的跨越片段，正文一律走 LLM 稿 + 确定性修复 + 校验 + 回炉
                     # 的普通通路（占位覆盖正是「过门镜头不生成」的根因）。
@@ -654,7 +662,7 @@ Instructions:
                         i, v_p, i_p, beat_packet, mode, is_last, is_threshold_or_reveal,
                         prev_v, prev_i, beat=beat, family=family, is_pre_bridge=is_pre_bridge,
                         is_post_reveal_cleanup=contract['is_post_reveal_cleanup'])
-                    structural, style_errs = self.split_structural_video_errors(errs)
+                    structural, style_errs = ([], []) if skip_reviews else self.split_structural_video_errors(errs)
                     reworked = None
                     if structural:
                         if sys.stdout:
@@ -828,7 +836,8 @@ Instructions:
                 )
                 if not is_threshold_or_reveal:
                     vid_prompt += " continuous construction time-lapse, not real-time footage."
-                vid_prompt = self.finalize_fallback_video(vid_prompt, contract)
+                if not skip_reviews:
+                    vid_prompt = self.finalize_fallback_video(vid_prompt, contract)
 
                 _attitude = ("horizon line remains level" if family == 'exterior'
                              else "camera pitch locked level; the central vanishing axis stays centered")
@@ -1009,10 +1018,11 @@ Instructions:
                 try:
                     # 第二空间的帧用换过锚点视图的包（见 packet_for_space）
                     _pkt = contract.get('packet') or packet
-                    v_p, i_p = self.apply_proactive_fixes(
-                        i, v_p, i_p, _pkt, mode, contract['is_last'], contract['is_threshold_or_reveal'],
-                        beat=contract['beat'], config=config, family=contract['family'],
-                        beat_ladder=beat_ladder)
+                    if not skip_reviews:
+                        v_p, i_p = self.apply_proactive_fixes(
+                            i, v_p, i_p, _pkt, mode, contract['is_last'], contract['is_threshold_or_reveal'],
+                            beat=contract['beat'], config=config, family=contract['family'],
+                            beat_ladder=beat_ladder)
                     # 2026-07-30：声明式切入拍的 VIDEO 不再被占位声明覆盖（同单拍通路的注释）。
                     prev_v = compiled_videos.get(i - 1) if i > 1 else None
                     prev_i = compiled_images.get(i) if i > 1 else None
@@ -1149,8 +1159,8 @@ Instructions:
             _save_checkpoint()
 
         # Quality gate
-        fallback_limit = 0 if strict_v2 and not diagnostic_mode else total_beats
-        if fallback_count > fallback_limit:
+        fallback_limit = 0 if not diagnostic_mode else total_beats
+        if not skip_reviews and fallback_count > fallback_limit:
             raise pp.ComposeFailure(
                 f"{fallback_count} of {total_beats} beats fell back to placeholder prompts "
                 f"(limit {fallback_limit}); diagnostic output cannot be shipped.",
@@ -1203,7 +1213,7 @@ Instructions:
         pp.stash_outline_delivery_ledger(config, beat_ladder,
                                          skeleton=parsed_brief.get('pacing_skeleton'))
 
-        skipped = config.get('_skipped_checks', 0) if isinstance(config, dict) else 0
+        skipped = config.get('_skipped_checks', 0) if isinstance(config, dict) and not skip_reviews else 0
         skipped_str = f"\n\n[WARNING] 本次跳过了 {skipped} 项校验。" if skipped > 0 else ""
 
         # Safety net: earlier free-form LLM generation steps can silently truncate or drop
@@ -1221,6 +1231,11 @@ Instructions:
                       f"rebuilding from the verified-complete compiled beat data.")
             reassembled_prompts_block = pp._format_prompt_block(formatted_images, formatted_videos)
 
+        audit_text = (
+            '全部审查规则已永久退役；正文保持模型原稿，未进行质量审查或自动改写。'
+            if skip_reviews else
+            'skill 直出模式：文本阶段无审查、无重写，批量直出+确定性修复一次成型；一致性审查在帧渲染完成后对着真实画面进行。'
+        )
         final_output = f"""===TITLE===
 {title}
 ===THEME===
@@ -1228,7 +1243,7 @@ Instructions:
 ===PROMPTS===
 {reassembled_prompts_block}
 ===AUDIT===
-skill 直出模式：文本阶段无审查、无重写，批量直出+确定性修复一次成型；一致性审查在帧渲染完成后对着真实画面进行。{skipped_str}"""
+{audit_text}{skipped_str}"""
 
         # 整单成功交付，断点续传存档功成身退——否则下次同一份 dimensions 的全新一键合成
         # 会被误当成续传，平白复用一份已经用过的旧输出。

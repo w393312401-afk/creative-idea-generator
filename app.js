@@ -42,6 +42,9 @@
 async function initServerMode() {
     try {
         const m = await fetch('/api/mode').then(r => r.json());
+        if (m && m.video_config && typeof applyServerVideoConfig === 'function') {
+            applyServerVideoConfig(m.video_config);
+        }
         if (m && m.image_gateway_models && typeof syncImageGatewayModelAvailability === 'function') {
             syncImageGatewayModelAvailability(m.image_gateway_models);
         }
@@ -92,13 +95,18 @@ async function initServerMode() {
                     onClick: async () => {
                         showToast('正在重启后端服务，请稍候...', 'info', 6000);
                         try {
-                            await fetch('/api/restart', {
+                            const resp = await fetch('/api/restart', {
                                 method: 'POST',
                                 headers: {
                                     'Content-Type': 'application/json',
                                     'X-Access-Code': ACCESS_CODE || ''
                                 }
                             });
+                            if (resp.status === 409) {
+                                const data = await resp.json().catch(() => ({}));
+                                showToast(data.message || '还有任务在运行，暂不能重启服务。', 'warning', 8000);
+                                return;
+                            }
                         } catch (_) {}
                         // 轮询等待新进程启动就绪
                         let restarted = false;
@@ -284,7 +292,7 @@ function renderAppVersion(rv) {
 
 
 // Initialize Elements
-document.addEventListener('DOMContentLoaded', () => {
+document.addEventListener('DOMContentLoaded', async () => {
     // ── Minimal debounce utility (avoids lodash dep) ──
     window._debounce = function(fn, delay) {
         let t;
@@ -295,20 +303,24 @@ document.addEventListener('DOMContentLoaded', () => {
     };
 
     loadConfig();
-    loadLibrary();
-    loadCurrentIdeaState();
     initCanvas();
     checkApiStatus();
     setupEventListeners();
     setupDragAndDrop();
     initDebugLimitControls();
+    initAutoVideoControl();
     initCoverBurnControl();
-    resumeActiveTaskIfExists();
-    resumeActiveBackgroundTasksIfExists();
+    initMergeSpeedControl();
     startGlobalTasksBadgePolling();
     updateDrawerTopOffset();
     window.addEventListener('resize', window._debounce(updateDrawerTopOffset, 150));
     initLocalServiceLogs();
+    // 任务登记按项目归属恢复；库与当前项目尚未读完时接流会丢掉后台任务。
+    await loadLibrary();
+    await loadCurrentIdeaState();
+    syncAutoVideoToggleFromIdea(currentIdea);
+    resumeActiveTaskIfExists();
+    resumeActiveBackgroundTasksIfExists();
 });
 
 // Function saveSelectionState moved to modular JS file
@@ -431,7 +443,7 @@ function updateFavoriteButtonState() {
     const saveBtnText = document.getElementById('save-idea-btn-text');
     if (!saveBtn || !currentIdea) return;
     
-    const isSaved = savedIdeas.some(item => item.title === currentIdea.title);
+    const isSaved = libraryEntries().some(item => item.title === currentIdea.title);
     if (isSaved) {
         saveBtn.classList.add('favorited');
         if (saveBtnText) saveBtnText.textContent = '已收藏点子';
@@ -650,28 +662,24 @@ function handleComposeProgressExtras(prog) {
 // Load saved ideas library from API or localStorage fallback
 async function loadLibrary() {
     try {
-        const response = await fetch('/api/library');
+        const response = await fetch('/api/library/index');
         if (response.ok) {
-            savedIdeas = await response.json();
-            console.log("Successfully loaded library from local server file.");
+            const data = await response.json();
+            if (!data || !Array.isArray(data.items)) throw new Error('创意库索引格式有误');
+            savedIdeaIndex = data.items.map(item => ({ ...item, _librarySummary: true }));
+            const ids = new Set(savedIdeaIndex.map(item => String(item.id)));
+            savedIdeas = savedIdeas.filter(item => !item._librarySummary && ids.has(String(item.id)));
+            console.log("Successfully loaded library index from local server file.");
             // 2026-07-12 整库清零事故防线：服务器返回“合法空库”但本地备份非空时，
             // 大概率是服务器文件被状态错乱的客户端清掉了（或刚发生过回滚）——采用
             // 本地备份并提示，绝不能让空结果静默吞掉最后一份幸存副本。不自动回写
             // 服务器：用户下一次正常保存动作会自然把恢复的库写回去。
-            if (Array.isArray(savedIdeas) && savedIdeas.length === 0) {
-                const stored = localStorage.getItem('spark_library');
-                if (stored) {
-                    try {
-                        const backup = JSON.parse(stored);
-                        if (Array.isArray(backup) && backup.length > 0) {
-                            savedIdeas = backup;
-                            console.warn(`Server library is empty but localStorage backup has ${backup.length} ideas — using the backup.`);
-                            if (typeof showToast === 'function') {
-                                showToast(`服务器创意库为空，已从本地备份恢复 ${backup.length} 条创意（保存任意改动即回写服务器）`, 'error');
-                            }
-                        }
-                    } catch (err) {
-                        console.error("Failed to parse localStorage library backup", err);
+            if (savedIdeaIndex.length === 0) {
+                const backup = readLibraryBackup();
+                if (backup.length > 0) {
+                    savedIdeas = backup;
+                    if (typeof showToast === 'function') {
+                        showToast(`服务器创意库为空，已从本地备份恢复 ${backup.length} 条创意（保存任意改动即回写服务器）`, 'error');
                     }
                 }
             }
@@ -680,16 +688,103 @@ async function loadLibrary() {
         }
     } catch (e) {
         console.warn("Failed to load library from server, falling back to localStorage", e);
-        const stored = localStorage.getItem('spark_library');
-        if (stored) {
-            try {
-                savedIdeas = JSON.parse(stored);
-            } catch (err) {
-                console.error("Failed to parse localStorage library", err);
-            }
-        }
+        savedIdeas = readLibraryBackup();
     }
     if (typeof refreshProjects === 'function') refreshProjects({ assets: false });
+}
+
+const libraryItemRequests = new Map();
+
+function libraryEntries() {
+    const entries = new Map(savedIdeaIndex.map(item => [String(item.id), item]));
+    savedIdeas.forEach(item => { if (item && !item._librarySummary) entries.set(String(item.id), item); });
+    return [...entries.values()];
+}
+
+function readLibraryBackup() {
+    try {
+        const items = JSON.parse(localStorage.getItem('spark_library') || '[]');
+        return Array.isArray(items) ? items.filter(item => item && !item._librarySummary) : [];
+    } catch (e) {
+        console.warn('[library] 本地正文备份读取失败', e);
+        return [];
+    }
+}
+
+// Merge hydrated records into the existing complete-record backup. Unopened records survive.
+function writeLibraryMirror({ deletedIds = [] } = {}) {
+    try {
+        const removed = new Set(deletedIds.map(String));
+        const records = new Map(readLibraryBackup().map(item => [String(item.id), item]));
+        savedIdeas.forEach(item => { if (item && !item._librarySummary) records.set(String(item.id), item); });
+        removed.forEach(id => records.delete(id));
+        localStorage.setItem('spark_library', JSON.stringify([...records.values()]));
+    } catch (e) {
+        console.warn('[library] localStorage 镜像写入失败（不影响服务器写入）', e);
+    }
+}
+
+function cacheLibraryIdea(idea) {
+    if (!idea || idea._librarySummary || idea.id === undefined || idea.id === null) return null;
+    const index = savedIdeas.findIndex(item => String(item.id) === String(idea.id));
+    if (index === -1) savedIdeas.push(idea);
+    else savedIdeas[index] = idea;
+    return idea;
+}
+
+// Concurrent project opening/recovery shares a single item request. A failed read only uses
+// complete cached bodies; directory metadata can never become an editable task owner.
+async function ensureLibraryIdea(id, { refresh = false } = {}) {
+    if (id === undefined || id === null || id === '') return null;
+    const key = String(id);
+    if (libraryItemRequests.has(key)) return libraryItemRequests.get(key);
+    const cached = savedIdeas.find(item => !item._librarySummary && String(item.id) === key);
+    if (cached && !refresh) return cached;
+    const request = (async () => {
+        try {
+            const response = await fetch(`/api/library/item?id=${encodeURIComponent(key)}`);
+            if (response.status === 404) return null;
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+            const idea = await response.json();
+            if (!idea || String(idea.id) !== key || idea._librarySummary) throw new Error('创意正文格式有误');
+            cacheLibraryIdea(idea);
+            writeLibraryMirror();
+            return idea;
+        } catch (error) {
+            const backup = cached || readLibraryBackup().find(item => String(item.id) === key);
+            if (backup) return cacheLibraryIdea(backup);
+            console.warn('[library] 创意正文读取失败', error);
+            return null;
+        }
+    })();
+    libraryItemRequests.set(key, request);
+    try { return await request; }
+    finally { if (libraryItemRequests.get(key) === request) libraryItemRequests.delete(key); }
+}
+
+function forgetLibraryIdeas(ids) {
+    const removed = new Set(ids.map(String));
+    savedIdeas = savedIdeas.filter(item => !removed.has(String(item.id)));
+    savedIdeaIndex = savedIdeaIndex.filter(item => !removed.has(String(item.id)));
+    writeLibraryMirror({ deletedIds: ids });
+}
+
+function rememberLibraryArchive(entry) {
+    if (!entry || !entry.id) return;
+    savedIdeaIndex = savedIdeaIndex.filter(item => String(item.id) !== String(entry.id));
+    savedIdeaIndex.push({ ...entry, _librarySummary: true });
+    const complete = savedIdeas.find(item => String(item.id) === String(entry.id))
+        || readLibraryBackup().find(item => String(item.id) === String(entry.id));
+    if (complete) {
+        Object.assign(complete, entry);
+        delete complete.frameRun;
+        complete.covers = [];
+        delete complete.activeCoverUrl;
+        delete complete.coverRoles;
+        delete complete.collage_url;
+        cacheLibraryIdea(complete);
+    }
+    writeLibraryMirror();
 }
 
 /* ==========================================================================
@@ -715,12 +810,13 @@ async function persistIdeaItem(idea) {
         console.warn('[library] 缺少 id，无法单条写入', idea);
         return false;
     }
-    // localStorage 仍留一份整库镜像作为服务器写失败时的兜底
-    try {
-        localStorage.setItem('spark_library', JSON.stringify(savedIdeas));
-    } catch (e) {
-        console.warn('[library] localStorage 镜像写入失败（不影响服务器写入）', e);
+    if (idea._librarySummary || savedIdeaIndex.includes(idea)) {
+        console.warn('[library] 拒绝把索引摘要写成创意正文');
+        if (typeof showToast === 'function') showToast('请先打开项目，载入完整创意后再保存。', 'error');
+        return false;
     }
+    cacheLibraryIdea(idea);
+    writeLibraryMirror();
     try {
         const res = await fetch('/api/library/item', {
             method: 'POST',
@@ -1383,31 +1479,81 @@ const IDEATION_TASK_TYPES = new Set(['idea', 'spark', 'spark_seed', 'spark_follo
 const isIdeationTask = (t) => !!t && IDEATION_TASK_TYPES.has((t.dimensions && t.dimensions.type) || 'idea');
 
 let globalBadgeTimeout = null;
+let globalBadgePolling = null;
 
 async function startGlobalTasksBadgePolling() {
-    if (globalBadgeTimeout) clearTimeout(globalBadgeTimeout);
-    
+    if (globalBadgePolling) globalBadgePolling.stop();
+    const state = { request: null, epoch: 0, stopped: false };
+    globalBadgePolling = state;
+    const clearPollTimer = () => {
+        if (globalBadgeTimeout) clearTimeout(globalBadgeTimeout);
+        globalBadgeTimeout = null;
+    };
+    const cancelRequest = () => {
+        state.epoch++;
+        const request = state.request;
+        state.request = null;
+        if (request) {
+            clearTimeout(request.deadline);
+            request.controller.abort();
+        }
+    };
+    const schedule = hasRunning => {
+        clearPollTimer();
+        if (!state.stopped && !document.hidden) {
+            globalBadgeTimeout = setTimeout(poll, hasRunning ? 5000 : 30000);
+        }
+    };
     const poll = async () => {
+        clearPollTimer();
+        if (state.stopped || document.hidden || state.request) return;
+        const request = { controller: new AbortController(), epoch: state.epoch, deadline: null };
+        state.request = request;
+        const isCurrent = () => !state.stopped && !document.hidden &&
+            state.request === request && state.epoch === request.epoch;
+        request.deadline = setTimeout(() => {
+            if (state.request !== request) return;
+            cancelRequest();
+            schedule(false);
+        }, 15000);
         let hasRunning = false;
         try {
-            const response = await fetch('/api/tasks');
-            if (response.ok) {
-                const resData = await response.json();
+            const response = await fetch('/api/tasks/summary', { cache: 'no-store', signal: request.controller.signal });
+            if (!isCurrent()) return;
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+            const resData = await response.json();
+            if (isCurrent()) {
                 // 与 renderTasks 同口径：图片/视频生成类任务不计入任务列表角标
-                const allTasks = Array.isArray(resData) ? resData : (resData.tasks || []);
+                const allTasks = Array.isArray(resData.tasks) ? resData.tasks : [];
                 window.dispatchEvent(new CustomEvent('spark:tasks-updated', { detail: { tasks: allTasks } }));
                 const tasks = allTasks.filter(isIdeationTask);
-                updateTasksBadge(tasks);
-                hasRunning = allTasks.some(t => t.status === 'running');
+                const counts = resData.counts || {};
+                updateTasksBadge(tasks, counts.ideation_running);
+                hasRunning = Number.isInteger(counts.running) ? counts.running > 0
+                    : allTasks.some(t => t.status === 'running');
             }
         } catch (e) {
-            console.warn("Background badge poll failed:", e);
+            if (isCurrent() && e.name !== 'AbortError') console.warn("Background badge poll failed:", e);
+        } finally {
+            clearTimeout(request.deadline);
+            if (state.request === request) {
+                state.request = null;
+                schedule(hasRunning);
+            }
         }
-        
-        const nextInterval = hasRunning ? 5000 : 30000;
-        globalBadgeTimeout = setTimeout(poll, nextInterval);
     };
-    
+    const onVisibilityChange = () => {
+        clearPollTimer();
+        if (document.hidden) cancelRequest();
+        else poll();
+    };
+    state.stop = () => {
+        state.stopped = true;
+        clearPollTimer();
+        cancelRequest();
+        document.removeEventListener('visibilitychange', onVisibilityChange);
+    };
+    document.addEventListener('visibilitychange', onVisibilityChange);
     poll();
 }
 
@@ -1487,6 +1633,9 @@ async function loadCompletedTask(taskId) {
                 project_key: data.project_key || null
             };
             
+            if (libraryEntries().some(item => String(item.id) === String(result.id))) {
+                await ensureLibraryIdea(result.id);
+            }
             currentIdea = result;
             saveCurrentIdeaState();
             generationState.status = 'idle';
@@ -1691,8 +1840,10 @@ async function clearTasks(statusGroup) {
             if (statusGroup === "all") {
                 if (typeof savedIdeas !== 'undefined') {
                     savedIdeas = [];
+                    savedIdeaIndex = [];
                     try {
-                        localStorage.setItem('spark_library', JSON.stringify(savedIdeas));
+                        localStorage.setItem('spark_library', '[]');
+                        localStorage.removeItem('spark_library_index');
                     } catch (e) {
                         console.warn('[library] localStorage 镜像写入失败', e);
                     }
@@ -1745,12 +1896,7 @@ async function clearTasks(statusGroup) {
                 if (Array.isArray(data.deleted_library_ids) && data.deleted_library_ids.length > 0) {
                     const deletedSet = new Set(data.deleted_library_ids);
                     if (typeof savedIdeas !== 'undefined' && Array.isArray(savedIdeas)) {
-                        savedIdeas = savedIdeas.filter(item => !deletedSet.has(item.id));
-                        try {
-                            localStorage.setItem('spark_library', JSON.stringify(savedIdeas));
-                        } catch (e) {
-                            console.warn('[library] localStorage 镜像写入失败', e);
-                        }
+                        forgetLibraryIdeas([...deletedSet]);
                     }
                     if (typeof updateFavoriteButtonState === 'function') {
                         updateFavoriteButtonState();
@@ -1773,7 +1919,7 @@ async function clearTasks(statusGroup) {
                                 currentGenerationController = null;
                             }
                             generationState.status = 'idle';
-                            const currentIdeaSaved = currentIdea && savedIdeas.some(item => item.id === currentIdea.id);
+                            const currentIdeaSaved = currentIdea && libraryEntries().some(item => item.id === currentIdea.id);
                             if (!currentIdeaSaved) {
                                 currentIdea = null;
                                 const placeholderView = document.getElementById('output-placeholder-view');
@@ -2294,7 +2440,18 @@ function _framesFeedAppendDom(text, cls, atDate, key) {
     const wrap = document.getElementById('frames-live-feed');
     if (wrap && wrap.style.display === 'none') wrap.style.display = 'block';
     const nearBottom = lines.scrollHeight - lines.scrollTop - lines.clientHeight < 60;
-    const d = atDate || new Date();
+    // localStorage 的 JSON 会把 Date 转成字符串；旧缓存也可能保存 Unix 时间戳。
+    // 日志时间无效时只回退这行显示，不能在监听启动前打断整个任务恢复。
+    let d;
+    try {
+        let value = atDate;
+        if (typeof value === 'string' && /^-?\d+(?:\.\d+)?$/.test(value.trim())) value = Number(value);
+        if (typeof value === 'number' && Math.abs(value) >= 1e9 && Math.abs(value) < 1e11) value *= 1000;
+        d = value === undefined || value === null || value === '' ? new Date() : new Date(value);
+    } catch (_) {
+        d = new Date();
+    }
+    if (!Number.isFinite(d.getTime())) d = new Date();
     const p = n => String(n).padStart(2, '0');
     // 带 key 的行是"同一条进度就地改写"（逐拍审查计数条等）：命中最后一行的
     // 同 key 就原地改，不再一拍灌一行把真正的结论顶出可视区
@@ -2429,7 +2586,96 @@ function framesFeedQualityLine(ideaId, f, isIsolatedRetry, guardPending) {
     }
 }
 
-async function streamFramesProgress(taskId, ownerIdea, targetSequences) {
+function restoreMediaTaskProgress(rec, kind, ownerIdea, targets, taskMetadata = {}, previousRecord) {
+    const snapshot = taskMetadata.resumeSnapshot || {};
+    const previous = previousRecord && previousRecord.taskId === rec.taskId ? previousRecord : {};
+    const isResuming = !!(taskMetadata.resumeSnapshot || taskMetadata.progress || previous.taskId);
+    for (const key of ['requestId', 'requestBody', 'requestEndpoint', 'cancelRequested', 'meta', 'feedLines']) {
+        if (snapshot[key] !== undefined) rec[key] = snapshot[key];
+        if (previous[key] !== undefined) rec[key] = previous[key];
+    }
+    rec.projectKey = taskMetadata.projectKey || snapshot.projectKey || previous.projectKey
+        || (typeof getIdeaSaveTitle === 'function' ? getIdeaSaveTitle(ownerIdea) : ownerIdea.project_key);
+    rec.ideaId = ownerIdea.id;
+    if (taskMetadata.requestId) rec.requestId = taskMetadata.requestId;
+    const targetKey = kind === 'frames' ? 'targetSequences' : 'targetSlots';
+    const autoVideo = taskMetadata.autoVideo || snapshot.autoVideo || previous.autoVideo;
+    const requested = [...(previous[targetKey] || []), ...(snapshot[targetKey] || []),
+        ...(taskMetadata[targetKey] || []), ...(targets || []),
+        ...(kind === 'videos' && autoVideo ? autoVideo.target_slots || [] : [])];
+    const restoredTargets = Array.from(new Set(requested.map(Number)
+        .filter(slot => Number.isInteger(slot) && slot > 0))).sort((a, b) => a - b);
+    if (restoredTargets.length) rec[targetKey] = restoredTargets;
+    if (autoVideo) rec.autoVideo = autoVideo;
+
+    const server = taskMetadata.progress || {};
+    const states = [snapshot.progressState || {}, previous.progressState || {}, rec.progressState || {}];
+    const slotStatus = {};
+    for (const state of states) {
+        for (const [slot, status] of Object.entries(state.slotStatus || {})) {
+            if (slotStatus[slot] !== 'done') slotStatus[slot] = status;
+        }
+    }
+    const serverSlots = server.slot_status || server.slotStatus || {};
+    // 服务端快照也能记录本任务的新重试；恢复时该状态优先于浏览器旧 done。
+    Object.assign(slotStatus, serverSlots);
+    const run = ownerIdea.frameRun || {};
+    const entries = kind === 'frames' ? run.frames || [] : run.videos || [];
+    const knownCurrent = Math.max(Number(snapshot.current) || 0, Number(previous.current) || 0,
+        ...states.map(state => Number(state.current) || 0));
+    const knownDone = Object.values(slotStatus).filter(status => status === 'done' || status === 'failed').length;
+    let inferredRemaining = Math.max(0, knownCurrent - knownDone);
+    // 旧文件只补足已保存的完成数；一个刚开始的重渲任务也可能在刷新后接回。
+    // 服务端有进度快照时只使用该快照，不凭旧清单猜测本轮已完成槽位。
+    for (const entry of isResuming && !taskMetadata.progress && inferredRemaining ? entries : []) {
+        const slot = Number(kind === 'frames' ? entry.sequence || entry.slot : entry.slot);
+        if (!slot || (restoredTargets.length && !restoredTargets.includes(slot)) || slotStatus[slot]) continue;
+        if (kind === 'frames' ? (entry.file || entry.path || entry.url || entry.image_url)
+            : entry.status === 'success' && !(entry.last_attempt && ['failed', 'cancelled'].includes(entry.last_attempt.status))) {
+            slotStatus[slot] = 'done';
+            inferredRemaining--;
+            if (!inferredRemaining) break;
+        }
+    }
+    const recoveryActive = kind === 'videos' && (server.phase === 'video_recovery'
+        || Object.values(serverSlots).includes('recovering') || states.some(state => state.recoveryActive));
+    const done = Object.values(slotStatus).filter(status => status === 'done' || (!recoveryActive && status === 'failed')).length;
+    rec.total = Math.max(Number(rec.total) || 0, Number(snapshot.total) || 0, Number(previous.total) || 0,
+        restoredTargets.length, Number(server.total) || 0, ...states.map(state => Number(state.total) || 0));
+    rec.current = recoveryActive ? done : Math.max(Number(rec.current) || 0, Number(snapshot.current) || 0,
+        Number(previous.current) || 0, Number(server.current) || 0, done,
+        ...states.map(state => Number(state.current) || 0));
+    const percentFromCount = rec.total ? 5 + Math.min(1, rec.current / rec.total) * (kind === 'frames' ? 90 : 83) : 0;
+    const label = server.label || server.message || previous.meta || snapshot.meta
+        || (previous.progressInfo || {}).label || (snapshot.progressInfo || {}).label
+        || (previous.progressState || {}).label || (snapshot.progressState || {}).label
+        || (rec.current ? `${kind === 'frames' ? '图片' : '视频'}生成 ${rec.current}/${rec.total}` : '');
+    rec.progressState = {
+        ...Object.assign({}, ...states), taskType: kind, total: rec.total, current: rec.current, slotStatus,
+        percent: recoveryActive ? percentFromCount
+            : Math.max(percentFromCount, Number(server.percent) || 0, ...states.map(state => Number(state.percent) || 0)),
+        ...(recoveryActive ? { recoveryActive: true,
+            recoveryPhase: server.recovery_phase || (autoVideo && autoVideo.phase)
+                || states.map(state => state.recoveryPhase).find(Boolean) || 'waiting',
+            recoverySlots: Object.keys(slotStatus).filter(slot => ['recovering', 'queued'].includes(slotStatus[slot])).map(Number)
+        } : {}),
+        phase: server.phase || previous.progressState && previous.progressState.phase
+            || snapshot.progressState && snapshot.progressState.phase || 'pending',
+        label, message: label
+    };
+    if (typeof ProgressModel !== 'undefined') {
+        const phase = rec.progressState.phase;
+        rec.progressInfo = ProgressModel.normalizeGenerationProgress('resume', { message: label }, kind, rec.progressState);
+        rec.progressState = rec.progressInfo.state;
+        rec.progressState.phase = rec.progressInfo.phase = phase;
+        // 进度数值达到 100 仍可能等待新帧；只有任务终态才结束监听。
+        rec.progressInfo.status = 'running';
+    }
+    if (label) rec.meta = label;
+    if (autoVideo && typeof handleAutoVideoHandoff === 'function') handleAutoVideoHandoff(ownerIdea, autoVideo);
+}
+
+async function streamFramesProgress(taskId, ownerIdea, targetSequences, taskMetadata = {}) {
     ownerIdea = ownerIdea || currentIdea;
     if (!ownerIdea) return;
     const ownerId = ownerIdea.id;
@@ -2442,16 +2688,25 @@ async function streamFramesProgress(taskId, ownerIdea, targetSequences) {
     // 同一个创意若已有一条帧序列监听在跑（理论上不该发生，generateFrames 已挡住），
     // 让新的接管旧的，避免两个 watcher 同时往同一份 record 里写。
     const existingRec = getIdeaTaskRecord(ownerId, 'frames');
+    if (existingRec && existingRec.taskId === taskId && existingRec.streaming) {
+        restoreMediaTaskProgress(existingRec, 'frames', ownerIdea, targetSequences, taskMetadata, existingRec);
+        saveActiveBackgroundTasksToLocalStorage();
+        return;
+    }
     if (existingRec && existingRec.controller) {
         try { existingRec.controller.abort(); } catch (_) { /* noop */ }
     }
     const controller = new AbortController();
     const rec = beginIdeaTask(ownerId, 'frames', taskId, controller);
+    rec.streaming = true;
+    restoreMediaTaskProgress(rec, 'frames', ownerIdea, targetSequences, taskMetadata, existingRec);
+    const hasRestoredProgress = !!(rec.current || rec.meta || (rec.feedLines || []).length);
+    if (typeof saveActiveBackgroundTasksToLocalStorage === 'function') saveActiveBackgroundTasksToLocalStorage();
+    if (isViewingIdea(ownerId)) syncAutoVideoToggleFromIdea(ownerIdea);
     // 调试模式（仅生成前 N 帧）：标记本次任务的目标槽位范围，renderFramesForIdea
     // 靠这个字段区分"还没轮到（等待中）"和"这次任务压根没请求（正常缺帧）"，
     // 见 retrySingleFrame 里的同款说明与 2026-07-20 的事故复盘。
-    if (targetSequences && targetSequences.length) rec.targetSequences = targetSequences;
-    const isCurrent = () => isIdeaTaskCurrent(ownerId, 'frames', taskId);
+    const isCurrent = () => getIdeaTaskRecord(ownerId, 'frames') === rec;
     const isViewing = () => isViewingIdea(ownerId);
     const setMeta = (text) => { rec.meta = text; if (isViewing()) meta.textContent = text; };
     const titleTag = () => isViewing() ? '' : `「${ownerIdea.title || '创意'}」`;
@@ -2463,18 +2718,29 @@ async function streamFramesProgress(taskId, ownerIdea, targetSequences) {
         progress.style.display = 'flex';
         if (typeof setFrameGridButtonsBusy === 'function') setFrameGridButtonsBusy(true);
     }
-    setMeta('连接帧生成事件流...');
+    setMeta(rec.meta || '连接帧生成事件流...');
 
     const applyFramesProgress = (type, data) => {
         if (!window.ProgressModel) return null;
-        const info = ProgressModel.normalizeGenerationProgress(type, data, 'frames', rec.progressState);
+        const total = Math.max(rec.total || 0, (rec.targetSequences || []).length, Number(data && data.total) || 0);
+        const info = ProgressModel.normalizeGenerationProgress(type, data && typeof data === 'object'
+            ? { ...data, total } : data, 'frames', rec.progressState);
         rec.progressState = info.state;
         rec.progressInfo = info;
+        rec.total = Math.max(rec.total || 0, info.total || 0);
+        rec.current = Math.max(rec.current || 0, info.current || 0);
+        if (typeof saveActiveBackgroundTasksToLocalStorage === 'function') saveActiveBackgroundTasksToLocalStorage();
         if (isViewing()) setProgressBar('frames', info);
         return info;
     };
-    applyFramesProgress('queue', { message: '连接帧生成事件流...' });
-    framesFeedReset(ownerId, '🔌 已连接帧生成事件流，等待后台开始…');
+    if (hasRestoredProgress) {
+        if (rec.progressInfo && isViewing()) setProgressBar('frames', rec.progressInfo);
+        if (typeof framesFeedHydrate === 'function') framesFeedHydrate(ownerId);
+        framesFeedSetLive(ownerId, true);
+    } else {
+        applyFramesProgress('queue', { message: '连接帧生成事件流...' });
+        framesFeedReset(ownerId, '🔌 已连接帧生成事件流，等待后台开始…');
+    }
 
     let disconnectedFrames = false;
     try {
@@ -2485,9 +2751,11 @@ async function streamFramesProgress(taskId, ownerIdea, targetSequences) {
                 if (!isCurrent()) return;
                 if (type === 'start') {
                     applyFramesProgress('start', data);
-                    const total = (data && data.total) || 0;
+                    const total = Math.max((data && data.total) || 0, rec.total || 0,
+                        (rec.targetSequences || []).length);
                     rec.total = total;
-                    const startMeta = `开始生成共 ${total} 帧序列图...`;
+                    const startMeta = rec.current ? `正在生成帧序列: ${rec.current}/${total}...`
+                        : `开始生成共 ${total} 帧序列图...`;
                     setMeta(startMeta);
                     framesFeedLine(ownerId, `🚀 开始生成，共 ${total} 帧（首帧文生图，后续逐帧图生图链式推进）`);
 
@@ -2507,10 +2775,10 @@ async function streamFramesProgress(taskId, ownerIdea, targetSequences) {
                         setMeta(startMeta);
                     }
                 } else if (type === 'frame') {
-                    applyFramesProgress('frame', data);
                     const f = data && data.frame;
-                    const cur = (data && data.current) || 0;
-                    const tot = (data && data.total) || 0;
+                    const info = applyFramesProgress('frame', data);
+                    const cur = rec.current || (info && info.current) || 0;
+                    const tot = rec.total || (info && info.total) || 0;
                     if (cur < tot) {
                         setMeta(`正在生成帧序列: ${cur}/${tot} (正在处理第 ${cur + 1} 帧)...`);
                     } else {
@@ -2522,6 +2790,9 @@ async function streamFramesProgress(taskId, ownerIdea, targetSequences) {
                     applyFrameEventToIdea(f, ownerIdea);
                     if (isViewing()) updateFrameSlotCard(f);
                 } else if (type === 'frame_start' || type === 'frame_retry' || type === 'queue' || type === 'frame_qa') {
+                    const seq = data && (data.sequence || data.slot);
+                    if (seq && rec.progressState.slotStatus[seq] === 'done') return;
+                    if (type === 'queue' && rec.current) return;
                     const info = applyFramesProgress(type, data);
                     if (info && info.label) setMeta(info.label);
                     if (type === 'frame_retry') {
@@ -2669,6 +2940,11 @@ async function streamFramesProgress(taskId, ownerIdea, targetSequences) {
                     } else if (data && data.passed) {
                         framesFeedLine(ownerId, '✅ 整套序列一致性审查通过', 'ok');
                     }
+                } else if (type === 'auto_video_started' || type === 'auto_video_updated' || type === 'auto_video_blocked') {
+                    handleAutoVideoHandoff(ownerIdea, data);
+                    setMeta((data && data.message) || (data && data.status === 'blocked'
+                        ? '自动视频未启动，请检查首尾帧。'
+                        : '首尾帧就绪的片段在后台生成视频，图片继续生成，无需等待视频完成。'));
                 } else if (type === 'reconnecting') {
                     setMeta(`连接中断，正在重连（第 ${data.attempt} 次）...`);
                     framesFeedLine(ownerId, `⚠️ 连接中断，正在重连（第 ${data.attempt} 次）…`, 'warn');
@@ -2699,8 +2975,33 @@ async function streamFramesProgress(taskId, ownerIdea, targetSequences) {
         }
 
         if (watch.result) {
-            await syncFrameRunToLibrary(watch.result, ownerIdea);
-            if (isViewing()) renderFramesForIdea(ownerIdea);
+            handleAutoVideoHandoff(ownerIdea, watch.result.auto_video);
+            let finalManifest = watch.result;
+            let manifestReadState;
+            if (watch.result.auto_video && watch.result.auto_video.task_id) {
+                // 子任务可能已交付片段；读取此刻的清单，并保留读取期间收到的交付事件。
+                if (typeof captureManifestReadState === 'function') manifestReadState = captureManifestReadState(ownerIdea);
+                try {
+                    const latest = await fetch(`/api/get_manifest?title=${encodeURIComponent(getIdeaSaveTitle(ownerIdea))}`, { cache: 'no-store' });
+                    if (latest.ok) finalManifest = await latest.json();
+                } catch (error) { console.warn('同步自动视频最新清单失败', error); }
+                if (!isCurrent()) return;
+                if (finalManifest.auto_video) handleAutoVideoHandoff(ownerIdea, finalManifest.auto_video);
+                finalManifest = mergeAutoVideoFrameResult(Object.assign({}, finalManifest,
+                    { auto_video: ownerIdea.frameRun.auto_video || watch.result.auto_video }), ownerIdea);
+            }
+            await syncFrameRunToLibrary(finalManifest, ownerIdea, manifestReadState);
+            const autoVideoState = watch.result.auto_video && autoVideoHandoffs.get(`${ownerId}:${watch.result.auto_video.task_id}`);
+            if (autoVideoState) {
+                autoVideoState.frameSynced = true;
+                autoVideoState.deliveredVideos.clear();
+                autoVideoState.result = null;
+            }
+            if (isViewing()) {
+                renderFramesForIdea(ownerIdea);
+                if (watch.result.auto_video) renderVideosForIdea(ownerIdea);
+                renderAutoVideoStatus(ownerIdea);
+            }
             // 链上守卫停链的单子不是渲完的单子：后端 break 出循环后照常收尾返回，
             // 这里若沿用"全部完成"的话术，用户会拿着一条断在半路的链去生成视频。
             // 判"停没停"只看 halted_at_sequence：首帧锚点判废时 halted_at_beat 是 0，
@@ -2760,9 +3061,29 @@ async function streamFramesProgress(taskId, ownerIdea, targetSequences) {
             }
         }
 
-        if (isViewing()) renderFramesForIdea(ownerIdea);
+        // 失败/取消前可能已交付部分图片和后台视频；终态不能只重画旧缓存。
+        const previousAuto = ownerIdea.frameRun && ownerIdea.frameRun.auto_video;
+        if (typeof reloadManifestIntoIdea === 'function') await reloadManifestIntoIdea(ownerIdea);
+        if (!isCurrent()) return;
+        const manifestAuto = ownerIdea.frameRun && ownerIdea.frameRun.auto_video;
+        if (previousAuto && previousAuto.task_id
+            && ['completed', 'completed_with_warnings', 'cancelled', 'partial_failed', 'blocked', 'skipped'].includes(previousAuto.status)
+            && manifestAuto && previousAuto.task_id === manifestAuto.task_id) {
+            ownerIdea.frameRun.auto_video = previousAuto;
+            handleAutoVideoHandoff(ownerIdea, manifestAuto);
+        } else if (manifestAuto && !manifestAuto.task_id && ['waiting', 'started'].includes(manifestAuto.status)) {
+            handleAutoVideoHandoff(ownerIdea, { ...manifestAuto,
+                status: e.name === 'AbortError' ? 'cancelled' : 'blocked',
+                message: e.name === 'AbortError' ? '图片生成已取消，自动视频未启动' : `图片生成已停止：${e.message}` });
+        }
+        if (isViewing()) {
+            renderFramesForIdea(ownerIdea);
+            renderVideosForIdea(ownerIdea);
+        }
     } finally {
         if (isCurrent()) {
+            rec.streaming = false;
+            if (typeof saveActiveBackgroundTasksToLocalStorage === 'function') saveActiveBackgroundTasksToLocalStorage();
             if (isViewing()) framesFeedSetLive(ownerId, false);
             // 失联分支保留任务登记：下次刷新页面 resumeActiveBackgroundTasksIfExists
             // 才有机会重新接上这条任务的事件流，而不是让它在客户端彻底失踪。
@@ -2782,13 +3103,15 @@ async function streamFramesProgress(taskId, ownerIdea, targetSequences) {
                     // 看起来像"取消了任务还在跑"（2026-07-28 实机截图）。清掉登记后
                     // 这些槽位落到「未生成/已失效」态，并重新带上生成/上传出口。
                     renderFramesForIdea(ownerIdea);
+                    syncAutoVideoToggleFromIdea(ownerIdea);
+                    renderAutoVideoStatus(ownerIdea);
                 }
             }
         }
     }
 }
 
-async function streamVideosProgress(taskId, ownerIdea, targetSlots) {
+async function streamVideosProgress(taskId, ownerIdea, targetSlots, taskMetadata = {}) {
     ownerIdea = ownerIdea || currentIdea;
     if (!ownerIdea) return;
     const ownerId = ownerIdea.id;
@@ -2800,19 +3123,26 @@ async function streamVideosProgress(taskId, ownerIdea, targetSlots) {
     if (!btn || !progress || !meta || !grid) return;
 
     const existingRec = getIdeaTaskRecord(ownerId, 'videos');
+    if (existingRec && existingRec.taskId === taskId && existingRec.streaming) {
+        restoreMediaTaskProgress(existingRec, 'videos', ownerIdea, targetSlots, taskMetadata, existingRec);
+        saveActiveBackgroundTasksToLocalStorage();
+        return;
+    }
     if (existingRec && existingRec.controller) {
         try { existingRec.controller.abort(); } catch (_) { /* noop */ }
     }
     const controller = new AbortController();
     const rec = beginIdeaTask(ownerId, 'videos', taskId, controller);
+    rec.streaming = true;
     if (existingRec && existingRec.requestId) Object.assign(rec, {
         requestId: existingRec.requestId, requestBody: existingRec.requestBody,
         requestEndpoint: existingRec.requestEndpoint, cancelRequested: existingRec.cancelRequested
     });
+    restoreMediaTaskProgress(rec, 'videos', ownerIdea, targetSlots, taskMetadata, existingRec);
+    const hasRestoredProgress = !!(rec.current || rec.meta);
     // 调试模式（仅生成前 N 段）：标记本次任务的目标槽位范围，renderVideosForIdea
     // 靠这个字段区分"还没轮到（等待中）"和"这次任务压根没请求（正常缺段）"，
     // 同 streamFramesProgress/retrySingleFrame 的同款契约。
-    if (targetSlots && targetSlots.length) rec.targetSlots = targetSlots;
     saveActiveBackgroundTasksToLocalStorage();
     const isCurrent = () => getIdeaTaskRecord(ownerId, 'videos') === rec;
     const isViewing = () => isViewingIdea(ownerId);
@@ -2824,17 +3154,33 @@ async function streamVideosProgress(taskId, ownerIdea, targetSlots) {
         if (chainBtn) chainBtn.disabled = true;
         progress.style.display = 'flex';
     }
-    setMeta('连接视频生成事件流...');
+    setMeta(rec.meta || '连接视频生成事件流...');
 
     const applyVideoProgress = (eventType, eventData) => {
         if (!window.ProgressModel) return null;
-        const progressInfo = ProgressModel.normalizeGenerationProgress(eventType, eventData, 'videos', rec.progressState);
+        // 渐进任务会按就绪片段广播小批次进度，整单分母始终使用完整目标数。
+        const total = Math.max(rec.total || 0, (rec.targetSlots || []).length,
+            Number(eventData && eventData.total) || 0);
+        const progressData = total && eventData && typeof eventData === 'object'
+            ? { ...eventData, total } : eventData;
+        const previousPercent = Number(rec.progressState && rec.progressState.percent) || 0;
+        const progressInfo = ProgressModel.normalizeGenerationProgress(eventType, progressData, 'videos', rec.progressState);
+        if (eventType === 'start' && !progressInfo.state.recoveryActive && previousPercent > progressInfo.percent) {
+            progressInfo.percent = previousPercent;
+            progressInfo.state.percent = previousPercent;
+        }
         rec.progressState = progressInfo.state;
         rec.progressInfo = progressInfo;
+        rec.total = Math.max(rec.total || 0, progressInfo.total || 0);
+        rec.current = progressInfo.state.recoveryActive ? progressInfo.current : Math.max(rec.current || 0, progressInfo.current || 0);
+        saveActiveBackgroundTasksToLocalStorage();
         if (isViewing()) setProgressBar('videos', progressInfo);
         return progressInfo;
     };
-    applyVideoProgress('queue', { message: '连接视频生成事件流...' });
+    if (hasRestoredProgress) {
+        if (rec.progressInfo && isViewing()) setProgressBar('videos', rec.progressInfo);
+        if (isViewing()) renderVideosForIdea(ownerIdea);
+    } else applyVideoProgress('queue', { message: '连接视频生成事件流...' });
 
     // 失败/取消时把还挂着转圈的槽位统一改画失败卡（仅在正看着这个创意时才有 DOM 可改）
     const failPendingSlots = (message, labelText) => {
@@ -2853,11 +3199,13 @@ async function streamVideosProgress(taskId, ownerIdea, targetSlots) {
             onEvent: (type, data) => {
                 if (!isCurrent()) return;
                 if (type === 'start') {
-                    applyVideoProgress('start', data);
-                    const total = (data && data.total) || 0;
+                    const total = Math.max((data && data.total) || 0, rec.total || 0,
+                        (rec.targetSlots || []).length);
                     const slots = (data && data.slots) || [];
                     rec.total = total;
-                    setMeta(`开始生成共 ${total} 段视频...`);
+                    if (slots.length) rec.targetSlots = Array.from(new Set([...(rec.targetSlots || []), ...slots].map(Number))).sort((a, b) => a - b);
+                    applyVideoProgress('start', { ...data, total });
+                    setMeta(rec.current ? `正在生成视频: ${rec.current}/${total}...` : `开始生成共 ${total} 段视频...`);
                     if (isViewing()) {
                         const isSubset = targetSlots && targetSlots.length;
                         const slotsToRender = slots.length ? slots : Array.from({ length: total }, (_, i) => i + 1);
@@ -2865,6 +3213,7 @@ async function streamVideosProgress(taskId, ownerIdea, targetSlots) {
                             clearSlotGrid(grid, 'video');
                         }
                         slotsToRender.forEach(slotIdx => {
+                            if (['done', 'failed', 'stopped'].includes(rec.progressState.slotStatus[slotIdx])) return;
                             let card = document.getElementById(`video-slot-${slotIdx}`);
                             if (!card) {
                                 card = document.createElement('div');
@@ -2876,32 +3225,44 @@ async function streamVideosProgress(taskId, ownerIdea, targetSlots) {
                             renderSlotCard(card, slotPendingState('video', slotIdx, '等待中'));
                         });
                     }
+                } else if (type === 'auto_video_started' || type === 'auto_video_updated' || type === 'auto_video_blocked') {
+                    if (typeof handleAutoVideoHandoff === 'function') handleAutoVideoHandoff(ownerIdea, data);
                 } else if (type === 'video_start') {
-                    applyVideoProgress('video_start', data);
-                    setMeta(`正在生成视频: ${data.current}/${data.total} (正在处理第 ${data.index} 段视频)...`);
+                    if (rec.progressState.slotStatus[data.index] === 'done') return;
+                    const info = applyVideoProgress('video_start', data);
+                    setMeta((info && info.label) || `正在处理 VID ${padSlot(data.index)}...`);
                     if (isViewing()) {
                         const slot = document.getElementById(`video-slot-${data.index}`);
-                        if (slot && slot.classList.contains('placeholder-frame-card')) {
+                        if (slot) {
                             renderVideoSlotPending(data.index, '生成中...');
                         }
                     }
                 } else if (type === 'video_done') {
-                    applyVideoProgress('video_done', data);
-                    setMeta(`正在生成视频: ${data.current}/${data.total}...`);
+                    const info = applyVideoProgress('video_done', data);
+                    setMeta((info && info.label) || '正在整理视频生成结果...');
+                    if (typeof recordAutoVideoDelivery === 'function' && data && data.video) {
+                        recordAutoVideoDelivery(ownerIdea, taskId,
+                            Object.assign({}, data.video, { slot: Number(data.video.slot) || Number(data.index) }));
+                    }
                     renderVideoSlotDone(data.index, data.video, ownerIdea);
                 } else if (type === 'video_error') {
-                    applyVideoProgress('video_error', data);
+                    if (rec.progressState.slotStatus[data.index] === 'done') return;
+                    const info = applyVideoProgress('video_error', data);
                     const msg = (data && data.message) || '生成失败';
-                    setMeta(`视频 ${data.index} 生成失败: ${msg}`);
+                    setMeta((info && info.label) || `视频 ${data.index} 生成失败: ${msg}`);
                     if (isViewing()) renderVideoSlotFailed(data.index, msg);
+                } else if (type === 'video_recovery') {
+                    const info = applyVideoProgress(type, data);
+                    setMeta((info && info.label) || (data && data.message) || '正在自动恢复未完成的视频');
+                    if (isViewing()) renderVideosForIdea(ownerIdea);
                 } else if (type === 'video_warning') {
-                    applyVideoProgress(type, data);
-                    setMeta((data && data.message) || '正在处理视频生成状态');
+                    const info = applyVideoProgress(type, data);
+                    setMeta((info && info.label) || (data && data.message) || '正在处理视频生成状态');
                 } else if (type === 'ip_rotating' || type === 'ip_rotated' || type === 'ip_rotation_failed') {
                     const info = applyVideoProgress(type, data);
                     const message = (data && data.message) || (info && info.label) || '正在处理出口 IP';
                     rec.lastIpRotation = { ...data, stage: type };
-                    setMeta(message);
+                    setMeta((info && info.label) || message);
                     if (type !== 'ip_rotating' && isViewing()) {
                         showToast(message, type === 'ip_rotation_failed' ? 'error' : 'info');
                     }
@@ -2928,6 +3289,7 @@ async function streamVideosProgress(taskId, ownerIdea, targetSlots) {
                         }
                     }
                 } else if (type === 'queue') {
+                    if (rec.current) return;
                     applyVideoProgress('queue', data);
                     setMeta((data && data.message) || '正在排队等待生成视频...');
                 } else if (type === 'merge_skip') {
@@ -2972,6 +3334,14 @@ async function streamVideosProgress(taskId, ownerIdea, targetSlots) {
         }
 
         if (watch.result) {
+            const declaredAuto = watch.result.auto_video;
+            if (declaredAuto && typeof handleAutoVideoHandoff === 'function') handleAutoVideoHandoff(ownerIdea, declaredAuto);
+            if (typeof settleAutoVideoHandoff === 'function') {
+                settleAutoVideoHandoff(ownerIdea, taskId,
+                    watch.result.completion_state === 'partial_failed' ? 'partial_failed'
+                        : watch.result.has_quality_warnings ? 'completed_with_warnings' : 'completed');
+            }
+            if (typeof recordAutoVideoDelivery === 'function') recordAutoVideoDelivery(ownerIdea, taskId, null, watch.result);
             if (watch.result.prompt_block) {
                 ownerIdea.prompt_block = watch.result.prompt_block;
                 if (typeof applyPromptBlockToIdea === 'function') {
@@ -2980,7 +3350,11 @@ async function streamVideosProgress(taskId, ownerIdea, targetSlots) {
                     if (isViewing()) renderPromptDisplay(ownerIdea.prompt_block);
                 }
             }
-            await syncFrameRunToLibrary(watch.result, ownerIdea);
+            const currentAuto = ownerIdea.frameRun && ownerIdea.frameRun.auto_video;
+            const finalResult = currentAuto && currentAuto.task_id === taskId
+                ? { ...watch.result, auto_video: currentAuto } : watch.result;
+            await syncFrameRunToLibrary(finalResult, ownerIdea);
+            if (typeof renderAutoVideoStatus === 'function' && isViewing()) renderAutoVideoStatus(ownerIdea);
             if (isViewing()) renderVideosForIdea(ownerIdea);
             const lastRun = (watch.result.video_generation_stats || {}).last_run || {};
             const requested = targetSlots && targetSlots.length ? new Set(targetSlots.map(Number)) : null;
@@ -3007,6 +3381,10 @@ async function streamVideosProgress(taskId, ownerIdea, targetSlots) {
     } catch (e) {
         if (!isCurrent()) return;
         console.error("Failed to generate videos:", e);
+        applyVideoProgress('error', { message: e.name === 'AbortError' ? '视频生成已被用户取消。' : e.message });
+        if (typeof settleAutoVideoHandoff === 'function') {
+            settleAutoVideoHandoff(ownerIdea, taskId, e.name === 'AbortError' ? 'cancelled' : 'partial_failed', e.message);
+        }
 
         if (e.name === 'AbortError') {
             setMeta('视频生成已被用户取消。');
@@ -3017,7 +3395,16 @@ async function streamVideosProgress(taskId, ownerIdea, targetSlots) {
             showToast(`${titleTag()}视频生成失败: ${e.message}`, "error");
             failPendingSlots(e.message || '生成失败', '生成失败');
 
+            const terminalAuto = ownerIdea.frameRun && ownerIdea.frameRun.auto_video;
             await reloadManifestIntoIdea(ownerIdea);
+            const manifestAuto = ownerIdea.frameRun && ownerIdea.frameRun.auto_video;
+            if (terminalAuto && terminalAuto.task_id === taskId && manifestAuto && manifestAuto.task_id === taskId) {
+                ownerIdea.frameRun.auto_video = terminalAuto;
+                handleAutoVideoHandoff(ownerIdea, manifestAuto);
+            }
+            if (typeof settleAutoVideoHandoff === 'function') {
+                settleAutoVideoHandoff(ownerIdea, taskId, 'partial_failed', e.message);
+            }
             if (isViewing() && ownerIdea.frameRun) renderVideosForIdea(ownerIdea);
             if (typeof NotificationCenter !== 'undefined') {
                 NotificationCenter.notify({
@@ -3029,6 +3416,8 @@ async function streamVideosProgress(taskId, ownerIdea, targetSlots) {
         }
     } finally {
         if (isCurrent()) {
+            rec.streaming = false;
+            saveActiveBackgroundTasksToLocalStorage();
             // 失联分支保留任务登记，供下次刷新页面重新接上事件流。
             if (!disconnectedVideos) {
                 endIdeaTask(ownerId, 'videos');
@@ -3243,7 +3632,7 @@ async function saveCurrentIdea() {
     if (!currentIdea) return;
 
     // Check if already saved
-    if (savedIdeas.some(item => item.title === currentIdea.title)) {
+    if (libraryEntries().some(item => item.title === currentIdea.title)) {
         showToast("该创意已存在于点子库中", "error");
         return;
     }
@@ -3258,18 +3647,13 @@ async function saveCurrentIdea() {
 }
 
 async function deleteFromLibrary(id) {
-    const idea = savedIdeas.find(item => item.id === id);
+    const idea = libraryEntries().find(item => item.id === id);
     if (!idea) return;
 
     const ok = await deleteIdeaItem(idea);
     if (!ok) return;   // 服务端没删成功就别动本地状态，否则两边会不一致
 
-    savedIdeas = savedIdeas.filter(item => item.id !== id);
-    try {
-        localStorage.setItem('spark_library', JSON.stringify(savedIdeas));
-    } catch (e) {
-        console.warn('[library] localStorage 镜像写入失败', e);
-    }
+    forgetLibraryIdeas([id]);
     if (typeof refreshProjects === 'function') refreshProjects({ assets: false });
     showToast("已从点子库删除，生成的图片/视频文件已一并清理", "success");
     updateFavoriteButtonState();
@@ -3277,6 +3661,15 @@ async function deleteFromLibrary(id) {
 }
 
 function loadSavedIdea(idea, options = {}) {
+    if (idea && idea._librarySummary) {
+        return ensureLibraryIdea(idea.id).then(complete => {
+            if (!complete) {
+                showToast('项目正文暂时无法读取，请稍后重试。', 'error');
+                return false;
+            }
+            return loadSavedIdea(complete, options);
+        });
+    }
     if (idea && idea.archived) {
         if (typeof openArchivedProject === 'function') openArchivedProject(idea.project_key);
         return;
@@ -3297,6 +3690,7 @@ function loadSavedIdea(idea, options = {}) {
     switchTab('overview');
     showToast(options.toast || "已载入收藏的创意", "success");
     updateActiveGenerationBanner();
+    return true;
 }
 
 /* ==========================================================================
@@ -3335,20 +3729,21 @@ function sparkProjectKeyMatches(a, b) {
 // 点子库里找这条创意的记录。project_key 优先（硬主键），其余是老记录的回落。
 // savedIdeas 按新→旧排列，find 天然取最近一次合成。
 function findSavedIdeaForSpark({ ideaId = null, seed = '', title = '', projectKey = '' } = {}) {
-    if (!Array.isArray(savedIdeas) || !savedIdeas.length) return null;
+    const entries = libraryEntries();
+    if (!entries.length) return null;
     if (ideaId) {
-        const byId = savedIdeas.find(i => String(i.id) === String(ideaId));
+        const byId = entries.find(i => String(i.id) === String(ideaId));
         if (byId) return byId;
     }
     if (projectKey) {
-        const byKey = savedIdeas.find(i => sparkProjectKeyMatches(i.project_key, projectKey));
+        const byKey = entries.find(i => sparkProjectKeyMatches(i.project_key, projectKey));
         if (byKey) return byKey;
     }
     // ── 以下仅供没有 project_key 的历史记录回落 ──
     const seedKey = sparkNormKey(seed);
     const titleKey = sparkNormKey(title);
-    return (seedKey && savedIdeas.find(i => sparkNormKey(i.theme) === seedKey))
-        || (titleKey && savedIdeas.find(i => sparkNormKey(i.title) === titleKey
+    return (seedKey && entries.find(i => sparkNormKey(i.theme) === seedKey))
+        || (titleKey && entries.find(i => sparkNormKey(i.title) === titleKey
                                           || sparkNormKey(i.theme) === titleKey))
         || null;
 }
@@ -3402,8 +3797,7 @@ async function openSparkProject({ ideaId = null, dna = '', seed = '', title = ''
     const idea = findSavedIdeaForSpark({ ideaId, seed, title, projectKey });
     if (idea) {
         switchMainTab('results');
-        loadSavedIdea(idea, { toast: `已打开激发项目「${idea.title || name}」` });
-        return true;
+        return await loadSavedIdea(idea, { toast: `已打开激发项目「${idea.title || name}」` });
     }
     const task = await findCompletedTaskForSpark({ dna, seed, title, projectKey });
     if (task) {
@@ -3416,13 +3810,28 @@ async function openSparkProject({ ideaId = null, dna = '', seed = '', title = ''
 }
 
 // Export Library to JSON
-function exportAllLibrary() {
-    if (savedIdeas.length === 0) {
+async function exportAllLibrary() {
+    if (libraryEntries().length === 0) {
         showToast("库中暂无点子可供导出", "error");
         return;
     }
     
-    const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(savedIdeas, null, 2));
+    let items;
+    try {
+        const response = await fetch('/api/library');
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        items = await response.json();
+        if (!Array.isArray(items) || items.some(item => !item || item._librarySummary)) throw new Error('创意库正文格式有误');
+    } catch (error) {
+        const cache = new Map(readLibraryBackup().map(item => [String(item.id), item]));
+        savedIdeas.forEach(item => { if (!item._librarySummary) cache.set(String(item.id), item); });
+        items = libraryEntries().map(item => cache.get(String(item.id)));
+        if (items.some(item => !item)) {
+            showToast('导出失败：服务暂时不可用，本地未缓存全部创意正文。', 'error');
+            return;
+        }
+    }
+    const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(items, null, 2));
     const downloadAnchor = document.createElement('a');
     downloadAnchor.setAttribute("href", dataStr);
     downloadAnchor.setAttribute("download", `spark_creative_library_${Date.now()}.json`);
@@ -3443,7 +3852,7 @@ function importLibrary(e) {
             if (!Array.isArray(imported)) throw new Error("Invalid file structure");
 
             // Merge without duplicates based on title
-            const existingTitles = new Set(savedIdeas.map(item => item.title));
+            const existingTitles = new Set(libraryEntries().map(item => item.title));
             const fresh = [];
             imported.forEach(item => {
                 if (item.title && !existingTitles.has(item.title)) {
@@ -3603,7 +4012,7 @@ async function renameIdeaToTheme(idea, newTitle) {
     const from = idea.title || '';
     const to = String(newTitle || '').trim();
     if (!to || to === from) return { renamed: false, from, to, reason: '' };
-    if (Array.isArray(savedIdeas) && savedIdeas.some(it => it.id !== idea.id && it.title === to)) {
+    if (libraryEntries().some(it => it.id !== idea.id && it.title === to)) {
         return { renamed: false, from, to, reason: `点子库里已有同名创意「${to}」` };
     }
 
@@ -3798,6 +4207,278 @@ function computeDebugTargets(kind, idea, slotType) {
     return slots.slice(0, n);
 }
 
+function autoVideoStorageKey(idea) {
+    const identity = idea && (idea.id || idea.project_key || idea.title);
+    return identity ? `spark_auto_generate_videos:${identity}` : null;
+}
+
+function isAutoGenerateVideosEnabled(idea) {
+    if (!idea) return false;
+    const key = autoVideoStorageKey(idea);
+    try {
+        const stored = key && localStorage.getItem(key);
+        if (stored === 'true' || stored === 'false') return stored === 'true';
+    } catch (_) {}
+    if (idea.auto_generate_videos === true) return true;
+    if (idea.auto_generate_videos === false && idea.auto_generate_videos_preference_explicit === true) return false;
+    const manifestValue = idea.frameRun && idea.frameRun.auto_generate_videos;
+    return manifestValue === false && idea.frameRun.auto_generate_videos_preference_explicit === true ? false : true;
+}
+
+// 自动任务、手动生成和失败槽位重试共享同一套首尾帧识别规则。
+function videoConfigForIdea(baseConfig, idea) {
+    return isAutoGenerateVideosEnabled(idea) || (idea && idea.frameRun && idea.frameRun.video_frame_pairing === 'auto')
+        ? Object.assign({}, baseConfig, { videoFramePairing: 'auto' }) : baseConfig;
+}
+
+function autoVideoPairingText(handoff, limit = 0) {
+    const pairs = handoff && Array.isArray(handoff.frame_pairs) ? handoff.frame_pairs : [];
+    const ready = new Set(autoVideoSlots(handoff, 'ready_slots'));
+    const readyPairs = limit && ready.size ? pairs.filter(pair => ready.has(Number(pair.slot))) : [];
+    const displayed = limit ? (readyPairs.length ? readyPairs.slice(-limit) : pairs.slice(0, limit)) : pairs;
+    const text = displayed.map(pair => {
+        const vid = `VID ${String(pair.slot).padStart(3, '0')}`;
+        const start = `IMG ${String(pair.start_anchor_slot).padStart(3, '0')}`;
+        const end = pair.end_anchor_slot == null ? '' : ` → IMG ${String(pair.end_anchor_slot).padStart(3, '0')}`;
+        return `${vid}：${start}${end}`;
+    }).join('；');
+    return text + (limit && pairs.length > displayed.length ? `；…共 ${pairs.length} 段` : '');
+}
+
+function autoVideoSlots(handoff, key) {
+    return handoff && Array.isArray(handoff[key])
+        ? Array.from(new Set(handoff[key].map(Number).filter(slot => Number.isInteger(slot) && slot > 0))).sort((a, b) => a - b)
+        : [];
+}
+
+function autoVideoSchedulingText(handoff) {
+    if (!handoff) return '';
+    const targets = autoVideoSlots(handoff, 'target_slots');
+    const queued = autoVideoSlots(handoff, 'queued_slots');
+    const pending = autoVideoSlots(handoff, 'pending_slots');
+    if (!Array.isArray(handoff.queued_slots) && !Array.isArray(handoff.pending_slots)) return '';
+    return `已调度 ${queued.length}${targets.length ? `/${targets.length}` : ''} 段${pending.length ? `，${pending.length} 段等待首尾帧` : ''}`;
+}
+
+function renderAutoVideoStatus(idea, handoff) {
+    const status = document.getElementById('frames-auto-video-status');
+    if (!status) return;
+    handoff = handoff || (idea && idea.frameRun && idea.frameRun.auto_video);
+    const enabled = isAutoGenerateVideosEnabled(idea);
+    status.hidden = !enabled && !handoff;
+    status.dataset.status = handoff && handoff.status || '';
+    const pairing = autoVideoPairingText(handoff, 4);
+    status.title = autoVideoPairingText(handoff);
+    const schedule = autoVideoSchedulingText(handoff);
+    if (handoff && handoff.status === 'started') {
+        const imagesRunning = idea && isIdeaTaskActive(idea.id, 'frames');
+        const recovering = ['querying', 'waiting', 'retrying'].includes(handoff.phase);
+        const label = recovering ? handoff.message || (handoff.phase === 'querying' ? '正在自动核对原视频'
+            : handoff.phase === 'retrying' ? '正在自动补跑未完成片段' : '等待自动恢复后继续生成') : '视频在后台生成';
+        status.textContent = `${label}${imagesRunning ? '，图片继续生成' : ''}${schedule ? ` · ${schedule}` : ''}${pairing ? ` · 首尾帧：${pairing}` : ''}`;
+    } else if (handoff && handoff.status === 'completed') {
+        status.textContent = `自动视频已完成${pairing ? ` · 首尾帧：${pairing}` : ''}`;
+    } else if (handoff && handoff.status === 'completed_with_warnings') {
+        status.textContent = `自动视频已完成，请查看提示${handoff.message ? `：${handoff.message}` : ''}${pairing ? ` · 首尾帧：${pairing}` : ''}`;
+    } else if (handoff && handoff.status === 'cancelled') {
+        status.textContent = `自动视频已取消${handoff.message ? `：${handoff.message}` : ''}`;
+    } else if (handoff && handoff.status === 'partial_failed') {
+        status.textContent = `自动视频部分完成，请检查未成功的片段${handoff.message ? `：${handoff.message}` : ''}`;
+    } else if (handoff && ['blocked', 'skipped'].includes(handoff.status)) {
+        status.textContent = `${handoff.status === 'blocked' ? '自动视频未启动' : '自动视频已跳过'}：${handoff.message || '请检查图片与视频提示词'}${pairing ? ` · 首尾帧：${pairing}` : ''}`;
+    } else if (handoff && handoff.status === 'waiting') {
+        status.textContent = `等待首尾帧就绪，随后立即生成对应视频${schedule ? ` · ${schedule}` : ''}`;
+    } else {
+        status.textContent = '每段首尾帧就绪后立即后台生成视频；图片持续生成，无需等待视频完成。';
+    }
+}
+
+function syncAutoVideoToggleFromIdea(idea) {
+    // 浏览器内显式拨过的偏好用于下一单；其他情况下用服务端清单恢复项目设置。
+    const manifestValue = idea && idea.frameRun && idea.frameRun.auto_generate_videos;
+    let hasLocalPreference = false;
+    try {
+        const key = autoVideoStorageKey(idea);
+        const stored = key && localStorage.getItem(key);
+        hasLocalPreference = stored === 'true' || stored === 'false';
+        if (hasLocalPreference && idea) {
+            idea.auto_generate_videos = stored === 'true';
+            idea.auto_generate_videos_preference_explicit = true;
+        }
+    } catch (_) {}
+    const manifestExplicit = idea && idea.frameRun && idea.frameRun.auto_generate_videos_preference_explicit === true;
+    if (idea && typeof manifestValue === 'boolean' && !hasLocalPreference
+        && idea.auto_generate_videos_preference_explicit !== true) {
+        idea.auto_generate_videos = manifestValue === true || !manifestExplicit;
+        if (manifestExplicit) idea.auto_generate_videos_preference_explicit = true;
+    }
+    const toggle = document.getElementById('frames-auto-video-toggle');
+    if (toggle) {
+        toggle.checked = isAutoGenerateVideosEnabled(idea);
+        toggle.disabled = !idea || isIdeaTaskActive(idea.id, 'frames');
+    }
+    renderAutoVideoStatus(idea);
+}
+
+function initAutoVideoControl() {
+    const toggle = document.getElementById('frames-auto-video-toggle');
+    if (!toggle) return;
+    syncAutoVideoToggleFromIdea(currentIdea);
+    toggle.addEventListener('change', () => {
+        const idea = currentIdea;
+        if (!idea) { toggle.checked = false; return; }
+        idea.auto_generate_videos = toggle.checked;
+        idea.auto_generate_videos_preference_explicit = true;
+        const key = autoVideoStorageKey(idea);
+        try { if (key) localStorage.setItem(key, String(toggle.checked)); } catch (_) {}
+        if (typeof saveCurrentIdeaState === 'function') saveCurrentIdeaState();
+        const saved = savedIdeas.find(item => item.id === idea.id);
+        if (saved) {
+            saved.auto_generate_videos = toggle.checked;
+            saved.auto_generate_videos_preference_explicit = true;
+            persistIdeaItem(saved);
+        }
+        renderAutoVideoStatus(idea);
+    });
+}
+
+function applyAutoVideoRequestOptions(body, ownerIdea) {
+    ownerIdea.auto_generate_videos = isAutoGenerateVideosEnabled(ownerIdea);
+    body.auto_generate_videos = ownerIdea.auto_generate_videos;
+    let explicitPreference = ownerIdea.auto_generate_videos_preference_explicit === true
+        || !!(ownerIdea.frameRun && ownerIdea.frameRun.auto_generate_videos_preference_explicit === true);
+    try {
+        const stored = localStorage.getItem(autoVideoStorageKey(ownerIdea));
+        explicitPreference = explicitPreference || stored === 'true' || stored === 'false';
+    } catch (_) {}
+    ownerIdea.auto_generate_videos_preference_explicit = explicitPreference;
+    body.auto_generate_videos_preference_explicit = explicitPreference;
+    if (!body.auto_generate_videos) return;
+    body.config = videoConfigForIdea(body.config, ownerIdea);
+    body.merge_speed = typeof getMergeSpeed === 'function' ? getMergeSpeed() : 4;
+    const slots = computeDebugTargets('videos', ownerIdea, 'video');
+    if (slots) body.video_target_slots = slots;
+    if (isViewingIdea(ownerIdea.id) && typeof saveCurrentIdeaState === 'function') saveCurrentIdeaState();
+}
+
+// SSE 会重放事件，帧 result 也会再次带回同一接续信息；每个子任务只接一次。
+const autoVideoHandoffs = new Map();
+
+function handleAutoVideoHandoff(ownerIdea, handoff) {
+    if (!ownerIdea || !handoff) return;
+    if (!ownerIdea.frameRun) ownerIdea.frameRun = { frames: [] };
+    const previous = ownerIdea.frameRun.auto_video;
+    const sameScope = !previous || !previous.request_id || !handoff.request_id
+        || previous.request_id === handoff.request_id;
+    if (previous && sameScope && (!previous.task_id || !handoff.task_id || previous.task_id === handoff.task_id)) {
+        const incoming = handoff;
+        handoff = { ...previous, ...incoming };
+        if (previous.task_id && !incoming.task_id) handoff.task_id = previous.task_id;
+        for (const field of ['target_slots', 'ready_slots', 'queued_slots']) {
+            if (Array.isArray(previous[field]) || Array.isArray(incoming[field])) {
+                handoff[field] = Array.from(new Set([...autoVideoSlots(previous, field), ...autoVideoSlots(incoming, field)])).sort((a, b) => a - b);
+            }
+        }
+        if (Array.isArray(handoff.pending_slots)) {
+            const queued = new Set(autoVideoSlots(handoff, 'queued_slots'));
+            handoff.pending_slots = autoVideoSlots(handoff, 'pending_slots').filter(slot => !queued.has(slot));
+        }
+        const terminal = ['completed', 'completed_with_warnings', 'cancelled', 'partial_failed', 'blocked', 'skipped'];
+        const previousTerminal = terminal.includes(previous.status)
+            && (!['blocked', 'skipped'].includes(previous.status) || previous.task_id);
+        if (previousTerminal && !terminal.includes(incoming.status)) {
+            handoff.status = previous.status;
+            handoff.message = previous.message;
+        }
+    }
+    ownerIdea.frameRun.auto_video = handoff;
+    if (typeof ownerIdea.auto_generate_videos !== 'boolean') ownerIdea.auto_generate_videos = true;
+    if (isViewingIdea(ownerIdea.id)) renderAutoVideoStatus(ownerIdea, handoff);
+    const frameTask = getIdeaTaskRecord(ownerIdea.id, 'frames');
+    if (frameTask) frameTask.autoVideo = handoff;
+    const key = `${ownerIdea.id}:${handoff.task_id || (frameTask && frameTask.taskId) || handoff.request_id || handoff.status}`;
+    let state = autoVideoHandoffs.get(key);
+    if (!state) {
+        state = { deliveredVideos: new Map(), attached: false };
+        autoVideoHandoffs.set(key, state);
+    }
+    const signature = JSON.stringify(handoff);
+    if (state.signature !== signature) {
+        state.signature = signature;
+        const pairing = autoVideoPairingText(handoff);
+        if (pairing && state.pairing !== pairing) {
+            state.pairing = pairing;
+            framesFeedLine(ownerIdea.id, `🔗 已识别首尾帧：${pairing}`, 'ok', `auto-video-pairs:${key}`);
+        }
+        const schedule = autoVideoSchedulingText(handoff);
+        const message = handoff.status === 'started'
+            ? `🎬 ${handoff.message || schedule || '首尾帧已就绪，立即生成对应视频'}`
+            : handoff.status === 'waiting' ? `🖼️ ${handoff.message || '等待首尾帧就绪，随后立即生成对应视频'}`
+            : handoff.status === 'completed' ? '🏁 自动视频已完成'
+            : handoff.status === 'completed_with_warnings' ? `⚠️ ${handoff.message || '自动视频已完成，请查看提示'}`
+            : handoff.status === 'cancelled' ? `⏹ ${handoff.message || '自动视频已取消'}`
+            : handoff.status === 'partial_failed' ? `⚠️ ${handoff.message || '自动视频部分完成，请检查未成功的片段'}`
+            : `⚠️ ${handoff.message || '自动视频未启动，请检查图片与视频提示词'}`;
+        framesFeedLine(ownerIdea.id, message, ['started', 'completed'].includes(handoff.status) ? 'ok'
+            : handoff.status === 'waiting' ? undefined : 'warn', `auto-video-status:${key}`);
+        if (handoff.status === 'blocked' && isViewingIdea(ownerIdea.id)) {
+            showToast(handoff.message || '自动视频未启动，请检查图片与视频提示词', 'warning');
+        }
+    }
+    const existing = getIdeaTaskRecord(ownerIdea.id, 'videos');
+    if (existing && existing.taskId === handoff.task_id) {
+        const targets = autoVideoSlots(handoff, 'target_slots');
+        if (targets.length) {
+            existing.targetSlots = targets;
+            existing.total = Math.max(existing.total || 0, targets.length);
+        }
+        existing.autoVideo = handoff;
+        if (typeof saveActiveBackgroundTasksToLocalStorage === 'function') saveActiveBackgroundTasksToLocalStorage();
+    }
+    if (handoff.status !== 'started' || !handoff.task_id) return;
+    if (existing) {
+        if (existing.taskId !== handoff.task_id) return;
+        if (existing.streaming !== false) { state.attached = true; return; }
+    } else if (state.attached) {
+        return;
+    }
+    state.attached = true;
+    const stream = streamVideosProgress(handoff.task_id, ownerIdea, handoff.target_slots,
+        { requestId: handoff.request_id, autoVideo: handoff, resumeSnapshot: existing || undefined });
+    if (stream && typeof stream.catch === 'function') {
+        stream.catch(error => console.warn('连接自动视频事件流失败', error));
+    }
+}
+
+function recordAutoVideoDelivery(ownerIdea, taskId, video, result) {
+    const state = autoVideoHandoffs.get(`${ownerIdea.id}:${taskId}`);
+    if (!state || state.frameSynced) return;
+    if (video) state.deliveredVideos.set(Number(video.slot), video);
+    if (result) state.result = result;
+}
+
+// 只有视频子任务自己的终态才能结束自动视频状态，图片父任务结束时仍保持 started。
+function settleAutoVideoHandoff(ownerIdea, taskId, status, message) {
+    const handoff = ownerIdea && ownerIdea.frameRun && ownerIdea.frameRun.auto_video;
+    if (!handoff || handoff.task_id !== taskId) return;
+    const terminal = ['completed', 'completed_with_warnings', 'cancelled', 'partial_failed', 'blocked', 'skipped'];
+    handleAutoVideoHandoff(ownerIdea, terminal.includes(handoff.status) && status !== 'cancelled' ? handoff
+        : { ...handoff, status, ...(message ? { message } : {}) });
+    if (typeof saveActiveBackgroundTasksToLocalStorage === 'function') saveActiveBackgroundTasksToLocalStorage();
+    if (isViewingIdea(ownerIdea.id) && typeof saveCurrentIdeaState === 'function') saveCurrentIdeaState();
+}
+
+// 帧 result 是接续视频启动时的快照，不能抹掉子任务已交付的视频。
+function mergeAutoVideoFrameResult(manifest, ownerIdea) {
+    const handoff = manifest && manifest.auto_video;
+    const state = handoff && autoVideoHandoffs.get(`${ownerIdea.id}:${handoff.task_id}`);
+    if (!state || state.frameSynced) return manifest;
+    if (state.result) return Object.assign({}, manifest, state.result, { auto_video: handoff });
+    const videos = new Map((manifest.videos || []).map(video => [Number(video.slot), video]));
+    state.deliveredVideos.forEach((video, slot) => videos.set(slot, video));
+    return Object.assign({}, manifest, { videos: Array.from(videos.values()).sort((a, b) => Number(a.slot) - Number(b.slot)) });
+}
+
 function hasIdeaCover(idea) {
     if (!idea) return false;
     if (Array.isArray(idea.covers) && idea.covers.length > 0) return true;
@@ -3947,6 +4628,10 @@ async function generateFrames() {
         showToast("该创意的帧序列已在生成中，请稍候", "error");
         return;
     }
+    if (isIdeaTaskActive(ownerIdea.id, 'videos')) {
+        showToast('该创意的视频任务正在进行中，请稍候再生成图片', 'info');
+        return;
+    }
 
     // 生成前同步提示词的新版本，避免使用浏览器里过期的项目快照。
     if (typeof ensureFreshPromptBlock === 'function') {
@@ -3985,6 +4670,7 @@ async function generateFrames() {
             diagnostic_mode: ownerIdea.diagnostic_mode === true
         };
         if (targetSequences) body.target_sequences = targetSequences;
+        applyAutoVideoRequestOptions(body, ownerIdea);
 
         const response = await fetch('/api/generate_frames', {
             method: 'POST',
@@ -4025,6 +4711,10 @@ async function generateFramesSelection() {
     const ownerIdea = currentIdea;
     if (isIdeaTaskActive(ownerIdea.id, 'frames')) {
         showToast("该创意的帧序列已在生成中，请稍候", "error");
+        return;
+    }
+    if (isIdeaTaskActive(ownerIdea.id, 'videos')) {
+        showToast('该创意的视频任务正在进行中，请稍候再生成图片', 'info');
         return;
     }
 
@@ -4073,6 +4763,7 @@ async function generateFramesSelection() {
             candidate_count: 4
         };
         if (targetSequences) body.target_sequences = targetSequences;
+        applyAutoVideoRequestOptions(body, ownerIdea);
 
         const response = await fetch('/api/generate_frames_selection', {
             method: 'POST',
@@ -4221,7 +4912,7 @@ async function openCandidateSelectionModal(seq, frameData) {
             bmBoxEl.innerHTML = `
                 <div style="display:flex; align-items:center; justify-content:space-between; background:rgba(245,158,11,0.08); border:1px solid rgba(245,158,11,0.3); border-radius:8px; padding:10px 14px; gap:12px; flex-wrap:wrap;">
                     <div style="display:flex; align-items:center; gap:12px;">
-                        <img src="${escapeHtml(refUrl)}" style="width:48px; height:85px; object-fit:cover; border-radius:4px; border:1px solid #f59e0b; cursor:pointer;" onclick="if(window.openLightbox) openLightbox('${escapeHtml(refUrl)}')" title="点击放大参考原片节拍抽帧" />
+                        <img ${typeof MediaPreview !== 'undefined' ? MediaPreview.attrs(refUrl) : `src="${escapeHtml(refUrl)}"`} style="width:48px; height:85px; object-fit:cover; border-radius:4px; border:1px solid #f59e0b; cursor:pointer;" onclick="if(window.openLightbox) openLightbox('${escapeHtml(refUrl)}')" title="点击放大参考原片节拍抽帧" />
                         <div>
                             <div style="font-weight:700; font-size:13px; color:#f59e0b; display:flex; align-items:center; gap:6px;">
                                 <span>🎯 参考原片节拍抽帧 (REF ${padSeq})</span>
@@ -4340,7 +5031,7 @@ async function openCandidateSelectionModal(seq, frameData) {
 
             card.innerHTML = `
                 <div class="candidate-thumb-wrap" style="position:relative; aspect-ratio: 9/16; background:#0f172a; overflow:hidden; cursor:pointer;" title="点击查看大图" onclick="if(window.openLightbox) openLightbox('${escapeHtml(fileUrl)}')">
-                    <img src="${escapeHtml(fileUrl)}" alt="Candidate #${cIdx}" style="width:100%; height:100%; object-fit:cover;" onerror="this.onerror=null; this.src='${escapeHtml(fileUrl)}';" />
+                    <img ${typeof MediaPreview !== 'undefined' ? MediaPreview.attrs(fileUrl) : `src="${escapeHtml(fileUrl)}"`} alt="Candidate #${cIdx}" style="width:100%; height:100%; object-fit:cover;" onerror="this.onerror=null; if(window.MediaPreview) MediaPreview.setSource(this, this.getAttribute('data-media-preview-src')); else this.src='${escapeHtml(fileUrl)}';" />
                     <div style="position:absolute; top:8px; left:8px; background:rgba(0,0,0,0.8); backdrop-filter:blur(4px); color:#fff; font-size:11px; padding:3px 7px; border-radius:4px; font-weight:bold;">
                         #${cIdx}
                     </div>
@@ -4539,7 +5230,7 @@ async function generateVideos() {
     try {
         operation = beginVideoOperation(ownerIdea, targetSlots);
         const body = {
-            config,
+            config: typeof videoConfigForIdea === 'function' ? videoConfigForIdea(config, ownerIdea) : config,
             title: getIdeaSaveTitle(ownerIdea),
             display_title: ownerIdea.title,
             prompt_block: ownerIdea.prompt_block,
@@ -4555,6 +5246,13 @@ async function generateVideos() {
         // 同 generateFrames：不 await，交给 streamVideosProgress 在后台独立跑完。
         streamVideosProgress(taskId, ownerIdea, targetSlots);
     } catch (e) {
+        if (e.submissionPending) {
+            const message = await handleVideoSubmissionPending(ownerIdea, e);
+            if (operation && getIdeaTaskRecord(ownerIdea.id, 'videos') === operation) endIdeaTask(ownerIdea.id, 'videos');
+            settleVideoOperationView(ownerIdea);
+            if (isViewingIdea(ownerIdea.id) && meta) meta.textContent = message;
+            return;
+        }
         if (e.uncertain && operation) {
             if (isViewingIdea(ownerIdea.id) && meta) meta.textContent = e.message;
             showToast(e.message, 'warning');
@@ -4621,6 +5319,13 @@ async function generateVideoChain() {
         streamVideosProgress(taskId, ownerIdea, targetSlots);
         showToast("已启动纯视频链式生成通道！", "success");
     } catch (e) {
+        if (e.submissionPending) {
+            const message = await handleVideoSubmissionPending(ownerIdea, e);
+            if (operation && getIdeaTaskRecord(ownerIdea.id, 'videos') === operation) endIdeaTask(ownerIdea.id, 'videos');
+            settleVideoOperationView(ownerIdea);
+            if (isViewingIdea(ownerIdea.id) && meta) meta.textContent = message;
+            return;
+        }
         if (e.uncertain && operation) {
             if (isViewingIdea(ownerIdea.id) && meta) meta.textContent = e.message;
             showToast(e.message, 'warning');
@@ -4650,6 +5355,20 @@ function getMergeSpeed() {
     const select = document.getElementById('merge-speed-select');
     const speed = Number(select && select.value);
     return [1, 1.5, 2, 3, 4].includes(speed) ? speed : 4;
+}
+
+// 成片速度按浏览器持久化：选了几倍，之后的自动合并/手动合并都用几倍，刷新后不回到 4 倍。
+const MERGE_SPEED_STORAGE_KEY = 'spark_merge_speed';
+
+function initMergeSpeedControl() {
+    const select = document.getElementById('merge-speed-select');
+    if (!select) return;
+    let stored = null;
+    try { stored = localStorage.getItem(MERGE_SPEED_STORAGE_KEY); } catch (_) {}
+    if (stored && Array.from(select.options).some(o => o.value === stored)) select.value = stored;
+    select.addEventListener('change', () => {
+        try { localStorage.setItem(MERGE_SPEED_STORAGE_KEY, select.value); } catch (_) {}
+    });
 }
 
 function mergeSpeedLabel(speed = getMergeSpeed()) {

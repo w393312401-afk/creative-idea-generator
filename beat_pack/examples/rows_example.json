@@ -1,0 +1,54 @@
+{
+ "rows": [
+  {
+   "index": 2,
+   "label": "铲雪、刷鳞并标出门线",
+   "act": "The builder shovels a trench through the snow to the footing and sweeps snow and ice from the lowest south scales with a stiff broom, then climbs the wooden ladder to scrape resin crust from a 2.0 m wide, 3.4 m tall patch of scales; a contact view shows the scraper lifting amber resin and exposing brown wood. With a plumb line and a straight edge the builder chalks a 0.90 m by 1.95 m rectangle across the scale joint, its bottom edge 2.0 m above the footing. Return to the face camera showing the cleared patch with the chalk outline while snow remains on the other scales.",
+   "vis": "门口一块鳞片被刷净，露出褐色木面和白线门框，其余鳞片仍压满雪。",
+   "upd": {
+    "shell": "A 2.0 m wide, 3.4 m tall patch of the lowest south scales is swept clear of snow and scraped of resin to brown wood with a chalk outline 0.90 m wide and 1.95 m high, its bottom edge 2.0 m above the footing; the rest of the cone keeps its snow load and closed scales.",
+    "door": "No opening exists yet; the chalk rectangle marks the planned door across the scale joint.",
+    "deck": "A wooden ladder leans against the cleared patch beside the chalk outline.",
+    "ground": "Deep snow lies between tall dark pines; a trench has been shovelled through the snow to the footing; a packed trail runs in from the south and the woodpile stands under a small tarp."
+   },
+   "sound": "snow shovel scraping, broom sweeping ice, scraper on dry resin, wind in the pines",
+   "wear": "A dark green insulated work jacket is worn over the shirt in the snow, with wool gloves and snow boots. "
+  },
+  {
+   "index": 9,
+   "label": "桥：登上平台，下到松果腔",
+   "act": "The camera starts on the fixed south view as the builder climbs the stair, lifts the bar latch and swings the door inward, then steps over the sill; the camera follows across the landing and settles at the sill looking north and down into the dim cone. The builder hooks an aluminium ladder on the sill and climbs down 1.9 m onto the bowl bottom. The space is a tall ribbed brown cave: the scale undersides spiral up the wall coated with amber resin and papery seed wings, a hollow woody core stands in the centre, a bowl of dry crumbs lies at the bottom and thin lines of daylight cut between the scales high above. The door box, landing rail and sill stay in view throughout.",
+   "vis": "外到内空间桥：第一次看到松果内部高大的鳞片螺旋和中央木芯。",
+   "upd": {
+    "door": "The spruce-green door leaf stands open flat against the door box wall; an aluminium ladder hooks on the sill and leads down 1.9 m to the bowl bottom."
+   },
+   "show": [
+    "door",
+    "floor",
+    "walls",
+    "core",
+    "ceiling"
+   ],
+   "sound": "boots on the stair and landing, door hinges, a tall dry echo up the ribbed cone",
+   "wear": "A dark green insulated work jacket is worn over the shirt in the snow, with wool gloves and snow boots. "
+  },
+  {
+   "index": 28,
+   "label": "无人整屋：沿螺旋梯上到卧室雪窗",
+   "act": "No person appears. The camera begins at the door looking round the lower ring: the bench and table at the right, the stove with its small flame and the curved counter under its window at the left and the round pine door in the core wall. It follows the ring to the stair foot and climbs the stair round the core past a glowing lamp, rises into the upper ring under the sloping pine roof and ends at the slot window over the bed, where the curtain is open to the low pale sun on the snowy pines; the lamps glow warmly. Nothing is added, moved or replaced.",
+   "vis": "空间回报：厨房柴炉、起居、卫浴、楼梯和卧室沿同一圈读完，窗外雪林暮色兑现“雪林里的家”。",
+   "upd": {
+    "sky": "Soft low golden sun on the snowy pines is seen through the slot windows while the lamps and stove glow warm."
+   },
+   "show": [
+    "sky",
+    "kitchen",
+    "soft",
+    "bath",
+    "bedroom",
+    "stair"
+   ],
+   "sound": "quiet room tone, soft stove crackle, a faint wind in the pines, no voices"
+  }
+ ]
+}

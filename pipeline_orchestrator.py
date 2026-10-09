@@ -6,10 +6,9 @@ anchor gate, the periodic reality-checkpoint recalibration, and the chain-tail d
 lookback. Frames 1..N now render unconditionally, as fast as the backend allows, and no
 step below rewrites a prompt or re-renders a frame on a judge's say-so.
 
-The one cross-frame consistency review that remains is **manual and out-of-band**:
-_sequence_consistency_review (exposed as run_sequence_consistency_review), which the user
-triggers from the frame grid after the sequence is done. No entry point here runs it for
-you, and it never blocks video generation.
+All quality review rules are retired. Legacy review entry points return an explicit
+retired result, without reading images, calling review models, or recording a pass.
+User-directed image changes and their undo snapshots remain available.
 
 Four entry points, sharing the same render/recovery machinery:
 
@@ -329,7 +328,8 @@ def _clear_manual_frame_issue(project_dir, sequence):
                 frame.pop('manual_issue', None)
                 frame.pop('manual_flag_prev_gate', None)
                 if frame.get('quality_gate') == 'manual_flagged':
-                    frame['quality_gate'] = 'pending_manual_review'
+                    frame['quality_gate'] = ('retired' if reviews_disabled()
+                                             else 'pending_manual_review')
                 break
         write_manifest(project_dir, manifest)
 
@@ -582,8 +582,8 @@ def _sequence_consistency_review(config, title, prompt_block, project_dir, on_pr
     if reviews_disabled(config):
         if on_progress:
             on_progress('sequence_review_result', {
-                'passed': False, 'skipped': True, 'reviewed_sequences': [],
-                'message': '已开启「一键关闭所有审查」，一致性审查已跳过。',
+                'passed': None, 'skipped': True, 'retired': True, 'reviewed_sequences': [],
+                'message': '质量门禁已退役，不再执行一致性审查。',
             })
         return prompt_block
     images, videos = _parse_prompt_slots(prompt_block)
@@ -1346,6 +1346,8 @@ def _measure_fix_triptych(config, title, images, videos, sequence, *, include_ri
     `include_right=False` 用于 Level 3 连带重渲：K+1 这一趟本来就要被盖掉，拿它当基线
     没有意义。
     """
+    if reviews_disabled(config):
+        return {'left': None, 'right': None, 'retired': True}
     import frame_continuity
     from frame_generator import _continuity_beat
 
@@ -1426,7 +1428,8 @@ def fix_frame_issue(config, title, prompt_block, sequence, on_progress=None, man
         set_manual_frame_issue(title, sequence, manual_reason)
     entry = _frame_manifest_entry(project_dir, sequence) or {}
     manual_issue = (entry.get('manual_issue') or '').strip()
-    auto_reason = (entry.get('vlm_qa_reason') or '').strip()
+    # Historical machine verdicts are retained as records, never as new instructions.
+    auto_reason = '' if reviews_disabled(config) else (entry.get('vlm_qa_reason') or '').strip()
     # 人工描述排在前面：人看的是真实画面、指的是具体哪里不对，比机器判定更该被
     # 优先满足；两者重复时只留一份，别让改写模型对着同一句话改两遍。
     issues = [t for t in (manual_issue, auto_reason) if t]
@@ -1434,7 +1437,7 @@ def fix_frame_issue(config, title, prompt_block, sequence, on_progress=None, man
         issues = issues[:1]
     if not issues:
         raise RuntimeError(f'IMG {sequence:03d} 当前没有记录待修复的问题——'
-                           f'请先在帧网格点「描述问题」写下这一帧哪里不对，或先运行一致性审查')
+                           f'请先在帧网格点「描述问题」写下要修改的内容')
     reason = '；'.join(issues)
 
     # 修复后复审要用的结构化问题清单，必须在重渲前取出：重渲会整体改写这一帧的
@@ -1468,8 +1471,8 @@ def fix_frame_issue(config, title, prompt_block, sequence, on_progress=None, man
     # 自己申报的那块，稳定区判读会把本该变的地方算成漂移。
     #
     # Level 3 连带重渲时不量右缝：K+1 这一趟本来就要被盖掉，拿它当基线没意义。
-    triptych_before = _measure_fix_triptych(
-        config, title, images, videos, sequence, include_right=not cascade_downstream)
+    triptych_before = (None if reviews_disabled(config) else _measure_fix_triptych(
+        config, title, images, videos, sequence, include_right=not cascade_downstream))
 
     if on_progress:
         on_progress('frame_issue_fix_start', {
@@ -1571,12 +1574,16 @@ def fix_frame_issue(config, title, prompt_block, sequence, on_progress=None, man
     # Level 3 连带重渲（cascade_downstream）不自动回滚：下游已经按新的 K 重渲过一轮，
     # 而快照里只有 K 这一帧，单独退回 K 会留下一条修了一半的链（上游旧图、下游新血统），
     # 比不回滚更坏。整链快照与整链回滚是另一件事，这里只把结论大声报出来。
-    triptych_after = _measure_fix_triptych(
+    triptych_after = (None if reviews_disabled(config) else _measure_fix_triptych(
         config, title, images, videos, sequence, include_right=not cascade_downstream,
-        baseline=triptych_before)
+        baseline=triptych_before))
     import frame_continuity as _fc
-    triptych = _fc.compare_triptych(triptych_before, triptych_after)
-    triptych['auto_rollback_available'] = not cascade_downstream
+    if reviews_disabled(config):
+        triptych = {'verdict': 'retired', 'retired': True,
+                    'auto_rollback_available': False}
+    else:
+        triptych = _fc.compare_triptych(triptych_before, triptych_after)
+        triptych['auto_rollback_available'] = not cascade_downstream
 
     if triptych['verdict'] == 'regressed' and not cascade_downstream:
         detail = _fc.describe_triptych(triptych)
@@ -1605,7 +1612,7 @@ def fix_frame_issue(config, title, prompt_block, sequence, on_progress=None, man
                                  'gate_detail': detail},
                 'undoable': False}
 
-    if on_progress and triptych['verdict'] != 'ok':
+    if on_progress and triptych['verdict'] not in ('ok', 'retired'):
         on_progress('frame_issue_triptych_gate', {
             'sequence': sequence, 'verdict': triptych['verdict'], 'triptych': triptych,
             'message': (f"⚠️ IMG {sequence:03d} 三联屏门禁：{_fc.describe_triptych(triptych)}"
@@ -1665,6 +1672,8 @@ def _reverify_frame_issues(config, title, sequence, recorded_issues, on_progress
     的那几条）；全部解决则落 pending_manual_review 等人最终确认。复核本身没跑成的
     （返回 None）一律按"仍存在"保守处理，不谎报修复成功。
     返回 {'resolved': [...], 'remaining': [...]}；没有结构化问题可验时返回 None。"""
+    if reviews_disabled(config):
+        return {'retired': True, 'resolved': [], 'remaining': [], 'reviewed': False}
     issues = [i for i in (recorded_issues or []) if isinstance(i, dict) and i.get('text')]
     if not issues:
         return None
@@ -1737,22 +1746,37 @@ def render_frames_for_task(config, title, prompt_block, on_progress=None):
 
 def _render_videos_with_recovery(config, title, prompt_block, on_progress=None,
                                  project_dir=None):
-    """Render all videos, then run one autonomous retry pass over any slot that came
-    back rejected/blocked (e.g. a failed Google FX anchor-match) instead of leaving it
-    for a human to notice and re-trigger manually."""
-    video_result = generate_video_sequence(config, title, prompt_block, on_progress=on_progress)
-    # 'skipped_cut'（旧单的硬切占位槽位，新单的 [CUT] 槽照常生成）是预期缺失，
-    # 不进恢复重试轮；'skipped_bridge_hold'
-    # 已停用（单一过门拍收编后不再有需要跳过的 HOLD 槽位），仅为兼容旧 manifest 保留
-    failed_slots = [v['slot'] for v in video_result.get('videos', [])
-                    if v.get('status') not in ('success', 'skipped_cut', 'skipped_bridge_hold')]
-    if failed_slots:
-        if on_progress:
-            on_progress('video_retry_autonomous', {'slots': failed_slots})
-        video_result = generate_video_sequence(
-            config, title, prompt_block, on_progress=on_progress, target_slots=failed_slots,
-        )
-    return video_result
+    """Keep the same pipeline alive while recovering only undelivered clips."""
+    if (config or {}).get('_defer_video_to_worker'):
+        return read_manifest(project_dir or _get_project_dir(title)) or {'videos': []}
+    from video_generation_recovery import execute_video_generation_with_recovery
+    return execute_video_generation_with_recovery(config, title, prompt_block,
+        on_progress=on_progress, generate_fn=generate_video_sequence, project_dir=project_dir)
+
+
+def _flow_video_outcome(config, video_result, prompt_block):
+    """Report paid Flow submissions that did not deliver every expected clip."""
+    if (config or {}).get('videoProvider') != 'flow2api':
+        return {}
+    result = video_result or {}
+    rows = [row for row in result.get('videos', []) if isinstance(row, dict)]
+    _, expected = _parse_prompt_slots(prompt_block)
+    by_slot = {row.get('slot'): row for row in rows}
+    last_run = (result.get('video_generation_stats') or {}).get('last_run') or {}
+    accepted = {'success', 'skipped_cut', 'skipped_bridge_hold'}
+    failed = bool(last_run.get('failed_slots') or last_run.get('cancelled_slots')) or any(
+        by_slot.get(slot, {}).get('status') not in accepted for slot in expected)
+    failed = failed or any(
+        row.get('status') not in accepted
+        or (row.get('last_attempt') or {}).get('submission_pending')
+        or (row.get('last_attempt') or {}).get('status') in ('failed', 'cancelled')
+        for row in rows)
+    warned = (not reviews_disabled(config)
+              and any(row.get('process_warned') or row.get('anchor_mismatch_overridden')
+                      for row in rows))
+    return {'completion_state': 'partial_failed' if failed else (
+                'completed_with_warnings' if warned else 'completed'),
+            'has_failures': bool(failed), 'has_quality_warnings': bool(warned)}
 
 
 def run_autonomous_pipeline(config, dimensions, on_progress=None):
@@ -1804,24 +1828,18 @@ def run_autonomous_pipeline(config, dimensions, on_progress=None):
         project_dir, (config or {}).get('_outline_delivery_ledger'), title=title)
     generate_frame_sequence(config, title, prompt_block, on_progress=on_progress,
                             target_sequences=None)
-    # 视频生成前优化门：根据真实渲染的帧序列画面差量优化所有视频提示词，以防跳变
-    try:
-        prompt_block = optimize_video_prompts_for_sequence(
-            config, title, prompt_block, on_progress=on_progress
-        )
-    except Exception as opt_e:
-        print(f"[ORCHESTRATOR] Video prompt optimization error (proceeding with original): {opt_e}")
-
     video_result = _render_videos_with_recovery(config, title, prompt_block, on_progress=on_progress,
                                                 project_dir=project_dir)
+    outcome = _flow_video_outcome(config, video_result, prompt_block)
 
     return {
         'title': title,
-        'status': 'completed',
+        'status': 'partial_failed' if outcome.get('has_failures') else 'completed',
         'prompt_block': prompt_block,
         'prompt_slots': prompt_slots_list(prompt_block),
         'project_dir': project_dir,
         'videos': video_result,
+        **outcome,
     }
 
 
@@ -1838,22 +1856,16 @@ def run_staged_frame_rendering(config, title, prompt_block, on_progress=None):
     project_dir = _get_project_dir(title)
     generate_frame_sequence(config, title, prompt_block, on_progress=on_progress,
                             target_sequences=None)
-    # 视频生成前优化门：根据真实渲染的帧序列画面差量优化所有视频提示词，以防跳变
-    try:
-        prompt_block = optimize_video_prompts_for_sequence(
-            config, title, prompt_block, on_progress=on_progress
-        )
-    except Exception as opt_e:
-        print(f"[ORCHESTRATOR] Video prompt optimization error (proceeding with original): {opt_e}")
-
     video_result = _render_videos_with_recovery(config, title, prompt_block, on_progress=on_progress,
                                                 project_dir=project_dir)
+    outcome = _flow_video_outcome(config, video_result, prompt_block)
 
     return {
         'title': title,
-        'status': 'completed',
+        'status': 'partial_failed' if outcome.get('has_failures') else 'completed',
         'prompt_block': prompt_block,
         'prompt_slots': prompt_slots_list(prompt_block),
         'project_dir': project_dir,
         'videos': video_result,
+        **outcome,
     }

@@ -10,12 +10,15 @@ import urllib.parse
 import base64
 import time
 import threading
+import queue
+import contextvars
 import mimetypes
 import contextlib
 from datetime import datetime
 from http.server import SimpleHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
 from web_runtime.static_files import StaticFilesMixin
+from web_runtime.compression import compress_response
 
 # Register MIME types to ensure correct browser content-type headers
 mimetypes.add_type('image/webp', '.webp')
@@ -26,11 +29,14 @@ import server_common
 from server_common import *
 from frame_generator import *
 from video_generator import *
+from video_generation_recovery import (
+    DEFAULT_RETRY_DELAYS as VIDEO_RETRY_DELAYS, VideoRecoveryExhaustedError,
+    delivered_slots, execute_video_generation_with_recovery, exhausted_message, max_slot_attempts)
 from prompt_pipeline import *
 
 # Explicitly import private functions that are not imported by wildcard '*'
 from server_common import (
-    _get_project_dir, _LOG_PATH, _account_switch_interval,
+    _get_project_dir, _safe_project_name, _LOG_PATH, _account_switch_interval,
     _IP_ROTATE_DISABLED,
     # 点子库拆分存储的内部读取路径：POST /api/library 的三道防护要在**已持有**
     # LIBRARY_LOCK 的情况下读一次现有库，读-判定-写这一串必须是原子的。
@@ -68,23 +74,7 @@ _RATE_LOCK = threading.Lock()
 
 
 def prompt_delivery_block_reason(payload):
-    """Return a render-blocking reason for explicitly degraded/new compose results.
-
-    Missing metadata is treated as a legacy caller and remains compatible.
-    """
-    if not isinstance(payload, dict):
-        return None
-    if reviews_disabled(payload.get('config')):
-        return None
-    quality = payload.get('quality_gate')
-    if payload.get('degraded') is True:
-        return '该提示词结果处于降级状态，不能进入帧渲染。'
-    if payload.get('generation_source') == 'static_fallback':
-        return '静态兜底结果不能进入帧渲染。'
-    if isinstance(quality, dict) and quality.get('status') != 'passed':
-        return '提示词质量门未通过，不能进入帧渲染。'
-    if payload.get('diagnostic_mode') is True:
-        return '诊断模式结果仅供排查，不能入库或渲染。'
+    """历史提示词质量标记不再拦截；编号与资源可用性在各操作入口校验。"""
     return None
 
 
@@ -370,14 +360,7 @@ def background_worker(task_id, config, dimensions):
         result['degraded'] = bool((config or {}).get('_compose_degraded'))
         result['diagnostic_mode'] = bool((config or {}).get('_compose_diagnostic'))
         result['failure_code'] = None
-        result['quality_gate'] = {
-            'status': 'degraded' if placeholder_count else 'passed',
-            'validated_beats': sum(
-                1 for value in ((config or {}).get('_compose_slot_states') or {}).values()
-                if value == 'validated'),
-            'placeholder_beats': placeholder_count,
-            'unresolved_hard_errors': placeholder_count,
-        }
+        result['quality_gate'] = {'status': 'retired', 'reviewed': False}
         # 交付总账再落一份进项目 manifest：帧渲染完之后用户手动触发的一致性审查跑在
         # 另一个任务/进程生命周期里，config 上这份到不了那边，而它正是画面层要判的
         # 「这拍该交付哪几条卡片工序」的唯一来源（见 persist_outline_delivery_ledger）。
@@ -486,20 +469,14 @@ def auto_run_worker(task_id, config, dimensions):
         start_accounting()
 
         def progress_cb(stage, details):
-            if stage == 'cancel_check':
-                return t["cancel_event"].is_set()
-            # 已取消 → 不再追加事件/广播，直接 raise 让 worker 快速退出
-            if t["cancel_event"].is_set():
-                raise GenerationCancelled("Generation cancelled by user")
-            with ACTIVE_TASKS_LOCK:
-                t["events"].append((stage, details))
-            notify_listeners(task_id, stage, details)
+            return _video_progress(task_id, t, stage, details)
 
         from pipeline_orchestrator import run_autonomous_pipeline
         # 自治管线的渲染/视频阶段驱动共享 FX 浏览器：全程持有 FX 串行锁
         # （_FX_SERIAL_LOCK 定义在本模块靠后位置，调用时才解析，安全）
-        with _fx_browser_slot(task_id, 'auto', t['cancel_event']):
-            result = run_autonomous_pipeline(config, dimensions, on_progress=progress_cb)
+        with _pipeline_generation_slot(config, task_id, 'auto', t['cancel_event']):
+            result = run_autonomous_pipeline(_pipeline_first_pass_config(config), dimensions, on_progress=progress_cb)
+        result = _continue_pipeline_videos(task_id, config, result, progress_cb, t['cancel_event'])
 
         usage = stop_and_get_accounting()
         if usage:
@@ -509,7 +486,11 @@ def auto_run_worker(task_id, config, dimensions):
         result.setdefault('timings', {})['total_duration_seconds'] = round(time.time() - start_time, 2)
 
         with ACTIVE_TASKS_LOCK:
+            if t['cancel_event'].is_set() or t['status'] != 'running':
+                raise GenerationCancelled('Generation cancelled by user')
             t["status"] = "completed"
+            if result.get('completion_state'):
+                t['outcome'] = result['completion_state']
             t["result"] = result
             t["events"].append(('result', result))
         notify_listeners(task_id, 'result', result)
@@ -527,13 +508,18 @@ def auto_run_worker(task_id, config, dimensions):
         log('WARN', 'AUTORUN', "自治管线任务已被用户取消")
     except Exception as e:
         log_exception('AUTORUN')
+        finalized = False
         with ACTIVE_TASKS_LOCK:
-            t["status"] = "failed"
-            t["error"] = str(e)
-            t["events"].append(('error', {'message': str(e)}))
-        notify_listeners(task_id, 'error', {'message': str(e)})
+            if t['status'] == 'running':
+                t['status'] = 'cancelled' if t['cancel_event'].is_set() else 'failed'
+                t['error'] = '用户取消了生成任务' if t['cancel_event'].is_set() else str(e)
+                t['events'].append(('error', {'message': t['error']}))
+                finalized = True
+        if finalized:
+            notify_listeners(task_id, 'error', {'message': t['error']})
         log('ERROR', 'AUTORUN', f"自治管线任务失败: {e}")
     finally:
+        _release_flow_project_run(config, task_id)
         save_task_to_disk(task_id)
         set_log_context(None)
         set_project_key_context(None)
@@ -709,6 +695,49 @@ def _task_outcome(task):
     if result.get('has_quality_warnings') or explicit == 'completed_with_warnings':
         return 'completed_with_warnings'
     return explicit or 'completed'
+
+
+def _auto_video_runtime_snapshot(result):
+    """Project referenced child terminal state without changing durable media data."""
+    if not isinstance(result, dict):
+        return result
+    handoff = result.get('auto_video')
+    if not isinstance(handoff, dict) or not isinstance(handoff.get('task_id'), str):
+        return result
+    with ACTIVE_TASKS_LOCK:
+        child = ACTIVE_TASKS.get(handoff['task_id'])
+        if not child or child.get('status') not in ('failed', 'cancelled', 'completed'):
+            # Missing history does not prove that a remote operation has stopped.
+            return result
+        child_result = child.get('result') if isinstance(child.get('result'), dict) else {}
+        terminal_info = child_result.get('auto_video')
+        if not isinstance(terminal_info, dict) or terminal_info.get('task_id') not in (
+                None, handoff['task_id']):
+            terminal_info = {}
+        if child['status'] == 'failed':
+            state = 'blocked'
+            message = child.get('error') or '自动视频任务已失败，生成已停止。'
+        elif child['status'] == 'cancelled':
+            state = 'cancelled'
+            message = child.get('error') or (
+                terminal_info.get('message') if terminal_info.get('status') == state else None
+            ) or '自动视频已取消。'
+        else:
+            outcome = _task_outcome(child)
+            terminal_states = {'completed', 'completed_with_warnings', 'partial_failed',
+                               'cancelled', 'blocked', 'skipped'}
+            if outcome in ('partial_failed', 'completed_with_warnings'):
+                state = outcome
+            else:
+                state = terminal_info.get('status')
+                if state not in terminal_states:
+                    state = outcome if outcome in terminal_states else 'completed'
+            messages = {'partial_failed': '自动视频部分完成，请检查未成功的片段。',
+                        'completed_with_warnings': '自动视频已完成，请查看提示。',
+                        'completed': '自动视频已完成。'}
+            message = terminal_info.get('message') if terminal_info.get('status') == state else None
+            message = message or messages.get(state) or '自动视频任务已结束。'
+    return {**result, 'auto_video': {**handoff, 'status': state, 'message': message}}
 
 
 def _fx_task_stage(task):
@@ -1470,8 +1499,657 @@ def _fx_log_tail(task_id='', keyword='', limit=120, fx_only=True, level='all'):
             for line in record['lines']]
 
 
+def _media_task_progress_snapshot(task):
+    """Recover media progress from the complete task history, not its last 50 events."""
+    dimensions = task.get('dimensions') or {}
+    kind = dimensions.get('type')
+    if kind not in ('frames', 'videos', 'video_chain'):
+        return None
+    targets = dimensions.get('target_sequences' if kind == 'frames' else 'target_slots')
+    targets = sorted({int(slot) for slot in (targets or [])
+                      if type(slot) is int and slot > 0})
+    total = len(targets)
+    slots, phase, label = {}, 'pending', ''
+    for event in task.get('events') or []:
+        if not isinstance(event, (list, tuple)) or len(event) < 2:
+            continue
+        stage, details = event[:2]
+        if stage == 'progress' and isinstance(details, dict) and details.get('stage'):
+            stage, details = details['stage'], details.get('details')
+        if not isinstance(details, dict):
+            continue
+        event_total = details.get('total')
+        if type(event_total) is int and event_total > 0 and not targets:
+            total = max(total, event_total)
+        slot = None
+        state = None
+        if kind == 'frames':
+            if stage in ('frame', 'frame_ready'):
+                frame = details.get('frame') or {}
+                slot = frame.get('sequence') or frame.get('slot') or details.get('sequence')
+                state = 'done'
+            elif stage in ('frame_start', 'frame_retry', 'frame_continuity_retry'):
+                slot = details.get('sequence') or details.get('slot')
+                state = 'active'
+            elif stage in ('frame_continuity_failed', 'chain_guard_halt'):
+                slot = details.get('sequence') or details.get('slot')
+                state = 'failed'
+        else:
+            if stage == 'video_recovery':
+                for recovered in details.get('completed_slots') or []:
+                    if type(recovered) is int and (not targets or recovered in targets):
+                        slots[str(recovered)] = 'done'
+                for recovering in details.get('slots') or []:
+                    if type(recovering) is int and (not targets or recovering in targets):
+                        slots[str(recovering)] = 'recovering'
+            slot = details.get('index')
+            if stage in ('video_done', 'video_skip_cut', 'video_skip_bridge_hold'):
+                state = 'done'
+            elif stage == 'video_error':
+                state = 'failed'
+            elif stage in ('video_start', 'request_submitting', 'request_submitted', 'request_accepted'):
+                state = 'active'
+        if type(slot) is int and slot > 0 and state and (not targets or slot in targets):
+            slots[str(slot)] = state
+        if stage != 'text_chunk':
+            phase = stage
+            if details.get('message'):
+                label = str(details['message'])
+    recovering = any(state == 'recovering' for state in slots.values())
+    current = sum(state == 'done' or state == 'failed' and not recovering for state in slots.values())
+    total = max(total, len(slots))
+    percent = min(95, round(5 + 90 * current / total)) if total else 0
+    return {'taskType': kind, 'total': total, 'current': current,
+            'slotStatus': slots, 'slot_status': slots, 'phase': phase,
+            'label': label, 'message': label, 'percent': percent}
+
+
+def _configure_frame_auto_video(config, body):
+    enabled = body.get('auto_generate_videos', True)
+    if type(enabled) is not bool:
+        raise ValueError('auto_generate_videos 必须为布尔值')
+    preference_explicit = body.get('auto_generate_videos_preference_explicit')
+    if preference_explicit is not None and type(preference_explicit) is not bool:
+        raise ValueError('auto_generate_videos_preference_explicit 必须为布尔值')
+    slots = body.get('video_target_slots')
+    if slots is not None and (not isinstance(slots, list) or not slots
+            or any(type(slot) is not int or slot <= 0 for slot in slots)):
+        raise ValueError('video_target_slots 必须为正整数槽位列表')
+    config['_auto_generate_videos'] = enabled
+    config['_auto_generate_videos_explicit'] = 'auto_generate_videos' in body
+    config['_auto_generate_videos_preference_explicit'] = preference_explicit
+    config['_auto_video_target_slots'] = sorted(set(slots)) if slots is not None else None
+    config['_merge_speed'] = body.get('merge_speed', 4)
+    if enabled:
+        config['videoFramePairing'] = 'auto'
+
+
+class _ProgressiveAutoVideo:
+    """Queue settled frame pairs; a separate video worker never holds up images."""
+
+    def __init__(self, task_id, task, config, title, prompt_block, progress_cb,
+                 target_sequences=None):
+        self.parent_id, self.parent = task_id, task
+        self.config = {**config, 'videoFramePairing': 'auto'}
+        self.config.pop('_flow_project_claim', None)
+        self.title, self.prompt_block, self.progress_cb = title, prompt_block, progress_cb
+        self.project_dir = _get_project_dir(config.get('_project_key') or title)
+        self.enabled = bool(config.get('_auto_generate_videos'))
+        self.explicit = config.get('_auto_generate_videos_explicit', False)
+        self.preference_explicit = config.get('_auto_generate_videos_preference_explicit')
+        images, self.videos = _parse_prompt_slots(prompt_block)
+        targets = config.get('_auto_video_target_slots')
+        self.targets = targets
+        self.target_sequences = target_sequences
+        self.selected = sorted(self.videos if targets is None else set(targets).intersection(self.videos))
+        self.image_count = max(images, default=0)
+        self.awaiting_replacement = set(images if target_sequences is None else target_sequences)
+        self.replaced = set()
+        self.processed, self.queued, self.blocked = set(), set(), {}
+        self.failed_slots, self.cancelled_slots = set(), set()
+        self.revised_slots = set()
+        self.ready = set()
+        self.child_id = None
+        self.child = None
+        self.request_id = 'auto_video:' + task_id
+        self.closed = False
+        self.initialized = False
+        self.error = None
+        self.pairs = [{'slot': slot, **resolve_video_frame_anchors(slot, self.videos[slot], self.config)}
+                      for slot in self.selected] if self.enabled else []
+        self.info = None
+        self._state_lock = threading.RLock()
+        self._queue = queue.Queue()
+        self.worker_thread = None
+        self.worker_done = threading.Event()
+        self._optimizing_slots = set()
+        self._aborted = False
+        self._video_usage = None
+        self._accounting_finished = False
+        # Shared per-slot paid-submission budget, and failed slots waiting for an
+        # in-run retry (monotonic due time) instead of waiting for every segment.
+        self.attempt_counts = {}
+        self.retry_due = {}
+
+    def _record(self, status, message='', emit=True):
+        info = {'status': status, 'request_id': self.request_id,
+                'frame_pairs': self.pairs, 'target_slots': self.selected,
+                'ready_slots': sorted(self.ready), 'queued_slots': sorted(self.queued),
+                'pending_slots': sorted(set(self.selected) - self.ready),
+                'blocked_slots': sorted(self.blocked), 'message': message}
+        if self.child_id:
+            info['task_id'] = self.child_id
+        if status == 'started' and self.info:
+            info.update({key: self.info[key] for key in
+                ('phase', 'slots', 'retry_round', 'next_retry_at', 'completed_slots') if key in self.info})
+        self.info = info
+        with manifest_lock(self.project_dir):
+            manifest = read_manifest(self.project_dir) or {}
+            manifest.update(auto_generate_videos=True, video_frame_pairing='auto', auto_video=info)
+            if self.preference_explicit is not None:
+                manifest['auto_generate_videos_preference_explicit'] = self.preference_explicit
+            write_manifest(self.project_dir, manifest)
+            if read_manifest(self.project_dir) != manifest:
+                raise RuntimeError('自动视频清单保存失败，已停止继续提交')
+        with ACTIVE_TASKS_LOCK:
+            if self.parent.get('status') == 'running':
+                self.parent['result'] = manifest
+            if self.child:
+                self.child['result'] = manifest
+        if emit:
+            event = 'auto_video_blocked' if status == 'blocked' else 'auto_video_updated'
+            # The image SSE may already have ended. The independent video SSE
+            # must still report scheduling/terminal state after the final image.
+            try:
+                self.progress_cb(event, info)
+            except ConnectionError:
+                pass
+            if self.child:
+                with ACTIVE_TASKS_LOCK:
+                    self.child['events'].append((event, info))
+                notify_listeners(self.child_id, event, info)
+        return manifest
+
+    def _ensure_child(self, manifest):
+        if self.child_id:
+            return True
+        with _VIDEO_OPERATION_LOCK:
+            if self.parent['cancel_event'].is_set():
+                raise GenerationCancelled('Generation cancelled by user')
+            project_key = self.config.get('_project_key') or self.title
+            if self.config.get('videoProvider') != 'flow2api':
+                admitted, message = FX_CONTROL.admission()
+                if not admitted:
+                    raise RuntimeError(message)
+            key = _safe_project_name(project_key)
+            with ACTIVE_TASKS_LOCK:
+                live = next((tid for tid, task in ACTIVE_TASKS.items()
+                    if tid != self.parent_id and task.get('status') == 'running'
+                    and (task.get('dimensions') or {}).get('type') in ('videos', 'video_chain')
+                    and _safe_project_name((task.get('dimensions') or {}).get('project_key')
+                        or (task.get('dimensions') or {}).get('theme') or '') == key), None)
+            if live:
+                raise RuntimeError('该项目已有视频任务运行，请等待原任务完成。')
+            operation, created = _VIDEO_OPERATIONS.reserve(self.request_id,
+                request_fingerprint({'title': project_key, 'prompt_block': self.prompt_block,
+                                     'target_slots': self.selected}, 'auto_video_progressive'))
+            if not created:
+                # A replay must reconnect to the existing child, never submit again.
+                self.child_id = operation['task_id']
+                self.child = ACTIVE_TASKS.get(self.child_id)
+                self.processed.update(self.selected)
+                self._record('started', '已恢复原自动视频任务。')
+                return False
+            self.child_id = operation['task_id']
+            self.child = get_or_create_task(self.child_id, {
+                'type': 'videos', 'theme': self.title, 'project_key': project_key,
+                'request_id': self.request_id, 'parent_frame_task_id': self.parent_id,
+                'video_provider': self.config.get('videoProvider') or 'google_fx',
+                'target_slots': self.selected, 'progressive': True,
+                'userId': None if self.config.get('videoProvider') == 'flow2api'
+                          else self.config.get('googleFxUserId') or None})
+            # Keep the image parent's claim until its worker exits, and keep
+            # cancellation independent so stopping videos cannot stop images.
+            self._record('started', '对应首尾帧已就绪，正在逐段生成视频。', emit=False)
+            if not save_task_to_disk(self.child_id) or not save_task_to_disk(self.parent_id):
+                raise RuntimeError('自动视频任务登记保存失败，未提交生成。')
+            if self.parent['cancel_event'].is_set():
+                raise GenerationCancelled('Generation cancelled by user')
+            self.progress_cb('auto_video_started', self.info)
+            return True
+
+    def _video_progress(self, stage, details):
+        if self.parent['cancel_event'].is_set():
+            self.child['cancel_event'].set()
+        with self._state_lock:
+            if stage == 'video_done':
+                self.failed_slots.discard(details.get('index'))
+            elif stage == 'video_error':
+                self.failed_slots.add(details.get('index'))
+            elif stage == 'video_recovery':
+                self.info.update({key: details[key] for key in
+                    ('phase', 'slots', 'retry_round', 'next_retry_at', 'completed_slots') if key in details})
+                self._record('started', details.get('message') or '正在自动恢复未完成视频。')
+        if stage == 'start':
+            # The generator starts one subset at a time; the UI represents the full run.
+            details = {**details, 'total': len(self.selected), 'slots': self.selected}
+        elif isinstance(details, dict) and 'total' in details:
+            details = {**details, 'total': len(self.selected)}
+        return _video_progress(self.child_id, self.child, stage, details)
+
+    def advance(self, details=None):
+        with self._state_lock:
+            return self._advance_ready(details)
+
+    def _advance_ready(self, details=None):
+        if not self.enabled or self.closed or self.error:
+            return
+        if self.parent['cancel_event'].is_set():
+            if self.child:
+                self.child['cancel_event'].set()
+            raise GenerationCancelled('Generation cancelled by user')
+        if self.child and self.child['cancel_event'].is_set():
+            return
+        if details:
+            frame = details.get('frame') or {}
+            sequence = details.get('sequence') or details.get('slot') or frame.get('sequence') or frame.get('slot')
+            if sequence:
+                self.awaiting_replacement.discard(int(sequence))
+                if not details.get('skipped'):
+                    self.replaced.add(int(sequence))
+        with manifest_lock(self.project_dir):
+            manifest = read_manifest(self.project_dir) or {}
+            if not self.initialized:
+                # The submitted prompt may contain edits newer than disk. Seed
+                # it once; later frame repairs/optimizations become authoritative.
+                # Auto video starts before the image renderer creates its folders.
+                os.makedirs(self.project_dir, exist_ok=True)
+                manifest.update(prompt_block=self.prompt_block,
+                                prompt_slots=prompt_slots_list(self.prompt_block))
+                write_manifest(self.project_dir, manifest)
+                self.initialized = True
+            if details and self.target_sequences is not None:
+                # Retried anchors can make untouched downstream images stale.
+                # Settle their lineage before spending on any new video pair.
+                existing_videos = manifest.get('videos', [])
+                update_manifest_stale_status(manifest, self.project_dir,
+                    regenerated_sequences=self.target_sequences, finalize=True)
+                manifest['videos'] = existing_videos
+                write_manifest(self.project_dir, manifest)
+        current_block = manifest.get('prompt_block') or self.prompt_block
+        if current_block != self.prompt_block:
+            self.prompt_block = current_block
+            previous_videos = self.videos
+            _, self.videos = _parse_prompt_slots(current_block)
+            # An accepted frame repair may also change a previously generated
+            # video's action or anchors. Treat that revision as new work.
+            changed = {slot for slot in self.processed - self._optimizing_slots
+                       if previous_videos.get(slot) != self.videos.get(slot)}
+            self.processed.difference_update(changed)
+            self.revised_slots.update(changed)
+            for slot in changed:
+                self.blocked.pop(slot, None)
+            self.selected = sorted(self.videos if self.targets is None else set(self.targets).intersection(self.videos))
+            self.pairs = [{'slot': slot, **resolve_video_frame_anchors(slot, self.videos[slot], self.config)}
+                          for slot in self.selected]
+            if self.child:
+                self.child['dimensions']['target_slots'] = self.selected
+        frames, quality = load_slot_frames(manifest, os.path.join(self.project_dir, 'frames'), self.image_count)
+        self.ready = {pair['slot'] for pair in self.pairs
+            if all(anchor not in self.awaiting_replacement and frames.get(anchor)
+                and os.path.isfile(frames[anchor]) and os.path.getsize(frames[anchor]) > 0
+                for anchor in (pair['start_anchor_slot'], pair['end_anchor_slot']) if anchor is not None)}
+        eligible = sorted(self.ready - self.processed)
+        if not eligible:
+            if self.selected:
+                self._record('started' if self.child_id else 'waiting',
+                             '等待下一段视频的对应首尾帧。')
+            return
+        try:
+            plans = plan_video_slots(self.videos, frames, quality, os.path.join(self.project_dir, 'videos'),
+                strict=strict_gates_enabled(self.config), gate_level=qa_gate_level(self.config),
+                stale_slots=load_stale_slots(manifest), existing_videos=manifest.get('videos', []),
+                config=self.config)
+            by_slot = {plan['slot']: plan for plan in plans}
+            submit = []
+            for slot in eligible:
+                plan = by_slot.get(slot) or {}
+                if plan.get('action') == 'blocked':
+                    self.blocked[slot] = plan.get('reason') or '首尾帧未通过视频生成检查'
+                    self.processed.add(slot)
+                elif plan.get('action') in ('reuse', 'skip_cut', 'skip_bridge_hold') and slot not in self.revised_slots and not any(
+                        anchor in self.replaced for anchor in (
+                            plan.get('start_anchor_slot'), plan.get('end_anchor_slot'))):
+                    self.processed.add(slot)
+                else:
+                    submit.append(slot)
+            if submit:
+                ensure_video_submissions_resolved(self.config.get('_project_key') or self.title,
+                    submit, manifest=manifest, provider=self.config.get('videoProvider') or 'google_fx')
+                if not self._ensure_child(manifest):
+                    return
+                self.queued.update(submit)
+                self.processed.update(submit)  # A replayed frame boundary cannot reset retries.
+                self.revised_slots.difference_update(submit)
+                self._record('started', '首尾帧已就绪，正在生成：' + '、'.join(f'视频 {s}' for s in submit))
+                self._queue.put(submit)
+                if self.worker_thread is None:
+                    # Do not inherit the image thread's FX lease ContextVars.
+                    self.worker_thread = threading.Thread(target=contextvars.Context().run,
+                        args=(self._run,), daemon=True,
+                        name=f'auto-video-{self.child_id}')
+                    self.worker_thread.start()
+        except ConnectionError:
+            raise
+        except Exception as error:
+            self.error = str(error)
+            self._record('blocked', f'自动视频已停止：{error}；图片将继续生成。')
+
+    def _run(self):
+        set_project_key_context(self.config.get('_project_key'))
+        set_log_context(self.child_id)
+        from prompt_pipeline import start_accounting
+        start_accounting()
+        try:
+            while True:
+                if self.parent['cancel_event'].is_set():
+                    self.child['cancel_event'].set()
+                if self.child['cancel_event'].is_set():
+                    raise GenerationCancelled('用户取消了自动视频生成')
+                # A due retry goes ahead of newly ready segments so one failure
+                # is repaired during the run rather than after every other clip.
+                submit = self._take_due_retries()
+                from_queue = submit is None
+                if from_queue:
+                    try:
+                        submit = self._queue.get(timeout=.1)
+                    except queue.Empty:
+                        continue
+                    if submit is None:
+                        break
+                try:
+                    with self._state_lock:
+                        latest = read_manifest(self.project_dir) or {}
+                        block = latest.get('prompt_block') or self.prompt_block
+                        self._optimizing_slots.update(submit)
+                    try:
+                        block = optimize_video_prompts_for_sequence(self.config, self.title, block,
+                            on_progress=self._video_progress, target_slots=submit, force=False) or block
+                    except ConnectionError:
+                        raise
+                    except Exception as error:
+                        log('WARN', 'VIDEOS', f'视频提示词优化异常，沿用原提示词: {error}', title=self.title)
+                    finally:
+                        with self._state_lock:
+                            latest = read_manifest(self.project_dir) or {}
+                            block = latest.get('prompt_block') or block
+                            _, optimized_videos = _parse_prompt_slots(block)
+                            baseline_images, _ = _parse_prompt_slots(self.prompt_block)
+                            for slot in submit:
+                                if slot in optimized_videos:
+                                    self.videos[slot] = optimized_videos[slot]
+                            # Only rebase this optimizer's slots. Unrelated
+                            # accepted frame repairs still need advance() to
+                            # discover revised videos rather than silently lose them.
+                            self.prompt_block = _format_prompt_block(baseline_images, self.videos)
+                            self._optimizing_slots.difference_update(submit)
+                            current_frames, _ = load_slot_frames(latest,
+                                os.path.join(self.project_dir, 'frames'), self.image_count)
+                            deferred = []
+                            for slot in submit:
+                                item = optimized_videos.get(slot)
+                                anchors = resolve_video_frame_anchors(slot, item, self.config) if item else {}
+                                needed = [anchors.get('start_anchor_slot'), anchors.get('end_anchor_slot')]
+                                if not item or any(anchor is not None and (
+                                        anchor in self.awaiting_replacement or not current_frames.get(anchor)
+                                        or not os.path.isfile(current_frames[anchor])
+                                        or os.path.getsize(current_frames[anchor]) == 0) for anchor in needed):
+                                    deferred.append(slot)
+                                    self.processed.discard(slot)
+                                    self.ready.discard(slot)
+                            if deferred:
+                                submit = [slot for slot in submit if slot not in deferred]
+                                self._record('started', '首尾帧已修订，等待新图片就绪：'
+                                    + '、'.join(f'视频 {slot}' for slot in deferred))
+                    if not submit:
+                        continue
+                    def generate_ready_round(*args, **kwargs):
+                        if kwargs.get('override_flagged') is False:
+                            kwargs.pop('override_flagged')
+                        with _video_generation_slot(self.config, self.child_id, self.child['cancel_event']):
+                            return generate_video_sequence(*args, **kwargs)
+                    batch_result = execute_video_generation_with_recovery(self.config, self.title, block,
+                        on_progress=self._video_progress, target_slots=submit,
+                        generate_fn=generate_ready_round, project_dir=self.project_dir, first_pass_only=True,
+                        attempt_counts=self.attempt_counts)
+                    last_run = (batch_result.get('video_generation_stats') or {}).get('last_run') or {}
+                    with self._state_lock:
+                        self.failed_slots.update(last_run.get('failed_slots') or [])
+                        self.cancelled_slots.update(last_run.get('cancelled_slots') or [])
+                        self._record('started', '本段视频已处理，等待下一段首尾帧或继续处理已就绪视频。')
+                    self._schedule_retries(submit, batch_result)
+                finally:
+                    if from_queue:
+                        self._queue.task_done()
+            if (self.config.get('videoContinuousGeneration') is True and not self._aborted
+                    and not self.child['cancel_event'].is_set()):
+                with self._state_lock:
+                    latest = read_manifest(self.project_dir) or {}
+                    block = latest.get('prompt_block') or self.prompt_block
+                    recoverable = sorted(set(self.selected) & self.processed - set(self.blocked))
+                if recoverable:
+                    def generate_round(*args, **kwargs):
+                        with _video_generation_slot(self.config, self.child_id, self.child['cancel_event']):
+                            return generate_video_sequence(*args, **kwargs)
+                    try:
+                        execute_video_generation_with_recovery(self.config, self.title, block,
+                            on_progress=self._video_progress, target_slots=recoverable,
+                            generate_fn=generate_round, project_dir=self.project_dir, recovery_only=True,
+                            attempt_counts=self.attempt_counts)
+                    except VideoRecoveryExhaustedError as error:
+                        # Give up only these slots; finish as partial_failed, not as a hang.
+                        with self._state_lock:
+                            for slot in error.slots:
+                                self.blocked[slot] = error.reasons.get(slot) or str(error)
+                            self._record('started', str(error))
+            with self._state_lock:
+                self._finish_videos(aborted=self._aborted)
+        except ConnectionError:
+            with self._state_lock:
+                self.child['cancel_event'].set()
+                self._finish_videos(aborted=True)
+        except Exception as error:
+            with self._state_lock:
+                self.error = str(error)
+                self._finish_videos(aborted=True)
+        finally:
+            with self._state_lock:
+                release_frame_run(self.project_dir, self.child_id)
+                save_task_to_disk(self.child_id)
+                self.worker_done.set()
+            set_log_context(None)
+            set_project_key_context(None)
+
+    def _take_due_retries(self):
+        if not self.retry_due:
+            return None
+        now = time.monotonic()
+        with self._state_lock:
+            due = sorted(slot for slot, at in self.retry_due.items() if at <= now)
+            if not due:
+                return None
+            for slot in due:
+                self.retry_due.pop(slot, None)
+            delivered = delivered_slots(read_manifest(self.project_dir) or {}, self.project_dir)
+            # A revised slot was released from ``processed``; advance() re-queues it.
+            due = [slot for slot in due if slot in self.processed and slot in self.selected
+                   and slot not in self.blocked and slot not in delivered]
+        return due or None
+
+    def _schedule_retries(self, submitted, manifest):
+        if self.config.get('videoContinuousGeneration') is not True:
+            return
+        delivered = delivered_slots(manifest, self.project_dir)
+        limit = max_slot_attempts(self.config)
+        now = time.monotonic()
+        exhausted = []
+        with self._state_lock:
+            for slot in submitted:
+                if slot in delivered or slot in self.blocked or slot not in self.processed:
+                    self.retry_due.pop(slot, None)
+                    continue
+                count = self.attempt_counts.get(slot, 0)
+                if count >= limit:
+                    exhausted.append(slot)
+                    self.retry_due.pop(slot, None)
+                    continue
+                delay = VIDEO_RETRY_DELAYS[min(max(count, 1) - 1, len(VIDEO_RETRY_DELAYS) - 1)]
+                self.retry_due[slot] = now + delay
+            if exhausted:
+                message = exhausted_message(exhausted, self.attempt_counts, manifest)
+                for slot in exhausted:
+                    self.blocked[slot] = exhausted_message([slot], self.attempt_counts, manifest)
+                self._record('started', message)
+            waiting = sorted(self.retry_due)
+            soonest = min(self.retry_due.values(), default=now)
+        if waiting:
+            seconds = max(0, round(soonest - now))
+            self._video_progress('video_recovery', {
+                'phase': 'waiting', 'slots': waiting, 'retry_round': 0,
+                'next_retry_at': time.time() + seconds, 'completed_slots': [],
+                'message': '、'.join(f'视频 {slot}' for slot in waiting)
+                           + f' 未成功，约 {seconds} 秒后自动重试，其余片段继续生成'})
+
+    def _merge_result(self, result):
+        if result is not None:
+            latest = read_manifest(self.project_dir) or {}
+            result.update({key: latest[key] for key in ('auto_generate_videos', 'video_frame_pairing',
+                'auto_generate_videos_preference_explicit', 'auto_video', 'videos', 'video_generation_stats',
+                'merged_video', 'prompt_block', 'prompt_slots') if key in latest})
+        return result
+
+    def finish(self, result=None, aborted=False):
+        with self._state_lock:
+            if self.closed:
+                return self._merge_result(result)
+            if self.enabled and not aborted:
+                self._advance_ready()
+            self.closed = True
+            self._aborted = aborted
+            if self.child and self.parent['cancel_event'].is_set():
+                self.child['cancel_event'].set()
+            if self.worker_thread is not None:
+                if not self.worker_done.is_set():
+                    holder = transfer_frame_run(self.project_dir, self.parent_id, self.child_id)
+                    if holder:
+                        self.error = '项目生成占位转交失败，自动视频已停止。'
+                        self.child['cancel_event'].set()
+                    self._queue.put(None)
+                return self._merge_result(result)
+            try:
+                return self._finish_videos(result, aborted)
+            finally:
+                self.worker_done.set()
+
+    def _finish_videos(self, result=None, aborted=False):
+        if self.worker_thread is threading.current_thread() and not self._accounting_finished:
+            from prompt_pipeline import stop_and_get_accounting
+            self._video_usage = stop_and_get_accounting()
+            self._accounting_finished = True
+        if not self.enabled:
+            if self.explicit:
+                with manifest_lock(self.project_dir):
+                    manifest = read_manifest(self.project_dir) or dict(result or {})
+                    manifest['auto_generate_videos'] = False
+                    if self.preference_explicit is not None:
+                        manifest['auto_generate_videos_preference_explicit'] = self.preference_explicit
+                    manifest.pop('auto_video', None)
+                    write_manifest(self.project_dir, manifest)
+                if result is not None:
+                    result.update(auto_generate_videos=False)
+                    if self.preference_explicit is not None:
+                        result['auto_generate_videos_preference_explicit'] = self.preference_explicit
+                    result.pop('auto_video', None)
+            self.closed = True
+            return result
+        try:
+            cancelled = self.parent['cancel_event'].is_set() or bool(
+                self.child and self.child['cancel_event'].is_set())
+            unresolved = set(self.selected) - self.processed
+            if cancelled:
+                self._record('cancelled', '用户取消了自动视频生成', emit=False)
+            if self.child and self.child.get('status') == 'running':
+                if cancelled or self.error:
+                    self.child.update(status='cancelled' if cancelled else 'failed',
+                                      error='用户取消了自动视频生成' if cancelled else self.error)
+                    self.child['events'].append(('error', {'message': self.child['error']}))
+                    notify_listeners(self.child_id, 'error', {'message': self.child['error']})
+                    self._record('cancelled' if cancelled else 'blocked', self.child['error'], emit=False)
+                else:
+                    with manifest_lock(self.project_dir):
+                        latest = read_manifest(self.project_dir) or dict(result or {})
+                        stats = latest.setdefault('video_generation_stats', {})
+                        stats['last_run'] = {**(stats.get('last_run') or {}),
+                            'failed_slots': sorted(self.failed_slots | unresolved | set(self.blocked)
+                                                   | (set(self.selected) if aborted else set())),
+                            'cancelled_slots': sorted(self.cancelled_slots),
+                            'planned_slots': len(self.selected)}
+                        write_manifest(self.project_dir, latest)
+                    self.prompt_block = latest.get('prompt_block') or self.prompt_block
+                    latest = _finish_video_generation(latest, self.config, self.title, self.prompt_block,
+                        self._video_progress, self.child['cancel_event'].is_set)
+                    if unresolved or self.blocked or aborted:
+                        latest.update(completion_state='partial_failed', has_failures=True)
+                    state = latest.get('completion_state', 'completed')
+                    self._record(state, '逐段视频生成已结束。' + ''.join(
+                        f'{reason}。' for reason in dict.fromkeys(self.blocked.values())))
+                    latest['auto_video'] = self.info
+                    if self._video_usage:
+                        latest['token_usage'] = self._video_usage
+                    with ACTIVE_TASKS_LOCK:
+                        if self.child['cancel_event'].is_set() or self.child['status'] != 'running':
+                            raise GenerationCancelled('Generation cancelled by user')
+                        self.child.update(status='completed', outcome=state, result=latest)
+                        self.child['events'].append(('result', latest))
+                    notify_listeners(self.child_id, 'result', latest)
+            elif not self.child_id:
+                state = 'skipped' if not self.selected else ('blocked' if unresolved or self.blocked or self.error else 'completed')
+                reasons = list(self.blocked.values())
+                if unresolved:
+                    reasons.append('以下视频首尾帧尚未就绪或未通过检查：' + '、'.join(map(str, sorted(unresolved))))
+                self._record(state, self.error or '；'.join(reasons) or
+                    ('没有可生成的视频提示词。' if not self.selected else '已有视频均可复用。'), emit=not aborted)
+        except ConnectionError:
+            if self.child:
+                self.child.update(status='cancelled', error='用户取消了自动视频生成')
+                self.child['events'].append(('error', {'message': self.child['error']}))
+                notify_listeners(self.child_id, 'error', {'message': self.child['error']})
+            self._record('cancelled', '用户取消了自动视频生成', emit=False)
+            raise
+        except Exception as error:
+            if self.child:
+                with ACTIVE_TASKS_LOCK:
+                    self.child.update(status='failed', error=str(error))
+                    self.child['events'].append(('error', {'message': str(error)}))
+            try:
+                self._record('blocked', f'自动视频收尾失败：{error}', emit=not aborted)
+            finally:
+                if self.child:
+                    # A terminal error must close the child SSE, including
+                    # unexpected encoding/manifest failures after images end.
+                    notify_listeners(self.child_id, 'error', {'message': str(error)})
+        finally:
+            self.closed = True
+            if self.child_id:
+                release_frame_run(self.project_dir, self.child_id)
+                save_task_to_disk(self.child_id)
+        return self._merge_result(result)
+
+
+
 def generate_frames_worker(task_id, config, title, prompt_block, target_sequences):
     t = get_or_create_task(task_id)
+    auto_video = None
     set_project_key_context(config.get('_project_key') if isinstance(config, dict) else None)
     # 之后本线程里所有 log() 调用自动带上 [task=task_id]，日志面板可以按任务过滤
     # （见 server_common.log 的说明），不用在每一处调用手动传 task_id。
@@ -1488,6 +2166,11 @@ def generate_frames_worker(task_id, config, title, prompt_block, target_sequence
             with ACTIVE_TASKS_LOCK:
                 t["events"].append((stage, details))
             notify_listeners(task_id, stage, details)
+            if stage == 'frame_ready' and auto_video:
+                auto_video.advance(details)
+
+        auto_video = _ProgressiveAutoVideo(task_id, t, config, title, prompt_block,
+                                          progress_cb, target_sequences)
 
         # 上游失败即时广播：每次尝试失败立刻推 SSE 'upstream_retry'，
         # 前端不再在后台重试退避链（最长分钟级）里干等着看"生成中"
@@ -1501,12 +2184,11 @@ def generate_frames_worker(task_id, config, title, prompt_block, target_sequence
         # （重）试前都会探测这个回调，取消能在下一次尝试前就生效。
         set_cancel_check_sink(lambda: t["cancel_event"].is_set())
         try:
-            # google_fx 后端共享同一个 AdsPower 浏览器、外部脚本的运行锁，以及
-            # builtins.google_fx_cancelled 这个 SPARK 内部旗标：必须与视频生成互斥，
-            # 否则新任务开跑时重置旗标/抢浏览器，会把另一个在跑的 FX 任务搅乱
-            # （跨任务串片事故的同族问题）。请求 ID 由队列上下文绑定到当前任务，
-            # 取消端点只撤销对应任务，不再影响队列中的其他任务。
+            # Keep the image browser lease throughout the run. Its video child
+            # gets a separate lease/account and queues independently when shared
+            # browser capacity is unavailable; images never await that queue.
             with _fx_serial_lock_for(config, task_id, 'frames', t['cancel_event']):
+                auto_video.advance()
                 if target_sequences is None:
                     # 整单渲染走编排层（渲染期不做任何审查，见 pipeline_orchestrator
                     # 模块头）；单帧/子集重试走 generate_frame_sequence 直调路径。
@@ -1526,8 +2208,10 @@ def generate_frames_worker(task_id, config, title, prompt_block, target_sequence
         usage = stop_and_get_accounting()
         if usage:
             result['token_usage'] = usage
-            
+        result = auto_video.finish(result)
         with ACTIVE_TASKS_LOCK:
+            if t['cancel_event'].is_set() or t['status'] != 'running':
+                raise GenerationCancelled('Generation cancelled by user')
             t["status"] = "completed"
             t["result"] = result
             t["events"].append(('result', result))
@@ -1554,6 +2238,13 @@ def generate_frames_worker(task_id, config, title, prompt_block, target_sequence
         notify_listeners(task_id, 'error', {'message': str(e)})
         log('ERROR', 'FRAMES', f"帧序列任务失败: {e}", title=title)
     finally:
+        if auto_video and not auto_video.closed:
+            try:
+                auto_video.finish(aborted=True)
+            except ConnectionError:
+                pass
+            except Exception as error:
+                log('ERROR', 'FRAMES', f'自动视频收尾失败: {error}', title=title)
         release_frame_run(_get_project_dir(title), task_id)
         save_task_to_disk(task_id)
         set_log_context(None)
@@ -1564,6 +2255,7 @@ def generate_frames_selection_worker(task_id, config, title, prompt_block, targe
     """4选1 AI鉴别迭代生成后台工作线程：每帧生成4张候选图，多模态AI模型鉴别并选出最佳一张，
     落盘并作为下一帧的参考图，依次类推。"""
     t = get_or_create_task(task_id)
+    auto_video = None
     set_project_key_context(config.get('_project_key') if isinstance(config, dict) else None)
     set_log_context(task_id)
     log('INFO', 'FRAMES_SEL', f"开始帧序列 4选1 智能生成任务 {'（整单）' if target_sequences is None else f'（子集 {target_sequences}）'}", title=title)
@@ -1578,6 +2270,11 @@ def generate_frames_selection_worker(task_id, config, title, prompt_block, targe
             with ACTIVE_TASKS_LOCK:
                 t["events"].append((stage, details))
             notify_listeners(task_id, stage, details)
+            if stage == 'frame_ready' and auto_video:
+                auto_video.advance(details)
+
+        auto_video = _ProgressiveAutoVideo(task_id, t, config, title, prompt_block,
+                                          progress_cb, target_sequences)
 
         from frame_generator import set_upstream_event_sink, set_cancel_check_sink
         set_upstream_event_sink(lambda ev: progress_cb('upstream_retry', ev))
@@ -1585,6 +2282,7 @@ def generate_frames_selection_worker(task_id, config, title, prompt_block, targe
         try:
             from candidate_selection_pipeline import run_candidate_selection_frame_sequence
             with _fx_serial_lock_for(config, task_id, 'frames_selection', t['cancel_event']):
+                auto_video.advance()
                 result = run_candidate_selection_frame_sequence(
                     config, title, prompt_block,
                     on_progress=progress_cb,
@@ -1597,8 +2295,10 @@ def generate_frames_selection_worker(task_id, config, title, prompt_block, targe
         usage = stop_and_get_accounting()
         if usage:
             result['token_usage'] = usage
-            
+        result = auto_video.finish(result)
         with ACTIVE_TASKS_LOCK:
+            if t['cancel_event'].is_set() or t['status'] != 'running':
+                raise GenerationCancelled('Generation cancelled by user')
             t["status"] = "completed"
             t["result"] = result
             t["events"].append(('result', result))
@@ -1624,6 +2324,13 @@ def generate_frames_selection_worker(task_id, config, title, prompt_block, targe
         notify_listeners(task_id, 'error', {'message': str(e)})
         log('ERROR', 'FRAMES_SEL', f"帧序列 4选1 任务失败: {e}", title=title)
     finally:
+        if auto_video and not auto_video.closed:
+            try:
+                auto_video.finish(aborted=True)
+            except ConnectionError:
+                pass
+            except Exception as error:
+                log('ERROR', 'FRAMES_SEL', f'自动视频收尾失败: {error}', title=title)
         release_frame_run(_get_project_dir(title), task_id)
         save_task_to_disk(task_id)
         set_log_context(None)
@@ -1796,13 +2503,7 @@ def render_staged_worker(task_id, config, title, prompt_block):
         start_accounting()
 
         def progress_cb(stage, details):
-            if stage == 'cancel_check':
-                return t["cancel_event"].is_set()
-            if t["cancel_event"].is_set():
-                raise GenerationCancelled("Generation cancelled by user")
-            with ACTIVE_TASKS_LOCK:
-                t["events"].append((stage, details))
-            notify_listeners(task_id, stage, details)
+            return _video_progress(task_id, t, stage, details)
 
         from pipeline_orchestrator import run_staged_frame_rendering
         from frame_generator import set_cancel_check_sink
@@ -1811,8 +2512,9 @@ def render_staged_worker(task_id, config, title, prompt_block):
         set_cancel_check_sink(lambda: t["cancel_event"].is_set())
         try:
             # 分步渲染尾段总会驱动 FX 视频生成：全程持有 FX 串行锁
-            with _fx_browser_slot(task_id, 'staged_render', t['cancel_event']):
-                result = run_staged_frame_rendering(config, title, prompt_block, on_progress=progress_cb)
+            with _pipeline_generation_slot(config, task_id, 'staged_render', t['cancel_event']):
+                result = run_staged_frame_rendering(_pipeline_first_pass_config(config), title, prompt_block, on_progress=progress_cb)
+            result = _continue_pipeline_videos(task_id, config, result, progress_cb, t['cancel_event'])
         finally:
             set_cancel_check_sink(None)
 
@@ -1821,7 +2523,11 @@ def render_staged_worker(task_id, config, title, prompt_block):
             result['token_usage'] = usage
 
         with ACTIVE_TASKS_LOCK:
+            if t['cancel_event'].is_set() or t['status'] != 'running':
+                raise GenerationCancelled('Generation cancelled by user')
             t["status"] = "completed"
+            if result.get('completion_state'):
+                t['outcome'] = result['completion_state']
             t["result"] = result
             t["events"].append(('result', result))
         notify_listeners(task_id, 'result', result)
@@ -1839,13 +2545,18 @@ def render_staged_worker(task_id, config, title, prompt_block):
         log('WARN', 'STAGED', "分步渲染任务已被用户取消", title=title)
     except Exception as e:
         log_exception('STAGED')
+        finalized = False
         with ACTIVE_TASKS_LOCK:
-            t["status"] = "failed"
-            t["error"] = str(e)
-            t["events"].append(('error', {'message': str(e)}))
-        notify_listeners(task_id, 'error', {'message': str(e)})
+            if t['status'] == 'running':
+                t['status'] = 'cancelled' if t['cancel_event'].is_set() else 'failed'
+                t['error'] = '用户取消了生成任务' if t['cancel_event'].is_set() else str(e)
+                t['events'].append(('error', {'message': t['error']}))
+                finalized = True
+        if finalized:
+            notify_listeners(task_id, 'error', {'message': t['error']})
         log('ERROR', 'STAGED', f"分步渲染任务失败: {e}", title=title)
     finally:
+        _release_flow_project_run(config, task_id)
         release_frame_run(_get_project_dir(title), task_id)
         save_task_to_disk(task_id)
         set_log_context(None)
@@ -1853,8 +2564,7 @@ def render_staged_worker(task_id, config, title, prompt_block):
 
 
 def stepped_pipeline_start_worker(task_id, config, dimensions):
-    """Starts the stepped pipeline: compose Phase 1 → render anchor → pause at review_anchor.
-    The pipeline is then advanced via stepped_pipeline_advance_worker calls."""
+    """Run all generation stages without the retired review pauses."""
     t = get_or_create_task(task_id, dimensions)
     set_project_key_context(config.get('_project_key') if isinstance(config, dict) else None)
     set_log_context(task_id)
@@ -1864,27 +2574,23 @@ def stepped_pipeline_start_worker(task_id, config, dimensions):
         start_accounting()
 
         def progress_cb(stage, details):
-            if stage == 'cancel_check':
-                return t["cancel_event"].is_set()
-            if t["cancel_event"].is_set():
-                raise GenerationCancelled("Generation cancelled by user")
-            with ACTIVE_TASKS_LOCK:
-                t["events"].append((stage, details))
-            notify_listeners(task_id, stage, details)
+            return _video_progress(task_id, t, stage, details)
 
         from stepped_pipeline import start_stepped_pipeline
         from frame_generator import set_cancel_check_sink
         set_cancel_check_sink(lambda: t["cancel_event"].is_set())
         try:
-            with _fx_browser_slot(task_id, 'stepped', t['cancel_event']):
-                pipeline_state = start_stepped_pipeline(config, dimensions, on_progress=progress_cb)
+            with _pipeline_generation_slot(config, task_id, 'stepped', t['cancel_event']):
+                pipeline_state = start_stepped_pipeline(_pipeline_first_pass_config(config), dimensions, on_progress=progress_cb)
+            pipeline_state = _continue_pipeline_videos(task_id, config, pipeline_state, progress_cb, t['cancel_event'])
         finally:
             set_cancel_check_sink(None)
 
         usage = stop_and_get_accounting()
 
+        status = 'partial_failed' if pipeline_state.get('has_failures') else 'completed'
         result = {
-            'status': 'paused',
+            'status': status,
             'stage': pipeline_state.get('stage'),
             'title': pipeline_state.get('title'),
             'pipeline_state': pipeline_state,
@@ -1893,12 +2599,14 @@ def stepped_pipeline_start_worker(task_id, config, dimensions):
             result['token_usage'] = usage
 
         with ACTIVE_TASKS_LOCK:
-            # "paused" — 不是 completed 也不是 failed：管线暂停等用户审核
-            t["status"] = "paused"
+            if t['cancel_event'].is_set() or t['status'] != 'running':
+                raise GenerationCancelled('Generation cancelled by user')
+            # 生成终态；质量审查停点已退役。
+            t["status"] = status
             t["result"] = result
-            t["events"].append(('stepped_paused', result))
-        notify_listeners(task_id, 'stepped_paused', result)
-        log('INFO', 'STEPPED', f"分步管线暂停于 {pipeline_state.get('stage')}", title=pipeline_state.get('title'))
+            t["events"].append(('result', result))
+        notify_listeners(task_id, 'result', result)
+        log('INFO', 'STEPPED', f"分步管线完成于 {pipeline_state.get('stage')}", title=pipeline_state.get('title'))
     except ConnectionError:
         finalize = False
         with ACTIVE_TASKS_LOCK:
@@ -1912,13 +2620,18 @@ def stepped_pipeline_start_worker(task_id, config, dimensions):
         log('WARN', 'STEPPED', "分步管线任务已被用户取消")
     except Exception as e:
         log_exception('STEPPED')
+        finalized = False
         with ACTIVE_TASKS_LOCK:
-            t["status"] = "failed"
-            t["error"] = str(e)
-            t["events"].append(('error', {'message': str(e)}))
-        notify_listeners(task_id, 'error', {'message': str(e)})
+            if t['status'] == 'running':
+                t['status'] = 'cancelled' if t['cancel_event'].is_set() else 'failed'
+                t['error'] = '用户取消了生成任务' if t['cancel_event'].is_set() else str(e)
+                t['events'].append(('error', {'message': t['error']}))
+                finalized = True
+        if finalized:
+            notify_listeners(task_id, 'error', {'message': t['error']})
         log('ERROR', 'STEPPED', f"分步管线任务失败: {e}")
     finally:
+        _release_flow_project_run(config, task_id)
         save_task_to_disk(task_id)
         set_log_context(None)
         set_project_key_context(None)
@@ -1935,20 +2648,16 @@ def stepped_pipeline_advance_worker(task_id, config, title, action):
         start_accounting()
 
         def progress_cb(stage, details):
-            if stage == 'cancel_check':
-                return t["cancel_event"].is_set()
-            if t["cancel_event"].is_set():
-                raise GenerationCancelled("Generation cancelled by user")
-            with ACTIVE_TASKS_LOCK:
-                t["events"].append((stage, details))
-            notify_listeners(task_id, stage, details)
+            return _video_progress(task_id, t, stage, details)
 
         from stepped_pipeline import advance_stepped_pipeline
         from frame_generator import set_cancel_check_sink
         set_cancel_check_sink(lambda: t["cancel_event"].is_set())
         try:
-            with _fx_browser_slot(task_id, 'stepped', t['cancel_event']):
-                pipeline_state = advance_stepped_pipeline(title, action=action, on_progress=progress_cb, config=config)
+            with _pipeline_generation_slot(config, task_id, 'stepped', t['cancel_event']):
+                pipeline_state = advance_stepped_pipeline(title, action=action, on_progress=progress_cb,
+                                                         config=_pipeline_first_pass_config(config))
+            pipeline_state = _continue_pipeline_videos(task_id, config, pipeline_state, progress_cb, t['cancel_event'])
         finally:
             set_cancel_check_sink(None)
 
@@ -1963,6 +2672,11 @@ def stepped_pipeline_advance_worker(task_id, config, title, action):
             'title': title,
             'pipeline_state': pipeline_state,
         }
+        for key in ('completion_state', 'has_failures', 'has_quality_warnings'):
+            if key in pipeline_state:
+                result[key] = pipeline_state[key]
+        if result.get('has_failures'):
+            result['status'] = 'partial_failed'
         if usage:
             result['token_usage'] = usage
         if is_completed and pipeline_state.get('prompt_block'):
@@ -1971,8 +2685,12 @@ def stepped_pipeline_advance_worker(task_id, config, title, action):
             result['prompt_slots'] = prompt_slots_list(pipeline_state['prompt_block'])
 
         with ACTIVE_TASKS_LOCK:
+            if t['cancel_event'].is_set() or t['status'] != 'running':
+                raise GenerationCancelled('Generation cancelled by user')
             t["status"] = "completed" if is_completed else ("paused" if is_paused else "running")
             t["result"] = result
+            if result.get('completion_state'):
+                t['outcome'] = result['completion_state']
             event_name = 'result' if is_completed else 'stepped_paused'
             t["events"].append((event_name, result))
         notify_listeners(task_id, event_name, result)
@@ -1990,13 +2708,18 @@ def stepped_pipeline_advance_worker(task_id, config, title, action):
         log('WARN', 'STEPPED', "分步管线推进已被用户取消", title=title)
     except Exception as e:
         log_exception('STEPPED')
+        finalized = False
         with ACTIVE_TASKS_LOCK:
-            t["status"] = "failed"
-            t["error"] = str(e)
-            t["events"].append(('error', {'message': str(e)}))
-        notify_listeners(task_id, 'error', {'message': str(e)})
+            if t['status'] == 'running':
+                t['status'] = 'cancelled' if t['cancel_event'].is_set() else 'failed'
+                t['error'] = '用户取消了生成任务' if t['cancel_event'].is_set() else str(e)
+                t['events'].append(('error', {'message': t['error']}))
+                finalized = True
+        if finalized:
+            notify_listeners(task_id, 'error', {'message': t['error']})
         log('ERROR', 'STEPPED', f"分步管线推进失败: {e}", title=title)
     finally:
+        _release_flow_project_run(config, task_id)
         save_task_to_disk(task_id)
         set_log_context(None)
         set_project_key_context(None)
@@ -2080,7 +2803,9 @@ def _fx_browser_slot(task_id, kind, cancel_event=None, priority=0, cancel_check=
         with FX_CONTROL.slot(task_id, kind, cancel_check=cancel_check,
                              priority=priority, account_pin=account_pin,
                              project_key=meta['project_key'], stage=meta['stage'],
-                             want_account=want_account):
+                             want_account=want_account,
+                             parallel_parent_task_id=(dims.get('parent_frame_task_id')
+                                 if kind == 'videos' and dims.get('progressive') is True else None)):
             # 并发（N>1）时兜底串行锁必须让路，否则它会把第二个任务挡成 10s 超时报错；
             # 互斥改由租约的准入条件保证。N=1 时保持原样。
             guard = (contextlib.nullcontext() if already_inside or FX_CONTROL.max_concurrent() > 1 else
@@ -2111,6 +2836,95 @@ def _fx_serial_lock_for(config, task_id=None, kind='frames', cancel_event=None):
         # 无任务上下文的调用方也必须进队列，否则就是 S1 里那条绕过队列的裸锁路径。
         task_id = f'anon_{kind}_{int(time.time() * 1000)}'
     return _fx_browser_slot(task_id, kind, cancel_event)
+
+
+def _video_generation_slot(config, task_id, cancel_event):
+    if (config or {}).get('videoProvider') == 'flow2api':
+        return contextlib.nullcontext()
+    return _fx_browser_slot(task_id, 'videos', cancel_event)
+
+
+def _pipeline_uses_fx(config):
+    return ((config or {}).get('imageBackend') == 'google_fx'
+            or (config or {}).get('videoProvider') != 'flow2api')
+
+
+def _pipeline_generation_slot(config, task_id, kind, cancel_event):
+    if not _pipeline_uses_fx(config):
+        return contextlib.nullcontext()
+    return _fx_browser_slot(task_id, kind, cancel_event)
+
+
+def _pipeline_first_pass_config(config):
+    # Frame rendering still owns its existing browser scope. Defer the entire
+    # video phase so its first submission and later waits share the same guards.
+    if (config or {}).get('videoContinuousGeneration') is True and _pipeline_uses_fx(config):
+        return {**config, '_defer_video_to_worker': True}
+    return config
+
+
+def _continue_pipeline_videos(task_id, config, result, progress_cb, cancel_event):
+    if (config or {}).get('videoContinuousGeneration') is not True or not isinstance(result, dict):
+        return result
+    video_key = 'video_result' if isinstance(result.get('video_result'), dict) else 'videos'
+    first_pass = result.get(video_key)
+    block = result.get('prompt_block')
+    if not isinstance(first_pass, dict) or not block:
+        return result
+    title = result.get('title') or (ACTIVE_TASKS.get(task_id, {}).get('dimensions') or {}).get('theme')
+    if not title:
+        raise ValueError('持续视频恢复缺少项目标题')
+
+    def generate_round(*args, **kwargs):
+        with _video_generation_slot(config, task_id, cancel_event):
+            return generate_video_sequence(*args, **kwargs)
+
+    recovered = execute_video_generation_with_recovery(config, title, block,
+        on_progress=progress_cb, generate_fn=generate_round, recovery_only=not _pipeline_uses_fx(config),
+        project_dir=result.get('project_dir') or _get_project_dir(title))
+    recovered = _finish_video_generation(recovered, config, title, block, progress_cb, cancel_event.is_set)
+    result[video_key] = recovered
+    result.update({key: recovered[key] for key in
+        ('completion_state', 'has_failures', 'has_quality_warnings', 'merged_video') if key in recovered})
+    if result.get('status') in ('completed', 'partial_failed'):
+        result['status'] = 'partial_failed' if result['has_failures'] else 'completed'
+    if video_key == 'video_result' and result.get('stage') in ('completed', 'render_videos'):
+        result['stage'] = 'completed'
+        from stepped_pipeline import _save_state
+        _save_state(title, result)
+        progress_cb('stepped_stage', {'stage': 'completed',
+            'completion_state': result['completion_state'], 'has_failures': result['has_failures'],
+            'message': '视频已全部完成并合并。' if not result['has_failures'] else '视频已完成，合并失败。'})
+    return result
+
+
+def _claim_flow_project_run(config, task_id, project_key):
+    """Keep one mutable manifest snapshot per project until its worker exits."""
+    recovery_holder = _video_recovery_project_holder(project_key)
+    if recovery_holder:
+        return recovery_holder
+    if (config or {}).get('videoProvider') != 'flow2api' or not project_key:
+        return None
+    project_dir = _get_project_dir(project_key)
+    holder = claim_frame_run(project_dir, task_id, until_released=True)
+    if not holder:
+        config['_flow_project_claim'] = project_dir
+    return holder
+
+
+def _video_recovery_project_holder(project_key):
+    if not project_key:
+        return None
+    key = os.path.normcase(os.path.abspath(_get_project_dir(project_key)))
+    with server_common._ACTIVE_FRAME_RUNS_LOCK:
+        holder = server_common._ACTIVE_FRAME_RUNS.get(key)
+        return holder if holder and holder.startswith('video_recovery_') else None
+
+
+def _release_flow_project_run(config, task_id):
+    project_dir = (config or {}).get('_flow_project_claim')
+    if project_dir:
+        release_frame_run(project_dir, task_id)
 
 
 # ── FX 运行时装配（2026-07-26）────────────────────────────────────────────────
@@ -2291,6 +3105,15 @@ def _fx_selector_drift_watchdog():
         time.sleep(interval)
 
 
+def _cancel_auto_video_children(parent_task_id, reason='用户取消了自动视频生成', actor='local'):
+    with ACTIVE_TASKS_LOCK:
+        children = [task_id for task_id, task in ACTIVE_TASKS.items()
+                    if task.get('status') == 'running'
+                    and (task.get('dimensions') or {}).get('parent_frame_task_id') == parent_task_id]
+    for child_id in children:
+        _cancel_fx_task(child_id, reason, actor)
+
+
 def _cancel_fx_task(task_id, reason, actor='local'):
     """给一个 FX 任务发取消信号并立即终态化（浏览器保持开启）。
 
@@ -2311,6 +3134,7 @@ def _cancel_fx_task(task_id, reason, actor='local'):
     if finalized:
         notify_listeners(task_id, 'error', {'message': reason})
         save_task_to_disk(task_id)
+    _cancel_auto_video_children(task_id, reason, actor)
     hit = False
     try:
         hit = bool(get_fx_cancel_flag().cancel_request(task_id))
@@ -2364,6 +3188,22 @@ def _fx_timeout_watchdog():
 
 def bootstrap_fx_runtime():
     """启动时装配 FX 运行时的宿主钩子。幂等，测试里也可以直接调。"""
+    admission_root = '/Users/fly/flow2api'
+    admission_bridge = os.path.join(admission_root, 'local/account_admission_bridge.py')
+    if os.path.isdir(admission_root):
+        try:
+            if not os.path.isfile(admission_bridge):
+                raise FileNotFoundError()
+            import importlib.util
+            spec = importlib.util.spec_from_file_location('_spark_flow_account_admission', admission_bridge)
+            bridge = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(bridge)
+            FX_CONTROL.account_admission_factory = bridge.profile_generation_lease
+        except Exception:
+            def admission_unavailable(_profile_id):
+                raise RuntimeError('busy_state_unknown')
+            FX_CONTROL.account_admission_factory = admission_unavailable
+            log('WARN', 'FX', '账号凭证维护锁初始化失败，浏览器账号使用已安全暂停: busy_state_unknown')
     try:
         from integrations.google_fx.utils import browser_gate, account_binding
         browser_gate.install(_fx_browser_gate)
@@ -2413,15 +3253,34 @@ def _video_operation_response(operation):
 def _video_progress(task_id, task, stage, details):
     if stage == 'cancel_check':
         return task['cancel_event'].is_set()
+    dimensions = task.get('dimensions') or {}
+    receipt_scope = {}
+    project_key = dimensions.get('project_key') or dimensions.get('theme')
+    if project_key:
+        receipt_scope['project_key'] = _safe_project_name(project_key)
+    if dimensions.get('video_provider'):
+        receipt_scope['provider'] = dimensions['video_provider']
+    if dimensions.get('request_id'):
+        receipt_scope['request_id'] = dimensions['request_id']
     # A receipt must survive cancellation arriving just after the remote click.
-    if stage == 'request_submitted':
-        _VIDEO_OPERATIONS.record_submission(task_id, details)
+    if stage in ('request_submitting', 'request_submitted', 'request_accepted', 'request_resolved'):
+        _VIDEO_OPERATIONS.record_submission(task_id, {**details, **receipt_scope})
+    elif stage in ('video_done', 'video_error'):
+        receipt = ((details.get('video') or {}).get('last_attempt')
+                   if stage == 'video_done' else details.get('last_attempt')) or {}
+        if receipt.get('submission_id'):
+            _VIDEO_OPERATIONS.record_submission(task_id, {
+                **receipt, 'index': details.get('index'),
+                'current': details.get('current'), 'total': details.get('total'),
+                **receipt_scope,
+            })
     if task['cancel_event'].is_set():
         raise GenerationCancelled('Generation cancelled by user')
     with ACTIVE_TASKS_LOCK:
         task['events'].append((stage, details))
         task['last_worker_progress_at'] = time.time()
-    if stage in ('request_submitted', 'video_done', 'merge_done'):
+    if stage in ('request_submitting', 'request_submitted', 'request_accepted', 'request_resolved',
+                 'video_done', 'video_error', 'video_recovery', 'merge_done'):
         if not save_task_to_disk(task_id):
             raise RuntimeError('视频任务进度保存失败，已停止继续提交')
     notify_listeners(task_id, stage, details)
@@ -2496,13 +3355,13 @@ def generate_videos_worker(task_id, config, title, prompt_block, target_slots, o
         except Exception as opt_err:
             log('WARN', 'VIDEOS', f"视频提示词优化门跳过或异常（继续按原提示词生成）: {opt_err}", title=title)
 
-        with _fx_browser_slot(task_id, 'videos', t['cancel_event']):
-            result = generate_video_sequence(
-                config, title, prompt_block,
-                on_progress=progress_cb,
-                target_slots=target_slots,
-                override_flagged=override_flagged
-            )
+        def generate_round(*args, **kwargs):
+            with _video_generation_slot(config, task_id, t['cancel_event']):
+                return generate_video_sequence(*args, **kwargs)
+        result = execute_video_generation_with_recovery(config, title, prompt_block,
+            on_progress=progress_cb, target_slots=target_slots,
+            override_flagged=override_flagged, generate_fn=generate_round,
+            project_dir=_get_project_dir(title))
         usage = stop_and_get_accounting()
         if usage:
             result['token_usage'] = usage
@@ -2543,6 +3402,7 @@ def generate_videos_worker(task_id, config, title, prompt_block, target_slots, o
             notify_listeners(task_id, 'error', {'message': t['error']})
         log('ERROR', 'VIDEOS', f"视频任务失败: {e}", title=title)
     finally:
+        _release_flow_project_run(config, task_id)
         save_task_to_disk(task_id)
         set_log_context(None)
         set_project_key_context(None)
@@ -2561,14 +3421,13 @@ def generate_video_chain_worker(task_id, config, title, prompt_block, target_slo
 
         progress_cb('queue', {'message': '纯视频提示词链式生成请求已加入队列，正在等待排队生成...'})
 
-        with _fx_browser_slot(task_id, 'videos', t['cancel_event']):
-            result = generate_video_chain_sequence(
-                config, title, prompt_block,
-                on_progress=progress_cb,
-                target_slots=target_slots,
-                override_flagged=override_flagged,
-                auto_merge=False
-            )
+        def generate_round(*args, **kwargs):
+            with _video_generation_slot(config, task_id, t['cancel_event']):
+                return generate_video_chain_sequence(*args, **kwargs, auto_merge=False)
+        result = execute_video_generation_with_recovery(config, title, prompt_block,
+            on_progress=progress_cb, target_slots=target_slots,
+            override_flagged=override_flagged, generate_fn=generate_round,
+            project_dir=_get_project_dir(title), is_chain=True)
         usage = stop_and_get_accounting()
         if usage:
             result['token_usage'] = usage
@@ -2606,6 +3465,7 @@ def generate_video_chain_worker(task_id, config, title, prompt_block, target_slo
             notify_listeners(task_id, 'error', {'message': t['error']})
         log('ERROR', 'VIDEOS', f"纯视频链式生成任务失败: {e}", title=title)
     finally:
+        _release_flow_project_run(config, task_id)
         save_task_to_disk(task_id)
         set_log_context(None)
         set_project_key_context(None)
@@ -2896,6 +3756,18 @@ HTTPD_INSTANCE = None
 _AUTO_RELOAD_TRIGGERED = False
 
 
+def _beat_pack_busy():
+    """排队或运行中的提示词包生成任务（形如 beat_pack:<id>）。
+
+    重启和自动重载都会掐断进程里正在计费的模型调用，所以它们得像 ACTIVE_TASKS 里的运行中任务一样让路；
+    模块出任何问题都按"不忙"处理，不能让一个附属功能挡住整个服务的重启。"""
+    try:
+        import beat_pack
+        return [f'beat_pack:{job_id}' for job_id in beat_pack.running_job_ids()]
+    except Exception:
+        return []
+
+
 def restart_server_process():
     """优雅重启后端服务进程"""
     global _AUTO_RELOAD_TRIGGERED, HTTPD_INSTANCE
@@ -2945,14 +3817,22 @@ def _start_auto_reload_watcher():
                 active_running = False
                 with ACTIVE_TASKS_LOCK:
                     for t in ACTIVE_TASKS.values():
-                        if isinstance(t, dict) and t.get('status') == 'running':
+                        if (isinstance(t, dict)
+                                and (t.get('status') == 'running' or t.get('_cookie_login') is True)):
                             active_running = True
                             break
-                if active_running:
+                if active_running or _beat_pack_busy():
                     continue
 
                 time.sleep(1.0)
-                _AUTO_RELOAD_TRIGGERED = True
+                # A maintenance/login worker can start during the delay above.
+                # Serialize the final decision with its running-task registration.
+                with ACTIVE_TASKS_LOCK:
+                    if any(isinstance(t, dict)
+                           and (t.get('status') == 'running' or t.get('_cookie_login') is True)
+                           for t in ACTIVE_TASKS.values()) or _beat_pack_busy():
+                        continue
+                    _AUTO_RELOAD_TRIGGERED = True
                 if sys.stdout:
                     files_str = ', '.join(report.get('stale_files', [])[:3])
                     print(f"[AUTO-RELOAD] 检测到核心源文件更新 ({files_str})，正在自动重启服务...")
@@ -3071,22 +3951,15 @@ class SparkRequestHandler(StaticFilesMixin, SimpleHTTPRequestHandler):
     def end_headers(self):
         # Enable CORS for local development flexibility
         # Local Codex can execute tools: never expose its control API to other sites.
-        if not (self.path or '').startswith('/api/codex-video-editor/'):
+        # Beat-pack generation spends the user's model quota: same rule.
+        if not (self.path or '').startswith(('/api/codex-video-editor/', '/api/beat-pack/')):
             self.send_header('Access-Control-Allow-Origin', '*')
             self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
             self.send_header('Access-Control-Allow-Headers', 'Content-Type, Authorization, Range')
         self.send_header('Access-Control-Expose-Headers', 'Content-Range, Accept-Ranges, Content-Length')
-        # Never let browsers / Cloudflare serve stale front-end assets. This is what
-        # caused "multiple UI forms" (old cached HTML/CSS shown alongside the new one).
-        # no-store（而非 no-cache）：no-cache 只是要求每次都带条件请求去服务端"问一下"，
-        # 但那次协商行为本身是在响应第一次被缓存时就已经和浏览器约定好的——如果某个
-        # URL 是在这条 no-cache 规则生效之前就被缓存下来的（更早的部署/没有这个头的
-        # 历史版本），浏览器压根不会再发请求去验证，永远沿用旧缓存，导致"必须开无痕
-        # 才能看到最新改动"。no-store 直接禁止缓存这个响应本身，不存在"沿用旧协商结果"
-        # 这个坑，每次加载都是从磁盘整份重新拉取。
-        p = (self.path or '').split('?')[0]
-        if p.endswith(('.html', '.css', '.js')) or p.endswith('/'):
-            self.send_header('Cache-Control', 'no-store')
+        # HTML refreshes content versions on every load. Only public JS/CSS with
+        # the current content hash may be immutable; old URLs revalidate.
+        p = urllib.parse.unquote((self.path or '').split('?')[0]).lower()
         # 帧/视频文件名是确定性的（img_001.webp 等），生成前请求会先拿到 404——
         # 404 在 RFC 7231 里是浏览器默认可启发式缓存的状态码，Safari 对此尤其
         # 激进。不加这个头，浏览器可能把"还没生成"的 404 缓存下来，等真正生成
@@ -3102,16 +3975,27 @@ class SparkRequestHandler(StaticFilesMixin, SimpleHTTPRequestHandler):
             # 验证：未变走 304（只有头部往返，不重新下载，不会回到旧的重复全量
             # 下载问题），覆盖后立即拿新图，删除后立即 404。
             self.send_header('Cache-Control', 'no-cache')
+        elif p.endswith('.html') or p.endswith('/'):
+            self.send_header('Cache-Control', 'no-store')
+        elif p.endswith(('.js', '.css')):
+            policy = 'no-store' if p.startswith('/api/') else getattr(self, '_spark_static_cache_control', 'no-store')
+            self.send_header('Cache-Control', policy)
         super().end_headers()
 
     def _send_json(self, obj, status=200):
         body = json.dumps(obj, ensure_ascii=False).encode('utf-8')
+        headers = getattr(self, 'headers', {})
+        body, encoding = compress_response(body, headers.get('Accept-Encoding', ''))
         try:
             self.send_response(status)
             self.send_header('Content-type', 'application/json; charset=utf-8')
+            self.send_header('Vary', 'Accept-Encoding')
+            if encoding:
+                self.send_header('Content-Encoding', encoding)
             self.send_header('Content-Length', str(len(body)))
             self.end_headers()
-            self.wfile.write(body)
+            if getattr(self, 'command', 'GET') != 'HEAD':
+                self.wfile.write(body)
         except (ConnectionError, BrokenPipeError) as e:
             # 客户端在响应写回前就断了（慢接口上很常见：积分探测要几十秒，用户
             # 中途刷新页面）。这时候连"再回一个 500"都写不出去，只会让 do_POST 的
@@ -3239,6 +4123,7 @@ class SparkRequestHandler(StaticFilesMixin, SimpleHTTPRequestHandler):
                         source=body.get('source', ''), mode=body.get('mode', 'trim'),
                         notes=body.get('notes', ''), request_id=body.get('request_id', ''),
                         model=body.get('model'), reasoning_effort=body.get('reasoning_effort'),
+                        engine=body.get('engine'),
                     )
                 payload = {'job': job}
             else:
@@ -3252,6 +4137,126 @@ class SparkRequestHandler(StaticFilesMixin, SimpleHTTPRequestHandler):
         except Exception as exc:
             log('ERROR', 'Codex 精剪', str(exc))
             self._send_json({'message': '精剪服务暂时无法处理请求，请稍后重试'}, status=500)
+
+    def _handle_beat_pack(self, path, query=None):
+        """Claude 提示词包生成：创建/查看/取消/续跑任务，并把完成的包导入项目工作台。
+
+        只有文本模型调用（不执行任何本机工具），所以走普通访问码门禁；但它按量计费，
+        因此和 Codex 精剪一样不开放跨站：响应不带 CORS 头（见 end_headers），
+        写请求必须是 application/json，浏览器里的第三方页面发不出预检通过的请求。"""
+        import beat_pack
+        mutation = self.command == 'POST'
+        if not self._gate(with_rate=mutation and path in ('/api/beat-pack/jobs', '/api/beat-pack/resume'),
+                          rate_action='beat_pack'):
+            return
+        if mutation and self.headers.get('Content-Type', '').split(';', 1)[0].strip().lower() != 'application/json':
+            self._send_json({'message': '提示词包请求需要使用 JSON 格式'}, status=415)
+            return
+        query = query or {}
+
+        def arg(name):
+            return (query.get(name) or [''])[0]
+        try:
+            beat_pack.set_concurrency(SERVER_CONFIG.get('beatPackConcurrency', 1))
+            body = self._read_json_body() if mutation else {}
+            if not isinstance(body, dict):
+                self._send_json({'message': '提示词包请求格式不正确'}, status=400)
+                return
+            if path == '/api/beat-pack/capabilities':
+                payload = beat_pack.capabilities(effective_config(body.get('config')))
+            elif not mutation and path == '/api/beat-pack/jobs':
+                payload = {'jobs': beat_pack.list_jobs()}
+            elif not mutation and path == '/api/beat-pack/job':
+                payload = {'job': beat_pack.get_job(arg('id'))}
+            elif not mutation and path == '/api/beat-pack/prompt':
+                name = arg('name') or '完整提示词.txt'
+                payload = {'name': name, 'text': beat_pack.prompt_text(arg('id'), name)}
+            elif mutation and path == '/api/beat-pack/jobs':
+                payload = {'job': beat_pack.start(body, effective_config(body.get('config')), request_id=body.get('request_id', ''))}
+            elif mutation and path == '/api/beat-pack/cancel':
+                payload = {'job': beat_pack.cancel(body.get('id'))}
+            elif mutation and path == '/api/beat-pack/resume':
+                payload = {'job': beat_pack.resume(body.get('id'), effective_config(body.get('config')))}
+            elif mutation and path == '/api/beat-pack/import':
+                payload = {'job': beat_pack.import_job(body.get('id'), body.get('title'))}
+            else:
+                self._send_json({'message': '提示词包接口不存在'}, status=404)
+                return
+            self._send_json(payload)
+        except beat_pack.BeatPackError as exc:
+            self._send_json({'message': str(exc), 'code': exc.code}, status=exc.status)
+        except (ValueError, TypeError):
+            self._send_json({'message': '提示词包请求参数不正确'}, status=400)
+        except Exception as exc:
+            log('ERROR', '提示词包', str(exc))
+            self._send_json({'message': '提示词包服务暂时无法处理请求，请稍后重试'}, status=500)
+
+    def _reconcile_video_operation(self, body):
+        """Claim the project while checking/downloading original submissions."""
+        import uuid
+        from video_submission_recovery import reconcile_video_submissions
+        if not isinstance(body, dict):
+            raise ValueError('核对请求格式无效')
+        project_key = body.get('title')
+        slots = body.get('target_slots')
+        if not isinstance(project_key, str) or not project_key.strip():
+            raise ValueError('缺少项目标识')
+        if (not isinstance(slots, list) or not 1 <= len(slots) <= 20
+                or any(type(slot) is not int or slot <= 0 for slot in slots)):
+            raise ValueError('请指定 1 至 20 个要核对的视频槽位')
+        config = {**effective_config(None), 'videoProvider': 'flow2api'}
+        claim_id = 'video_recovery_' + uuid.uuid4().hex
+        key = _safe_project_name(project_key)
+        from project_archive import MUTATION_LOCK, archived_request
+        with MUTATION_LOCK, _VIDEO_OPERATION_LOCK:
+            if archived_request(body):
+                self._send_json({'status': 'error', 'failure_code': 'PROJECT_ARCHIVED',
+                    'message': '项目已归档，不能接回视频'}, status=409)
+                return
+            with ACTIVE_TASKS_LOCK:
+                live = next((tid for tid, task in ACTIVE_TASKS.items()
+                    if task.get('status') == 'running'
+                    and _safe_project_name((task.get('dimensions') or {}).get('project_key')
+                        or (task.get('dimensions') or {}).get('theme') or '') == key), None)
+            holder = live or _claim_flow_project_run(config, claim_id, project_key)
+            if holder:
+                self._send_json({'status': 'error', 'failure_code': 'PROJECT_BUSY',
+                    'message': '该项目仍有任务运行，请等原任务退出后核对', 'task_id': holder}, status=409)
+                return
+
+        def checkpoint(task_id, receipt, manifest):
+            with ACTIVE_TASKS_LOCK:
+                task = ACTIVE_TASKS.get(task_id)
+                if task is None:
+                    return
+                result = task.get('result')
+                if not isinstance(result, dict):
+                    result = task['result'] = {}
+                if isinstance(result, dict):
+                    result.update(manifest)
+                    by_slot = {v.get('slot'): v for v in manifest.get('videos', []) if isinstance(v, dict)}
+                    _, declared = _parse_prompt_slots(result.get('prompt_block') or manifest.get('prompt_block') or '')
+                    expected = set(declared) or set(by_slot)
+                    failed = any(slot not in by_slot
+                        or (by_slot[slot].get('last_attempt') or {}).get('submission_pending') is True
+                        or ((by_slot[slot].get('last_attempt') or {}).get('status', by_slot[slot].get('status')) != 'success'
+                            and by_slot[slot].get('status') not in ('skipped_cut', 'skipped_bridge_hold'))
+                        for slot in expected)
+                    result.update(has_failures=failed,
+                                  completion_state='partial_failed' if failed else 'completed')
+                task.setdefault('events', []).append(('submission_reconciled', {
+                    'index': receipt.get('slot'), 'submission_id': receipt.get('submission_id'),
+                    'operation_id': receipt.get('operation_id'),
+                    'submission_pending': receipt.get('submission_pending'),
+                    'recovery_state': receipt.get('recovery_state')}))
+            if not save_task_to_disk(task_id):
+                raise RuntimeError('原任务核对记录保存失败')
+        try:
+            response = reconcile_video_submissions(project_key, slots, config,
+                store=_VIDEO_OPERATIONS, on_checkpoint=checkpoint)
+            self._send_json(response)
+        finally:
+            _release_flow_project_run(config, claim_id)
 
     def _dispatch_video_operation(self, body, route):
         import uuid
@@ -3268,27 +4273,82 @@ class SparkRequestHandler(StaticFilesMixin, SimpleHTTPRequestHandler):
             if not rate_ok(_client_ip(self), 'videos'):
                 self._send_json({'error': '请求过于频繁，请稍后再试'}, status=429)
                 return
-            if not _require_fx_admission(self):
-                return
             config = effective_config(body.get('config'))
+            if 'videoFixedUserId' in body:
+                if config.get('videoProvider', 'google_fx') != 'google_fx':
+                    raise ValueError('固定 AdsPower 环境仅适用于 Google FX 视频通道')
+                fixed = server_common.validate_video_fixed_user_id(body['videoFixedUserId'])
+                config['videoFixedUserId'] = fixed
+                config['googleFxUserId'] = fixed
+            if config.get('videoProvider') != 'flow2api' and not _require_fx_admission(self):
+                return
             project_key = body.get('title', '')
             title = body.get('display_title') or project_key
             config['_project_key'] = project_key
             config['_merge_speed'] = body.get('merge_speed', 4)
+            project_dir = _get_project_dir(project_key or title)
+            manifest = read_manifest(project_dir) if project_dir else None
+            if (manifest or {}).get('video_frame_pairing') == 'auto' and 'videoFramePairing' not in config:
+                config['videoFramePairing'] = 'auto'
+            with ACTIVE_TASKS_LOCK:
+                pending_auto = next((tid for tid, task in ACTIVE_TASKS.items()
+                    if task.get('status') == 'running'
+                    and (task.get('dimensions') or {}).get('auto_generate_videos') is True
+                    and _safe_project_name((task.get('dimensions') or {}).get('project_key') or '')
+                        == _safe_project_name(project_key)), None)
+            if pending_auto:
+                self._send_json({'status': 'error', 'failure_code': 'PROJECT_BUSY',
+                    'message': '图片任务将自动接续生成视频，请等待原任务完成。',
+                    'task_id': pending_auto}, status=409)
+                return
             is_chain = route == '/api/generate_video_chain' or config.get('generation_channel') == 'video_chain'
             if not is_chain:
-                project_dir = _get_project_dir(project_key or title)
-                manifest = read_manifest(project_dir) if project_dir else None
                 is_chain = bool(manifest and manifest.get('generation_channel') == 'video_chain')
+            try:
+                ensure_video_submissions_resolved(project_key or title,
+                    video_submission_slots(body.get('prompt_block', ''), body.get('target_slots'), is_chain),
+                    manifest=manifest or {}, provider=config.get('videoProvider') or 'google_fx')
+            except VideoSubmissionPendingError as error:
+                pending = []
+                for item in error.pending:
+                    details = dict(item)
+                    task_id = item.get('task_id')
+                    receipts = _VIDEO_OPERATIONS.submissions(task_id) if task_id else []
+                    receipt = next((r for r in reversed(receipts)
+                                    if r.get('slot') == item['slot'] and r.get('submission_pending') is True), {})
+                    attempt = next(((v.get('last_attempt') or {}) for v in (manifest or {}).get('videos', [])
+                                    if v.get('slot') == item['slot']), {})
+                    dimensions = (ACTIVE_TASKS.get(task_id) or {}).get('dimensions') or {}
+                    provider = receipt.get('provider') or attempt.get('provider') or dimensions.get('video_provider')
+                    if provider:
+                        details['provider'] = provider
+                    if receipt.get('fixed_video_account') is True or attempt.get('fixed_video_account') is True:
+                        details['fixed_video_account'] = True
+                    pending.append(details)
+                self._send_json({'status': 'error', 'failure_code': 'SUBMISSION_PENDING',
+                                 'message': str(error), 'pending_submissions': pending}, status=409)
+                return
             operation, created = _VIDEO_OPERATIONS.reserve(request_id, fingerprint, 'vchain' if is_chain else 'videos')
             if created:
                 task_id = operation['task_id']
                 task = get_or_create_task(task_id, {
                     'type': 'video_chain' if is_chain else 'videos', 'theme': title,
                     'project_key': project_key, 'request_id': request_id,
-                    'target_slots': body.get('target_slots'), 'userId': config.get('googleFxUserId') or None})
+                    'video_provider': config.get('videoProvider') or 'google_fx',
+                    'video_fixed_user_id': config.get('videoFixedUserId'),
+                    'target_slots': body.get('target_slots'),
+                    'userId': None if config.get('videoProvider') == 'flow2api' else config.get('googleFxUserId') or None})
+                holder = _claim_flow_project_run(config, task_id, project_key or title)
+                if holder:
+                    task.update(status='failed', failure_code='PROJECT_BUSY',
+                                error='该项目仍有生成任务未退出，请等它结束后再生成视频')
+                    save_task_to_disk(task_id)
+                    self._send_json({'status': 'error', 'message': task['error'],
+                                     'failure_code': 'PROJECT_BUSY', 'task_id': holder}, status=409)
+                    return
                 if not save_task_to_disk(task_id):
                     task.update(status='failed', error='视频任务登记保存失败，未提交生成')
+                    _release_flow_project_run(config, task_id)
                     raise RuntimeError(task['error'])
                 try:
                     threading.Thread(target=generate_video_chain_worker if is_chain else generate_videos_worker,
@@ -3297,6 +4357,7 @@ class SparkRequestHandler(StaticFilesMixin, SimpleHTTPRequestHandler):
                 except Exception as error:
                     task.update(status='failed', error=str(error))
                     save_task_to_disk(task_id)
+                    _release_flow_project_run(config, task_id)
                     raise
             self._send_json(_video_operation_response(operation))
 
@@ -3416,6 +4477,8 @@ class SparkRequestHandler(StaticFilesMixin, SimpleHTTPRequestHandler):
 
         if path.startswith('/api/codex-video-editor/'):
             self._handle_codex_editor(path, query)
+        elif path.startswith('/api/beat-pack/'):
+            self._handle_beat_pack(path, query)
         elif path == '/api/library':
             # 整表兼容层：老前端（saveLibrary/loadLibrary 与 api_client.js 里
             # 十几处调用）仍按"始终持有完整数组"的契约工作。数据现在存在拆分库
@@ -3483,7 +4546,7 @@ class SparkRequestHandler(StaticFilesMixin, SimpleHTTPRequestHandler):
                 try:
                     with open(manifest_path, 'r', encoding='utf-8') as f:
                         data = json.load(f)
-                    self._send_json(data)
+                    self._send_json(_auto_video_runtime_snapshot(data))
                 except Exception as e:
                     self._send_json({'error': str(e)}, status=500)
             else:
@@ -3637,6 +4700,44 @@ class SparkRequestHandler(StaticFilesMixin, SimpleHTTPRequestHandler):
             finally:
                 if stop_evt:
                     stop_evt.set()
+        elif path == '/api/tasks/summary':
+            if not self._gate():
+                return
+            cleanup_old_tasks()
+            with ACTIVE_TASKS_LOCK:
+                tasks = sorted(ACTIVE_TASKS.values(),
+                               key=lambda task: task.get('last_active') or 0, reverse=True)
+                running = [task for task in tasks if task.get('status') == 'running']
+                counts = {
+                    'running': len(running),
+                    'ideation_running': sum(
+                        str((task.get('dimensions') or {}).get('type') or '') in PROJECT_TASK_TYPES
+                        for task in running),
+                }
+                rows = []
+                for task in tasks[:100]:
+                    dimensions = task.get('dimensions') or {}
+                    result = task.get('result')
+                    outcome = _task_outcome(task)
+                    entry = {
+                        'id': task.get('id'), 'status': task.get('status'),
+                        'outcome': outcome, 'last_active': task.get('last_active') or 0,
+                        'dimensions': {key: dimensions[key] for key in
+                                       ('type', 'project_key', 'title', 'theme', 'task_label')
+                                       if key in dimensions},
+                    }
+                    if isinstance(result, dict):
+                        summary = {}
+                        if result.get('project_key'):
+                            summary['project_key'] = result['project_key']
+                        if task.get('status') == 'completed':
+                            summary.update(completion_state=outcome,
+                                           has_failures=outcome == 'partial_failed')
+                        if summary:
+                            entry['result'] = summary
+                    rows.append(entry)
+                total_count = len(tasks)
+            self._send_json({'tasks': rows, 'counts': counts, 'total_count': total_count})
         elif path == '/api/tasks':
             if not self._gate():
                 return
@@ -3649,10 +4750,29 @@ class SparkRequestHandler(StaticFilesMixin, SimpleHTTPRequestHandler):
                     pass
             with ACTIVE_TASKS_LOCK:
                 res = []
-                for tid, t in ACTIVE_TASKS.items():
+                project_key = query.get('project_key', [''])[0]
+                include_ids = set(query.get('include_id', []))
+                candidates = []
+                for tid, task in ACTIVE_TASKS.items():
+                    if project_key and tid not in include_ids and task.get('id') not in include_ids:
+                        dimensions = task.get('dimensions') or {}
+                        result = task.get('result')
+                        result = result if isinstance(result, dict) else {}
+                        owner_key = dimensions.get('project_key') or result.get('project_key')
+                        # Legacy media tasks may only have a title. A hard key
+                        # always wins; title prefixes and fuzzy matches never do.
+                        owner_key = owner_key or dimensions.get('title')
+                        if str(owner_key or '') != project_key:
+                            continue
+                    candidates.append((tid, task))
+                candidates.sort(key=lambda row: row[1].get('last_active') or 0, reverse=True)
+                total_count = len(candidates)
+                if limit > 0:
+                    candidates = candidates[:limit]
+                for tid, t in candidates:
                     # 列表接口只回瘦身摘要：完整 result（提示词全文/封面/帧清单）
                     # 会被 2.5s 一次的角标轮询反复整包下载
-                    full_result = t.get("result")
+                    full_result = _auto_video_runtime_snapshot(t.get("result"))
                     outcome = _task_outcome(t)
                     result_summary = None
                     if isinstance(full_result, dict):
@@ -3692,19 +4812,21 @@ class SparkRequestHandler(StaticFilesMixin, SimpleHTTPRequestHandler):
                         "error": t["error"],
                         "last_active": t["last_active"]
                     }
+                    if isinstance(full_result, dict) and full_result.get('auto_video'):
+                        entry['auto_video'] = full_result['auto_video']
                     if events_summary is not None:
                         entry["events"] = events_summary
+                        progress = _media_task_progress_snapshot(t)
+                        if progress is not None:
+                            entry['progress'] = progress
+                            parent = ACTIVE_TASKS.get((t.get('dimensions') or {}).get('parent_frame_task_id'))
+                            result = _auto_video_runtime_snapshot(
+                                t.get('result') or (parent or {}).get('result') or {})
+                            if isinstance(result, dict) and result.get('auto_video'):
+                                entry['auto_video'] = result['auto_video']
                     res.append(entry)
-            # 按活跃时间排序：任务 ID 是「毫秒时间戳」和「frames_<uuid>」混排，
-            # 旧的字符串排序会把两类 ID 搅在一起
-            res.sort(key=lambda x: x.get("last_active") or 0, reverse=True)
-            total_count = len(res)
-            if limit and limit > 0:
-                sliced = res[:limit]
-            else:
-                sliced = res
             self._send_json({
-                "tasks": sliced,
+                "tasks": res,
                 "total_count": total_count
             })
         elif path == '/api/projects':
@@ -3821,7 +4943,7 @@ class SparkRequestHandler(StaticFilesMixin, SimpleHTTPRequestHandler):
                 res = {
                     "id": task["id"],
                     "status": task["status"],
-                    "result": task["result"],
+                    "result": _auto_video_runtime_snapshot(task["result"]),
                     "error": task["error"],
                     "dimensions": task["dimensions"],
                     "generation_source": ((task.get("result") or {}).get("generation_source")
@@ -3836,6 +4958,17 @@ class SparkRequestHandler(StaticFilesMixin, SimpleHTTPRequestHandler):
                     "last_worker_progress_at": task.get("last_worker_progress_at"),
                     "runtime_version": task.get("runtime_version"),
                 }
+                if isinstance(res['result'], dict) and res['result'].get('auto_video'):
+                    res['auto_video'] = res['result']['auto_video']
+                if task['status'] == 'running':
+                    progress = _media_task_progress_snapshot(task)
+                    if progress is not None:
+                        res['progress'] = progress
+                        parent = ACTIVE_TASKS.get((task.get('dimensions') or {}).get('parent_frame_task_id'))
+                        result = _auto_video_runtime_snapshot(
+                            task.get('result') or (parent or {}).get('result') or {})
+                        if isinstance(result, dict) and result.get('auto_video'):
+                            res['auto_video'] = result['auto_video']
             self._send_json(res)
         elif path == '/api/mode':
             # Public: tells the frontend whether to hide the API settings and prompt for an access code.
@@ -3864,11 +4997,13 @@ class SparkRequestHandler(StaticFilesMixin, SimpleHTTPRequestHandler):
                 'skill_contracts': skill_contract_reports(),
                 'runtime_version': _runtime_version,
                 'image_gateway_models': get_image_gateway_model_catalog(),
+                'video_config': server_common.video_service_config_report(),
                 # 质量门禁总表（server_common.GATE_SETTINGS）：键名/类型/默认值/
                 # 选项/文案 + 服务端当前生效值。配置中心的开关面板照它渲染，
                 # 前端不再抄一份默认值——抄一份就是又开了一个会漂移的真相源
                 # （白名单漂移那一类 bug 的老路，见 effective_config 上方注释）。
                 'gate_settings': gate_settings_report(),
+                'quality_reviews_retired': True,
             })
         elif path == '/api/image/task/status':
             if not self._gate():
@@ -3958,6 +5093,36 @@ class SparkRequestHandler(StaticFilesMixin, SimpleHTTPRequestHandler):
                 self._send_json({'message': str(exc)}, status=exc.status)
             except (BrokenPipeError, ConnectionResetError):
                 self.close_connection = True
+        elif path in ('/api/gallery/index', '/api/gallery/items'):
+            if not self._gate():
+                return
+            import gallery_index
+            try:
+                options = {
+                    'filter': query.get('filter', ['all'])[0],
+                    'q': query.get('q', [''])[0],
+                    'sort': query.get('sort', ['newest'])[0],
+                    'refresh': query.get('refresh', ['0'])[0] == '1',
+                    'scanner': scan_gallery,
+                    'collect_references': gallery_collect_references,
+                }
+                if path.endswith('/index'):
+                    result = gallery_index.gallery_index(**options)
+                else:
+                    result = gallery_index.gallery_items(
+                        query.get('group', [''])[0],
+                        offset=query.get('offset', ['0'])[0],
+                        limit=query.get('limit', ['12'])[0],
+                        revision=query.get('revision', [''])[0], **options)
+                self._send_json(result)
+            except gallery_index.GallerySnapshotChanged as exc:
+                self._send_json({'error': 'snapshot_changed', 'revision': exc.revision}, status=409)
+            except gallery_index.GalleryGroupNotFound:
+                self._send_json({'error': '画廊分组不存在'}, status=404)
+            except (ValueError, TypeError) as exc:
+                self._send_json({'error': str(exc)}, status=400)
+            except Exception as exc:
+                self._send_json({'error': str(exc)}, status=500)
         elif path == '/api/gallery':
             # 画廊：扫描 outputs/ 下全部历史媒体（封面/帧序列/视频/图像工坊），
             # 并标注引用关系（封面 in_use / 项目组 orphan）。引用收集失败时降级
@@ -4164,6 +5329,12 @@ class SparkRequestHandler(StaticFilesMixin, SimpleHTTPRequestHandler):
                 })
             except Exception as e:
                 self._send_json({'status': 'error', 'message': str(e)}, status=500)
+        elif path == '/api/engagement-cta/settings':
+            # 配置中心「成片引导」：精剪成片自动烧录片尾引导动画（见 cta_burn.py）
+            if not self._gate():
+                return
+            import cta_burn
+            self._send_json({'status': 'ok', **cta_burn.public_settings()})
         elif path == '/api/google-fx/config':
             if not self._gate():
                 return
@@ -4333,9 +5504,29 @@ class SparkRequestHandler(StaticFilesMixin, SimpleHTTPRequestHandler):
 
     def do_POST(self):
         from project_archive import MUTATION_LOCK, PROJECT_MUTATIONS
+        import gallery_index
         path = urllib.parse.urlsplit(self.path).path
-        with MUTATION_LOCK if path in PROJECT_MUTATIONS else contextlib.nullcontext():
-            self._do_POST_impl()
+        original_send = self._send_json
+        if path in gallery_index.MUTATION_PATHS:
+            def send_mutation_result(payload, status=200):
+                success = (200 <= status < 300 and isinstance(payload, dict)
+                           and payload.get('status') not in ('error', 'failed')
+                           and not payload.get('error'))
+                preview = False
+                if success and path == '/api/projects/archive':
+                    try:
+                        preview = self._read_json_body().get('preview', True) is True
+                    except (ValueError, TypeError, AttributeError):
+                        preview = True
+                if success and not preview:
+                    gallery_index.invalidate()
+                return original_send(payload, status=status)
+            self._send_json = send_mutation_result
+        try:
+            with MUTATION_LOCK if path in PROJECT_MUTATIONS and path != '/api/video-operation/reconcile' else contextlib.nullcontext():
+                self._do_POST_impl()
+        finally:
+            self._send_json = original_send
 
     def _do_POST_impl(self):
         from urllib.parse import urlparse, parse_qs
@@ -4363,12 +5554,40 @@ class SparkRequestHandler(StaticFilesMixin, SimpleHTTPRequestHandler):
             self.close_connection = True
             self._send_json({'message': '剪辑要求过长，请精简后重试'}, status=413)
             return
+        if path.startswith('/api/beat-pack/') and content_length > 262144:
+            self.close_connection = True
+            self._send_json({'message': '提示词包请求过长（创意主题与参考框架合计请控制在 20 万字以内）'}, status=413)
+            return
+        if path == '/api/engagement-cta/custom':
+            import cta_burn
+            if content_length > cta_burn.MAX_CUSTOM_BYTES:
+                self.close_connection = True
+                self._send_json({'status': 'error', 'message': f'视频超过 {cta_burn.MAX_CUSTOM_BYTES // 1048576} MB 上限'}, status=413)
+                return
         if content_length > 1024 * 1024 * 1024:
             self._send_json({'status': 'error', 'message': '请求体大小超过 1GB 上限'}, status=413)
             return
         self._body_bytes = self.rfile.read(content_length) if content_length else b''
 
         from project_archive import PROJECT_MUTATIONS, ARCHIVE_ALLOWED, archived_request
+        if path in PROJECT_MUTATIONS and path != '/api/video-operation/reconcile':
+            content_type = getattr(self, 'headers', {}).get('Content-Type', '')
+            if not content_type.startswith('multipart/'):
+                try:
+                    recovery_body = self._read_json_body()
+                except (ValueError, TypeError):
+                    self._send_json({'status': 'error', 'message': '请求数据无效'}, status=400)
+                    return
+                if isinstance(recovery_body, dict):
+                    source = recovery_body.get('item') if isinstance(recovery_body.get('item'), dict) else recovery_body
+                    dims = source.get('dimensions') if isinstance(source.get('dimensions'), dict) else {}
+                    project = source.get('project_key') or source.get('title') or dims.get('project_key')
+                    holder = _video_recovery_project_holder(project)
+                    if holder:
+                        self._send_json({'status': 'error', 'failure_code': 'PROJECT_BUSY',
+                            'message': '该项目正在核对并接回原视频，请等核对结束后继续',
+                            'task_id': holder}, status=409)
+                        return
         if path in PROJECT_MUTATIONS and path not in ARCHIVE_ALLOWED:
             content_type = getattr(self, 'headers', {}).get('Content-Type', '')
             if not content_type.startswith('multipart/'):
@@ -4395,6 +5614,8 @@ class SparkRequestHandler(StaticFilesMixin, SimpleHTTPRequestHandler):
         # （见 server_common.write_ledger）。
         if path.startswith('/api/codex-video-editor/'):
             self._handle_codex_editor(path)
+        elif path.startswith('/api/beat-pack/'):
+            self._handle_beat_pack(path)
         elif path == '/api/library/item':
             # 新契约：写一条创意只碰它自己的正文文件 + 索引，绝不重写别的记录。
             # 因此这条路径上没有"整表覆盖"可言，也就不需要空库/缩量/槽位自洽
@@ -4599,6 +5820,30 @@ class SparkRequestHandler(StaticFilesMixin, SimpleHTTPRequestHandler):
                 self._send_json({'status': 'error', 'message': str(e)}, status=400)
             except Exception as e:
                 self._send_json({'status': 'error', 'message': str(e)}, status=500)
+
+        elif path in ('/api/engagement-cta/settings', '/api/engagement-cta/custom',
+                      '/api/engagement-cta/custom/delete'):
+            if not self._gate(with_rate=path == '/api/engagement-cta/custom', rate_action='engagement_cta_upload'):
+                return
+            import cta_burn
+            try:
+                if path == '/api/engagement-cta/settings':
+                    body = self._read_json_body()
+                    payload = cta_burn.save_settings(body.get('patch') if isinstance(body, dict) else None)
+                elif path == '/api/engagement-cta/custom':
+                    # 原始视频字节直接作为请求体；文件名走 URL 编码的请求头
+                    filename = urllib.parse.unquote(self.headers.get('X-Filename', ''))
+                    payload = cta_burn.store_custom(self._body_bytes, filename)
+                else:
+                    payload = cta_burn.remove_custom()
+                self._send_json({'status': 'ok', **payload})
+            except cta_burn.CtaSettingsError as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=e.status)
+            except (ValueError, TypeError):
+                self._send_json({'status': 'error', 'message': '请求数据无效'}, status=400)
+            except Exception as e:
+                log('ERROR', '成片引导', str(e))
+                self._send_json({'status': 'error', 'message': '保存失败，请稍后重试'}, status=500)
 
         elif path == '/api/google-fx/config':
             if not self._gate():
@@ -5111,6 +6356,79 @@ class SparkRequestHandler(StaticFilesMixin, SimpleHTTPRequestHandler):
             except Exception as e:
                 self._send_json({'status': 'error', 'message': str(e)}, status=500)
 
+        elif path == '/api/account-pool/login-sync':
+            # Explicit pool recovery: the host owns a real browser lease and
+            # validates the session without writing Flow account cookies.
+            if not self._gate(with_rate=True, rate_action='account_refresh'):
+                return
+            try:
+                body = self._read_json_body()
+            except (ValueError, UnicodeError):
+                self._send_json({'status': 'error', 'code': 'invalid_login_request'}, status=400)
+                return
+            try:
+                import asyncio as _pool_login_asyncio
+                import importlib.util as _pool_login_importlib_util
+                from pathlib import Path as _pool_login_Path
+                import uuid as _pool_login_uuid
+                import threading as _pool_login_threading
+                import time as _pool_login_time
+                host_path = _pool_login_Path('/Users/fly/flow2api/local/sync_adspower_login_host.py')
+                if not host_path.is_file() or host_path.is_symlink():
+                    self._send_json({'status': 'deferred', 'code': 'login_host_unavailable'}, status=409)
+                    return
+                spec = _pool_login_importlib_util.spec_from_file_location(
+                    '_pool_login_host_' + _pool_login_uuid.uuid4().hex, host_path)
+                if spec is None or spec.loader is None:
+                    self._send_json({'status': 'deferred', 'code': 'login_host_unavailable'}, status=409)
+                    return
+                host = _pool_login_importlib_util.module_from_spec(spec)
+                spec.loader.exec_module(host)
+
+                def snapshot():
+                    with ACTIVE_TASKS_LOCK:
+                        # The host only needs statuses; no task content or
+                        # account/transport credentials cross this boundary.
+                        tasks = [{'task_id': tid, 'status': row.get('status'),
+                                  'maintenance': 'cookie_login' if row.get('_cookie_login') is True else None,
+                                  'profile_id': row.get('profile_id'),
+                                  'cancelled': bool(row.get('cancel_event') and row['cancel_event'].is_set())}
+                                 if isinstance(row, dict) else {}
+                                 for tid, row in ACTIVE_TASKS.items()]
+                    return {'queue': FX_CONTROL.snapshot(),
+                            'board': FX_CONTROL.board(), 'tasks': tasks}
+
+                def task_started(task_id, profile_id):
+                    with ACTIVE_TASKS_LOCK:
+                        if _AUTO_RELOAD_TRIGGERED or task_id in ACTIVE_TASKS:
+                            raise host.LoginError('login_host_unavailable')
+                        ACTIVE_TASKS[task_id] = {
+                            'id': task_id, 'task_id': task_id, 'status': 'running', '_cookie_login': True,
+                            'profile_id': profile_id, 'events': [], 'listeners': set(),
+                            'cancel_event': _pool_login_threading.Event(), 'result': None, 'error': None,
+                            'last_active': _pool_login_time.time(),
+                            'dimensions': {'userId': profile_id, 'fx_capable': False,
+                                           'type': 'auto_login'},
+                        }
+
+                def task_finished(task_id):
+                    with ACTIVE_TASKS_LOCK:
+                        row = ACTIVE_TASKS.get(task_id)
+                        if isinstance(row, dict) and row.get('_cookie_login') is True:
+                            if row.get('status') == 'running':
+                                row['status'] = 'completed'
+                            for _, stop_event in list(row.get('listeners') or ()):
+                                stop_event.set()
+                            ACTIVE_TASKS.pop(task_id, None)
+
+                payload, status = _pool_login_asyncio.run(host.handle_login_sync(
+                    body, slot_factory=_fx_browser_slot, spark_snapshot=snapshot,
+                    task_started=task_started, task_finished=task_finished))
+                self._send_json(payload, status=status)
+            except Exception:
+                # Never expose exception text from authentication/transport.
+                self._send_json({'status': 'error', 'code': 'login_internal_error'}, status=500)
+
         elif path == '/api/account-pool/login':
             # 现在就用存好的凭据登一次（控制台「测试登录」）。开浏览器、走完整
             # 登录表单，很慢，前端必须有 loading 态。
@@ -5476,28 +6794,48 @@ class SparkRequestHandler(StaticFilesMixin, SimpleHTTPRequestHandler):
                 body = self._read_json_body()
                 dimensions = body.get('dimensions', {})
                 config = effective_config(body.get('config'))
-                if not _require_fx_admission(self):
+                if _pipeline_uses_fx(config) and not _require_fx_admission(self):
                     return
-                # 自治管线全程驱动 FX 浏览器：把浏览器编号带进 dimensions，
-                # /api/compose-cancel 取消时据此关闭正确的 AdsPower 窗口
+                # Persist the selected backends' capability; cancellation must not
+                # infer Ads usage merely from a pipeline task's name.
+                dimensions['fx_capable'] = _pipeline_uses_fx(config)
+                dimensions['video_provider'] = config.get('videoProvider') or 'google_fx'
                 dimensions['userId'] = config.get('googleFxUserId') or None
                 task_id = body.get('task_id')
                 if not task_id:
                     task_id = f"auto_{int(time.time() * 1000)}"
 
                 # Start background thread
-                cleanup_old_tasks()
-                # 同 /api/compose：重试复用 task_id 时原地覆盖旧记录，运行中防重复提交
-                _, already_running = prepare_task_for_run(task_id, dimensions)
-                if already_running:
-                    self._send_json({'status': 'ok', 'task_id': task_id, 'already_running': True})
-                    return
+                if config.get('videoProvider') == 'flow2api':
+                    existing = ACTIVE_TASKS.get(task_id)
+                    if existing and existing.get('status') == 'running':
+                        self._send_json({'status': 'ok', 'task_id': task_id, 'already_running': True})
+                        return
+                    project_key = ensure_task_project_key(task_id, dimensions) or make_idea_project_key(
+                        task_id, dimensions.get('task_label') or dimensions.get('theme'))
+                    dimensions['project_key'] = project_key
+                    holder = _claim_flow_project_run(config, task_id, project_key)
+                    if holder:
+                        self._send_json({'status': 'error', 'message': '该项目仍有生成任务未退出',
+                                         'failure_code': 'PROJECT_BUSY', 'task_id': holder}, status=409)
+                        return
 
-                threading.Thread(
-                    target=auto_run_worker,
-                    args=(task_id, config, dimensions),
-                    daemon=True
-                ).start()
+                try:
+                    cleanup_old_tasks()
+                    # 同 /api/compose：重试复用 task_id 时原地覆盖旧记录，运行中防重复提交
+                    _, already_running = prepare_task_for_run(task_id, dimensions)
+                    if already_running:
+                        self._send_json({'status': 'ok', 'task_id': task_id, 'already_running': True})
+                        return
+
+                    threading.Thread(
+                        target=auto_run_worker,
+                        args=(task_id, config, dimensions),
+                        daemon=True
+                    ).start()
+                except BaseException:
+                    _release_flow_project_run(config, task_id)
+                    raise
 
                 self._send_json({'status': 'ok', 'task_id': task_id})
             except Exception as e:
@@ -5523,6 +6861,7 @@ class SparkRequestHandler(StaticFilesMixin, SimpleHTTPRequestHandler):
                 if task_id and task_id in ACTIVE_TASKS:
                     log('INFO', 'CANCEL', "收到取消请求", task_id=task_id)
                     ACTIVE_TASKS[task_id]["cancel_event"].set()
+                    _cancel_auto_video_children(task_id)
 
                     # 所有类型的任务都立即终态化：旧写法只对非 FX 任务立即切
                     # cancelled，FX 任务（frames/videos/staged/auto）依赖 worker
@@ -5536,6 +6875,11 @@ class SparkRequestHandler(StaticFilesMixin, SimpleHTTPRequestHandler):
                         id_prefix in ('frames', 'videos', 'staged', 'auto', 'vchain')
                         or dimensions.get('type') in ('frames', 'videos', 'staged', 'auto_run', 'video_chain')
                     )
+                    if isinstance(dimensions.get('fx_capable'), bool):
+                        is_fx_capable = dimensions['fx_capable']
+                    is_flow_video = (dimensions.get('video_provider') == 'flow2api' and
+                                     (id_prefix in ('videos', 'vchain') or
+                                      dimensions.get('type') in ('videos', 'video_chain')))
                     finalized = False
                     with ACTIVE_TASKS_LOCK:
                         t = ACTIVE_TASKS.get(task_id)
@@ -5549,11 +6893,12 @@ class SparkRequestHandler(StaticFilesMixin, SimpleHTTPRequestHandler):
                     if finalized:
                         notify_listeners(task_id, 'error', {'message': '用户取消了生成任务'})
                         save_task_to_disk(task_id)
-                    if is_fx_capable:
+                    if is_fx_capable and not is_flow_video:
                         import builtins
                         # 纯 SPARK 内部旗标（video_generator 在腿边界读它）；外部 AdsPower
                         # 脚本自 2026-07 起不再读任何进程级全局标志。
-                        builtins.google_fx_cancelled = True
+                        if not dimensions.get('parent_frame_task_id'):
+                            builtins.google_fx_cancelled = True
 
                         # 取消 = 只发信号，不动浏览器（2026-07-26）。
                         # 原来这里会 stop_ads_browser()，那是"取消了半天停不下来、日志还在
@@ -5967,6 +7312,7 @@ class SparkRequestHandler(StaticFilesMixin, SimpleHTTPRequestHandler):
                                      'failure_code': 'PROMPT_DELIVERY_BLOCKED'}, status=409)
                     return
                 config = effective_config(body.get('config'))
+                _configure_frame_auto_video(config, body)
                 if not _require_fx_admission(self, config.get('imageBackend') == 'google_fx'):
                     return
                 project_key = body.get('title', '')
@@ -5984,9 +7330,16 @@ class SparkRequestHandler(StaticFilesMixin, SimpleHTTPRequestHandler):
                 # 丢失"。已有 worker 在跑时不再起第二个，直接把它的 task_id 转告
                 # 前端重新挂流（与 compose 的 already_running 同款语义）。
                 project_dir = _get_project_dir(project_key)
-                holder = claim_frame_run(project_dir, task_id)
+                holder = claim_frame_run(project_dir, task_id,
+                    until_released=config.get('_auto_generate_videos', False))
                 if holder:
-                    self._send_json({'status': 'ok', 'task_id': holder, 'already_running': True})
+                    holder_type = (ACTIVE_TASKS.get(holder, {}).get('dimensions') or {}).get('type')
+                    if holder_type in ('videos', 'video_chain'):
+                        self._send_json({'status': 'error', 'failure_code': 'PROJECT_BUSY',
+                            'message': '该项目正在生成视频，请等待视频任务结束后再修改图片。',
+                            'task_id': holder}, status=409)
+                    else:
+                        self._send_json({'status': 'ok', 'task_id': holder, 'already_running': True})
                     return
 
                 # Register in ACTIVE_TASKS
@@ -5994,6 +7347,8 @@ class SparkRequestHandler(StaticFilesMixin, SimpleHTTPRequestHandler):
                 # userId：本次使用的 AdsPower 浏览器编号，供 /api/compose-cancel 取消时
                 # 关闭正确的窗口（仅 google_fx 后端相关，api 后端留 None 无影响）
                 get_or_create_task(task_id, {"type": "frames", "theme": title, "project_key": project_key,
+                                             "target_sequences": target_sequences,
+                                             "auto_generate_videos": config.get("_auto_generate_videos", False),
                                              "userId": config.get('googleFxUserId') or None})
 
                 # 模式判定见 server_common.resolve_candidate_selection_mode：请求里
@@ -6013,6 +7368,8 @@ class SparkRequestHandler(StaticFilesMixin, SimpleHTTPRequestHandler):
                 ).start()
 
                 self._send_json({'status': 'ok', 'task_id': task_id})
+            except (ValueError, TypeError) as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=400)
             except Exception as e:
                 self._send_json({'status': 'error', 'message': str(e)}, status=500)
 
@@ -6031,6 +7388,7 @@ class SparkRequestHandler(StaticFilesMixin, SimpleHTTPRequestHandler):
                                      'failure_code': 'PROMPT_DELIVERY_BLOCKED'}, status=409)
                     return
                 config = effective_config(body.get('config'))
+                _configure_frame_auto_video(config, body)
                 if not _require_fx_admission(self, config.get('imageBackend') == 'google_fx'):
                     return
                 project_key = body.get('title', '')
@@ -6044,13 +7402,22 @@ class SparkRequestHandler(StaticFilesMixin, SimpleHTTPRequestHandler):
                 task_id = f"frames_sel_{uuid.uuid4().hex}"
 
                 project_dir = _get_project_dir(project_key)
-                holder = claim_frame_run(project_dir, task_id)
+                holder = claim_frame_run(project_dir, task_id,
+                    until_released=config.get('_auto_generate_videos', False))
                 if holder:
-                    self._send_json({'status': 'ok', 'task_id': holder, 'already_running': True})
+                    holder_type = (ACTIVE_TASKS.get(holder, {}).get('dimensions') or {}).get('type')
+                    if holder_type in ('videos', 'video_chain'):
+                        self._send_json({'status': 'error', 'failure_code': 'PROJECT_BUSY',
+                            'message': '该项目正在生成视频，请等待视频任务结束后再修改图片。',
+                            'task_id': holder}, status=409)
+                    else:
+                        self._send_json({'status': 'ok', 'task_id': holder, 'already_running': True})
                     return
 
                 cleanup_old_tasks()
                 get_or_create_task(task_id, {"type": "frames", "theme": title, "project_key": project_key,
+                                             "target_sequences": target_sequences,
+                                             "auto_generate_videos": config.get("_auto_generate_videos", False),
                                              "userId": config.get('googleFxUserId') or None})
 
                 threading.Thread(
@@ -6060,6 +7427,8 @@ class SparkRequestHandler(StaticFilesMixin, SimpleHTTPRequestHandler):
                 ).start()
 
                 self._send_json({'status': 'ok', 'task_id': task_id})
+            except (ValueError, TypeError) as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=400)
             except Exception as e:
                 self._send_json({'status': 'error', 'message': str(e)}, status=500)
 
@@ -6280,46 +7649,14 @@ class SparkRequestHandler(StaticFilesMixin, SimpleHTTPRequestHandler):
                 self._send_json({'status': 'error', 'message': str(e)}, status=500)
 
         elif path == '/api/sequence_review':
-            try:
-                if not access_ok(self):
-                    self._send_json({'error': '访问码无效或缺失'}, status=401)
-                    return
-                if not rate_ok(_client_ip(self), 'frames'):
-                    self._send_json({'error': '请求过于频繁，请稍后再试'}, status=429)
-                    return
-                body = self._read_json_body()
-                config = effective_config(body.get('config'))
-                project_key = body.get('title', '')
-                title = body.get('display_title') or project_key
-                config['_project_key'] = project_key
-                prompt_block = body.get('prompt_block', '')
-                # scope='full'＝前端的「全量重审」：不复用任何既有结论。默认增量，
-                # 只重审帧图变过、结论已失效的那几拍（见 _sequence_consistency_review）。
-                full = str(body.get('scope') or '').strip().lower() == 'full'
-
-                import uuid
-                task_id = f"seqreview_{uuid.uuid4().hex}"
-
-                # 与 /api/generate_frames、/api/fix_frame_issue 同款互斥：审查也会
-                # 整体改写同一份 manifest，不能跟另一个渲染/修复 worker 同时跑同一个项目。
-                project_dir = _get_project_dir(project_key)
-                holder = claim_frame_run(project_dir, task_id)
-                if holder:
-                    self._send_json({'status': 'ok', 'task_id': holder, 'already_running': True})
-                    return
-
-                cleanup_old_tasks()
-                get_or_create_task(task_id, {"type": "frames", "theme": title, "project_key": project_key})
-
-                threading.Thread(
-                    target=sequence_review_worker,
-                    args=(task_id, config, title, prompt_block, full),
-                    daemon=True
-                ).start()
-
-                self._send_json({'status': 'ok', 'task_id': task_id})
-            except Exception as e:
-                self._send_json({'status': 'error', 'message': str(e)}, status=500)
+            if not access_ok(self):
+                self._send_json({'error': '访问码无效或缺失'}, status=401)
+                return
+            self._read_json_body()
+            self._send_json({
+                'status': 'retired', 'retired': True, 'skipped': True,
+                'message': '质量审查规则已永久退役，不再创建审查任务。',
+            }, status=410)
 
         elif path == '/api/render_staged':
             try:
@@ -6336,7 +7673,7 @@ class SparkRequestHandler(StaticFilesMixin, SimpleHTTPRequestHandler):
                                      'failure_code': 'PROMPT_DELIVERY_BLOCKED'}, status=409)
                     return
                 config = effective_config(body.get('config'))
-                if not _require_fx_admission(self):
+                if _pipeline_uses_fx(config) and not _require_fx_admission(self):
                     return
                 project_key = body.get('title', '')
                 title = body.get('display_title') or project_key
@@ -6350,19 +7687,31 @@ class SparkRequestHandler(StaticFilesMixin, SimpleHTTPRequestHandler):
                 # project manifest，不能跟另一个渲染 worker（含手动帧序列按钮）
                 # 同时跑同一个项目。
                 project_dir = _get_project_dir(project_key)
-                holder = claim_frame_run(project_dir, task_id)
+                holder = (_claim_flow_project_run(config, task_id, project_key)
+                          if config.get('videoProvider') == 'flow2api'
+                          else claim_frame_run(project_dir, task_id))
                 if holder:
-                    self._send_json({'status': 'ok', 'task_id': holder, 'already_running': True})
+                    if config.get('videoProvider') == 'flow2api':
+                        self._send_json({'status': 'error', 'message': '该项目仍有生成任务未退出',
+                                         'failure_code': 'PROJECT_BUSY', 'task_id': holder}, status=409)
+                    else:
+                        self._send_json({'status': 'ok', 'task_id': holder, 'already_running': True})
                     return
 
-                cleanup_old_tasks()
-                get_or_create_task(task_id, {"type": "staged_render", "theme": title, "userId": config.get('googleFxUserId') or None})
+                try:
+                    cleanup_old_tasks()
+                    get_or_create_task(task_id, {"type": "staged_render", "theme": title,
+                        "project_key": project_key, "video_provider": config.get('videoProvider') or 'google_fx',
+                        "fx_capable": _pipeline_uses_fx(config), "userId": config.get('googleFxUserId') or None})
 
-                threading.Thread(
-                    target=render_staged_worker,
-                    args=(task_id, config, title, prompt_block),
-                    daemon=True
-                ).start()
+                    threading.Thread(
+                        target=render_staged_worker,
+                        args=(task_id, config, title, prompt_block),
+                        daemon=True
+                    ).start()
+                except BaseException:
+                    _release_flow_project_run(config, task_id)
+                    raise
 
                 self._send_json({'status': 'ok', 'task_id': task_id})
             except Exception as e:
@@ -6380,24 +7729,40 @@ class SparkRequestHandler(StaticFilesMixin, SimpleHTTPRequestHandler):
                     return
                 body = self._read_json_body()
                 config = effective_config(body.get('config'))
-                if not _require_fx_admission(self):
+                if _pipeline_uses_fx(config) and not _require_fx_admission(self):
                     return
                 dimensions = body.get('dimensions') or body
+                dimensions['fx_capable'] = _pipeline_uses_fx(config)
                 project_key = body.get('project_key') or body.get('title', '')
+                dimensions['project_key'] = project_key
+                dimensions['video_provider'] = config.get('videoProvider') or 'google_fx'
                 config['_project_key'] = project_key
 
                 import uuid
                 task_id = f"stepped_{uuid.uuid4().hex}"
 
-                cleanup_old_tasks()
-                get_or_create_task(task_id, {"type": "stepped", "theme": project_key,
-                                             "userId": config.get('googleFxUserId') or None})
+                holder = _claim_flow_project_run(config, task_id, project_key)
+                if holder:
+                    self._send_json({'status': 'error', 'message': '该项目仍有生成任务未退出',
+                                     'failure_code': 'PROJECT_BUSY', 'task_id': holder}, status=409)
+                    return
 
-                threading.Thread(
-                    target=stepped_pipeline_start_worker,
-                    args=(task_id, config, dimensions),
-                    daemon=True
-                ).start()
+                try:
+                    cleanup_old_tasks()
+                    get_or_create_task(task_id, {"type": "stepped", "theme": project_key,
+                                                 "project_key": project_key,
+                                                 "video_provider": dimensions['video_provider'],
+                                                 "fx_capable": dimensions['fx_capable'],
+                                                 "userId": config.get('googleFxUserId') or None})
+
+                    threading.Thread(
+                        target=stepped_pipeline_start_worker,
+                        args=(task_id, config, dimensions),
+                        daemon=True
+                    ).start()
+                except BaseException:
+                    _release_flow_project_run(config, task_id)
+                    raise
 
                 self._send_json({'status': 'ok', 'task_id': task_id})
             except Exception as e:
@@ -6413,7 +7778,7 @@ class SparkRequestHandler(StaticFilesMixin, SimpleHTTPRequestHandler):
                     return
                 body = self._read_json_body()
                 config = effective_config(body.get('config'))
-                if not _require_fx_admission(self):
+                if _pipeline_uses_fx(config) and not _require_fx_admission(self):
                     return
                 title = body.get('title', '')
                 action = body.get('action', 'approve')
@@ -6432,18 +7797,35 @@ class SparkRequestHandler(StaticFilesMixin, SimpleHTTPRequestHandler):
                     import uuid
                     task_id = f"stepped_adv_{uuid.uuid4().hex}"
 
-                cleanup_old_tasks()
-                # prepare_task_for_run 能正确处理 running/终态/不存在 三种情况
-                t, already_running = prepare_task_for_run(task_id, {"type": "stepped_advance", "theme": title})
-                if already_running:
-                    self._send_json({'status': 'ok', 'task_id': task_id, 'already_running': True})
+                if config.get('videoProvider') == 'flow2api':
+                    existing = ACTIVE_TASKS.get(task_id)
+                    if existing and existing.get('status') == 'running':
+                        self._send_json({'status': 'ok', 'task_id': task_id, 'already_running': True})
+                        return
+                holder = _claim_flow_project_run(config, task_id, title)
+                if holder:
+                    self._send_json({'status': 'error', 'message': '该项目仍有生成任务未退出',
+                                     'failure_code': 'PROJECT_BUSY', 'task_id': holder}, status=409)
                     return
 
-                threading.Thread(
-                    target=stepped_pipeline_advance_worker,
-                    args=(task_id, config, title, action),
-                    daemon=True
-                ).start()
+                try:
+                    cleanup_old_tasks()
+                    # prepare_task_for_run 能正确处理 running/终态/不存在 三种情况
+                    t, already_running = prepare_task_for_run(task_id, {"type": "stepped_advance", "theme": title,
+                        "project_key": title, "video_provider": config.get('videoProvider') or 'google_fx',
+                        "fx_capable": _pipeline_uses_fx(config)})
+                    if already_running:
+                        self._send_json({'status': 'ok', 'task_id': task_id, 'already_running': True})
+                        return
+
+                    threading.Thread(
+                        target=stepped_pipeline_advance_worker,
+                        args=(task_id, config, title, action),
+                        daemon=True
+                    ).start()
+                except BaseException:
+                    _release_flow_project_run(config, task_id)
+                    raise
 
                 self._send_json({'status': 'ok', 'task_id': task_id})
             except Exception as e:
@@ -6494,6 +7876,16 @@ class SparkRequestHandler(StaticFilesMixin, SimpleHTTPRequestHandler):
                 self._send_json(response)
             except Exception as e:
                 self._send_json({'status': 'error', 'message': str(e)}, status=500)
+
+        elif path == '/api/video-operation/reconcile':
+            if not self._gate():
+                return
+            try:
+                self._reconcile_video_operation(self._read_json_body())
+            except (ValueError, TypeError) as error:
+                self._send_json({'status': 'error', 'message': str(error)}, status=400)
+            except Exception as error:
+                self._send_json({'status': 'error', 'message': str(error)}, status=500)
 
         elif path in ('/api/generate_videos', '/api/generate_video_chain'):
             if not self._gate():
@@ -6692,6 +8084,10 @@ class SparkRequestHandler(StaticFilesMixin, SimpleHTTPRequestHandler):
                     self._send_json({'error': 'slot 必须是数字'}, status=400)
                     return
 
+                if _video_recovery_project_holder(title):
+                    self._send_json({'status': 'error', 'failure_code': 'PROJECT_BUSY',
+                                     'message': '该项目正在接回原视频，请等核对结束后上传素材'}, status=409)
+                    return
                 if archived_request({'title': title}):
                     self._send_json({'status': 'error', 'message': '项目已归档，不能上传新素材',
                                      'failure_code': 'PROJECT_ARCHIVED'}, status=409)
@@ -7140,6 +8536,10 @@ class SparkRequestHandler(StaticFilesMixin, SimpleHTTPRequestHandler):
                     self._send_json({'error': 'sequence 必须从 1 开始'}, status=400)
                     return
 
+                if _video_recovery_project_holder(title):
+                    self._send_json({'status': 'error', 'failure_code': 'PROJECT_BUSY',
+                                     'message': '该项目正在接回原视频，请等核对结束后上传素材'}, status=409)
+                    return
                 if archived_request({'title': title}):
                     self._send_json({'status': 'error', 'message': '项目已归档，不能上传新素材',
                                      'failure_code': 'PROJECT_ARCHIVED'}, status=409)
@@ -7216,7 +8616,7 @@ class SparkRequestHandler(StaticFilesMixin, SimpleHTTPRequestHandler):
                         target['source'] = 'manual_upload'
                         target['aspect_ratio'] = aspect_ratio
                         # 机器判定全部作废：这张图不是模型渲的，谁也没看过它
-                        target['quality_gate'] = 'pending_manual_review'
+                        target['quality_gate'] = 'retired'
                         target['vlm_qa_reason'] = None
                         for key in ('manual_issue', 'manual_flag_prev_gate', 'review_issues',
                                     'review_frames_sha256', 'stale_lineage'):
@@ -8393,6 +9793,8 @@ class SparkRequestHandler(StaticFilesMixin, SimpleHTTPRequestHandler):
                 config = effective_config(body.get('config'))
                 if 'config' in body:
                     del body['config']
+                # Claude 不接受自定义采样参数、max_tokens 有上限：与 _chat 同一套整形。
+                shape_chat_payload(body['model'], body)
                 
                 base_url, api_key = resolve_gateway(body.get('model'), config)
                 if sys.stdout:
@@ -8473,6 +9875,21 @@ class SparkRequestHandler(StaticFilesMixin, SimpleHTTPRequestHandler):
             try:
                 if not access_ok(self):
                     self._send_json({'error': '访问码无效或缺失'}, status=401)
+                    return
+                body = self._read_json_body() if int(self.headers.get('Content-Length') or 0) else {}
+                with ACTIVE_TASKS_LOCK:
+                    running = sorted(tid for tid, t in ACTIVE_TASKS.items()
+                                     if isinstance(t, dict) and (t.get('status') == 'running'
+                                                                 or t.get('_cookie_login') is True))
+                running += _beat_pack_busy()
+                # 重启会直接杀掉进程里正在跑的任务：已发出的付费视频提交变成没人接的孤儿，
+                # 界面再点一次又会重新提交。有任务在跑时拒绝，交给自动重载在空闲时完成。
+                if running and not (isinstance(body, dict) and body.get('force') is True):
+                    self._send_json({'status': 'error', 'failure_code': 'TASKS_RUNNING',
+                                     'running_tasks': running,
+                                     'message': f'还有 {len(running)} 个任务在运行，重启会中断它们。'
+                                                '等任务结束后服务会自动重载新代码；确需立即重启请先取消这些任务。'},
+                                    status=409)
                     return
                 self._send_json({'status': 'ok', 'message': '正在重启服务...'})
                 threading.Thread(target=restart_server_process, daemon=True).start()
@@ -8652,7 +10069,7 @@ def _sync_project_manifest_with_disk_locked(project_dir, migrate_media=True):
                 "aspect_ratio": manifest.get('aspect_ratio') or "9:16",
                 "image_size": manifest.get('image_size') or "2K",
                 "retry_count": 0,
-                "quality_gate": "pending_manual_review"
+                "quality_gate": "retired"
             }
             new_frames.append(new_frame)
             modified = True
@@ -8681,7 +10098,7 @@ def _sync_project_manifest_with_disk_locked(project_dir, migrate_media=True):
         frame.setdefault("aspect_ratio", manifest.get('aspect_ratio') or "9:16")
         frame.setdefault("image_size", manifest.get('image_size') or "2K")
         frame.setdefault("retry_count", 0)
-        frame.setdefault("quality_gate", "pending_manual_review")
+        frame.setdefault("quality_gate", "retired")
 
         # 候选池同步与补齐（含 gpt-image-2 及所有历史生成帧，全量扫描盘与元数据）
         if migrate_media:

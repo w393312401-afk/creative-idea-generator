@@ -10,12 +10,28 @@ import os
 import shutil
 import tempfile
 import unittest
+import pytest
 from unittest.mock import patch
 
 import server_common
 import frame_continuity as fc
 import pipeline_orchestrator as po
 import candidate_selection_pipeline as csp
+import prompt_pipeline as pp
+
+
+@pytest.fixture(autouse=True)
+def historical_triptych_algorithm_only(monkeypatch):
+    """Preserve offline snapshot/math contracts; runtime gates stay permanently retired."""
+    monkeypatch.setattr(po, 'reviews_disabled', lambda config=None: False)
+    monkeypatch.setattr(fc, '_reviews_retired', lambda: False)
+    monkeypatch.setattr(fc, 'continuity_mode',
+                        lambda config=None: (config or {}).get('frameContinuityMode', 'balanced'))
+    def offline_chat(*args, **kwargs):
+        raise RuntimeError('Historical triptych tests never call a live model')
+    monkeypatch.setattr(pp, '_multimodal_chat', offline_chat)
+    monkeypatch.setattr(pp, '_chat', offline_chat)
+    monkeypatch.setattr(pp, '_execute_request_with_retry', offline_chat)
 
 
 def _seam(status, hard=('camera',)):

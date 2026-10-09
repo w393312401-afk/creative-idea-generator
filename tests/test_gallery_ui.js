@@ -24,7 +24,7 @@ function harness() {
     const toasts = [];
     const confirmations = [];
     const ctx = {
-        console, CSS: { escape: value => value },
+        console, URLSearchParams, CSS: { escape: value => value },
         localStorage: { getItem() { return null; }, setItem() {} },
         setTimeout(callback) { callback(); return 1; }, clearTimeout() {},
         showToast: (...args) => toasts.push(args),
@@ -165,7 +165,7 @@ async function testDeleteSelectedRetainsRecordsAndDoesNotSendHiddenAssets() {
     });
     assert.match(h.confirmations[0], /当前筛选中选中的 1 个文件/);
     assert.match(h.confirmations[0], /项目记录与此范围以外的文件保留/);
-    assert.equal(requests[1].url, '/api/gallery');
+    assert.match(requests[1].url, /^\/api\/gallery\/index\?/);
 }
 
 function testGroupDeleteMeansFilteredMediaEvenWhenCollapsed() {

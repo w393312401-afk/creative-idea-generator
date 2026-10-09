@@ -1,0 +1,459 @@
+{
+ "name": "松果屋",
+ "subtitle": "雪林住所",
+ "title": "巨型干松果 → 雪林住所",
+ "space_id": "pinecone_dwelling",
+ "geometry": "One original fictional giant cured pine cone, treated as a hard designed building shell, stands upright on a round stone footing 6.4 m in diameter and 0.30 m high in a snowy pine forest. It is 10.4 m tall; its base is 5.0 m in diameter, it swells to 8.0 m at 4.2 m above the footing, then tapers to a rounded tip 2.2 m wide. It is built of overlapping woody scales about 1.2 m wide, each 0.14 m thick, in spiral rows, closed tight and weighted with snow, around a hollow woody core 2.4 m in outer diameter whose wall is 0.2 m thick. The only entrance is cut through the south lower scales into the lower level: 0.90 m wide and 1.95 m high with its sill 2.0 m above the footing, fitted with a timber door box 0.5 m deep; the inward-opening door leaf is 0.85 m by 1.90 m. The inner bottom of the cone lies 1.9 m below the sill until the platform is built. Finished levels: the lower floor is a timber platform over a 1.7 m underfloor void, level with the sill, an annular ring 1.8 m wide between the core and the wall, with a clear height of about 2.65 m; a 15-riser stair (risers 0.193 m, 0.75 m wide) curls round the outside of the core to the upper floor, 2.9 m higher, an annular ring about 2.2 m wide under a sloping scale roof (headroom 1.75 m or more in the inner 1.4 m of the ring) with a flat ring ceiling 2.5 m above the floor beside the core. Later, and only in their own segments, five slot windows 1.0 m wide by 0.55 m high are opened in the gaps between scales, two on the lower level at 1.3 m above the floor and three on the upper level, and a 0.10 m flue sleeve is cut for the stove. Dimensions of interior fittings are given in the state text once each fitting exists. No extension, annex or second building exists.",
+ "weather": "Cold clear forest light; lights and sky states follow the sky component.",
+ "ambience": "wind in the pines and soft snow dust falling, and the exact contact sounds of the visible tools and materials",
+ "components": [
+  {
+   "key": "shell",
+   "scope": "ext",
+   "text": "The giant cone is a closed spiral of overlapping woody scales weighted with snow, brown and silver-grey with resin streaks, with a rounded tip, no door and no window."
+  },
+  {
+   "key": "door",
+   "scope": "both",
+   "text": "No entrance exists; the lowest south scales lie tight against each other and the planned sill level is 2.0 m above the footing."
+  },
+  {
+   "key": "deck",
+   "scope": "ext",
+   "text": "No landing, stair or winch exists; the footing stands 0.30 m above the snow and a wooden ladder lies in the snow beside it."
+  },
+  {
+   "key": "power",
+   "scope": "ext",
+   "text": "No solar pole, battery, tank or flue exists. A petrol generator on a sled and a buried water standpipe box stand 10 m away."
+  },
+  {
+   "key": "stock",
+   "scope": "ext",
+   "text": "No building materials are stacked in the forest; only a woodpile, a snow shovel, a hand sled and a toolbox stand near the footing."
+  },
+  {
+   "key": "ground",
+   "scope": "ext",
+   "text": "Deep snow lies between tall dark pines; a packed trail runs in from the south and the woodpile stands under a small tarp."
+  },
+  {
+   "key": "window",
+   "scope": "both",
+   "text": "No window exists between the scales."
+  },
+  {
+   "key": "sky",
+   "scope": "both",
+   "text": "Cold clear morning with low pale sun through the pines and fine snow dust drifting off the branches."
+  },
+  {
+   "key": "floor",
+   "scope": "int",
+   "text": "The inner bottom of the cone is a bowl of dry brown scale undersides and drifted seeds and resin crumbs about 0.5 m deep, with a cold hollow core rising in the centre."
+  },
+  {
+   "key": "walls",
+   "scope": "int",
+   "text": "The scale undersides form a ribbed brown wall coated with dry resin and papery seed wings, spiralling up the cone."
+  },
+  {
+   "key": "core",
+   "scope": "int",
+   "text": "The woody core, 2.4 m wide, is a hollow tube of brittle brown pith 0.4 m thick inside its 0.2 m wall running the full height of the cone."
+  },
+  {
+   "key": "ceiling",
+   "scope": "int",
+   "text": "High overhead the ribbed scale roof narrows toward the tip, dim, with thin lines of daylight between the scales."
+  },
+  {
+   "key": "stair",
+   "scope": "int",
+   "text": "No platform, stair or rail exists; the hollow core and the ribbed wall rise bare."
+  },
+  {
+   "key": "upper",
+   "scope": "int",
+   "text": "No upper floor exists; the cone rises empty above the lower ring."
+  },
+  {
+   "key": "utilities",
+   "scope": "int",
+   "text": "No sleeves, pipes, conduit, tanks or wiring exist."
+  },
+  {
+   "key": "bath",
+   "scope": "int",
+   "text": "No bathroom exists."
+  },
+  {
+   "key": "kitchen",
+   "scope": "int",
+   "text": "No kitchen or stove exists."
+  },
+  {
+   "key": "bedroom",
+   "scope": "int",
+   "text": "No bed exists."
+  },
+  {
+   "key": "soft",
+   "scope": "int",
+   "text": "No lamp, textile, furniture or household item exists."
+  }
+ ],
+ "cameras": {
+  "open": {
+   "scope": "ext",
+   "text": "Use a low camera 0.50 m above the snow beside a stacked woodpile and a snow shovel, 14 m south of the footing, looking up the closed-scale cone so the footing, the spiral scale rows, the widest girth and the rounded tip are all legible among the snowy pines."
+  },
+  "face": {
+   "scope": "ext",
+   "text": "Use a fixed medium-wide camera on the snow 4.5 m south of the footing at 1.5 m height, aimed at the lower south scales, so the footing edge, the scale rows, the snow on them and the future door position are visible; keep the same lens and framing on every return."
+  },
+  "work": {
+   "scope": "ext",
+   "text": "Use a fixed south-west three-quarter camera at 1.4 m height, 24 m from the footing, wide enough to see the whole cone from footing to tip, the door and stair, the canopy of lifted scales, the slot windows, the solar pole, the woodpile and the snowy pines; keep the same lens and horizon on every return."
+  },
+  "bridge": {
+   "scope": "ext",
+   "text": "Start on the fixed 4.5 m south view facing the door, then travel forward up the eleven steps and across the landing into the doorway and end at the sill looking north and down into the cone at 1.5 m above the sill, keeping the door box and landing rail in view during the crossing.",
+   "travelling": true
+  },
+  "int_s": {
+   "scope": "int",
+   "text": "Use a fixed interior camera 1.5 m above the sill level just inside the south door box, looking north across the lower ring toward the hollow core on the left and the curved scale wall on the right; keep the same lens on every return to this view."
+  },
+  "int_k": {
+   "scope": "int",
+   "text": "Use a fixed interior camera 1.5 m above the finished lower floor at the west side of the ring, looking east round the ring toward the core, the stair foot and the east scale wall; keep the same lens on every return."
+  },
+  "int_u": {
+   "scope": "int",
+   "text": "Use a fixed interior camera 1.4 m above the upper floor at the stair head, looking round the upper ring with the core at the left edge and the sloping scale roof and slot windows at the right; keep the same lens on every return."
+  },
+  "reveal": {
+   "scope": "int",
+   "text": "Use a slow unattended interior camera starting 1.4 m high at the door looking round the lower ring, then following the stair up round the core and ending in the upper ring at the slot window over the bed, always keeping the stationary door box, stair rail and core wall legible.",
+   "travelling": true
+  }
+ },
+ "spaces": [
+  {
+   "id": "pinecone_dwelling",
+   "shape": "two annular rings round a hollow core inside a cone",
+   "dimensions_m": {
+    "width": 1.8,
+    "length": 17.0,
+    "height": 2.65
+   },
+   "provenance": "原创幻想设计；高10.4m、最宽8.0m（距台基4.2m）、底径5.0m、鳞片厚0.14m；木芯外径2.4m、壁厚0.2m；下层环宽1.8m、净高2.65m；上层环宽约2.2m、斜顶内侧净高≥1.75m；创意阶段为“下层环宽约1.6m、上层约2.0m、高约9.6m、最大直径约7.2m”，几何核算后放大。",
+   "relative_constraints": [
+    "builder_A 身高1.75m=H；门0.90×1.95m，门叶0.85×1.90m。",
+    "下层净高2.65m≈1.51H；楼梯15级×0.193m≈2.9m。",
+    "木芯内径2.0m，内置卫浴；柴炉靠木芯，烟道穿墙。",
+    "下层门槛距台基2.0m，距雪面2.3m；地台下架空1.7m。"
+   ]
+  }
+ ],
+ "openings": [
+  {
+   "id": "south_door",
+   "width_m": 0.9,
+   "height_m": 1.95,
+   "fixed": true
+  },
+  {
+   "id": "five_slot_windows",
+   "count": 5,
+   "width_m": 1.0,
+   "height_m": 0.55,
+   "fixed": true
+  },
+  {
+   "id": "core_service_door",
+   "width_m": 0.65,
+   "fixed": true
+  }
+ ],
+ "ledger": {
+  "lower_ring": {
+   "width_m": 1.8,
+   "clear_height_m": 2.65
+  },
+  "upper_ring": {
+   "width_m": 2.2,
+   "floor_above_lower_m": 2.9
+  },
+  "stair": {
+   "risers": 15,
+   "riser_m": 0.193,
+   "tread_m": 0.28,
+   "width_m": 0.75,
+   "rise_m": 2.9
+  },
+  "kitchen_counter": {
+   "length_m": 2.6,
+   "depth_m": 0.6,
+   "height_m": 0.9,
+   "position": "west scale wall"
+  },
+  "bath": {
+   "diameter_m": 2.0,
+   "height_m": 2.4,
+   "position": "inside hollow core"
+  },
+  "bed": {
+   "length_m": 1.9,
+   "width_m": 1.4,
+   "height_m": 0.45
+  },
+  "bench": {
+   "length_m": 1.8,
+   "position": "east scale wall"
+  }
+ },
+ "checks": [
+  {
+   "id": "dwelling_functions",
+   "scope": "design",
+   "status": "pass",
+   "reason": "睡：上层床；起居：下层长凳与折叠桌，柴炉取暖；烹饪：下层2.6m厨台含水槽、电炉、冰箱，另有柴炉；如厕：木芯内堆肥马桶；洗浴：木芯内0.8m淋浴盘；楼梯连通两层。"
+  },
+  {
+   "id": "ring_widths",
+   "scope": "design",
+   "status": "unverified",
+   "reason": "环宽按锥形截面估算：下层台面高2.0m处外半径约3.2m、扣墙层与木芯后环宽1.8m；上层高4.9m处外半径约3.7m；斜顶使上层内侧1.4m才有站立净高；需要平面+剖面确认，渲染前不得宣称尺寸通过。"
+  },
+  {
+   "id": "stair_rise",
+   "scope": "design",
+   "status": "pass",
+   "reason": "15级×0.193m=2.895m≈2.9m；踏面0.28m，沿木芯外侧盘绕约116度；梯宽0.75m，在1.8m宽下环内留出行走与厨台所需通道。"
+  },
+  {
+   "id": "cavity_and_core",
+   "scope": "design",
+   "status": "pass",
+   "reason": "空腔来源是松果内部的干种子、树脂屑与碎翅，第11段清出；木芯为空管，第12段掏出脆髓并开0.8m服务门；卫浴放在木芯内，不新增房间。"
+  },
+  {
+   "id": "heating_and_flue",
+   "scope": "design",
+   "status": "pass",
+   "reason": "柴炉靠木芯放瓷砖炉床，烟道经预钻烟道套管穿墙；存柴格在地台下；炉火在第27段点燃，与终景微光一致。"
+  },
+  {
+   "id": "material_sources",
+   "scope": "design",
+   "status": "pass",
+   "reason": "第9段手摇绞车与物料垛；两个300L保温水箱半体、电池柜过0.90m门；胶合板预切；剩余库存逐段减少；门盘立作长椅靠背。"
+  },
+  {
+   "id": "utility_chain",
+   "scope": "design",
+   "status": "pass",
+   "reason": "电：光伏杆→地下导管→门侧套管→电池柜→线管→灯/电炉/冰箱；水：埋地标准管+伴热管→水套管→保温水箱→水槽/淋浴；排水：地台管→北侧排水套管；排风：堆肥马桶→通风套管；烟道：柴炉→烟道套管。均在包覆前布设。"
+  },
+  {
+   "id": "render_identity_scale_space",
+   "scope": "design",
+   "status": "unverified",
+   "reason": "尚未渲染，人物参考与空间图均为planned；环形窄空间与斜顶需先出平面+剖面。"
+  }
+ ],
+ "hook": {
+  "first_conflict": "大雪压枝的松林里立着一只鳞片合拢、压满积雪的巨型干松果，没有门窗，柴垛和雪铲给出尺度。",
+  "focus": "压满雪的最下圈南向鳞片与计划开口位置",
+  "payoff": "同一只松果里下层炉火、楼梯、木芯卫浴和上层雪窗卧室沿一圈读完。"
+ },
+ "work_scope": {
+  "boundary": "整只松果（10.4 m高）、门前平台与十一级台阶、门上鳞片雨篷、光伏杆与伴热水管、雪地小径",
+  "main_camera_visible": "work 机位同时看见整只松果、门、鳞片雨篷、五扇鳞缝窗、光伏杆、柴垛和雪松",
+  "phases": "初：压满雪的合拢鳞片；中：撬鳞开门、平台、能力件；终：鳞缝窗透出暖光的住所"
+ },
+ "payoff": {
+  "people_present": false,
+  "reason": "第28段无人，沿楼梯读完下层、木芯卫浴和上层卧室。"
+ },
+ "concept": "# 巨型干松果 → 雪林住所\n\n原创幻想设计，不是源片观察。\n\n**首屏**：大雪压枝的松林里立着一只鳞片合拢、压满积雪的巨型干松果，没有门窗，柴垛和雪铲给出尺度。\n\n**空间**：高10.4 m；中央空木芯里放卫浴；外圈两层环形空间——下层（环宽1.8 m，净高2.65 m）是起居、厨房、柴炉，上层（环宽约2.2 m）是卧室；楼梯15级环绕木芯。\n\n**功能落点**：睡＝上层床；起居＝下层长凳折叠桌与柴炉；烹饪＝下层厨台；如厕＝木芯堆肥马桶；洗浴＝淋浴盘。电来自光伏，水来自保温水管与水箱。\n",
+ "spatial_notes": [
+  "H=1.75 m；门0.90×1.95 m，门槛距台基2.0 m。",
+  "下层环宽1.8 m，净高2.65 m；楼梯15级×0.193 m≈2.9 m。"
+ ],
+ "outline": [
+  {
+   "label": "载体与尺度：踏雪走向合拢的巨松果",
+   "stage": "0 奇观与目标",
+   "cam": "open",
+   "kind": "construction"
+  },
+  {
+   "label": "铲雪、刷鳞并标出门线",
+   "stage": "1 入口从轮廓到可开合",
+   "cam": "face",
+   "kind": "construction"
+  },
+  {
+   "label": "撬起三片鳞片，锯出门洞",
+   "stage": "1 入口从轮廓到可开合",
+   "cam": "face",
+   "kind": "construction"
+  },
+  {
+   "label": "取出门盘、装木门框",
+   "stage": "1 入口从轮廓到可开合",
+   "cam": "face",
+   "kind": "construction"
+  },
+  {
+   "label": "门扇装好并试开合",
+   "stage": "1 入口从轮廓到可开合",
+   "cam": "face",
+   "kind": "construction"
+  },
+  {
+   "label": "门前平台与十一级台阶",
+   "stage": "2 外部支持与住宅前景",
+   "cam": "work",
+   "kind": "construction"
+  },
+  {
+   "label": "光伏杆、融雪水管与手摇绞车",
+   "stage": "2 外部支持与住宅前景",
+   "cam": "work",
+   "kind": "construction"
+  },
+  {
+   "label": "物料垛、雪路、灯与常绿盆栽",
+   "stage": "2 外部支持与住宅前景",
+   "cam": "work",
+   "kind": "construction"
+  },
+  {
+   "label": "桥：登上平台，下到松果腔",
+   "stage": "3 入室与引光",
+   "cam": "bridge",
+   "kind": "bridge",
+   "imgcam": "face"
+  },
+  {
+   "label": "清出干种子、树脂屑与碎翅",
+   "stage": "3 入室与引光",
+   "cam": "int_s",
+   "kind": "construction"
+  },
+  {
+   "label": "掏空中央木芯，刮净、烘干并封壳",
+   "stage": "3 入室与引光",
+   "cam": "int_s",
+   "kind": "construction"
+  },
+  {
+   "label": "撬开鳞缝装五扇窗，钻出烟道套管",
+   "stage": "3 入室与引光",
+   "cam": "work",
+   "kind": "construction"
+  },
+  {
+   "label": "立架空地台柱，放入水箱、电池柜与存柴格",
+   "stage": "4 地面基层分层",
+   "cam": "int_s",
+   "kind": "construction"
+  },
+  {
+   "label": "铺环形地台板、膜、保温板与排水管",
+   "stage": "4 地面基层分层",
+   "cam": "int_s",
+   "kind": "construction"
+  },
+  {
+   "label": "螺旋楼梯与上层环形楼板",
+   "stage": "4 地面基层分层",
+   "cam": "int_s",
+   "kind": "construction"
+  },
+  {
+   "label": "甲板铺好后墙与屋顶包覆黑膜",
+   "stage": "5 墙顶包覆与三面填充",
+   "cam": "int_s",
+   "kind": "construction"
+  },
+  {
+   "label": "墙格、顶格、线管、水管与烟道",
+   "stage": "5 墙顶包覆与三面填充",
+   "cam": "int_s",
+   "kind": "construction"
+  },
+  {
+   "label": "下墙填充黄色矿棉",
+   "stage": "5 墙顶包覆与三面填充",
+   "cam": "int_s",
+   "kind": "construction"
+  },
+  {
+   "label": "上墙与斜顶填充",
+   "stage": "5 墙顶包覆与三面填充",
+   "cam": "int_u",
+   "kind": "construction"
+  },
+  {
+   "label": "铺松木地板：下层、踏板与上层",
+   "stage": "6 三面木饰面",
+   "cam": "int_s",
+   "kind": "construction"
+  },
+  {
+   "label": "松木墙板与窗洞饰面",
+   "stage": "6 三面木饰面",
+   "cam": "int_s",
+   "kind": "construction"
+  },
+  {
+   "label": "屋顶与环形顶板封闭",
+   "stage": "6 三面木饰面",
+   "cam": "int_u",
+   "kind": "construction"
+  },
+  {
+   "label": "中央木芯里的卫浴：马桶与淋浴",
+   "stage": "7 生活布置与点亮",
+   "cam": "int_s",
+   "kind": "construction"
+  },
+  {
+   "label": "下层厨房与柴炉",
+   "stage": "7 生活布置与点亮",
+   "cam": "int_k",
+   "kind": "construction"
+  },
+  {
+   "label": "上层卧室：床与小架",
+   "stage": "7 生活布置与点亮",
+   "cam": "int_u",
+   "kind": "construction"
+  },
+  {
+   "label": "灯光、地毯与窗帘",
+   "stage": "7 生活布置与点亮",
+   "cam": "int_k",
+   "kind": "construction"
+  },
+  {
+   "label": "长凳、折叠桌与日常用品",
+   "stage": "7 生活布置与点亮",
+   "cam": "int_k",
+   "kind": "construction"
+  },
+  {
+   "label": "无人整屋：沿螺旋梯上到卧室雪窗",
+   "stage": "8 无人回报",
+   "cam": "reveal",
+   "kind": "reveal",
+   "cam_end": "int_u",
+   "imgcam": "int_s"
+  }
+ ]
+}

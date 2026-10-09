@@ -17,6 +17,7 @@ import os
 import shutil
 import tempfile
 import unittest
+import pytest
 from unittest.mock import MagicMock, patch
 
 from video_generator import (
@@ -26,6 +27,8 @@ from video_generator import (
     generate_video_collage,
     _extract_video_frame,
 )
+
+pytestmark = pytest.mark.usefixtures('offline_fx_video_io')
 
 
 class TestPreparePromptForT2V(unittest.TestCase):
@@ -88,6 +91,15 @@ class TestVideoChainSequenceGeneration(unittest.TestCase):
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
+        for target, value in (
+            ('_get_account_pool_service', None), ('_select_pool_account', None),
+            ('apply_google_fx_runtime_overrides', None),
+            ('verify_video_anchors', (True, 'offline-test')),
+            ('check_video_process', ('accept', 'offline-test')),
+        ):
+            isolated = patch('video_generator.' + target, return_value=value)
+            isolated.start()
+            self.addCleanup(isolated.stop)
         self.config = {
             'videoModel': 'Veo 3.1 - Fast',
             'imageAspectRatio': '9:16',

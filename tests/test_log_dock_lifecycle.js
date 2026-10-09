@@ -6,7 +6,7 @@ const path = require('node:path');
 const semantics = require('../js/log_semantics.js');
 const source = fs.readFileSync(path.join(__dirname, '../js/api_client.js'), 'utf8');
 
-function setup(idea = null) {
+function setup(idea = null, options = {}) {
   const nodes = new Map();
   function element(id = '') {
     const classes = new Set();
@@ -29,23 +29,34 @@ function setup(idea = null) {
     'log-pill', 'log-pill-badge', 'log-mode-tabs', 'log-event-list', 'log-headline', 'log-panel-foot'].forEach(element);
   const dots = [element(), element()];
   const listeners = {};
+  const documentListeners = {};
+  const streams = [];
+  const timers = new Map();
+  let timerId = 0;
   const context = { console, SparkLogSemantics: semantics, currentIdea: idea, ideaTasksById: {}, innerWidth: 1280,
-    localStorage: { getItem: () => null, setItem() {} },
+    localStorage: { getItem: key => (options.saved || {})[key] ?? null, setItem() {} },
     getComputedStyle: () => ({ getPropertyValue: () => '420px' }),
     document: { getElementById: id => nodes.get(id), querySelectorAll: () => dots, createElement: () => element(),
-      createDocumentFragment: () => element(), addEventListener() {}, body: element(), documentElement: element() },
+      createDocumentFragment: () => element(), hidden: !!options.hidden,
+      addEventListener(type, fn) { documentListeners[type] = fn; }, body: element(), documentElement: element() },
     addEventListener(type, fn) { listeners[type] = fn; },
-    setTimeout() { return 1; }, clearTimeout() {}, requestAnimationFrame() {}, escapeHtml: value => String(value),
-    EventSource: class { addEventListener() {} close() {} },
+    setTimeout(fn, ms) { const id = ++timerId; timers.set(id, { fn, ms }); return id; },
+    clearTimeout(id) { timers.delete(id); }, requestAnimationFrame() {}, escapeHtml: value => String(value),
+    EventSource: class {
+      constructor(url) { this.url = url; this.handlers = {}; this.closed = false; streams.push(this); }
+      addEventListener(type, fn) { this.handlers[type] = fn; }
+      close() { this.closed = true; }
+      fire(type, payload = {}) { this.handlers[type]?.(payload); }
+    },
   };
   context.window = context;
   vm.createContext(context);
   const start = source.indexOf('const _LOG_LINE_RE');
   const end = source.indexOf('// 帧/视频序列渲染都有串行锁');
-  const code = source.slice(start, end).replace('    connectLogStream();\n}',
-    '    connectLogStream(); globalThis.dockTest = { appendLine, renderOverview, setConnected, applyDockWidth, setLogScope, entries };\n}');
+  const code = source.slice(start, end).replace('    syncLogStream();\n}',
+    '    syncLogStream(); globalThis.dockTest = { appendLine, renderOverview, setConnected, applyDockWidth, setLogScope, setLogDockOpen, entries };\n}');
   vm.runInContext(code + '\ninitLocalServiceLogs();', context);
-  return { context, nodes, dots, listeners, dock: context.dockTest };
+  return { context, nodes, dots, listeners, documentListeners, streams, timers, dock: context.dockTest };
 }
 const error = (task, index) => `12:00:00.000 [ERROR] [TASK] [task=${task}] video_error index=${index} current=${index} total=47 message=warning`;
 
@@ -83,7 +94,7 @@ test('current project is the default scope with an explicit all-logs escape', ()
 });
 
 test('disconnected log state survives overview rendering and small screens overlay', () => {
-  const { dock, nodes, context } = setup();
+  const { dock, nodes, context } = setup(null, { saved: { spark_log_dock_open: '1' } });
   dock.setConnected(false);
   dock.renderOverview();
   assert.match(nodes.get('log-headline').textContent, /日志同步中断/);
@@ -93,6 +104,55 @@ test('disconnected log state survives overview rendering and small screens overl
   context.innerWidth = 1600;
   dock.applyDockWidth(420);
   assert.equal(context.document.body.classList.contains('log-docked'), true);
+});
+
+test('collapsed and hidden logs pause traffic, foreground resumes with history', () => {
+  const s = setup();
+  assert.equal(s.streams.length, 0, 'folded startup must not download logs');
+  assert.match(s.nodes.get('log-headline').textContent, /日志同步已暂停/);
+  s.dock.setLogDockOpen(true);
+  assert.equal(s.streams.length, 1);
+  const first = s.streams[0];
+  first.fire('open');
+  first.fire('history', { data: JSON.stringify({ data: { lines: [error('v1', 4)] } }) });
+  assert.equal(s.dock.entries.length, 1);
+  s.context.document.hidden = true;
+  s.documentListeners.visibilitychange();
+  assert.equal(first.closed, true);
+  s.dock.renderOverview();
+  assert.match(s.nodes.get('log-headline').textContent, /日志同步已暂停/);
+  first.fire('error');
+  assert.equal([...s.timers.values()].filter(timer => timer.ms === 3000).length, 0);
+  s.context.document.hidden = false;
+  s.documentListeners.visibilitychange();
+  assert.equal(s.streams.length, 2);
+  const second = s.streams[1];
+  first.fire('open'); first.fire('log', { data: JSON.stringify({ text: error('old', 5) + '\n' }) });
+  first.fire('history', { data: JSON.stringify({ lines: [error('old', 6)] }) }); first.fire('error');
+  assert.equal(second.closed, false, 'retired stream cannot close a new stream');
+  assert.equal(s.dock.entries.length, 1, 'retired stream cannot change history');
+  second.fire('open');
+  second.fire('history', { data: JSON.stringify({ lines: [error('v2', 7)] }) });
+  assert.equal(s.dock.entries[0].task, 'v2');
+  s.dock.setLogDockOpen(false);
+  assert.equal(second.closed, true);
+  s.documentListeners.visibilitychange();
+  assert.equal(s.streams.length, 2, 'foreground folded drawer remains paused');
+});
+
+test('closing logs cancels retry and saved detail-open state connects safely', () => {
+  const s = setup(null, { saved: { spark_log_dock_open: '1', spark_log_dock_mode: 'detail' } });
+  assert.equal(s.streams.length, 1, 'saved detail-open startup must avoid temporal dead zone');
+  const stream = s.streams[0];
+  stream.fire('error');
+  assert.equal(stream.closed, true);
+  assert.equal([...s.timers.values()].filter(timer => timer.ms === 3000).length, 1);
+  stream.fire('error');
+  assert.equal([...s.timers.values()].filter(timer => timer.ms === 3000).length, 1, 'duplicate error cannot stack retries');
+  s.dock.setLogDockOpen(false);
+  assert.equal([...s.timers.values()].filter(timer => timer.ms === 3000).length, 0);
+  s.dock.setLogDockOpen(true);
+  assert.equal(s.streams.length, 2);
 });
 
 test('preview remains available while generation buttons are busy', () => {

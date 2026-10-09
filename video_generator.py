@@ -11,6 +11,7 @@ import contextlib
 import contextvars
 import uuid
 import math
+from fx_console import normalize_video_retry_count
 from datetime import datetime, timezone
 
 from server_common import (
@@ -45,6 +46,94 @@ def _win_subprocess_flags():
 _MEDIA_CONTEXT = contextvars.ContextVar('video_media_operation', default=None)
 _MERGE_LOCKS = {}
 _MERGE_LOCKS_GUARD = threading.Lock()
+
+
+class VideoSubmissionPendingError(RuntimeError):
+    """An unresolved fixed native account submission cannot run again."""
+
+    def __init__(self, pending):
+        super().__init__('视频已提交，结果待确认；请先核对原任务，不可重复提交该槽位')
+        self.pending = pending
+
+
+def video_submission_slots(prompt_block, target_slots=None, is_chain=False):
+    from prompt_pipeline import _parse_prompt_slots
+    images, videos = _parse_prompt_slots(prompt_block)
+    slots = set(videos)
+    if is_chain and not slots:
+        slots = set(images) or ({1} if str(prompt_block or '').strip() else set())
+    if target_slots is not None:
+        slots.intersection_update(int(value) for value in target_slots)
+    return slots
+
+
+def ensure_video_submissions_resolved(project_key, slots=None, *, manifest=None, provider=None):
+    """Guard unresolved fixed native submissions for one project.
+
+    Journal scope survives task cleanup; older receipts fall back to loaded task
+    metadata. The journal can be newer than the manifest when cancellation or a
+    disk error interrupted the progress callback.
+    Flow2API attempts remain recorded with their actual pending state, but do not
+    require reconciliation before a new submission, including legacy adapter rows.
+    """
+    if not project_key or str(provider or '').strip().lower() == 'flow2api':
+        return
+    wanted = None if slots is None else {int(slot) for slot in slots}
+    if wanted == set():
+        return
+    if manifest is None:
+        manifest = read_manifest(_get_project_dir(project_key)) or {}
+    records = {}
+
+    def collect(receipt, slot, *, task_id=None, request_id=None, provider=None):
+        if not isinstance(receipt, dict):
+            return
+        try:
+            slot = int(slot)
+        except (TypeError, ValueError):
+            return
+        if slot <= 0 or (wanted is not None and slot not in wanted):
+            return
+        ads_identity = any(receipt.get(k) for k in ('account_id', 'project_url', 'tile_id'))
+        # A retained MP4's provider describes the old successful artifact, not
+        # necessarily the newest attempt (which may have switched providers).
+        origin = receipt.get('provider') or (provider if not ads_identity else None)
+        submission_id = receipt.get('submission_id')
+        fixed_native = receipt.get('fixed_video_account') is True and bool(submission_id)
+        if origin == 'flow2api' or not fixed_native:
+            return
+        identity = (slot, str(submission_id or task_id or 'manifest'))
+        pending = receipt.get('submission_pending') is True
+        if pending or receipt.get('submission_pending') is False:
+            records[identity] = (pending, {
+                'slot': slot,
+                **({'task_id': task_id} if task_id else {}),
+                **({'request_id': request_id} if request_id else {}),
+            })
+
+    for video in manifest.get('videos') or []:
+        if isinstance(video, dict):
+            collect(video.get('last_attempt'), video.get('slot'), provider=video.get('provider'))
+
+    with ACTIVE_TASKS_LOCK:
+        tasks = [(task_id, dict(task.get('dimensions') or {}))
+                 for task_id, task in ACTIVE_TASKS.items()]
+    from video_operations import VideoOperationStore
+    store = VideoOperationStore()
+    key = _safe_project_name(project_key)
+    for task_id, receipt in store.project_submissions(key):
+        collect(receipt, receipt.get('slot'), task_id=task_id, request_id=receipt.get('request_id'))
+    for task_id, dimensions in tasks:
+        task_project = dimensions.get('project_key') or dimensions.get('theme')
+        if not task_project or _safe_project_name(task_project) != key:
+            continue
+        for receipt in store.submissions(task_id):
+            if not receipt.get('project_key'):
+                collect(receipt, receipt.get('slot'), task_id=task_id,
+                        request_id=dimensions.get('request_id'), provider=dimensions.get('video_provider'))
+    pending = [details for unresolved, details in records.values() if unresolved]
+    if pending:
+        raise VideoSubmissionPendingError(sorted(pending, key=lambda item: item['slot']))
 
 
 def _check_media_cancel():
@@ -257,6 +346,35 @@ def _get_google_fx_video_service():
     return google_fx_video, models
 
 
+def _uses_flow2api(config):
+    provider = str((config or {}).get('videoProvider') or 'google_fx').strip().lower()
+    if provider not in ('google_fx', 'flow2api'):
+        raise ValueError('不支持的视频服务配置')
+    return provider == 'flow2api'
+
+
+def _get_video_generation_service(config):
+    if _uses_flow2api(config):
+        from flow2api_video import Flow2APIVideoService
+        from integrations.google_fx import models
+        return Flow2APIVideoService(config), models
+    return _get_google_fx_video_service()
+
+
+@contextlib.contextmanager
+def _video_account_context(config, account_id, cancel_check):
+    # Flow2API owns its account and browser. SPARK only supplies the media request.
+    if _uses_flow2api(config):
+        yield
+        return
+    from integrations.google_fx.utils import account_binding
+    binding = (account_binding.bound_fixed_task_account(account_id)
+               if config.get('videoFixedUserId') else account_binding.bound_task_account(account_id))
+    with binding, \
+            fx_cancel_context(cancel_check, deadline=fx_request_deadline()):
+        yield
+
+
 def _get_credit_helpers():
     from integrations.google_fx.services import google_fx_credit
     return google_fx_credit
@@ -420,7 +538,7 @@ def verify_video_anchors(video_path, start_frame_path, end_frame_path, strict=Fa
     """
     import tempfile
     if not gate_setting('videoAnchorVerify', config):
-        return True, 'disabled:videoAnchorVerify=false（锚点校验已按配置关闭，串片不会被拦截）'
+        return True, 'retired:videoAnchorVerify（质量锚点审查已永久退役）'
     try:
         import numpy as np
         with tempfile.TemporaryDirectory() as td:
@@ -801,10 +919,8 @@ def _declared_frame_anchors(prompt):
     返回 (start_slot: int, end_slot: Optional[int]) 或 None。end_slot 为 None 表示
     正文声明这一段只有首帧（英雄展示）。
 
-    注意：这个函数的返回值**不决定送哪两张帧**。槽位契约（视频 slot 绑定
-    IMAGE slot -> IMAGE slot+1）才是唯一权威，见 plan_video_slots 的说明。这里解出
-    来的编号只用于两件事：把正文改写成 Flow 两卡位的 IMAGE 1/IMAGE 2，以及在声明
-    与契约不符时报警。
+    默认生成模式仍按视频 slot 绑定 IMAGE slot -> IMAGE slot+1；声明只用于改写。
+    自动配对模式由 resolve_video_frame_anchors 复用此解析器选择实际输入帧。
 
     支持的声明模式：
       - 单帧/英雄展示: "Use ... (IMAGE 11) as the sole starting-frame anchor" -> (11, None)
@@ -878,6 +994,81 @@ def extract_declared_frame_anchors(prompt, default_start=1, default_end=2):
     if declared is None:
         return default_start, default_end
     return declared
+
+
+def _normalize_auto_frame_references(text):
+    """Use one spelling for explicitly numbered image references."""
+    text = str(text or '').strip()
+    text = re.sub(r'\b(?:IMG|FRAME)\s*(\d+)', r'IMAGE \1', text, flags=re.IGNORECASE)
+    text = re.sub(r'(?:图像|画面|图片|图)\s*(\d+)', r'IMAGE \1', text)
+    roles = r'(?:首帧|起始帧|开始帧|第一帧|尾帧|结束帧|最后一?帧|\b(?:start|first|starting|end|last|ending)[- ]frame\b)'
+    text = re.sub('(' + roles + r'\s*[:：=]?\s*)(\d+)\b', r'\1IMAGE \2', text, flags=re.IGNORECASE)
+    return text
+
+
+def _auto_declared_frame_anchors(text):
+    """Recognize explicit frame declarations, including compact header notation."""
+    text = _normalize_auto_frame_references(text)
+    if not text:
+        return None
+    text = re.sub(r'→|⇒|⟶|⟹', '->', text)
+    text = re.sub(r'(IMAGE\s*\d+\s*->\s*)(\d+)\b', r'\1IMAGE \2', text, flags=re.IGNORECASE)
+    text = re.sub(r'(?:single|only)\s+(?:starting|first)[- ]frame',
+                  'sole starting-frame', text, flags=re.IGNORECASE)
+    declared = _declared_frame_anchors(text)
+    if declared is not None:
+        return declared
+    # Delivery formatting replaces planning arrows with this phrase.
+    resulting = re.search(r'IMAGE\s*(\d+)\s*,?\s*resulting\s+in\s+IMAGE\s*(\d+)',
+                          text, re.IGNORECASE)
+    if resulting:
+        return int(resulting.group(1)), int(resulting.group(2))
+
+    ref = r'(?:IMAGE\s*)?(\d+)'
+    start_role = r'(?:首帧|起始帧|开始帧|第一帧|\b(?:start|first|starting)[- ]frame\b)'
+    end_role = r'(?:尾帧|结束帧|最后一?帧|\b(?:end|last|ending)[- ]frame\b)'
+    delimiter = r'\s*[:：=]?\s*'
+    start = re.search(start_role + delimiter + ref, text, re.IGNORECASE)
+    end = re.search(end_role + delimiter + ref, text, re.IGNORECASE)
+    if start and end:
+        return int(start.group(1)), int(end.group(1))
+    if start and re.search(r'单帧|仅首帧|只有首帧|仅使用首帧|no\s+last[- ]frame', text, re.IGNORECASE):
+        return int(start.group(1)), None
+    return None
+
+
+def resolve_video_frame_anchors(slot, item, config=None):
+    """Resolve an I2V slot's input frames without inspecting or substituting files.
+
+    Existing projects retain the adjacent-frame contract. ``videoFramePairing:
+    'auto'`` opts into explicit declarations in metadata/header or body; header
+    declarations take precedence. Missing declared frames remain the requested
+    anchors so callers can report the missing frame rather than select another.
+    HERO metadata always selects only a starting frame.
+    """
+    slot = int(slot)
+    fields = item if isinstance(item, dict) else {'body': item}
+    is_hero = 'HERO' in str(fields.get('meta') or '').upper()
+    result = {
+        'start_anchor_slot': slot,
+        'end_anchor_slot': None if is_hero else slot + 1,
+        'source': 'slot_contract',
+        'declaration_location': None,
+    }
+    if str((config or {}).get('videoFramePairing') or '').strip().lower() != 'auto':
+        return result
+    declarations = [
+        ('header', ' '.join(str(fields.get(key) or '') for key in ('meta', 'summary', 'header'))),
+        ('body', fields.get('body')),
+    ]
+    for location, text in declarations:
+        declared = _auto_declared_frame_anchors(text)
+        if declared is not None:
+            start, end = declared
+            result.update(start_anchor_slot=start, end_anchor_slot=None if is_hero else end,
+                          source='prompt_declaration', declaration_location=location)
+            break
+    return result
 
 
 # 两卡位锚点声明句：整句就是"首帧=IMAGE a、尾帧=IMAGE b、在两者之间插值"这件事，
@@ -998,13 +1189,13 @@ def rewrite_prompt_for_two_card_ui(prompt, slot, start_slot=None, end_slot=None,
     )
 
     if end_slot is not None and start_slot != end_slot:
-        prompt = re.sub(rf'\bimage\s+{start_slot}\b', '___IMG_ANCHOR_1___', prompt, flags=re.IGNORECASE)
+        prompt = re.sub(rf'\bimage\s*{start_slot}\b', '___IMG_ANCHOR_1___', prompt, flags=re.IGNORECASE)
         prompt = re.sub(rf'图片\s*{start_slot}\b', '___IMG_ANCHOR_1___', prompt)
-        prompt = re.sub(rf'\bimage\s+{end_slot}\b', '___IMG_ANCHOR_2___', prompt, flags=re.IGNORECASE)
+        prompt = re.sub(rf'\bimage\s*{end_slot}\b', '___IMG_ANCHOR_2___', prompt, flags=re.IGNORECASE)
         prompt = re.sub(rf'图片\s*{end_slot}\b', '___IMG_ANCHOR_2___', prompt)
         prompt = prompt.replace('___IMG_ANCHOR_1___', 'IMAGE 1').replace('___IMG_ANCHOR_2___', 'IMAGE 2')
     elif end_slot is not None and start_slot == end_slot:
-        prompt = re.sub(rf'\bimage\s+{start_slot}\b', 'IMAGE 1', prompt, flags=re.IGNORECASE)
+        prompt = re.sub(rf'\bimage\s*{start_slot}\b', 'IMAGE 1', prompt, flags=re.IGNORECASE)
         prompt = re.sub(rf'图片\s*{start_slot}\b', 'IMAGE 1', prompt)
     else:
         # 单帧（HERO / 末槽单图）：不能只换首帧编号了事——正文里的尾帧声明和插值指令
@@ -1197,6 +1388,13 @@ def plan_video_slots(video_slots, slot_to_path, slot_to_quality, videos_dir, tar
     }
 
     plans = []
+
+    def usable_frame(path):
+        try:
+            return bool(path and os.path.isfile(path) and os.path.getsize(path) > 0)
+        except OSError:
+            return False
+
     for seq, slot in enumerate(slots, start=1):
         item = video_slots[slot]
         prompt = item['body'] if isinstance(item, dict) else item
@@ -1206,16 +1404,20 @@ def plan_video_slots(video_slots, slot_to_path, slot_to_quality, videos_dir, tar
         # （见 prompt_pipeline._compose_hero_showcase_video），不设结束锚点。
         is_hero = 'HERO' in meta
 
-        # 槽位契约是唯一权威：视频 slot 绑定 IMAGE slot -> IMAGE slot+1（HERO 只有首帧）。
-        # 直接按槽位契约取帧生成，不再校验或拦截提示词正文中的锚点声明。
-        start_slot = slot
-        end_slot = None if is_hero else (slot + 1)
+        anchors = resolve_video_frame_anchors(slot, item, config)
+        start_slot = anchors['start_anchor_slot']
+        end_slot = anchors['end_anchor_slot']
+        auto_pairing = str((config or {}).get('videoFramePairing') or '').strip().lower() == 'auto'
 
+        if auto_pairing:
+            prompt = _normalize_auto_frame_references(prompt)
         declared = _declared_frame_anchors(prompt)
-        rewrite_start = declared[0] if declared and declared[0] is not None else start_slot
-        rewrite_end = declared[1] if (declared and declared[1] is not None) else end_slot
+        rewrite_start = start_slot if auto_pairing else (declared[0] if declared and declared[0] is not None else start_slot)
+        rewrite_end = end_slot if auto_pairing else (declared[1] if declared and declared[1] is not None else end_slot)
         prompt = rewrite_prompt_for_two_card_ui(prompt, slot, start_slot=rewrite_start,
                                                 end_slot=rewrite_end, single_frame=(end_slot is None))
+        if auto_pairing and end_slot is not None:
+            prompt = 'Use IMAGE 1 as the first-frame image and IMAGE 2 as the last-frame image. ' + prompt
         dest_path = os.path.join(videos_dir, f'vid_{slot:03d}.mp4')
         start_p = slot_to_path.get(start_slot)
         end_p = None if (is_hero or end_slot is None) else slot_to_path.get(end_slot)
@@ -1228,6 +1430,9 @@ def plan_video_slots(video_slots, slot_to_path, slot_to_quality, videos_dir, tar
             'end_frame': end_p,
             'start_anchor_slot': start_slot,
             'end_anchor_slot': end_slot,
+            'anchor_pairing_source': anchors['source'],
+            'anchor_declaration_location': anchors['declaration_location'],
+            'is_single_frame': end_slot is None,
             'anchor_declaration_mismatch': None,
             'delete_existing': False,
             'reason': '',
@@ -1236,7 +1441,37 @@ def plan_video_slots(video_slots, slot_to_path, slot_to_quality, videos_dir, tar
 
         existing_entry = existing_by_slot.get(slot)
         existing = os.path.exists(dest_path) and os.path.getsize(dest_path) > 0
-        if not is_explicit_retry and existing:
+        if auto_pairing and not usable_frame(start_p):
+            plan['action'] = 'blocked'
+            plan['reason'] = f"视频 {slot} 所需的起始帧 IMAGE {start_slot} 不存在。请重新生成该帧！"
+            plans.append(plan)
+            continue
+        if auto_pairing and end_slot is not None and not usable_frame(end_p):
+            plan['action'] = 'blocked'
+            plan['reason'] = f"视频 {slot} 所需的结束帧 IMAGE {end_slot} 不存在。请重新生成该帧！"
+            plans.append(plan)
+            continue
+        if auto_pairing and end_slot == start_slot:
+            plan['action'] = 'blocked'
+            plan['reason'] = (f"视频 {slot} 的首尾帧都指向 IMAGE {start_slot}，无法形成两张独立锚点。"
+                              '请指定不同的首尾帧，或明确声明仅使用首帧生成单帧视频。')
+            plans.append(plan)
+            continue
+        previous_start = (existing_entry or {}).get('start_anchor_slot') or slot
+        previous_end = (existing_entry or {}).get('end_anchor_slot')
+        if previous_end is None and not ((existing_entry or {}).get('is_single_frame')
+                or (existing_entry or {}).get('is_hero')
+                or 'HERO' in str((existing_entry or {}).get('meta') or '').upper()):
+            previous_end = slot + 1
+        manual_video = bool(existing_entry and (
+            existing_entry.get('source') in ('manual_upload', 'manual_swap')
+            or existing_entry.get('model') == 'manual_upload'
+            or existing_entry.get('swapped_from_slot') is not None
+            or existing_entry.get('swapped_from_sequence') is not None
+            or existing_entry.get('anchor_mismatch_overridden')))
+        replace_pair = auto_pairing and not manual_video and (
+            (previous_start, previous_end) != (start_slot, end_slot))
+        if not is_explicit_retry and existing and not replace_pair:
             # 1. 手动上传的视频（/api/upload_video 已做过校验/force 确认）：直接信任复用，不重新验锚点
             if existing_entry and (existing_entry.get('source') == 'manual_upload' or existing_entry.get('model') == 'manual_upload'):
                 plan['action'] = 'reuse'
@@ -1270,6 +1505,9 @@ def plan_video_slots(video_slots, slot_to_path, slot_to_quality, videos_dir, tar
             plan['reason'] = f"已存在的片段与当前锚点帧不符（{verify_reason}），视为过期，将重新生成。"
         elif is_explicit_retry and existing:
             plan['delete_existing'] = True
+        elif existing and replace_pair:
+            plan['delete_existing'] = True
+            plan['reason'] = '已识别的首尾帧与现有视频绑定不同，将保留旧文件并重新生成该段。'
 
         if not start_p or not os.path.exists(start_p):
             plan['action'] = 'blocked'
@@ -1406,12 +1644,14 @@ def _video_info(plan, video_model, status, error=None):
         'prompt': plan['prompt'],
         'model': video_model,
         'status': status,
-        # 起始锚点帧编号，现在总是等于自身 slot；字段保留供 merge_project_videos 的
-        # 锚点一致性核对读取，兼容旧 manifest 里 TBCP v3 Bridge SPAN 的重定向记录。
+        # 实际选择的帧编号供合并和断点续传复核；自动配对可选择非相邻帧。
         'start_anchor_slot': plan.get('start_anchor_slot', plan['slot']),
         # 结束锚点帧编号：merge_project_videos 读它做合并期的锚点复核。不落盘的话
         # 那边只能回退成 slot+1，生成期与合并期就会拿两对不同的帧互相核对。
         'end_anchor_slot': plan.get('end_anchor_slot'),
+        'anchor_pairing_source': plan.get('anchor_pairing_source', 'slot_contract'),
+        'anchor_declaration_location': plan.get('anchor_declaration_location'),
+        'is_single_frame': plan.get('end_anchor_slot') is None,
         'meta': plan.get('meta', ''),
         # 英雄展示视频（默认收尾步骤）：只上传首帧、无独立结束锚点，前端据此选用
         # 不同的槽位标签/文案，merge_project_videos 据此把它当可选附加片段处理。
@@ -1453,6 +1693,8 @@ class _ManifestWriter:
     def __init__(self, manifest_path, manifest_data, all_slots):
         self.path = manifest_path
         self.data = manifest_data
+        self._saved_snapshot = json.loads(json.dumps(manifest_data))
+        self._metadata_updates = {}
         self.all_slots = sorted(all_slots)
         self.results = []  # 本次运行产生的 video_info（含失败），按发生顺序
         self.attempt_id = uuid.uuid4().hex
@@ -1468,10 +1710,20 @@ class _ManifestWriter:
         info = dict(video_info)
         status = info.get('status')
         attempt = dict(old_attempt or {})
+        incoming_attempt = info.get('last_attempt') or {}
+        if (incoming_attempt.get('submission_id')
+                and incoming_attempt['submission_id'] != attempt.get('submission_id')):
+            # Each automatic retry is a separate paid submission. Its initial
+            # receipt must not inherit the failed operation/account or settlement
+            # fields from the previous submission in this same slot.
+            attempt = {}
         for key in ('account_id', 'project_url', 'tile_id', 'media_id', 'prompt_hash',
-                    'start_uuid', 'end_uuid', 'refs', 'submission_pending', 'confirmed'):
-            if key in (info.get('last_attempt') or {}):
-                attempt[key] = info['last_attempt'][key]
+                    'start_uuid', 'end_uuid', 'refs', 'submission_pending', 'confirmed', 'submission_id',
+                    'provider', 'api_model', 'fixed_video_account', 'operation_id', 'upstream_task_id',
+                    'upstream_account_id', 'client_submission_id', 'upstream_accepted',
+                    'upstream_error_code', 'upstream_reason', 'native_submission_diagnostic'):
+            if key in incoming_attempt:
+                attempt[key] = incoming_attempt[key]
         attempt.update(id=self.attempt_id, status=status, started_at=self.started_at)
         if status == 'success':
             attempt['submission_pending'] = False
@@ -1521,13 +1773,19 @@ class _ManifestWriter:
                              'cancelled_slots': [s for s, a in self.attempt_outcomes.items() if a['status'] == 'cancelled']}
         self.save()
 
+    def record_frame(self, frame_info):
+        """Register a frame extracted by a video operation without stale writes."""
+        with manifest_lock(os.path.dirname(self.path)):
+            current = read_manifest(os.path.dirname(self.path)) or dict(self.data)
+            frames = [frame for frame in current.get('frames', [])
+                      if frame.get('slot') != frame_info['slot']]
+            frames.append(frame_info)
+            frames.sort(key=lambda frame: frame.get('slot', 0))
+            current['frames'] = frames
+            write_json_atomic(self.path, current)
+            self.data['frames'] = frames
+
     def save(self):
-        by_slot = {v['slot']: v for v in self.data.get('videos', []) if isinstance(v, dict) and 'slot' in v}
-        for v in self.results:
-            if isinstance(v, dict) and 'slot' in v:
-                by_slot[v['slot']] = v
-        all_known_slots = sorted(set(self.all_slots) | set(by_slot.keys()))
-        self.data['videos'] = [by_slot[s] for s in all_known_slots if s in by_slot]
         self.data['video_generation_stats']['last_run'].update(
             attempt_id=self.attempt_id,
             failed_slots=[s for s, a in self.attempt_outcomes.items() if a['status'] == 'failed'],
@@ -1535,9 +1793,56 @@ class _ManifestWriter:
         # 视频阶段的能力印章：numpy/ffmpeg 缺失时防串片的首尾帧锚点校验、i2v 帧对
         # 契约、冻结检测全都静默跳过（返回 'skipped'/False，不拦截也不报错）。每次
         # 落盘都重盖一次，环境中途变化也能如实反映（stamp 内部按阶段覆盖，不累积）。
-        stamp_manifest_capabilities(self.data, 'videos')
         with manifest_lock(os.path.dirname(self.path)):
-            write_json_atomic(self.path, self.data)
+            latest = read_manifest(os.path.dirname(self.path))
+            merged = dict(latest if isinstance(latest, dict) else self.data)
+            by_slot = {v['slot']: v for v in merged.get('videos', [])
+                       if isinstance(v, dict) and 'slot' in v}
+            for video in self.results:
+                if isinstance(video, dict) and 'slot' in video:
+                    by_slot[video['slot']] = video
+            merged['videos'] = [by_slot[slot] for slot in sorted(by_slot)]
+            stats = dict(merged.get('video_generation_stats') or {})
+            local_stats = self.data.get('video_generation_stats') or {}
+            stats['last_run'] = local_stats['last_run']
+            if 'cumulative' in local_stats:
+                baseline = (self._saved_snapshot.get('video_generation_stats') or {}).get('cumulative') or {}
+                cumulative = dict(stats.get('cumulative') or {})
+                for key, value in local_stats['cumulative'].items():
+                    delta = int(value or 0) - int(baseline.get(key, 0) or 0)
+                    cumulative[key] = int(cumulative.get(key, 0) or 0) + delta
+                stats['cumulative'] = cumulative
+            merged['video_generation_stats'] = stats
+            projects = dict(merged.get('google_fx_projects') or {})
+            prior_projects = self._saved_snapshot.get('google_fx_projects') or {}
+            for account, url in (self.data.get('google_fx_projects') or {}).items():
+                if url != prior_projects.get(account):
+                    projects[account] = url
+            if projects:
+                merged['google_fx_projects'] = projects
+            for key in ('merged_video', 'merge_error', 'generation_channel'):
+                if key in self.data and (
+                        self.data[key] != self._saved_snapshot.get(key)
+                        or key == 'generation_channel' and self.data[key] == 'video_chain'):
+                    merged[key] = self.data[key]
+                elif key not in self.data and key in self._saved_snapshot:
+                    merged.pop(key, None)
+            recoveries = list(merged.get('video_recoveries') or [])
+            prior_recoveries = self._saved_snapshot.get('video_recoveries') or []
+            for recovery in self.data.get('video_recoveries') or []:
+                if recovery not in prior_recoveries and recovery not in recoveries:
+                    recoveries.append(recovery)
+            if recoveries:
+                merged['video_recoveries'] = recoveries
+            # Frame rendering and auto-video scheduling may have committed newer
+            # data while this provider was working. Only update video-owned fields.
+            merged.update(self._metadata_updates)
+            stamp_manifest_capabilities(merged, 'videos')
+            write_json_atomic(self.path, merged)
+            self.data.clear()
+            self.data.update(merged)
+            self._saved_snapshot = json.loads(json.dumps(merged))
+            self._metadata_updates.clear()
 
 
 
@@ -1609,6 +1914,7 @@ class _BatchBridge:
         # Flow explicitly blocked this request/account. The runner drains its
         # in-flight tiles; the sequence must not start a preplanned later leg.
         self.flow_unusual_activity = False
+        self.fixed_account_stopped = False
         # 批量脚本在风控失败重试时自己换掉的号池账号（account_switched 事件）。
         # 批次跑完后并入 used_account_ids，免得补跑那一轮又挑回刚被判过的号。
         self.switched_accounts = []
@@ -1648,7 +1954,13 @@ class _BatchBridge:
         if stage == 'video_warning':
             if (details or {}).get('code') == 'flow_unusual_activity':
                 self.flow_unusual_activity = True
-            self._emit(stage, {**(details or {}), 'total': self.total})
+            if (details or {}).get('code') == 'fixed_video_account_stopped':
+                self.fixed_account_stopped = True
+            payload = {**(details or {}), 'total': self.total}
+            if payload.get('code') in {'flow2api_auto_retry', 'video_auto_retry'}:
+                plan = self.pending[batch_idx]['plan']
+                payload.update(index=plan['slot'], current=plan['seq'])
+            self._emit(stage, payload)
             return None
         if stage in ('ip_rotating', 'ip_rotated', 'ip_rotation_failed'):
             # 出口切换属于整个生成任务，不依赖某个分段；保留结构化信息供事件回放。
@@ -1702,11 +2014,12 @@ class _BatchBridge:
             self._emit('video_start', {
                 'index': plan['slot'], 'current': plan['seq'], 'total': self.total,
             })
-        elif stage == 'request_submitted':
-            self.stats['submitted_requests'] += 1
+        elif stage in ('request_submitting', 'request_submitted', 'request_accepted', 'request_resolved'):
+            if stage == 'request_submitted':
+                self.stats['submitted_requests'] += 1
             # Journal the paid submission at the task layer even if the project
             # checkpoint below fails (for example because its disk is full).
-            self._emit('request_submitted', {
+            self._emit(stage, {
                 **(details or {}),
                 'index': plan['slot'], 'current': plan['seq'], 'total': self.total,
             })
@@ -1714,10 +2027,20 @@ class _BatchBridge:
             submitted['last_attempt'] = details or {}
             self.writer.record(submitted)
         elif stage == 'video_done':
+            if (details or {}).get('submission_id'):
+                # Record the upstream terminal receipt before local validation or
+                # cancellation can interrupt delivery of the downloaded artifact.
+                self._emit('request_resolved', {
+                    **details, 'index': plan['slot'],
+                    'current': plan['seq'], 'total': self.total,
+                })
+                resolved = _video_info(plan, self.video_model, status='running')
+                resolved['last_attempt'] = details
+                self.writer.record(resolved)
             self.stats['downloaded_results'] += 1
             generated_path = (details or {}).get('video_url')
             if not (generated_path and os.path.isfile(generated_path) and os.path.getsize(generated_path) > 0):
-                self._fail(plan, '生成的视频文件不存在')
+                self._fail(plan, '生成的视频文件不存在', details)
                 return None
             fd, candidate = tempfile.mkstemp(prefix='.video-attempt-', suffix='.mp4',
                                               dir=os.path.dirname(plan['dest_path']))
@@ -1776,9 +2099,10 @@ class _BatchBridge:
                 if self.cancel_check and self.cancel_check():
                     raise ConnectionError('视频生成已取消，已保留原视频')
                 info = _video_info(plan, self.video_model, status='success')
+                info['last_attempt'] = details or {}
                 # Keep the upstream output identity with the local slot; DOM stamps
                 # are transient and cannot serve as a durable provenance record.
-                for key in ('flow_media_id', 'flow_project_url', 'account_id'):
+                for key in ('flow_media_id', 'flow_project_url', 'account_id', 'provider', 'api_model'):
                     if (details or {}).get(key):
                         info[key] = details[key]
                 # 校验结果留痕：skipped:* 表示该片段其实没经过锚点核验（环境异常被放行）
@@ -1845,8 +2169,10 @@ class _BatchBridge:
 def generate_video_sequence(config, title, prompt_block, on_progress=None, target_slots=None,
                              override_flagged=False):
     import builtins
-    builtins.google_fx_cancelled = False
-    apply_google_fx_runtime_overrides(config)
+    flow2api = _uses_flow2api(config)
+    if not flow2api and not config.get('videoFixedUserId'):
+        builtins.google_fx_cancelled = False
+        apply_google_fx_runtime_overrides(config)
     from prompt_pipeline import _parse_prompt_slots
     images, videos = _parse_prompt_slots(prompt_block)
     project_dir = _get_project_dir(title)
@@ -1863,6 +2189,12 @@ def generate_video_sequence(config, title, prompt_block, on_progress=None, targe
         except Exception as e:
             print(f"Warning: could not read manifest.json ({e})")
 
+    if 'videoFramePairing' not in config and manifest_data.get('video_frame_pairing') == 'auto':
+        config = {**config, 'videoFramePairing': 'auto'}
+
+    ensure_video_submissions_resolved(config.get('_project_key') or title,
+        video_submission_slots(prompt_block, target_slots), manifest=manifest_data,
+        provider=config.get('videoProvider') or 'google_fx')
     slot_to_path, slot_to_quality = load_slot_frames(manifest_data, frames_dir, len(images))
     if not slot_to_path:
         raise RuntimeError('未找到已生成的帧图像。请先生成帧序列！')
@@ -1883,7 +2215,7 @@ def generate_video_sequence(config, title, prompt_block, on_progress=None, targe
             'slots': [p['slot'] for p in plans],
         })
 
-    google_fx_video, models = _get_google_fx_video_service()
+    google_fx_video, models = _get_video_generation_service(config)
     video_model = config.get('videoModel') or 'Veo 3.1 - Lite [Lower Priority]'
     # 时长 tab（4s/6s/8s/10s）只有 Omni Flash 模型的 Flow 面板才提供；Veo 系列面板没有
     # 这个 tab，误传会导致自动化脚本在那边找不到目标 tab、把 duration 判为未确认项而
@@ -1937,6 +2269,9 @@ def generate_video_sequence(config, title, prompt_block, on_progress=None, targe
                 # 否则合并期又会回退到 slot+1 去核对。
                 if info.get('end_anchor_slot') is None:
                     info['end_anchor_slot'] = plan.get('end_anchor_slot')
+                info.setdefault('anchor_pairing_source', plan.get('anchor_pairing_source', 'slot_contract'))
+                info.setdefault('anchor_declaration_location', plan.get('anchor_declaration_location'))
+                info.setdefault('is_single_frame', plan.get('end_anchor_slot') is None)
                 if 'meta' not in info:
                     info['meta'] = plan.get('meta', '')
                 if 'is_hero' not in info:
@@ -1975,13 +2310,14 @@ def generate_video_sequence(config, title, prompt_block, on_progress=None, targe
             prompt=plan['prompt'],
             image=plan['start_frame'],
             end_image=plan['end_frame'] or '',
-            image_uuid=frame_canvas_uuids.get(plan['start_frame'] or '', ''),
-            end_image_uuid=frame_canvas_uuids.get(plan['end_frame'] or '', ''),
+            image_uuid='' if flow2api else frame_canvas_uuids.get(plan['start_frame'] or '', ''),
+            end_image_uuid='' if flow2api else frame_canvas_uuids.get(plan['end_frame'] or '', ''),
             model=video_model,
             ratio=config.get('imageAspectRatio') or '9:16',
             duration=video_duration,
             resolution=video_resolution,
-            output_path=temp_out_dir
+            output_path=temp_out_dir,
+            retry_count=normalize_video_retry_count(config.get('videoRetryCount')),
         )
         pending_items.append({'plan': plan, 'req': req, 'temp_out_dir': temp_out_dir})
 
@@ -1996,9 +2332,9 @@ def generate_video_sequence(config, title, prompt_block, on_progress=None, targe
 
     try:
         if pending_items:
-            account_pool = _get_account_pool_service()
-            pool_account_id = _select_pool_account(config, account_pool)
-            if pool_account_id:
+            account_pool = None if flow2api else _get_account_pool_service()
+            pool_account_id = None if flow2api else _select_pool_account(config, account_pool)
+            if pool_account_id and not config.get('videoFixedUserId'):
                 apply_google_fx_runtime_overrides(config)
 
             def _process_gate(plan):
@@ -2017,10 +2353,11 @@ def generate_video_sequence(config, title, prompt_block, on_progress=None, targe
 
             def _run_leg(items, account_id):
                 """跑一条腿：绑定这一腿的号池账号，再交给批量脚本。返回 bridge。"""
-                actual_account_id = account_id or pool_account_id or config.get('googleFxUserId')
+                actual_account_id = None if flow2api else (account_id or pool_account_id or config.get('googleFxUserId'))
                 if actual_account_id:
                     config['googleFxUserId'] = actual_account_id
-                    apply_google_fx_runtime_overrides(config)
+                    if not config.get('videoFixedUserId'):
+                        apply_google_fx_runtime_overrides(config)
                 leg_bridge = _BatchBridge(items, len(plans), video_model, writer, on_progress,
                                           strict=strict_gates_enabled(config),
                                           process_check_fn=_process_gate,
@@ -2029,8 +2366,7 @@ def generate_video_sequence(config, title, prompt_block, on_progress=None, targe
                                           allow_anchor_mismatch=override_flagged,
                                           config=config, cancel_check=cancel_check_cb)
                 run_bridges.append(leg_bridge)
-                from integrations.google_fx.utils import account_binding
-                flow_project_url = _video_project_for_account(writer.data, actual_account_id)
+                flow_project_url = '' if flow2api else _video_project_for_account(writer.data, actual_account_id)
                 for item in items:
                     item['req'].project_url = flow_project_url
                 # fx_cancel_context 必须包住这次调用：cancel_check 只有 _ChunkRunner 自己的
@@ -2040,8 +2376,7 @@ def generate_video_sequence(config, title, prompt_block, on_progress=None, targe
                 # （3 轮 ×（45s 启动超时 + 10×2s 重试）），它只认 contextvar，传进去的
                 # cancel_check 只往下透给 find_or_create_page，重试循环本身读不到。
                 # 帧链一直是对的（frame_generator._fx_generate_batch），这里对齐它。
-                with account_binding.bound_task_account(actual_account_id), \
-                        fx_cancel_context(cancel_check_cb, deadline=fx_request_deadline()):
+                with _video_account_context(config, actual_account_id, cancel_check_cb):
                     try:
                         fx_results = google_fx_video.generate_videos_batch_google_fx(
                             [it['req'] for it in items],
@@ -2065,7 +2400,8 @@ def generate_video_sequence(config, title, prompt_block, on_progress=None, targe
                 return leg_bridge
 
             # 复用可用浏览器跑完整条序列，服务在余额耗尽后续跑剩余请求。
-            ring = _account_rotation_ring(config, account_pool, pool_account_id) if pool_account_id else []
+            ring = (_account_rotation_ring(config, account_pool, pool_account_id)
+                    if pool_account_id and not config.get('videoFixedUserId') else [])
             legs = plan_generation_legs(pending_items, ring, _account_switch_interval(config))
             used_account_ids = []
             login_required_accounts = []
@@ -2101,7 +2437,7 @@ def generate_video_sequence(config, title, prompt_block, on_progress=None, targe
                                         f"跑 {len(leg['items'])} 个片段（保持当前 IP，不换 IP）"),
                         })
                     leg_bridge = _run_leg(leg['items'], leg['user_id'])
-                    if leg_bridge.flow_unusual_activity:
+                    if leg_bridge.flow_unusual_activity or leg_bridge.fixed_account_stopped:
                         # The blocked leg already saved every collected result.
                         # Do not send this batch's remaining clips on another account.
                         break
@@ -2121,45 +2457,13 @@ def generate_video_sequence(config, title, prompt_block, on_progress=None, targe
                 for it in pending_items:
                     shutil.rmtree(it['temp_out_dir'], ignore_errors=True)
 
-            # 🔁 2026-07-24: 号池自动选号的批次里，如果观测到"登录失效等待人工处理
-            # 超时"（人工没能在 20 分钟内处理完），换一个账号很可能就能跑通剩下的
-            # 失败槽位——不必等人工手动点"重试失败片段"。只在自动选号（非手动
-            # 指定账号）时触发，且只补一轮，避免账号池被跑穿也无限换号刷屏。
-            # 2026-07-25: 挑重试账号改走轮转环。原来这里二次调用 _select_pool_account 其实
-            # 永远返回 None——首次选号已经把 googleFxUserId 写回 config，二次调用会把它当成
-            # 手动指定而直接跳过，这条自动换号重试路径从未真正生效过。
-            if pool_account_id and login_required_accounts and not getattr(builtins, 'google_fx_cancelled', False) and not cancel_check_cb():
-                for acct in login_required_accounts:
-                    try:
-                        account_pool.mark_login_required(acct)
-                    except Exception as e:
-                        print(f"Warning: 账号池登录失效标记失败 ({e})")
-                done_slots = {slot for slot, attempt in writer.attempt_outcomes.items() if attempt['status'] == 'success'}
-                retry_source = [it for it in pending_items if it['plan']['slot'] not in done_slots
-                                and not writer.attempt_outcomes.get(it['plan']['slot'], {}).get('submission_pending')]
-                next_account_id = _next_unused_account(
-                    config, account_pool, ring, set(used_account_ids) | set(login_required_accounts))
-                if retry_source and next_account_id:
-                    if on_progress:
-                        on_progress('video_warning', {
-                            'total': len(plans),
-                            'message': (f"检测到账号登录失效且等待人工处理超时，已自动切换号池账号 "
-                                        f"重试剩余 {len(retry_source)} 个片段"),
-                        })
-                    retry_items = []
-                    for it in retry_source:
-                        new_temp_dir = tempfile.mkdtemp()
-                        old_req = it['req']
-                        new_req = models.VideoRequest(
-                            prompt=old_req.prompt, image=old_req.image, end_image=old_req.end_image,
-                            image_uuid=old_req.image_uuid, end_image_uuid=old_req.end_image_uuid,
-                            model=old_req.model, ratio=old_req.ratio, duration=old_req.duration,
-                            resolution=getattr(old_req, 'resolution', None),
-                            output_path=new_temp_dir,
-                        )
-                        retry_items.append({'plan': it['plan'], 'req': new_req, 'temp_out_dir': new_temp_dir})
-
-                    _run_leg(retry_items, next_account_id)
+            # Providers consume the configured retry budget internally. Mark
+            # expired logins without starting a fresh pass that resets the budget.
+            for account_id in login_required_accounts:
+                try:
+                    account_pool.mark_login_required(account_id)
+                except Exception as error:
+                    print(f"Warning: 账号池登录失效标记失败 ({error})")
 
             if cancel_check_cb():
                 raise ConnectionError('视频生成已取消，已保留原视频')
@@ -2260,8 +2564,10 @@ def generate_video_chain_sequence(config, title, prompt_block, on_progress=None,
     - 生成完成后自动抽取关键帧更新 Manifest、生成 5 列多宫格拼图、并自动合并成片。
     """
     import builtins
-    builtins.google_fx_cancelled = False
-    apply_google_fx_runtime_overrides(config)
+    flow2api = _uses_flow2api(config)
+    if not flow2api and not config.get('videoFixedUserId'):
+        builtins.google_fx_cancelled = False
+        apply_google_fx_runtime_overrides(config)
     from prompt_pipeline import _parse_prompt_slots
     images, videos = _parse_prompt_slots(prompt_block)
     if not videos:
@@ -2289,6 +2595,9 @@ def generate_video_chain_sequence(config, title, prompt_block, on_progress=None,
         except Exception as e:
             print(f"Warning: could not read manifest.json ({e})")
 
+    ensure_video_submissions_resolved(config.get('_project_key') or title,
+        video_submission_slots(prompt_block, target_slots, is_chain=True), manifest=manifest_data,
+        provider=config.get('videoProvider') or 'google_fx')
     manifest_data.setdefault('videos', [])
     manifest_data.setdefault('frames', [])
     manifest_data['prompt_block'] = prompt_block
@@ -2310,7 +2619,7 @@ def generate_video_chain_sequence(config, title, prompt_block, on_progress=None,
             'mode': 'video_chain',
         })
 
-    google_fx_video, models = _get_google_fx_video_service()
+    google_fx_video, models = _get_video_generation_service(config)
     video_model = config.get('videoModel') or 'Veo 3.1 - Lite [Lower Priority]'
     if 'omni' in str(video_model).strip().lower():
         video_duration = str(resolve_video_duration(config, fallback_hint=_infer_batch_omni_duration(videos)))
@@ -2319,12 +2628,13 @@ def generate_video_chain_sequence(config, title, prompt_block, on_progress=None,
         video_duration = None
         video_resolution = None
 
-    account_pool = _get_account_pool_service()
-    pool_account_id = _select_pool_account(config, account_pool)
-    actual_account_id = pool_account_id or config.get('googleFxUserId')
+    account_pool = None if flow2api else _get_account_pool_service()
+    pool_account_id = None if flow2api else _select_pool_account(config, account_pool)
+    actual_account_id = None if flow2api else (pool_account_id or config.get('googleFxUserId'))
     if actual_account_id:
         config['googleFxUserId'] = actual_account_id
-        apply_google_fx_runtime_overrides(config)
+        if not config.get('videoFixedUserId'):
+            apply_google_fx_runtime_overrides(config)
 
     def cancel_check_cb():
         if on_progress:
@@ -2334,10 +2644,9 @@ def generate_video_chain_sequence(config, title, prompt_block, on_progress=None,
                 return True
         return False
 
-    from integrations.google_fx.utils import account_binding
-
     writer = _ManifestWriter(manifest_path, manifest_data, all_available_slots)
-    canvas_project_url = _video_project_for_account(manifest_data, actual_account_id)
+    writer._metadata_updates = {'prompt_block': prompt_block, 'generation_channel': 'video_chain'}
+    canvas_project_url = '' if flow2api else _video_project_for_account(manifest_data, actual_account_id)
 
     existing_videos = {
         v['slot']: v for v in manifest_data.get('videos', [])
@@ -2348,18 +2657,15 @@ def generate_video_chain_sequence(config, title, prompt_block, on_progress=None,
         """把抽出来的帧登记进 manifest.frames（同槽位覆盖）。抽帧文件写了却不登记，
         帧面板与后续门禁就看不到它。"""
         rel_f = os.path.relpath(frame_path, _BASE_DIR).replace('\\', '/')
-        flist = [f for f in writer.data.get('frames', []) if f.get('slot') != frame_slot]
-        flist.append({
+        frame_info = {
             'slot': frame_slot,
             'sequence': frame_slot,
             'file': rel_f,
             'url': '/' + rel_f,
             'quality_gate': quality_gate,
             'source': source,
-        })
-        flist.sort(key=lambda x: x.get('slot', 0))
-        writer.data['frames'] = flist
-        writer.save()
+        }
+        writer.record_frame(frame_info)
 
     for seq_idx, slot in enumerate(slots_to_run, start=1):
         if cancel_check_cb():
@@ -2415,14 +2721,26 @@ def generate_video_chain_sequence(config, title, prompt_block, on_progress=None,
             prev_slot = slot - 1
             prev_video_path = os.path.join(videos_dir, f'vid_{prev_slot:03d}.mp4')
 
-            # 如果参考帧图片不存在，尝试从上一段视频的尾帧抽取
-            if (not os.path.exists(start_frame_path) or os.path.getsize(start_frame_path) == 0) and os.path.exists(prev_video_path):
+            # Flow2API chains require the accepted predecessor's actual tail.
+            # A prior frame-mode image or a retained clip from a failed retry
+            # must not silently become the next paid request's input.
+            predecessor_failed = (
+                flow2api and prev_slot in writer.attempt_outcomes
+                and writer.attempt_outcomes[prev_slot].get('status') != 'success'
+            )
+            tail_ready = not flow2api
+            needs_tail = flow2api or not os.path.exists(start_frame_path) or os.path.getsize(start_frame_path) == 0
+            if (needs_tail and not predecessor_failed and os.path.isfile(prev_video_path)
+                    and os.path.getsize(prev_video_path) > 0):
                 if _extract_video_frame(prev_video_path, start_frame_path, 'last', sseof_offset=0.15):
                     _register_frame(slot, start_frame_path, 'extracted_from_prev_video_last_frame',
                                     f'vid_{prev_slot:03d}.mp4')
+                    tail_ready = True
 
-            if not os.path.exists(start_frame_path) or os.path.getsize(start_frame_path) == 0:
+            if predecessor_failed or not tail_ready or not os.path.exists(start_frame_path) or os.path.getsize(start_frame_path) == 0:
                 err_msg = f"缺少上一段视频 (vid_{prev_slot:03d}.mp4) 的尾帧作为参考帧，无法生成视频 {slot}！"
+                if predecessor_failed:
+                    err_msg = f"上一段视频 {prev_slot} 本次未成功交付，已停止依赖它的视频 {slot} 提交。"
                 print(f"[VIDEO CHAIN][ERROR] {err_msg}")
                 plan_mock = {
                     'slot': slot, 'seq': seq_idx, 'prompt': raw_prompt,
@@ -2458,7 +2776,8 @@ def generate_video_chain_sequence(config, title, prompt_block, on_progress=None,
             duration=video_duration,
             resolution=video_resolution,
             output_path=temp_out_dir,
-            project_url=canvas_project_url or None,
+            project_url=None if flow2api else (canvas_project_url or None),
+            retry_count=normalize_video_retry_count(config.get('videoRetryCount')),
         )
 
         plan_item = {
@@ -2490,8 +2809,7 @@ def generate_video_chain_sequence(config, title, prompt_block, on_progress=None,
             config=config, cancel_check=cancel_check_cb
         )
 
-        with account_binding.bound_task_account(actual_account_id), \
-                fx_cancel_context(cancel_check_cb, deadline=fx_request_deadline()):
+        with _video_account_context(config, actual_account_id, cancel_check_cb):
             try:
                 fx_results = google_fx_video.generate_videos_batch_google_fx(
                     [req],
@@ -2505,7 +2823,7 @@ def generate_video_chain_sequence(config, title, prompt_block, on_progress=None,
                     result_account = item_result.get('account_id') or actual_account_id
                     if result_url and result_account:
                         writer.data.setdefault('google_fx_projects', {})[result_account] = result_url
-                canvas_project_url = _video_project_for_account(writer.data, actual_account_id)
+                canvas_project_url = '' if flow2api else _video_project_for_account(writer.data, actual_account_id)
                 writer.save()
                 if writer.attempt_outcomes.get(slot, {}).get('status') != 'success':
                     downloaded = [os.path.join(temp_out_dir, name) for name in os.listdir(temp_out_dir)
@@ -2541,6 +2859,20 @@ def generate_video_chain_sequence(config, title, prompt_block, on_progress=None,
             if _extract_video_frame(dest_path, next_f, 'last', sseof_offset=0.15):
                 _register_frame(slot + 1, next_f, 'extracted_from_video_last_frame',
                                 f'vid_{slot:03d}.mp4')
+
+        if slot_bridge.fixed_account_stopped:
+            stop_reason = '指定的视频环境遇到访问、验证或额度问题，已停止后续提交，未切换其他环境'
+            for remaining in slots_to_run[seq_idx:]:
+                previous = next((v for v in writer.data.get('videos', [])
+                                 if v.get('slot') == remaining), {})
+                if (previous.get('last_attempt') or {}).get('submission_pending') is True:
+                    continue
+                writer.record({'slot': remaining, 'sequence': remaining, 'status': 'failed',
+                               'file': '', 'url': '', 'error': stop_reason,
+                               'last_attempt': {'fixed_video_account': True,
+                                                'submission_pending': False}})
+            writer.finish_unresolved('failed', stop_reason)
+            break
 
     try:
         generate_video_collage(project_dir)
@@ -3230,8 +3562,35 @@ def merge_project_videos(project_dir, allow_partial=False, speed=4.0,
                          cover_burn=COVER_BURN_DEFAULT, cover_path=None, config=None,
                          on_progress=None, cancel_check=None):
     with _merge_operation(project_dir, on_progress, cancel_check, config):
-        return _merge_project_videos_unlocked(project_dir, allow_partial, speed,
-                                              cover_burn, cover_path, config)
+        merged = _merge_project_videos_unlocked(project_dir, allow_partial, speed,
+                                                cover_burn, cover_path, config)
+    _auto_codex_edit_after_merge(merged, config)
+    return merged
+
+
+def _auto_codex_edit_after_merge(merged, config):
+    """合成完整成片后自动排入一次精剪（autoCodexEditAfterMerge，默认开）。
+
+    三个合成入口（视频任务收尾、链式视频收尾、手动合并）都走 merge_project_videos，
+    放在这里才不会漏。缺段强制合成（partial）不精剪；精剪不可用或这条成片已有精剪
+    在跑时只记一行日志——成片已经交付，精剪失败不能反过来让合成失败。合成的
+    on_progress 只承载 merge_progress，精剪进度由成片下方的精剪面板轮询展示。"""
+    if (config or {}).get('autoCodexEditAfterMerge', True) is False:
+        return None
+    if not isinstance(merged, dict) or merged.get('status') != 'success' or merged.get('partial'):
+        return None
+    from server_common import log
+    try:
+        import codex_video_editor
+        job = codex_video_editor.start_after_merge(merged)
+    except Exception as error:
+        log('WARN', 'VIDEOS', f'成片已合成，自动精剪未启动: {error}')
+        return None
+    if job:
+        merged['auto_codex_edit'] = {'job_id': job.get('id'), 'status': job.get('status')}
+        log('INFO', 'VIDEOS', f"成片已合成，已自动开始精剪 job={job.get('id')} "
+                              f"model={job.get('model')} effort={job.get('reasoning_effort')}")
+    return job
 
 
 def _merge_project_videos_unlocked(project_dir, allow_partial=False, speed=4.0,
@@ -3299,7 +3658,10 @@ def _merge_project_videos_unlocked(project_dir, allow_partial=False, speed=4.0,
     }
     frame_transition_slots = set(range(1, len(frames))) if frames else set()
 
-    all_slots = sorted(frame_transition_slots | manifest_video_slots | parsed_video_slots)
+    pairing_mode = (config or {}).get('videoFramePairing', manifest_data.get('video_frame_pairing'))
+    auto_pairing = str(pairing_mode or '').strip().lower() == 'auto'
+    all_slots = sorted(parsed_video_slots if auto_pairing and parsed_video_slots else
+                       (frame_transition_slots | manifest_video_slots | parsed_video_slots))
 
     # 排除声明式硬切（旧单兼容：status='skipped_cut' / 'skipped_bridge_hold'）
     skipped_cut = {
@@ -3357,11 +3719,9 @@ def _merge_project_videos_unlocked(project_dir, allow_partial=False, speed=4.0,
                 good[slot] = abs_path
                 continue
 
-            # 锚点编号按槽位契约恒为 slot -> slot+1（见 plan_video_slots）；两个字段
-            # 仍保留读取，一是兼容旧 manifest 里 TBCP v3 Bridge SPAN 的重定向记录，
-            # 二是 end_anchor_slot 在它落盘之前生成的条目里就是缺的，得能回退。
+            # 自动配对使用落盘的实际锚点；旧记录未保存尾帧时仍回退为 slot+1。
             start_slot = v.get('start_anchor_slot') or slot
-            end_slot = v.get('end_anchor_slot') or (slot + 1)
+            end_slot = None if v.get('is_single_frame') else (v.get('end_anchor_slot') or (slot + 1))
             start_p = _resolve_frame(frame_by_slot.get(start_slot))
             end_p = _resolve_frame(frame_by_slot.get(end_slot)) if end_slot else None
             ok, reason = verify_video_anchors(abs_path, start_p, end_p,

@@ -4,9 +4,11 @@ import uuid
 import subprocess
 import math
 import glob
+import hashlib
 from datetime import datetime
 
-from server_common import _get_project_dir, read_manifest, write_manifest, manifest_lock
+from server_common import (_get_project_dir, read_manifest, write_manifest,
+                           manifest_lock, reviews_disabled)
 from prompt_pipeline import (
     compose_anchor_and_packet,
     compose_remaining_beats,
@@ -18,24 +20,24 @@ from prompt_pipeline import (
     optimize_video_prompts_for_sequence,
     find_reference_frames_with_roles,
 )
-from pipeline_orchestrator import render_single_frame, _render_videos_with_recovery, persist_outline_delivery_ledger
+from pipeline_orchestrator import (render_single_frame, _render_videos_with_recovery,
+                                   _flow_video_outcome, persist_outline_delivery_ledger)
 from frame_generator import generate_frame_sequence
 
 STAGES = [
     'compose_phase1',     # Phase 1: parse brief → Beat Ladder → Drift Lock Packet → IMAGE 1 prompt
     'render_anchor',      # Render Frame 1 (anchor frame)
-    'review_anchor',      # ⏸ PAUSE: user reviews anchor frame
     'compose_phase2',     # Phase 2: compose remaining beat prompts
     'render_batch',       # Render current batch of frames (loops)
-    'review_batch',       # ⏸ PAUSE: user reviews batch collage (loops)
-    'final_review',       # ⏸ PAUSE: full sequence collage review
+    'frames_completed',   # All frame batches rendered
     'render_videos',      # Generate video clips
     'completed',          # Done
     'cancelled',
 ]
 
-# Stages where the pipeline pauses for user review
-REVIEW_STAGES = {'review_anchor', 'review_batch', 'final_review'}
+# Kept for callers importing the old pause set. Review stages are retired.
+REVIEW_STAGES = set()
+LEGACY_REVIEW_STAGES = {'review_anchor', 'review_batch', 'final_review'}
 
 
 def _state_path(title):
@@ -175,13 +177,7 @@ def _render_batch(config, title, prompt_block, batch_sequences, on_progress=None
 
 
 def start_stepped_pipeline(config, dimensions, on_progress=None):
-    """Starts the stepped pipeline: compose Phase 1 + render anchor, then pause for review.
-
-    Unlike run_autonomous_pipeline which runs to completion, this pauses at review_anchor
-    so the user can inspect Frame 1 before committing to the rest of the pipeline.
-    Title is derived from compose_anchor_and_packet (same as run_autonomous_pipeline).
-
-    """
+    """Compose and render in bounded batches without quality review pauses."""
     state = {
         'pipeline_id': f'stepped_{uuid.uuid4().hex[:12]}',
         'title': None,  # Set after compose_anchor_and_packet
@@ -214,6 +210,7 @@ def start_stepped_pipeline(config, dimensions, on_progress=None):
             config, dimensions, on_progress=on_progress)
         # Title comes from compose_anchor_and_packet, same as run_autonomous_pipeline
         title = compose_state['title']
+        state['compose_context'] = dict(compose_state)
         state['title'] = title
         state['image_1_prompt'] = compose_state.get('image_1_prompt')
         state['packet'] = compose_state.get('packet')
@@ -258,6 +255,11 @@ def start_stepped_pipeline(config, dimensions, on_progress=None):
         if state['total_beats'] > 1:
             batch_lists = _compute_batches(state['total_beats'], state['batch_size'])
             state['batches'] = [{'sequences': b, 'status': 'queued', 'collage': None} for b in batch_lists]
+
+        if reviews_disabled(config):
+            state['stage'] = 'compose_phase2'
+            state['quality_review_retired'] = True
+            return _complete_without_reviews(state, config, on_progress)
             
         state['stage'] = 'review_anchor'
         state['updated_at'] = datetime.now().isoformat()
@@ -292,6 +294,8 @@ def advance_stepped_pipeline(title, action='approve', on_progress=None, config=N
     stage = state['stage']
     
     try:
+        if reviews_disabled(config):
+            return _complete_without_reviews(state, config, on_progress, action=action)
         if stage == 'review_anchor':
             if action == 'approve':
                 state['stage'] = 'compose_phase2'
@@ -316,7 +320,7 @@ def advance_stepped_pipeline(title, action='approve', on_progress=None, config=N
                 
                 # 事后门禁复核：若简报带有 banned_elements，对 Phase 2 重写后的成稿做二次扫描
                 banned = (state.get('parsed_brief') or {}).get('banned_elements') or []
-                if banned:
+                if banned and not reviews_disabled(config):
                     from prompt_pipeline.reference_context import banned_element_hits
                     hits = banned_element_hits(prompt_block, banned)
                     state['banned_hits'] = hits
@@ -388,27 +392,29 @@ def advance_stepped_pipeline(title, action='approve', on_progress=None, config=N
                 _save_state(title, state)
                 
                 if on_progress:
-                    on_progress('stepped_stage', {'stage': 'render_videos', 'message': '阶段 7/7: 开始依据真实画面差量优化视频提示词并生成视频段落...'})
-
-                # 视频生成前优化门：根据真实渲染的帧序列画面差量优化所有视频提示词，以防跳变
-                try:
-                    state['prompt_block'] = optimize_video_prompts_for_sequence(
-                        config, title, state['prompt_block'], on_progress=on_progress
-                    )
-                    _save_state(title, state)
-                except Exception as opt_err:
-                    print(f"[STEPPED] Video prompt optimization warning: {opt_err}")
+                    on_progress('stepped_stage', {'stage': 'render_videos', 'message': '正在使用原提示词生成视频段落...'})
                     
                 video_result = _render_videos_with_recovery(config, title, state['prompt_block'], on_progress=on_progress,
                                                             project_dir=_get_project_dir(title))
                 state['video_result'] = video_result
+                if config.get('_defer_video_to_worker'):
+                    state['updated_at'] = datetime.now().isoformat()
+                    _save_state(title, state)
+                    return _enrich_state_with_refs(state)
+                state.update(_flow_video_outcome(config, video_result, state['prompt_block']))
                 
                 state['stage'] = 'completed'
                 state['updated_at'] = datetime.now().isoformat()
                 _save_state(title, state)
                 
                 if on_progress:
-                    on_progress('stepped_stage', {'stage': 'completed', 'message': '流水线全部完成！'})
+                    on_progress('stepped_stage', {
+                        'stage': 'completed',
+                        'completion_state': state.get('completion_state', 'completed'),
+                        'has_failures': bool(state.get('has_failures')),
+                        'message': ('视频存在失败或未决片段，请核对后手动补跑。'
+                                    if state.get('has_failures') else '流水线全部完成！'),
+                    })
                     
             elif action == 'retry':
                 # User stays at final_review, makes adjustments manually and re-triggers approve
@@ -421,6 +427,102 @@ def advance_stepped_pipeline(title, action='approve', on_progress=None, config=N
         state['updated_at'] = datetime.now().isoformat()
         _save_state(title, state)
         raise
+
+
+def _complete_without_reviews(state, config, on_progress=None, action='approve'):
+    """Run remaining work, including old persisted pause states, without approval gates.
+
+    Explicit retries still mean a user-directed regeneration. Quality verdicts never
+    trigger retries. Video generation honors an explicitly disabled frame handoff.
+    """
+    title = state['title']
+    stage = state['stage']
+    state['quality_review_retired'] = True
+    if stage in ('completed', 'cancelled'):
+        return _enrich_state_with_refs(state)
+
+    if stage in ('review_anchor', 'compose_phase2'):
+        if stage == 'review_anchor' and action == 'retry':
+            rendered = render_single_frame(
+                _anchor_config(config), title, 1, state['image_1_prompt'],
+                on_progress=on_progress)
+            state['anchor_image_path'] = rendered.get('image_path')
+        state['stage'] = 'compose_phase2'
+        _save_state(title, state)
+        if on_progress:
+            on_progress('stepped_stage', {'stage': 'compose_phase2',
+                'message': '首帧生成完成，正在生成后续提示词。'})
+        compose_state = dict(state.get('compose_context') or {})
+        compose_state.update({key: state.get(key) for key in (
+            'title', 'image_1_prompt', 'packet', 'parsed_brief', 'beat_ladder')})
+        compose_state.setdefault('theme', state.get('theme') or title)
+        compose_state.setdefault('total_beats', state.get('total_beats')
+                                 or len(state.get('beat_ladder') or []))
+        compose_state.setdefault('brief_fingerprint', hashlib.sha256(
+            json.dumps(compose_state, ensure_ascii=False, sort_keys=True).encode()).hexdigest())
+        state['prompt_block'] = prompt_block_from_output(
+            compose_remaining_beats(config, compose_state, on_progress=on_progress))
+        state['banned_hits'] = []
+        persist_outline_delivery_ledger(
+            _get_project_dir(title), config.get('_outline_delivery_ledger'), title=title)
+        state['current_batch_index'] = 0
+        state['stage'] = 'render_batch'
+    elif stage == 'review_batch':
+        idx = state['current_batch_index']
+        if action != 'retry':
+            state['batches'][idx]['status'] = 'rendered'
+            state['current_batch_index'] += 1
+        state['stage'] = 'render_batch'
+    elif stage == 'final_review':
+        state['stage'] = 'frames_completed'
+
+    if state['stage'] == 'render_batch':
+        while state['current_batch_index'] < len(state['batches']):
+            idx = state['current_batch_index']
+            _execute_render_batch_sync(state, config, on_progress)
+            batch = state['batches'][idx]
+            batch['collage'] = _generate_batch_collage(title, batch['sequences'], idx)
+            batch['status'] = 'rendered'
+            state['current_batch_index'] += 1
+            state['updated_at'] = datetime.now().isoformat()
+            _save_state(title, state)
+        state['full_collage'] = _generate_full_collage(title)
+        state['stage'] = 'frames_completed'
+        _save_state(title, state)
+
+    if state['stage'] in ('frames_completed', 'render_videos'):
+        video_disabled = (config.get('_auto_generate_videos') is False
+                          or config.get('autoGenerateVideosAfterFrames') is False)
+        _, videos = _parse_prompt_slots(state.get('prompt_block') or '')
+        if videos and not video_disabled:
+            state['stage'] = 'render_videos'
+            _save_state(title, state)
+            if on_progress:
+                on_progress('stepped_stage', {'stage': 'render_videos',
+                    'message': '帧序列生成完成，正在使用原提示词生成视频段落。'})
+            result = _render_videos_with_recovery(
+                config, title, state['prompt_block'], on_progress=on_progress,
+                project_dir=_get_project_dir(title))
+            state['video_result'] = result
+            if config.get('_defer_video_to_worker'):
+                state['updated_at'] = datetime.now().isoformat()
+                _save_state(title, state)
+                return _enrich_state_with_refs(state)
+            state.update(_flow_video_outcome(config, result, state['prompt_block']))
+        else:
+            state['completion_state'] = 'completed'
+            state['has_failures'] = False
+        state['stage'] = 'completed'
+        state['updated_at'] = datetime.now().isoformat()
+        _save_state(title, state)
+        if on_progress:
+            on_progress('stepped_stage', {'stage': 'completed',
+                'completion_state': state.get('completion_state', 'completed'),
+                'has_failures': bool(state.get('has_failures')),
+                'quality_review_retired': True,
+                'message': ('部分视频生成失败或未决。' if state.get('has_failures')
+                            else '流水线生成完成。')})
+    return _enrich_state_with_refs(state)
 
 
 def _execute_render_batch(state, config, on_progress):

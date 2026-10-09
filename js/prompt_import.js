@@ -456,7 +456,8 @@ async function importPromptSetAsNewIdea(report, sourceLabel) {
         showToast('标题不能为空，导入已取消。', 'error');
         return false;
     }
-    if (Array.isArray(savedIdeas) && savedIdeas.some(it => it.title === title)) {
+    const library = typeof libraryEntries === 'function' ? libraryEntries() : savedIdeas;
+    if (Array.isArray(library) && library.some(it => it.title === title)) {
         showToast('点子库里已有同名创意，请换一个标题。', 'error');
         return false;
     }

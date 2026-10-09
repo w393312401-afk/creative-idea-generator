@@ -28,6 +28,14 @@ class FxQueueTimeout(TimeoutError):
     """任务等待浏览器超过超时时间。"""
 
 
+class FxAccountAdmissionBlocked(RuntimeError):
+    """A profile cannot be used while account maintenance owns it."""
+
+    def __init__(self, reason='generation_busy'):
+        self.reason = reason
+        super().__init__(reason)
+
+
 _CURRENT_TASK_ID = contextvars.ContextVar('spark_fx_task_id', default=None)
 _SLOT_DEPTH = contextvars.ContextVar('spark_fx_slot_depth', default=0)
 _ACCOUNT_PIN = contextvars.ContextVar('spark_fx_account_pin', default=None)
@@ -78,7 +86,7 @@ class FxControlPlane:
     N=1 时容量条件等价于旧的互斥锁，行为只多了"按序放行"。
     """
 
-    def __init__(self, state_path=None, audit_path=None):
+    def __init__(self, state_path=None, audit_path=None, account_admission_factory=None):
         self.state_path = str(state_path or '')
         self.audit_path = str(audit_path or '')
         self._active_lock = threading.Lock()
@@ -92,6 +100,10 @@ class FxControlPlane:
         self._history = collections.deque(maxlen=max(10, BOARD_HISTORY_MAX))
         self._seq = 0
         self._stall_reported = set()
+        # Kernel account locks stay private: lease snapshots must remain JSON.
+        self.account_admission_factory = account_admission_factory
+        self._account_guards = {}
+        self._account_initial_profiles = {}
         # 宿主注入：user_id -> 出口身份字符串（None=未知）。只在 N>1 时才会被调用。
         self.egress_resolver = None
         # 上一个进程退出时还占着浏览器的租约（崩溃/被杀）；只在启动时从状态文件读一次。
@@ -216,9 +228,11 @@ class FxControlPlane:
     def _holder_of(lease):
         return lease.get('user_id') or lease.get('account_pin') or None
 
-    def _blockers_locked(self, waiter):
+    def _blockers_locked(self, waiter, include_account_admission=True):
         """列出 waiter 当前被什么挡住；空列表 = 可以放行。"""
         blockers = []
+        if include_account_admission and waiter.get('account_admission_blocked'):
+            blockers.append({'type': 'account_maintenance', 'reason': waiter['account_admission_blocked']})
         leases = sorted(self._leases.values(), key=lambda row: row['seg_id'])
         capacity = self._max_concurrent()
         if len(leases) >= capacity and leases:
@@ -234,7 +248,12 @@ class FxControlPlane:
                     blockers.append({'type': 'ip', 'holder_task': clash['task_id'], 'rule': 'R5'})
         project = waiter.get('project_key')
         if project:
-            clash = next((row for row in leases if row.get('project_key') == project), None)
+            # 仅自动视频与它自己的图片父任务可以共享项目，浏览器/出口仍各自独占。
+            parallel_parent = waiter.get('parallel_parent_task_id')
+            clash = next((row for row in leases if row.get('project_key') == project
+                and not (parallel_parent and row['task_id'] == parallel_parent
+                    and waiter.get('kind') == 'videos'
+                    and row.get('kind') in ('frames', 'frames_selection'))), None)
             if clash:
                 blockers.append({'type': 'project', 'holder_task': clash['task_id'], 'rule': 'R2',
                                  'enforced': True})
@@ -245,29 +264,74 @@ class FxControlPlane:
         return sorted(self._waiting.values(), key=lambda row: (
             -(row.get('priority') or 0), row['since_ts'], row['seq']))
 
-    def _next_admissible_locked(self):
+    def _try_account_admission(self, profile_id, task_id, kind, initial_profile=None):
+        if not profile_id or self.account_admission_factory is None:
+            return True, None, None
+        # These IDs are created only by the authenticated cookie-login host;
+        # its owner/worker locks already fence generation for this profile.
+        if (kind == 'auto_login' and str(task_id).startswith('cookie_login_')
+                and initial_profile == profile_id):
+            return True, None, None
+        try:
+            guard = self.account_admission_factory(str(profile_id))
+            if guard is not None and not callable(getattr(guard, 'close', None)):
+                raise FxAccountAdmissionBlocked('busy_state_unknown')
+            return True, guard, None  # None means the profile is not bound to Flow2API.
+        except Exception as exc:
+            reason = getattr(exc, 'reason', None)
+            if reason not in ('generation_busy', 'already_running', 'busy_state_unknown'):
+                reason = 'busy_state_unknown'
+            return False, None, reason
+
+    def _account_guard_locked(self, lease, profile_id):
+        guards = self._account_guards.setdefault(lease['seg_id'], {})
+        if profile_id in guards:
+            return True, None
+        allowed, guard, reason = self._try_account_admission(
+            profile_id, lease['task_id'], lease['kind'], self._account_initial_profiles.get(lease['seg_id']))
+        if allowed:
+            guards[profile_id] = guard
+        return allowed, reason
+
+    def _next_admissible_locked(self, caller_task_id):
         for row in self._ordered_waiting_locked():
-            if not self._blockers_locked(row):
-                return row['task_id']
-        return None
+            if self._blockers_locked(row, include_account_admission=False):
+                continue
+            allowed, guard, reason = self._try_account_admission(
+                row.get('want_account'), row['task_id'], row['kind'], row.get('want_account'))
+            if not allowed:
+                row['account_admission_blocked'] = reason
+                continue  # A maintained profile must not hold up another account.
+            row.pop('account_admission_blocked', None)
+            if row['task_id'] != caller_task_id and guard is not None:
+                guard.close()
+                guard = None
+            return row['task_id'], guard
+        return None, None
 
     # ── 核心入口 ──────────────────────────────────────────
 
     @contextlib.contextmanager
     def slot(self, task_id, kind='task', account_pin=None, cancel_check=None, wait_timeout=None, priority=0,
-             project_key=None, stage=None, want_account=None, **kwargs):
+             project_key=None, stage=None, want_account=None, parallel_parent_task_id=None, **kwargs):
         """排队申请一份浏览器租约。支持同上下文嵌套重入（嵌套的旁路动作复用外层租约）。
 
         project_key/stage：归属标注，同时用于项目互斥（R2）。
         want_account：任务明确要用的 AdsPower 环境（用户指定/探针目标）；它被别的租约占着，
         或出口与别的租约相同时，本任务继续排队。没指定（自动选号）的任务不受此限，
         选号时由 claim_account 原子占账号。
+        parallel_parent_task_id：仅 videos 与指定 frames/frames_selection 父租约
+        可共享项目；容量、账号与出口限制仍逐一生效。
         """
         task_id = str(task_id or f'anon_{int(time.time() * 1000)}')
         depth = _SLOT_DEPTH.get()
 
         # 嵌套重入：同一上下文已经持有 slot 时直接放行，防止自锁
         if depth > 0:
+            nested_profile = str(account_pin or want_account or '').strip()
+            if (nested_profile and self.account_admission_factory is not None
+                    and not self.claim_account(nested_profile)):
+                raise FxAccountAdmissionBlocked()
             token_depth = _SLOT_DEPTH.set(depth + 1)
             try:
                 yield
@@ -275,11 +339,11 @@ class FxControlPlane:
                 _SLOT_DEPTH.reset(token_depth)
             return
 
-        want_account = str(want_account).strip() if want_account else None
+        want_account = str(account_pin or want_account).strip() if want_account or account_pin else None
         want_egress = self._egress_of(want_account) if want_account else None
         start_wait = time.time()
         self._register_waiting(task_id, kind, account_pin, priority, project_key, stage,
-                               want_account, want_egress)
+                               want_account, want_egress, parallel_parent_task_id)
         lease = None
         try:
             while lease is None:
@@ -288,9 +352,17 @@ class FxControlPlane:
                 if wait_timeout and (time.time() - start_wait) > wait_timeout:
                     raise FxQueueTimeout(f'任务 {task_id} 等待浏览器超时（{wait_timeout}s）')
                 with self._cond:
-                    if self._next_admissible_locked() == task_id:
-                        lease = self._grant_locked(task_id, kind, account_pin, project_key, stage,
-                                                   want_account, want_egress)
+                    next_task, guard = self._next_admissible_locked(task_id)
+                    if next_task == task_id:
+                        try:
+                            lease = self._grant_locked(task_id, kind, account_pin, project_key, stage,
+                                                       want_account, want_egress)
+                        except BaseException:
+                            if guard is not None:
+                                guard.close()
+                            raise
+                        self._account_guards[lease['seg_id']] = {want_account: guard} if want_account else {}
+                        self._account_initial_profiles[lease['seg_id']] = want_account
                     else:
                         self._cond.wait(timeout=0.1)
         except BaseException:
@@ -300,13 +372,13 @@ class FxControlPlane:
         token_id = _CURRENT_TASK_ID.set(task_id)
         token_depth = _SLOT_DEPTH.set(1)
         token_pin = _ACCOUNT_PIN.set(account_pin or None)
-        self._persist_lease()
-        self.audit('lease.grant', task_id=task_id, details={
-            'lease_id': lease['lease_id'], 'kind': str(kind or 'task'),
-            'project_key': project_key or '', 'stage': stage or '',
-            'waited_seconds': round(time.time() - start_wait, 1)})
         outcome = 'ok'
         try:
+            self._persist_lease()
+            self.audit('lease.grant', task_id=task_id, details={
+                'lease_id': lease['lease_id'], 'kind': str(kind or 'task'),
+                'project_key': project_key or '', 'stage': stage or '',
+                'waited_seconds': round(time.time() - start_wait, 1)})
             yield
         except BaseException as exc:
             # GenerationCancelled 等取消信号都带 Cancel 字样；其余一律记为 error。
@@ -315,19 +387,27 @@ class FxControlPlane:
         finally:
             with self._cond:
                 row = self._leases.pop(lease['seg_id'], None)
+                guards = self._account_guards.pop(lease['seg_id'], {})
+                self._account_initial_profiles.pop(lease['seg_id'], None)
                 if row is not None and not row.get('force_released'):
                     self._record_history_locked(row, outcome)
                 self._stall_reported.discard(lease['seg_id'])
                 self._cond.notify_all()
-            if row is not None:
-                self._persist_lease()
-                self.audit('lease.release', task_id=task_id, details={
-                    'lease_id': row.get('lease_id'), 'outcome': outcome,
-                    'user_id': row.get('user_id'), 'force_released': bool(row.get('force_released')),
-                    'held_seconds': round(time.time() - row['started_ts'], 1)})
-            _ACCOUNT_PIN.reset(token_pin)
-            _SLOT_DEPTH.reset(token_depth)
-            _CURRENT_TASK_ID.reset(token_id)
+            try:
+                if row is not None:
+                    self._persist_lease()
+                    self.audit('lease.release', task_id=task_id, details={
+                        'lease_id': row.get('lease_id'), 'outcome': outcome,
+                        'user_id': row.get('user_id'), 'force_released': bool(row.get('force_released')),
+                        'held_seconds': round(time.time() - row['started_ts'], 1)})
+            finally:
+                for guard in guards.values():
+                    if guard is not None:
+                        with contextlib.suppress(OSError):
+                            guard.close()
+                _ACCOUNT_PIN.reset(token_pin)
+                _SLOT_DEPTH.reset(token_depth)
+                _CURRENT_TASK_ID.reset(token_id)
 
     def _grant_locked(self, task_id, kind, account_pin, project_key, stage, want_account, want_egress):
         self._waiting.pop(task_id, None)
@@ -370,18 +450,29 @@ class FxControlPlane:
         """当前租约改占 user_id；与别的租约冲突（同账号 R1 / 同出口 R5）返回 False。
 
         选号 + 占用在同一个临界区里完成，两个任务不可能同时拿到同一个账号。
-        N=1 时没有"别的租约"，永远返回 True，与旧行为一致。
+        N=1 时仍需通过宿主的跨进程账号准入；未安装钩子时保持原行为。
         """
         user_id = str(user_id or '').strip()
         task_id = _CURRENT_TASK_ID.get()
         if not user_id or not task_id:
             return True
+        with self._cond:
+            mine = self._own_lease_locked(task_id)
+            if mine is None:
+                return self.account_admission_factory is None
+            if self._holder_of(mine) == user_id and not any(
+                    row is not mine and (self._holder_of(row) == user_id
+                        or (self._egress_policy() == 'hard' and mine.get('egress_id')
+                            and row.get('egress_id') == mine['egress_id']))
+                    for row in self._leases.values()):
+                allowed, _reason = self._account_guard_locked(mine, user_id)
+                return allowed
         egress = self._egress_of(user_id)
         reason = None
         with self._cond:
             mine = self._own_lease_locked(task_id)
             if mine is None:
-                return True
+                return self.account_admission_factory is None
             for other in self._leases.values():
                 if other is mine:
                     continue
@@ -393,8 +484,12 @@ class FxControlPlane:
                     reason = ('ip', other['task_id'])
                     break
             if reason is None:
-                mine['user_id'] = user_id
-                mine['egress_id'] = egress or mine.get('egress_id')
+                allowed, admission_reason = self._account_guard_locked(mine, user_id)
+                if allowed:
+                    mine['user_id'] = user_id
+                    mine['egress_id'] = egress or mine.get('egress_id')
+                else:
+                    reason = ('account_maintenance', admission_reason)
         if reason:
             self.audit('lease.claim_denied', task_id=task_id, details={
                 'user_id': user_id, 'reason': reason[0], 'holder_task': reason[1]})
@@ -422,7 +517,7 @@ class FxControlPlane:
     # ── 作战板观测（只读）──────────────────────────────────
 
     def _register_waiting(self, task_id, kind, account_pin, priority, project_key=None, stage=None,
-                          want_account=None, want_egress=None):
+                          want_account=None, want_egress=None, parallel_parent_task_id=None):
         with self._cond:
             self._seq += 1
             self._waiting[task_id] = {
@@ -434,6 +529,7 @@ class FxControlPlane:
                 'stage': stage or '',
                 'want_account': want_account,
                 'want_egress': want_egress,
+                'parallel_parent_task_id': str(parallel_parent_task_id) if parallel_parent_task_id else None,
                 'since_ts': time.time(),
                 'seq': self._seq,
             }
@@ -538,6 +634,29 @@ class FxControlPlane:
             return {str(self._holder_of(row)) for row in self._leases.values()
                     if self._holder_of(row) and not (current and row['task_id'] == current)}
 
+    def protected_from_cleanup(self, profile_id):
+        """Keep Flow-managed profiles outside automatic neighbor cleanup.
+
+        A login host can release its FX lease before Flow finishes committing
+        credentials. Binding, rather than the current FX lease, protects that
+        browser throughout this interval. Unknown bindings are retained too.
+        """
+        factory = self.account_admission_factory
+        if factory is None:
+            return False
+        try:
+            guard = factory(str(profile_id))
+            if guard is None:
+                return False
+            # This is only a binding probe. Never retain its shared kernel lock
+            # or use success as permission to close a managed browser.
+            close = getattr(guard, 'close', None)
+            if callable(close):
+                close()
+            return True
+        except Exception:
+            return True
+
     def touch(self):
         """当前任务的心跳（每条日志调一次）。只刷新"自己的"租约。"""
         task_id = _CURRENT_TASK_ID.get()
@@ -552,12 +671,15 @@ class FxControlPlane:
         """account_binding 的观察钩子：当前执行上下文绑定了某个账号。
 
         只记到当前租约上（按 contextvar 里的 task_id 对号入座），泳道据此知道占用落在哪个账号。
-        这是被动记录，不做冲突判断（真正的互斥在 claim_account）；若发现与别的租约撞号，写审计。
+        安装账号准入钩子时先经过 claim_account，观察记录不能绕过维护锁。
+        未安装钩子时保持旧的被动记录行为；若发现与别的租约撞号，写审计。
         """
         user_id = str(user_id or '').strip()
         task_id = _CURRENT_TASK_ID.get()
         if not user_id or not task_id:
             return
+        if self.account_admission_factory is not None and not self.claim_account(user_id):
+            raise FxAccountAdmissionBlocked()
         clash = None
         with self._active_lock:
             mine = self._own_lease_locked(task_id)

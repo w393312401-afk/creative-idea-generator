@@ -7,6 +7,19 @@ import server
 PROMPT = '图片 1:\nstart\n图片 2:\nend\n视频 1:\nmove\n'
 
 
+@pytest.mark.parametrize('image_backend,video_provider,expects_slot', [
+    ('google_fx', 'flow2api', True), ('api', 'flow2api', False),
+    ('api', 'google_fx', True), ('google_fx', 'google_fx', True),
+])
+def test_full_pipeline_slot_respects_both_media_backends(monkeypatch, image_backend, video_provider, expects_slot):
+    calls = []
+    monkeypatch.setattr(server, '_fx_browser_slot', lambda *a: calls.append(a) or contextlib.nullcontext())
+    with server._pipeline_generation_slot({'imageBackend': image_backend, 'videoProvider': video_provider},
+                                         'test', 'auto', None):
+        pass
+    assert bool(calls) is expects_slot
+
+
 @pytest.fixture
 def worker_env(monkeypatch, tmp_path):
     state = {'browser_busy': False, 'merged': 0, 'chain_deferred': None}
@@ -51,6 +64,22 @@ def test_encoding_runs_outside_browser_slot(worker_env, chain):
     if chain:
         assert worker_env['chain_deferred'] is False
     assert any(evt[0] == 'merge_progress' for evt in task['events'])
+
+
+@pytest.mark.parametrize('chain', [False, True])
+def test_flow2api_worker_does_not_reserve_adspower_browser(worker_env, monkeypatch, chain):
+    def generate(*args, **kwargs):
+        assert not worker_env['browser_busy']
+        assert args[0]['videoProvider'] == 'flow2api'
+        return {'videos': [{'slot': 1, 'status': 'success'}]}
+
+    monkeypatch.setattr(server, 'generate_video_sequence', generate)
+    monkeypatch.setattr(server, 'generate_video_chain_sequence', generate)
+    worker = server.generate_video_chain_worker if chain else server.generate_videos_worker
+    worker('videos_flow2api_worker_test', {'videoProvider': 'flow2api'}, 'test', PROMPT, [1])
+    task = server.ACTIVE_TASKS['videos_flow2api_worker_test']
+    assert task['status'] == 'completed' and task['outcome'] == 'completed'
+    assert worker_env['merged'] == 1
 
 
 def test_old_success_does_not_hide_failed_retry(worker_env):

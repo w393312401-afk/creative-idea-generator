@@ -128,4 +128,26 @@ for (let i = 0; i < 400; i++) framesFeedLine('idea-1', `line ${i}`);
 assert.ok(domCount() <= 300, `DOM 行数必须裁到 300 以内，实际 ${domCount()}`);
 assert.ok(rec.feedLines.length <= 300, '缓冲区同样有上限');
 
+/* ── ⑥ 刷新后 JSON 时间字符串/epoch 不得打断任务监听启动 ─────────────── */
+const originalTime = new Date('2026-10-05T01:02:03.000Z');
+const restoredTimes = [originalTime, originalTime.toISOString(), originalTime.getTime(),
+    originalTime.getTime() / 1000, String(originalTime.getTime()), 0, 'invalid-time', null];
+rec.feedLines = restoredTimes.map((time, index) => ({ text: `restored ${index}`, time }));
+feedLines.children = [];
+assert.doesNotThrow(() => framesFeedHydrate('idea-1'), 'Serialized timestamps must not throw getHours before the watcher starts');
+assert.strictEqual(domCount(), restoredTimes.length);
+const clock = date => [date.getHours(), date.getMinutes(), date.getSeconds()]
+    .map(number => String(number).padStart(2, '0')).join(':');
+for (let index = 0; index < 5; index++) {
+    assert.ok(text(feedLines.children[index]).includes(`[${clock(originalTime)}]`),
+        `Date/string/epoch variant ${index} must preserve the original timestamp`);
+}
+assert.ok(text(feedLines.children[5]).includes(`[${clock(new Date(0))}]`), 'Zero is a valid epoch, not a missing value');
+assert.ok(feedLines.children.every(line => !text(line).includes('NaN')), 'Malformed legacy timestamps use a valid fallback');
+// The exact representation written to localStorage must replay too.
+rec.feedLines = JSON.parse(JSON.stringify([{ text: 'real cached Date', time: originalTime }]));
+feedLines.children = [];
+assert.doesNotThrow(() => framesFeedHydrate('idea-1'));
+assert.ok(text(feedLines.children[0]).includes(`[${clock(originalTime)}]`));
+
 console.log('frames feed collapse tests passed');

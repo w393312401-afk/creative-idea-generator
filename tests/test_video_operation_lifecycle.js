@@ -21,6 +21,7 @@ function setup(fetch) {
         endIdeaTask: () => { record = null; },
         saveActiveBackgroundTasksToLocalStorage: () => snapshots.push(JSON.parse(JSON.stringify(record))),
         isViewingIdea: () => true, renderVideosForIdea() {}, reloadManifestIntoIdea: async () => {},
+        refreshSlotGridBusy() {}, getIdeaSaveTitle: idea => idea.title,
         showToast: (...args) => toasts.push(args), streamVideosProgress: (...args) => calls.push(['watch', ...args]),
     };
     vm.createContext(context); vm.runInContext(helpers, context);
@@ -64,6 +65,75 @@ const missing = () => ({ ok: false, status: 404 });
         assert.equal(s.record(), rec, 'uncertain request must retain task lock');
         assert.equal(s.timers.length, 1);
         assert(rec.requestBody.request_id);
+    }
+    {
+        const s = setup(async () => ({ ok: false, status: 409, text: async () => JSON.stringify({
+            failure_code: 'SUBMISSION_PENDING', message: '原提交结果待确认',
+            pending_submissions: [{ slot: 37, task_id: 'original', request_id: 'original-request' }] }) }));
+        const rec = s.context.beginVideoOperation(s.owner, [37]);
+        await assert.rejects(s.context.submitVideoOperation(rec, '/api/generate_videos', {}), error => {
+            assert(error.submissionPending && error.definitive);
+            assert.equal(error.failureCode, 'SUBMISSION_PENDING');
+            assert.equal(error.pendingSubmissions[0].task_id, 'original');
+            assert.equal(error.message, '原提交结果待确认');
+            return true;
+        });
+        assert.equal(s.calls.length, 1, '明确的待确认冲突不能重发或查询本次新request_id');
+    }
+    for (const state of ['recovered', 'pending', 'refused', 'failed', 'not_found', 'recovery_failed']) {
+        const s = setup(async (url, options) => {
+            assert.equal(url, '/api/video-operation/reconcile', '核对只走原任务恢复接口');
+            assert.deepStrictEqual(JSON.parse(options.body), { title: 'project', target_slots: [37] });
+            return ok({ status: 'ok', outcomes: [{ slot: 37, state, message: `original ${state}` }] });
+        });
+        const video = { slot: 37, provider: 'flow2api', status: 'failed', last_attempt: {
+            provider: 'flow2api', submission_id: 'original-flow-submission', submission_pending: true } };
+        s.owner.frameRun = { videos: [video] };
+        s.context.config = { videoProvider: 'flow2api' };
+        let reloads = 0;
+        s.context.reloadManifestIntoIdea = async idea => {
+            ++reloads;
+            assert.strictEqual(idea, s.owner);
+            const attempt = video.last_attempt;
+            if (state === 'recovered') {
+                video.status = 'success';
+                video.url = '/recovered-original.mp4';
+                attempt.submission_pending = false;
+            } else if (['refused', 'failed', 'recovery_failed'].includes(state)) {
+                attempt.submission_pending = false;
+            }
+            attempt.confirmed = state === 'recovered' || state === 'recovery_failed';
+            attempt.recovery_state = state;
+        };
+        const result = await s.context.reconcileVideoSubmission(37, { ownerIdea: s.owner });
+        assert.equal(result.status, 'ok');
+        assert.equal(s.record(), null);
+        assert.equal(s.calls.length, 1, '核对成功、失败或待确认均不能自动提交生成');
+        assert.equal(s.toasts[0][1], state === 'recovered' ? 'success' : 'warning');
+        assert.equal(reloads, 1, '核对后刷新原项目清单');
+        const card = require('../js/slot_model.js').videoSlotState(video, { seq: 37, videoProvider: 'flow2api' });
+        if (['pending', 'not_found'].includes(state)) {
+            assert.equal(card.kind, 'submission-pending');
+            assert.equal(card.actions.find(action => action.primary).act, 'query-video-submission');
+        } else if (state === 'recovered') {
+            assert.equal(card.kind, 'ready');
+            assert.equal(card.url, '/recovered-original.mp4');
+        } else if (state === 'recovery_failed') {
+            assert.equal(card.actions.find(action => action.primary).label, '取回原视频');
+        } else {
+            assert.equal(card.kind, 'failed');
+            assert.equal(card.actions.find(action => action.primary).act, 'retry-video');
+        }
+    }
+    {
+        const s = setup(async () => ({ ok: false, status: 409, text: async () => JSON.stringify({
+            failure_code: 'PROJECT_BUSY', message: '原任务仍在运行' }) }));
+        const result = await s.context.reconcileVideoSubmission(37, { ownerIdea: s.owner });
+        assert.equal(result.status, 'pending');
+        assert.equal(s.record(), null);
+        assert.equal(s.calls.length, 1);
+        assert.equal(s.toasts[0][1], 'warning');
+        assert(!s.toasts[0][0].includes('failure_code'));
     }
     {
         const s = setup(async url => {
@@ -110,11 +180,11 @@ const missing = () => ({ ok: false, status: 404 });
     }
     {
         let requests = 0; const attempts = [];
-        const ctx = { console: { warn() {}, error() {} }, TextDecoder, Date, setTimeout: callback => callback(),
+        const ctx = { console: { warn() {}, error() {} }, TextDecoder, Date, AbortController, setTimeout: callback => callback(),
             fetch: async url => url.includes('compose-status') ? ok({ status: 'running' }) :
                 (++requests, { ok: true, status: 200, body: { getReader: () => ({ read: async () => ({ done: true }) }) } }) };
         vm.createContext(ctx); vm.runInContext(watcher, ctx);
-        const outcome = await ctx.watchTaskUntilTerminal('task', { maxReconnects: 2,
+        const outcome = await ctx.watchTaskUntilTerminal('task', { maxReconnects: 2, statusPollIntervalMs: 0,
             onEvent: (type, data) => { if (type === 'reconnecting') attempts.push(data.attempt); } });
         assert.equal(outcome.status, 'disconnected');
         assert.equal(requests, 3);
@@ -122,7 +192,7 @@ const missing = () => ({ ok: false, status: 404 });
     }
     {
         let requests = 0; const delivered = [], headers = [];
-        const ctx = { console, TextDecoder, Date, setTimeout: callback => callback(), fetch: async (url, options) => {
+        const ctx = { console, TextDecoder, Date, AbortController, setTimeout: callback => callback(), fetch: async (url, options) => {
             if (url.includes('compose-status')) return ok({ status: 'running' });
             headers.push(options.headers); const n = ++requests; let consumed = false;
             const text = n === 1 ? 'id: 1\ndata: {"type":"video_done","data":{"index":1}}\n\n'
@@ -131,10 +201,29 @@ const missing = () => ({ ok: false, status: 404 });
                 : (consumed = true, { done: false, value: new TextEncoder().encode(text) }), cancel: async () => {} }) } };
         }};
         vm.createContext(ctx); vm.runInContext(watcher, ctx);
-        const result = await ctx.watchTaskUntilTerminal('task', { onEvent: type => delivered.push(type) });
+        const result = await ctx.watchTaskUntilTerminal('task', { statusPollIntervalMs: 0, onEvent: type => delivered.push(type) });
         assert.equal(result.status, 'completed');
         assert.equal(headers[1]['Last-Event-ID'], '1');
         assert.equal(delivered.filter(type => type === 'video_done').length, 1, 'duplicate IDs must not re-render media');
+    }
+    for (const functionName of ['generateVideos', 'generateVideoChain']) {
+        const s = setup(async () => ({ ok: false, status: 409, text: async () => JSON.stringify({
+            failure_code: 'SUBMISSION_PENDING', message: '原提交结果待确认', pending_submissions: [{ slot: 37 }] }) }));
+        s.owner.prompt_block = 'saved prompt'; s.owner.frameRun = { frames: [{ sequence: 1 }] };
+        Object.assign(s.context, { currentIdea: s.owner, config: {},
+            document: { getElementById: () => ({ style: {}, disabled: false }) },
+            slotRenderTarget: () => ({ querySelectorAll: () => [] }),
+            confirmSequenceReviewOverride: async () => ({ proceed: true, override: false }),
+            computeDebugTargets: () => [37], getIdeaSaveTitle: () => 'project-key', getMergeSpeed: () => 2 });
+        const app = fs.readFileSync(require('path').join(__dirname, '../app.js'), 'utf8');
+        vm.runInContext(app.slice(app.indexOf('async function generateVideos('), app.indexOf('function getMergeSpeed(')), s.context);
+        await s.context[functionName]();
+        assert.equal(s.record(), null, `${functionName} must clear the rejected new request`);
+        assert(s.owner.frameRun.videos[0].last_attempt.submission_pending);
+        assert.equal(s.toasts.length, 1);
+        assert.equal(s.toasts[0][1], 'warning', `${functionName} must explain pending without reporting failure`);
+        assert(!s.toasts[0][0].includes('HTTP'));
+        assert.equal(s.calls.length, 1, `${functionName} must not submit again or watch a stale original task`);
     }
     for (const functionName of ['generateVideos', 'generateVideoChain']) {
         let accept;

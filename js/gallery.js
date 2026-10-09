@@ -1,6 +1,7 @@
 /* ==========================================================================
    Gallery (画廊) — 本地历史媒体资产总览与管理。
-   数据源是服务端 /api/gallery（实时扫描 outputs/：图像工坊 image-station/、
+   首屏读 /api/gallery/index，展开分组时分页读 /api/gallery/items。
+   兼容完整 /api/gallery 数据（实时扫描 outputs/：图像工坊 image-station/、
    各项目的 frames/ + videos/ + 根目录的合成视频与封面 cover_*，以及迁移前的
    历史封面池 covers/——新封面已跟着项目走），并带引用标注：
    封面 item.in_use（被点子库/任务引用）、项目组 group.orphan（无引用且超过
@@ -9,7 +10,7 @@
    ========================================================================== */
 
 let galleryLoading = false;
-let galleryData = null;             // /api/gallery 的原始返回
+let galleryData = null;             // 分组索引及已加载页；兼容旧完整列表
 let galleryFilter = 'all';          // all | cover | frame | video (片段) | merged (成片) | studio | orphan
 let gallerySearch = '';             // 文件名/项目名子串（不区分大小写）
 let gallerySort = 'newest';         // newest | oldest | size | name
@@ -17,6 +18,14 @@ const gallerySelected = new Set();  // 已勾选 item.path，仅保留在当前�
 let galleryDownloading = false;
 const galleryExpanded = new Set();  // 本次会话内点过"展开全部"的组 key
 const GALLERY_TRUNCATE = 12;        // 每组默认最多显示的卡片数
+const gallerySelectedItems = new Map(); // 跨页勾选的元数据，不能用已加载页裁剪选择
+const galleryPageRequests = new Map();
+let galleryRequestRevision = 0;
+let galleryBulkLoading = false;
+const galleryOpened = new Set((() => {
+    try { return JSON.parse(localStorage.getItem('spark_gallery_opened') || '[]'); }
+    catch (_) { return []; }
+})());
 
 // 显示方式跨会话记住。三档只改 #gallery-groups 上的 view-* 类，卡片 HTML 与
 // 数据完全不动 —— 切视图不该重扫磁盘，也不该丢掉已有的勾选和展开态。
@@ -68,11 +77,8 @@ function gallerySetView(view) {
 }
 
 function galleryTabEntered() {
-    // 每次切进画廊都重新扫描（不再只扫一次）：磁盘上的帧序列/视频会在其他
-    // 标签页里被重试、修复、重渲，画廊若只信"本会话扫过一次"的旧结果，
-    // 切回来也看不到这些原地覆盖的新文件。扫描本身是轻量的目录遍历，
-    // galleryLoading 仍防止同时并发发起第二次。
-    if (!galleryLoading) refreshGallery();
+    // 每次进入重取轻量计数。文件清单只在明确展开分组后加载。
+    refreshGallery();
 }
 
 function galleryFmtSize(bytes) {
@@ -105,38 +111,200 @@ function galleryVersionedUrl(it) {
 // 扫描进行中的 Promise：其它模块（项目工作台、图像工坊）跳进画廊时要等它跑完再定位，
 // 之前靠 setTimeout(600) 猜扫描耗时，扫描慢一点就定位落空。
 let galleryRefreshPromise = null;
+let galleryRefreshQuery = '';
 
-function refreshGallery() {
-    if (galleryLoading) return galleryRefreshPromise;
-    galleryRefreshPromise = galleryDoRefresh().finally(() => { galleryRefreshPromise = null; });
-    return galleryRefreshPromise;
+function galleryQueryKey() {
+    return JSON.stringify([galleryFilter, gallerySearch.trim().toLowerCase(), gallerySort]);
 }
 
-async function galleryDoRefresh() {
+function galleryQueryParams() {
+    return new URLSearchParams({ filter: galleryFilter, q: gallerySearch.trim(), sort: gallerySort });
+}
+
+function refreshGallery(options = {}) {
+    const key = galleryQueryKey();
+    if (galleryLoading && galleryRefreshQuery === key && !options.force) return galleryRefreshPromise;
+    const revision = ++galleryRequestRevision;
+    galleryRefreshQuery = key;
+    const promise = galleryDoRefresh(options, revision, key).finally(() => {
+        if (galleryRefreshPromise === promise) galleryRefreshPromise = null;
+        if (revision === galleryRequestRevision) galleryLoading = false;
+    });
+    galleryRefreshPromise = promise;
+    return promise;
+}
+
+async function galleryDoRefresh(options, revision, key) {
     galleryLoading = true;
     const container = document.getElementById('gallery-groups');
     if (container && !galleryData) {
-        container.innerHTML = '<div class="gallery-status">📡 正在扫描本地媒体文件…</div>';
+        container.innerHTML = '<div class="gallery-status">📡 正在汇总媒体计数…</div>';
     }
     try {
-        const res = await fetch('/api/gallery');
+        const params = galleryQueryParams();
+        if (options.force) params.set('refresh', '1');
+        const res = await fetch(`/api/gallery/index?${params}`);
         if (!res.ok) throw new Error('HTTP ' + res.status);
         const data = await res.json();
         if (data && data.error) throw new Error(data.error);
-        galleryData = data;
-        // 清掉磁盘上已不存在的勾选项，避免"删除所选"携带幽灵路径
-        const alive = new Set();
-        (galleryData.groups || []).forEach(g => (g.items || []).forEach(it => alive.add(it.path)));
-        [...gallerySelected].forEach(p => { if (!alive.has(p)) gallerySelected.delete(p); });
+        if (revision !== galleryRequestRevision || key !== galleryQueryKey()) return false;
+        const previous = new Map((galleryData?.groups || []).map(group => [group.key, group]));
+        const reusePages = galleryData?.lazy && galleryData.queryKey === key && galleryData.revision === data.revision;
+        galleryData = { ...data, lazy: true, queryKey: key, groups: (data.groups || []).map(group => ({
+            ...group, items: reusePages ? previous.get(group.key)?.items || [] : [],
+            visibleCount: previous.get(group.key)?.visibleCount || GALLERY_TRUNCATE,
+            loading: false, error: '',
+        })) };
+        galleryData.groups.forEach(group => {
+            if (galleryOpened.has(group.key)) galleryCollapsed.delete(group.key);
+            else galleryCollapsed.add(group.key);
+            gallerySelectedItems.forEach(record => {
+                if (record.group.key === group.key) record.group = { key: group.key, kind: group.kind,
+                    title: group.title, idea_title: group.idea_title, orphan: group.orphan };
+            });
+        });
+        galleryPruneSelection();
     } catch (e) {
+        if (revision !== galleryRequestRevision || key !== galleryQueryKey()) return false;
         galleryLoading = false;
         if (container) {
             container.innerHTML = `<div class="gallery-status error">画廊加载失败：${escapeHtml(e.message)}</div>`;
         }
-        return;
+        return false;
     }
+    if (revision !== galleryRequestRevision || key !== galleryQueryKey()) return false;
     galleryLoading = false;
     renderGallery();
+    if (!options.suppressAutoLoad) {
+        galleryData.groups.filter(group => galleryOpened.has(group.key)).forEach(group => {
+            galleryLoadGroup(group.key).catch(() => {});
+        });
+    }
+    return true;
+}
+
+function galleryScopeError(message, code) {
+    const error = new Error(message);
+    error.code = code;
+    return error;
+}
+
+async function galleryFetchGroup(key, { more = false, complete = false } = {}) {
+    if (!galleryData?.lazy) return (galleryVisibleGroups().find(group => group.key === key)?.items || []);
+    const group = galleryData.groups.find(item => item.key === key);
+    if (!group) return [];
+    const query = galleryQueryKey(), epoch = galleryRequestRevision, snapshot = galleryData.revision;
+    const target = complete ? group.filtered_count
+        : Math.min(group.filtered_count, (group.visibleCount || GALLERY_TRUNCATE) + (more ? GALLERY_TRUNCATE : 0));
+    const pendingKey = `${epoch}:${key}`;
+    if (galleryPageRequests.has(pendingKey)) {
+        await galleryPageRequests.get(pendingKey);
+        if (epoch !== galleryRequestRevision || query !== galleryQueryKey()) throw galleryScopeError('筛选已改变，请重新操作', 'query_changed');
+        return galleryFetchGroup(key, { more, complete });
+    }
+    if (group.items.length >= target) {
+        if (!complete) group.visibleCount = target;
+        renderGallery();
+        return group.items;
+    }
+    group.loading = true;
+    group.error = '';
+    renderGallery();
+    const promise = (async () => {
+        let items = [...group.items];
+        while (items.length < target) {
+            const params = galleryQueryParams();
+            params.set('group', key);
+            params.set('offset', String(items.length));
+            params.set('limit', String(complete ? 200 : GALLERY_TRUNCATE));
+            params.set('revision', snapshot);
+            const response = await fetch(`/api/gallery/items?${params}`);
+            const data = await response.json();
+            if (epoch !== galleryRequestRevision || query !== galleryQueryKey()) throw galleryScopeError('筛选已改变，请重新操作', 'query_changed');
+            if (response.status === 409 || data.error === 'snapshot_changed'
+                    || (response.ok && data.revision !== snapshot)) {
+                throw galleryScopeError('媒体清单已更新，请重新加载后再操作', 'snapshot_changed');
+            }
+            if (!response.ok || data.error) throw new Error(data.message || data.error || `HTTP ${response.status}`);
+            if (data.group_key !== key || data.filtered_count !== group.filtered_count || data.offset !== items.length
+                    || !Array.isArray(data.items) || !data.items.length) {
+                throw galleryScopeError('媒体清单发生变化，请重新加载后再操作', 'snapshot_changed');
+            }
+            items = items.concat(data.items);
+        }
+        if (epoch !== galleryRequestRevision || query !== galleryQueryKey()) throw galleryScopeError('筛选已改变，请重新操作', 'query_changed');
+        group.items = items;
+        if (!complete) group.visibleCount = target;
+        items.forEach(item => {
+            if (gallerySelected.has(item.path)) galleryRememberSelection(item, group);
+        });
+        if (items.length >= group.filtered_count) {
+            const alive = new Set(items.map(item => item.path));
+            gallerySelectedItems.forEach((record, path) => {
+                if (record.group.key === key && !alive.has(path)) { gallerySelected.delete(path); gallerySelectedItems.delete(path); }
+            });
+        }
+        return items;
+    })();
+    galleryPageRequests.set(pendingKey, promise);
+    try { return await promise; }
+    finally {
+        galleryPageRequests.delete(pendingKey);
+        group.loading = false;
+        if (epoch === galleryRequestRevision && query === galleryQueryKey()) renderGallery();
+    }
+}
+
+async function galleryLoadGroup(key, options = {}) {
+    const query = galleryQueryKey();
+    for (let attempt = 0; attempt < 2; attempt++) {
+        try { return await galleryFetchGroup(key, options); }
+        catch (error) {
+            if (error.code === 'query_changed' || query !== galleryQueryKey()) return [];
+            if (error.code === 'snapshot_changed' && attempt === 0) {
+                await refreshGallery({ force: true, suppressAutoLoad: true });
+                if (query !== galleryQueryKey()) return [];
+                continue;
+            }
+            const group = galleryData?.groups.find(item => item.key === key);
+            if (group) group.error = error.message;
+            renderGallery();
+            showToast(`加载媒体失败：${error.message}`, 'error');
+            return [];
+        }
+    }
+}
+
+// 批量操作及整组灯箱是用户明确请求的范围；先取齐全部元数据再行动。
+// 列表翻页和折叠不会改变该范围，更不能把「删除本组」缩成已显示的 12 项。
+async function galleryCollectScope(keys = null) {
+    if (!galleryData?.lazy) return galleryVisibleGroups().filter(group => !keys || keys.includes(group.key));
+    const query = galleryQueryKey();
+    for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+            const refreshed = await refreshGallery({ force: attempt > 0, suppressAutoLoad: true });
+            if (!refreshed || query !== galleryQueryKey()) throw galleryScopeError('筛选已改变，请重新操作', 'query_changed');
+            const epoch = galleryRequestRevision, snapshot = galleryData.revision;
+            const groups = galleryData.groups.filter(group => !keys || keys.includes(group.key));
+            const checkScope = () => {
+                if (query !== galleryQueryKey()) throw galleryScopeError('筛选已改变，请重新操作', 'query_changed');
+                if (epoch !== galleryRequestRevision || snapshot !== galleryData.revision) {
+                    throw galleryScopeError('画廊已刷新，请重新操作', 'query_changed');
+                }
+            };
+            for (const group of groups) { checkScope(); await galleryFetchGroup(group.key, { complete: true }); checkScope(); }
+            checkScope();
+            return groups;
+        } catch (error) {
+            if (error.code === 'snapshot_changed' && attempt === 0 && query === galleryQueryKey()) continue;
+            throw error;
+        }
+    }
+}
+
+function galleryRememberSelection(item, group) {
+    gallerySelectedItems.set(item.path, { item, group: { key: group.key, kind: group.kind,
+        title: group.title, idea_title: group.idea_title, orphan: group.orphan } });
 }
 
 function gallerySetFilter(filter) {
@@ -165,11 +333,13 @@ async function galleryFocus({ groupKey = '', search = '', filter = 'all' } = {})
     gallerySetFilter(filter);
     gallerySetSearch(search);
     switchMainTab('gallery');            // 进入画廊会触发一次重新扫描
-    await (galleryRefreshPromise || refreshGallery());
+    await refreshGallery();
     if (!galleryData) return false;      // 扫描失败，面板里已有错误提示
     if (groupKey) {
+        galleryOpened.add(groupKey);
         galleryCollapsed.delete(groupKey);
         galleryPersistCollapsed();
+        if (galleryData.lazy) await galleryLoadGroup(groupKey);
     }
     renderGallery();
     if (!groupKey) return true;
@@ -246,6 +416,7 @@ function gallerySortGroups(groups) {
 
 function galleryVisibleGroups() {
     if (!galleryData || !Array.isArray(galleryData.groups)) return [];
+    if (galleryData.lazy) return galleryData.queryKey === galleryQueryKey() ? galleryData.groups : [];
     const q = gallerySearch.trim().toLowerCase();
     const out = [];
     for (const g of galleryData.groups) {
@@ -266,6 +437,7 @@ function galleryVisibleGroups() {
 
 // 各筛选档的条目数（不含搜索词，让 chip 计数保持稳定的"分类体量"含义）
 function galleryFilterCounts() {
+    if (galleryData?.lazy) return galleryData.filter_counts || {};
     const counts = { all: 0, cover: 0, frame: 0, video: 0, merged: 0, studio: 0, orphan: 0 };
     for (const g of (galleryData && galleryData.groups) || []) {
         for (const it of g.items || []) {
@@ -282,19 +454,34 @@ function galleryFilterCounts() {
 }
 
 function gallerySelectedPaths() {
+    if (galleryData?.lazy) {
+        const visible = galleryData.queryKey === galleryQueryKey()
+            ? new Set(galleryData.groups.map(group => group.key)) : null;
+        const query = gallerySearch.trim().toLowerCase();
+        return [...gallerySelected].filter(path => {
+            const record = gallerySelectedItems.get(path);
+            if (!record || (visible && !visible.has(record.group.key))
+                    || !galleryItemMatchesFilter(record.group, record.item)) return false;
+            return !query || [record.group.title, record.group.idea_title, record.item.name, record.item.path]
+                .some(value => String(value || '').toLowerCase().includes(query));
+        });
+    }
     const allowed = new Set(galleryVisibleGroups().flatMap(group => group.items.map(item => item.path)));
     return [...gallerySelected].filter(path => allowed.has(path));
 }
 
 function galleryPruneSelection() {
     const selected = new Set(gallerySelectedPaths());
-    [...gallerySelected].forEach(path => { if (!selected.has(path)) gallerySelected.delete(path); });
+    [...gallerySelected].forEach(path => {
+        if (!selected.has(path)) { gallerySelected.delete(path); gallerySelectedItems.delete(path); }
+    });
 }
 
 
 function renderGallery() {
     const container = document.getElementById('gallery-groups');
     if (!container || !galleryData) return;
+    const scrollTop = container.scrollTop;
 
     const groups = galleryVisibleGroups();
     galleryPruneSelection();
@@ -324,8 +511,10 @@ function renderGallery() {
         const icon = GALLERY_GROUP_ICONS[g.kind] || '📁';
         const collapsed = galleryCollapsed.has(g.key);
         const expanded = galleryExpanded.has(g.key);
-        const shown = collapsed ? [] : (expanded ? g.items : g.items.slice(0, GALLERY_TRUNCATE));
-        const gBytes = g.items.reduce((s, it) => s + (it.size || 0), 0);
+        const shown = collapsed ? [] : (galleryData.lazy ? g.items.slice(0, g.visibleCount || GALLERY_TRUNCATE)
+            : (expanded ? g.items : g.items.slice(0, GALLERY_TRUNCATE)));
+        const matchCount = galleryData.lazy ? g.filtered_count : g.items.length;
+        const gBytes = galleryData.lazy ? g.bytes : g.items.reduce((s, it) => s + (it.size || 0), 0);
         const orphanBadge = g.orphan === true ? '<span class="g-orphan-badge" title="未被任何点子/任务引用的历史遗留项目">⚠ 孤儿</span>' : '';
         // 只有项目组才谈得上"回到激发项目"——封面池与图像工坊不属于任何一单合成。
         // idea_id 是服务端按目录命名反查到的点子库归属（见 gallery_collect_references）；
@@ -341,7 +530,13 @@ function renderGallery() {
         if (!collapsed) {
             const cards = shown.map(it => galleryCardHtml(it)).join('');
             let moreBtn = '';
-            if (!expanded && g.items.length > GALLERY_TRUNCATE) {
+            if (galleryData.lazy) {
+                if (g.error) moreBtn = `<div class="gallery-status error">${escapeHtml(g.error)} <button type="button" class="gallery-expand-btn" data-expand="retry">重新加载</button></div>`;
+                else if (g.loading) moreBtn = '<div class="gallery-status">正在加载媒体清单…</div>';
+                else if (shown.length < matchCount) {
+                    moreBtn = `<button type="button" class="gallery-expand-btn" data-expand="more">加载更多（已显示 ${shown.length} / ${matchCount} 项）</button>`;
+                }
+            } else if (!expanded && g.items.length > GALLERY_TRUNCATE) {
                 moreBtn = `<button type="button" class="gallery-expand-btn" data-expand="1">▼ 展开全部 ${g.items.length} 项</button>`;
             } else if (expanded && g.items.length > GALLERY_TRUNCATE) {
                 moreBtn = `<button type="button" class="gallery-expand-btn" data-expand="0">▲ 收起（保留前 ${GALLERY_TRUNCATE} 项）</button>`;
@@ -352,8 +547,9 @@ function renderGallery() {
         // 项目名称作为标题；磁盘路径收进可展开详情。
         // 改过名的项目可能仍沿用旧目录，路径可在详情里核对。
         const groupName = g.idea_title || g.title;
-        const totalCount = ((galleryData.groups || []).find(raw => raw.key === g.key)?.items || []).length;
-        const filtered = totalCount !== g.items.length;
+        const totalCount = galleryData.lazy ? g.total_count
+            : ((galleryData.groups || []).find(raw => raw.key === g.key)?.items || []).length;
+        const filtered = totalCount !== matchCount;
         const groupDetails = g.kind === 'project'
             ? `<details class="gallery-group-details"><summary>项目详情</summary><div>本地目录 <code>outputs/${escapeHtml(g.title)}</code></div></details>`
             : '';
@@ -366,13 +562,13 @@ function renderGallery() {
                 <h3 class="g-group-title" title="点击折叠/展开${g.kind === 'project' ? `\n本地目录 outputs/${escapeHtml(g.title)}` : ''}">
                     <span class="g-collapse-caret">${collapsed ? '▸' : '▾'}</span>
                     <span class="g-group-icon">${icon}</span><span class="g-group-name">${escapeHtml(groupName)}</span>${orphanBadge}
-                    <span class="g-count">${filtered ? `筛选 ${g.items.length} / ${totalCount}` : g.items.length} 项 · ${galleryFmtSize(gBytes)}</span>
+                    <span class="g-count">${filtered ? `筛选 ${matchCount} / ${totalCount}` : matchCount} 项 · ${galleryFmtSize(gBytes)}</span>
                 </h3>
                 <div class="gallery-group-actions">
                     ${openProjectBtn}
                     ${locateProjectBtn}
                     <button type="button" class="gallery-tool-btn small g-group-select" title="${filtered ? '选择本组当前筛选结果' : '选择本组全部媒体'}"><span class="g-btn-ico">☑</span><span class="g-btn-label">选择${filtered ? '筛选结果' : '本组媒体'}</span></button>
-                    <button type="button" class="gallery-tool-btn small danger g-group-delete" title="仅删除本组当前筛选中的 ${g.items.length} 个媒体文件"><span class="g-btn-ico">🗑️</span><span class="g-btn-label">${deleteLabel}</span></button>
+                    <button type="button" class="gallery-tool-btn small danger g-group-delete" title="仅删除本组当前筛选中的 ${matchCount} 个媒体文件"><span class="g-btn-ico">🗑️</span><span class="g-btn-label">${deleteLabel}</span></button>
                 </div>
             </div>
             ${groupDetails}
@@ -380,6 +576,7 @@ function renderGallery() {
         </section>`;
     }).join('');
 
+    if (Number.isFinite(scrollTop)) container.scrollTop = scrollTop;
     galleryUpdateToolbar();
 }
 
@@ -389,10 +586,13 @@ function galleryCardHtml(it) {
     const badge = it.is_edited ? '精剪成片' : (GALLERY_KIND_LABELS[it.kind] || '');
     const inUseBadge = (it.kind === 'cover' && it.in_use === true)
         ? '<span class="gallery-inuse-badge" title="正被点子库或任务引用，删除会导致卡片破图">🔗 使用中</span>' : '';
+    const previewUrl = it.type === 'video' ? `${url}#t=0.1` : url;
+    const sourceAttrs = typeof MediaPreview !== 'undefined'
+        ? MediaPreview.attrs(previewUrl) : `src="${escapeHtml(previewUrl)}"`;
     const thumb = it.type === 'video'
-        ? `<video preload="metadata" src="${escapeHtml(url)}#t=0.1" muted playsinline></video>
+        ? `<video preload="metadata" ${sourceAttrs} muted playsinline></video>
            <span class="gallery-play-badge">▶</span>`
-        : `<img loading="lazy" src="${escapeHtml(url)}" alt="${escapeHtml(it.name)}">`;
+        : `<img loading="lazy" ${sourceAttrs} alt="${escapeHtml(it.name)}">`;
     return `
     <div class="gallery-card${sel ? ' selected' : ''}" data-path="${escapeHtml(it.path)}">
         <div class="gallery-thumb">
@@ -447,9 +647,11 @@ function galleryUpdateToolbar() {
     const selAllBtn = document.getElementById('gallery-select-all-btn');
     if (selAllBtn) {
         const visible = galleryVisibleGroups().flatMap(g => g.items.map(it => it.path));
-        const allSelected = visible.length > 0 && visible.every(p => gallerySelected.has(p));
-        selAllBtn.textContent = allSelected ? '取消本筛选全选' : '全选筛选结果';
-        selAllBtn.disabled = visible.length === 0;
+        const total = galleryData?.lazy ? galleryVisibleGroups().reduce((sum, group) => sum + group.filtered_count, 0) : visible.length;
+        const allSelected = galleryData?.lazy ? total > 0 && selected.length === total
+            : visible.length > 0 && visible.every(p => gallerySelected.has(p));
+        selAllBtn.textContent = galleryBulkLoading ? '正在准备完整清单…' : allSelected ? '取消本筛选全选' : '全选筛选结果';
+        selAllBtn.disabled = total === 0 || galleryBulkLoading;
     }
     const collapseAllBtn = document.getElementById('gallery-collapse-all-btn');
     if (collapseAllBtn) {
@@ -458,6 +660,12 @@ function galleryUpdateToolbar() {
         collapseAllBtn.textContent = allCollapsed ? '⬇️ 全部展开' : '⬆️ 全部收起';
         collapseAllBtn.disabled = groups.length === 0;
     }
+    if (galleryBulkLoading) {
+        if (downloadBtn) downloadBtn.disabled = true;
+        if (delBtn) delBtn.disabled = true;
+    }
+    document.querySelectorAll('#gallery-groups .g-group-select, #gallery-groups .g-group-delete')
+        .forEach(button => { button.disabled = galleryBulkLoading; });
 }
 
 function galleryFindItem(path) {
@@ -465,11 +673,16 @@ function galleryFindItem(path) {
         const hit = (g.items || []).find(it => it.path === path);
         if (hit) return hit;
     }
-    return null;
+    return gallerySelectedItems.get(path)?.item || null;
 }
 
 function gallerySetSelected(path, on) {
-    if (on) gallerySelected.add(path); else gallerySelected.delete(path);
+    if (on) {
+        gallerySelected.add(path);
+        const group = galleryData?.groups.find(item => item.items.some(media => media.path === path));
+        const item = group?.items.find(media => media.path === path);
+        if (item) galleryRememberSelection(item, group);
+    } else { gallerySelected.delete(path); gallerySelectedItems.delete(path); }
     const card = document.querySelector(`#gallery-groups .gallery-card[data-path="${CSS.escape(path)}"]`);
     if (card) {
         card.classList.toggle('selected', on);
@@ -482,14 +695,16 @@ function gallerySetSelected(path, on) {
 function galleryPersistCollapsed() {
     try {
         localStorage.setItem(GALLERY_COLLAPSED_LS_KEY, JSON.stringify([...galleryCollapsed]));
+        localStorage.setItem('spark_gallery_opened', JSON.stringify([...galleryOpened]));
     } catch (e) { /* 存储满/隐私模式：折叠状态不持久化也能用 */ }
 }
 
 function galleryToggleCollapse(key) {
-    if (galleryCollapsed.has(key)) galleryCollapsed.delete(key);
-    else galleryCollapsed.add(key);
+    if (galleryCollapsed.has(key)) { galleryCollapsed.delete(key); galleryOpened.add(key); }
+    else { galleryCollapsed.add(key); galleryOpened.delete(key); }
     galleryPersistCollapsed();
     renderGallery();
+    if (galleryData?.lazy && !galleryCollapsed.has(key)) return galleryLoadGroup(key);
 }
 
 // 工具栏"全部收起/展开"：作用于当前筛选下可见的分组（而非磁盘上的全部分组，
@@ -500,16 +715,23 @@ function galleryToggleCollapseAll() {
     if (!groups.length) return;
     const allCollapsed = groups.every(g => galleryCollapsed.has(g.key));
     groups.forEach(g => {
-        if (allCollapsed) galleryCollapsed.delete(g.key);
-        else galleryCollapsed.add(g.key);
+        if (allCollapsed) { galleryCollapsed.delete(g.key); galleryOpened.add(g.key); }
+        else { galleryCollapsed.add(g.key); galleryOpened.delete(g.key); }
     });
     galleryPersistCollapsed();
     renderGallery();
+    if (galleryData?.lazy && allCollapsed) groups.forEach(group => galleryLoadGroup(group.key));
 }
 
-function galleryOpenPreview(path) {
+async function galleryOpenPreview(path) {
     // 灯箱在"当前筛选+排序下所在组"内左右翻页（含被截断未显示的卡片）
-    const groups = galleryVisibleGroups();
+    let groups = galleryVisibleGroups();
+    if (galleryData?.lazy) {
+        const key = groups.find(group => group.items.some(item => item.path === path))?.key;
+        if (!key) return;
+        try { groups = await galleryCollectScope([key]); }
+        catch (error) { showToast(`预览未打开：${error.message}`, 'error'); return; }
+    }
     for (const g of groups) {
         const idx = g.items.findIndex(it => it.path === path);
         if (idx !== -1) {
@@ -570,9 +792,70 @@ function galleryDownload(it) {
     a.remove();
 }
 
-async function galleryDownloadSelected() {
+async function galleryWithBulkAction(action) {
+    if (galleryBulkLoading) return;
+    galleryBulkLoading = true;
+    galleryUpdateToolbar();
+    try { return await action(); }
+    catch (error) { showToast(`操作未执行：${error.message}`, error.code === 'query_changed' ? 'info' : 'error'); }
+    finally { galleryBulkLoading = false; renderGallery(); }
+}
+
+async function galleryToggleScopeSelection(keys = null) {
+    if (!galleryData?.lazy) {
+        const groups = galleryVisibleGroups().filter(group => !keys || keys.includes(group.key));
+        const paths = groups.flatMap(group => group.items.map(item => item.path));
+        const allSelected = paths.length > 0 && paths.every(path => gallerySelected.has(path));
+        paths.forEach(path => { if (allSelected) gallerySelected.delete(path); else gallerySelected.add(path); });
+        renderGallery();
+        return;
+    }
+    return galleryWithBulkAction(async () => {
+        const groups = await galleryCollectScope(keys);
+        const paths = groups.flatMap(group => group.items.map(item => item.path));
+        const allSelected = paths.length > 0 && paths.every(path => gallerySelected.has(path));
+        groups.forEach(group => group.items.forEach(item => {
+            if (allSelected) { gallerySelected.delete(item.path); gallerySelectedItems.delete(item.path); }
+            else { gallerySelected.add(item.path); galleryRememberSelection(item, group); }
+        }));
+    });
+}
+
+async function galleryResolvePaths(paths) {
+    if (!galleryData?.lazy) return paths;
+    const keys = [...new Set(paths.map(path => gallerySelectedItems.get(path)?.group.key
+        || galleryData.groups.find(group => group.items.some(item => item.path === path))?.key).filter(Boolean))];
+    if (!keys.length) return [];
+    const groups = await galleryCollectScope(keys);
+    const alive = new Set(groups.flatMap(group => group.items.map(item => item.path)));
+    return paths.filter(path => alive.has(path));
+}
+
+function galleryDeleteGroup(key) {
+    if (!galleryData?.lazy) {
+        const group = galleryVisibleGroups().find(item => item.key === key);
+        if (group) return galleryDeletePaths(group.items.map(item => item.path),
+            `「${group.idea_title || group.title}」当前筛选中的 ${group.items.length} 个媒体文件`);
+        return;
+    }
+    return galleryWithBulkAction(async () => {
+        const group = (await galleryCollectScope([key]))[0];
+        if (!group) return;
+        await galleryDeletePaths(group.items.map(item => item.path),
+            `「${group.idea_title || group.title}」当前筛选中的 ${group.items.length} 个媒体文件`, { validated: true });
+    });
+}
+
+async function galleryDownloadSelected(options = {}) {
     if (galleryDownloading) return;
-    const paths = gallerySelectedPaths();
+    if (galleryData?.lazy && !options.validated) {
+        const requested = gallerySelectedPaths();
+        return galleryWithBulkAction(async () => {
+            const paths = await galleryResolvePaths(requested);
+            if (paths.length) await galleryDownloadSelected({ validated: true, paths });
+        });
+    }
+    const paths = options.paths || gallerySelectedPaths();
     if (!paths.length) return;
     if (paths.length === 1) { galleryDownload(galleryFindItem(paths[0])); return; }
     galleryDownloading = true;
@@ -602,8 +885,14 @@ async function galleryDownloadSelected() {
 }
 
 
-async function galleryDeletePaths(paths, label) {
+async function galleryDeletePaths(paths, label, options = {}) {
     if (!paths.length) return;
+    if (galleryData?.lazy && !options.validated) {
+        return galleryWithBulkAction(async () => {
+            const current = await galleryResolvePaths(paths);
+            if (current.length) await galleryDeletePaths(current, label, { validated: true });
+        });
+    }
     const inUseCount = paths.filter(p => {
         const it = galleryFindItem(p);
         return it && it.in_use === true;
@@ -633,8 +922,8 @@ async function galleryDeletePaths(paths, label) {
         } else {
             showToast(`已删除 ${nDel} 个文件${dirNote}`, 'success');
         }
-        paths.forEach(p => gallerySelected.delete(p));
-        await refreshGallery();
+        paths.forEach(p => { gallerySelected.delete(p); gallerySelectedItems.delete(p); });
+        await refreshGallery({ force: true });
     } catch (e) {
         showToast(`删除失败：${e.message}`, 'error');
     }
@@ -660,7 +949,7 @@ function initGallery() {
         const chip = e.target.closest('.gallery-filter-chip');
         if (!chip) return;
         gallerySetFilter(chip.dataset.filter);
-        renderGallery();
+        if (!galleryData || galleryData.lazy) refreshGallery(); else renderGallery();
     });
 
     // 搜索（去抖 200ms）
@@ -669,39 +958,40 @@ function initGallery() {
     searchInput?.addEventListener('input', () => {
         clearTimeout(searchTimer);
         searchTimer = setTimeout(() => {
-            gallerySearch = searchInput.value || '';
-            renderGallery();
+            gallerySetSearch(searchInput.value || '');
+            if (!galleryData || galleryData.lazy) refreshGallery(); else renderGallery();
         }, 200);
     });
 
     // 排序
     document.getElementById('gallery-sort')?.addEventListener('change', (e) => {
         gallerySort = e.target.value || 'newest';
-        renderGallery();
+        if (!galleryData || galleryData.lazy) refreshGallery(); else renderGallery();
     });
 
     document.getElementById('gallery-refresh-btn')?.addEventListener('click', () => {
         galleryData = null; // 强制显示扫描中状态
-        refreshGallery();
+        refreshGallery({ force: true });
     });
 
     document.getElementById('gallery-collapse-all-btn')?.addEventListener('click', galleryToggleCollapseAll);
 
-    document.getElementById('gallery-select-all-btn')?.addEventListener('click', () => {
-        const visible = galleryVisibleGroups().flatMap(g => g.items.map(it => it.path));
-        const allSelected = visible.length > 0 && visible.every(p => gallerySelected.has(p));
-        visible.forEach(p => { if (allSelected) gallerySelected.delete(p); else gallerySelected.add(p); });
-        renderGallery();
-    });
+    document.getElementById('gallery-select-all-btn')?.addEventListener('click', () => galleryToggleScopeSelection());
 
     document.getElementById('gallery-clear-selection-btn')?.addEventListener('click', () => {
         gallerySelected.clear();
+        gallerySelectedItems.clear();
         renderGallery();
     });
     document.getElementById('gallery-download-selected-btn')?.addEventListener('click', galleryDownloadSelected);
     document.getElementById('gallery-delete-selected-btn')?.addEventListener('click', () => {
         const paths = gallerySelectedPaths();
-        galleryDeletePaths(paths, `当前筛选中选中的 ${paths.length} 个文件`);
+        if (galleryData?.lazy) {
+            galleryWithBulkAction(async () => {
+                const current = await galleryResolvePaths(paths);
+                if (current.length) await galleryDeletePaths(current, `当前筛选中选中的 ${current.length} 个文件`, { validated: true });
+            });
+        } else galleryDeletePaths(paths, `当前筛选中选中的 ${paths.length} 个文件`);
     });
 
     // 卡片与分组操作：单一事件委托，重渲染后无需重绑
@@ -722,20 +1012,12 @@ function initGallery() {
         }
         if (e.target.closest('.g-group-select')) {
             const key = groupEl?.dataset.group;
-            const group = galleryVisibleGroups().find(g => g.key === key);
-            if (!group) return;
-            const paths = group.items.map(it => it.path);
-            const allSelected = paths.every(p => gallerySelected.has(p));
-            paths.forEach(p => { if (allSelected) gallerySelected.delete(p); else gallerySelected.add(p); });
-            renderGallery();
+            if (key) galleryToggleScopeSelection([key]);
             return;
         }
         if (e.target.closest('.g-group-delete')) {
             const key = groupEl?.dataset.group;
-            const group = galleryVisibleGroups().find(g => g.key === key);
-            if (!group) return;
-            const named = group.idea_title || group.title;
-            galleryDeletePaths(group.items.map(it => it.path), `「${named}」当前筛选中的 ${group.items.length} 个媒体文件`);
+            if (key) galleryDeleteGroup(key);
             return;
         }
         // 组标题（含 caret）点击 → 折叠/展开
@@ -749,6 +1031,10 @@ function initGallery() {
         if (expandBtn) {
             const key = groupEl?.dataset.group;
             if (!key) return;
+            if (galleryData?.lazy) {
+                galleryLoadGroup(key, { more: expandBtn.dataset.expand === 'more' });
+                return;
+            }
             if (expandBtn.dataset.expand === '1') galleryExpanded.add(key);
             else galleryExpanded.delete(key);
             renderGallery();

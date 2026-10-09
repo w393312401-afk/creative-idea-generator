@@ -21,6 +21,11 @@ const DEFAULT_CONFIG = {
     // 帧序列生成方式: 'api'（LLM 网关）| 'google_fx'（AdsPower 浏览器 UI 自动化）
     imageBackend: 'api',
     googleFxImageModel: 'Nano Banana 2',
+    videoProvider: 'google_fx',
+    flow2apiVideoConcurrency: 3,
+    // 每轮确认失败后的额外重试次数；持续生成会在轮次耗尽后等待并继续。
+    videoRetryCount: 5,
+    videoContinuousGeneration: true,
     videoModel: 'Veo 3.1 - Lite [Lower Priority]',
     // 提示词链路（做哪个视频模型的提示词，就读哪个技能包）：
     // 'auto' = 跟随 videoModel 推断（服务端 active_skill_profile 判定，规则表由
@@ -45,14 +50,8 @@ const DEFAULT_CONFIG = {
     imageQuality: '2K',
     // 4选1 模式 API 候选图生成并发度（1~8，默认 4）
     candidateConcurrency: 4,
-    // 质量门禁项（frameContinuityMode / qaGateLevel / videoProcessVlmReview / …）
-    // 刻意**不**在这里写默认值：唯一真源是 server_common.GATE_SETTINGS，经
-    // /api/mode 的 gate_settings 字段下发，配置中心「质量门禁」分区照它渲染
-    // （见 js/gate_settings.js）。在这里抄一份就是又开一个会漂移的真相源——
-    // 前端默认 balanced、服务端改成 strict，用户看到的和实际跑的就对不上了。
-    // 只有用户显式改过的门禁项才会出现在 config 里并随请求带走。
-    frameContinuityLocalEdit: 'off',
-    strictPromptPipelineV2: true,
+    // 所有审查规则已永久退役；旧缓存值会在加载和保存时清理。
+    reviewsDisabled: true,
     composeBatchSize: 5,
     composeRequestTimeoutSeconds: 45,
     composeBatchRetryCount: 1,
@@ -77,6 +76,8 @@ const DEFAULT_CONFIG = {
 // 配置中心与项目再跑共用当前模型清单；旧配置由 config.js 迁移。
 // - gpt: GPT-6 系列经 resolve_gateway 转发到 codex 网关。
 //   2026-10-01 已通过本机网关 /models 确认下列四款模型可用。
+// - claude: 经 OpenAI 兼容网关转发，地址与密钥由服务端 claudeBaseUrl / claudeApiKey 提供
+//   （未配置时沿用 config.baseUrl）。型号 ID 取自 Anthropic 当前型号表，是否可用以网关为准。
 // - gemini: 走默认网关（config.baseUrl，即 8046）。
 const LLM_MODEL_GROUPS = {
     gpt: [
@@ -84,6 +85,12 @@ const LLM_MODEL_GROUPS = {
         { value: 'gpt-6-astra', label: 'gpt-6-astra' },
         { value: 'gpt-6-sol', label: 'gpt-6-sol' },
         { value: 'gpt-6-luna', label: 'gpt-6-luna' }
+    ],
+    claude: [
+        { value: 'claude-opus-5-5', label: 'claude-opus-5-5', recommended: true },
+        { value: 'claude-sonnet-5-5', label: 'claude-sonnet-5-5' },
+        { value: 'claude-fable-5-1', label: 'claude-fable-5-1' },
+        { value: 'claude-haiku-5-5', label: 'claude-haiku-5-5' }
     ],
     gemini: [
         { value: 'gemini-3.8-flash-high', label: 'gemini-3.8-flash-high', recommended: true }
@@ -161,6 +168,8 @@ let config = { ...DEFAULT_CONFIG };
 // 访问码(server-managed 模式);app.js 的 fetch 包装器与 initServerMode 读取/更新它
 let ACCESS_CODE = localStorage.getItem('spark_access_code') || '';
 
+// List metadata and hydrated records have separate stores: summaries are never saved as bodies.
+let savedIdeaIndex = [];
 let savedIdeas = [];
 let currentIdea = null;
 

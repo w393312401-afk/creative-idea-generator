@@ -6,7 +6,9 @@ const ProgressModel = require('../js/progress_model.js');
 
 const app = fs.readFileSync(path.join(__dirname, '../app.js'), 'utf8');
 const api = fs.readFileSync(path.join(__dirname, '../js/api_client.js'), 'utf8');
-const fullStream = app.slice(app.indexOf('async function streamVideosProgress('),
+const progressRestore = app.slice(app.indexOf('function restoreMediaTaskProgress('),
+    app.indexOf('async function streamFramesProgress('));
+const fullStream = progressRestore + app.slice(app.indexOf('async function streamVideosProgress('),
     app.indexOf('async function streamCoverProgress('));
 const retryStream = api.slice(api.indexOf('async function retrySingleVideo('),
     api.indexOf('// setVideoUploadButtonsBusy'));

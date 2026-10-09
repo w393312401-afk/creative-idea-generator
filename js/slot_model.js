@@ -37,6 +37,24 @@ function slotSwappedFrom(entry, key) {
     return Number.isFinite(v) ? v : null;
 }
 
+// 当前 Flow2API 通道可直接重试旧记录；继续使用原生固定账号时保留原提交保护。
+// 早期 Flow2API 回执只有 submission_id，没有 provider。
+function slotVideoAllowsDirectRetry(video, videoProvider) {
+    if (videoProvider === 'flow2api') return true;
+    const attempt = video && video.last_attempt || {};
+    if (attempt.fixed_video_account === true) return false;
+    const provider = attempt.provider || (video && video.provider);
+    return provider ? provider === 'flow2api' : !!attempt.submission_id;
+}
+
+// 核对接口只查询原 Flow2API 回执；当前选择的新通道不改变原提交归属。
+function slotVideoCanQuerySubmission(video) {
+    const attempt = video && video.last_attempt || {};
+    if (attempt.fixed_video_account === true) return false;
+    const provider = attempt.provider || (video && video.provider);
+    return provider ? provider === 'flow2api' : !!attempt.submission_id;
+}
+
 // ── 徽标表 ──────────────────────────────────────────────────────────
 // 新增一种徽标 = 在表里加一行。tip 是徽标自身的悬浮说明，hover 是它要往
 // 整卡 title 里追加的那句话（两者措辞不同是既有行为，原样保留）。
@@ -134,14 +152,31 @@ const FRAME_BADGE_DEFS = [
 
 const VIDEO_BADGE_DEFS = [
     {
+        id: 'submission-pending', text: '原提交待确认 · 保留原片', cls: 'degraded-badge',
+        test: v => !!(v.last_attempt && v.last_attempt.submission_pending === true),
+        tip: () => '原提交的结果尚未确认，请先核对原任务。',
+        hover: () => '（原提交结果待确认，请核对原任务）',
+    },
+    {
+        id: 'recovery-failed', text: '原视频取回未完成 · 保留原片', cls: 'degraded-badge',
+        test: v => !!(v.last_attempt && v.last_attempt.confirmed === true
+            && v.last_attempt.recovery_state === 'recovery_failed'),
+        tip: v => v.last_attempt.error || '原视频已生成，可再次取回原视频。',
+        hover: () => '（原视频取回未完成，可再次取回）',
+    },
+    {
         id: 'retry-failed', text: '本次重试失败 · 保留原片', cls: 'vlm-failed-badge',
-        test: v => v.status === 'success' && v.last_attempt && v.last_attempt.status === 'failed',
+        test: v => v.status === 'success' && v.last_attempt
+            && v.last_attempt.status === 'failed'
+            && v.last_attempt.submission_pending !== true
+            && v.last_attempt.recovery_state !== 'recovery_failed',
         tip: v => v.last_attempt.error || '本次重试失败，仍可播放上次成功的视频。',
         hover: v => `（本次重试失败：${v.last_attempt.error || '仍保留上次成功的视频'}）`,
     },
     {
         id: 'retry-cancelled', text: '本次重试取消 · 保留原片', cls: 'degraded-badge',
-        test: v => v.status === 'success' && v.last_attempt && v.last_attempt.status === 'cancelled',
+        test: v => v.status === 'success' && v.last_attempt && v.last_attempt.status === 'cancelled'
+            && v.last_attempt.submission_pending !== true,
         tip: () => '本次重试已取消，仍可播放上次成功的视频。',
         hover: () => '（本次重试已取消，保留上次成功的视频）',
     },
@@ -188,8 +223,8 @@ function frameIsFixable(frame) {
     return !!frame && (frameIsReviewFailed(frame) || !!frameManualIssue(frame));
 }
 
-function collectBadges(defs, entry) {
-    return defs.filter(d => d.test(entry)).map(d => ({
+function collectBadges(defs, entry, ctx = {}) {
+    return defs.filter(d => d.test(entry, ctx)).map(d => ({
         id: d.id,
         text: typeof d.text === 'function' ? d.text(entry) : d.text,
         cls: d.cls,
@@ -311,14 +346,21 @@ function videoActions(state, ctx) {
     const mk = (act, label, opts) => slotAction(act, label,
         Object.assign({ busy, busyTip: BUSY_TIP_VIDEOS }, opts));
     if (state.kind === 'pending' || state.kind === 'cut') return [];
+    if (state.flags.submissionPending && !state.flags.directRetry && !state.flags.canQuerySubmission) {
+        return state.kind === 'ready' ? [Object.assign(slotAction('preview-slot', '播放原片', {
+            cls: 'preview-slot-btn', idle: '播放上次成功的视频', busy: false,
+        }), { primary: true })] : [];
+    }
     const isReady = state.kind === 'ready';
     // 占位卡是浅色底，上传/删除沿用 secondary 的浅色描边；出图卡是深色底，
     // 删除用红底跟其余按钮区分（两种底色下的既有外观）
     const sub = isReady ? '' : ' secondary';
     const list = [
-        mk('retry-video', state.kind === 'missing' ? '生成' : '重试', {
+        mk('retry-video', state.flags.submissionPending || state.flags.originalDownloadFailed
+            ? '重新生成' : state.kind === 'missing' ? '生成' : '重试', {
             cls: 'retry-video-btn',
-            idle: isReady ? '重新生成此槽位视频（覆盖当前片段）' : '',
+            idle: state.flags.submissionPending ? '先核对原提交；此操作会重新生成该段视频'
+                : isReady ? '重新生成此槽位视频（覆盖当前片段）' : '',
         }),
         mk('upload-video', '上传', {
             cls: 'upload-video-btn' + sub,
@@ -330,27 +372,35 @@ function videoActions(state, ctx) {
             idle: DELETE_TIP,
         }),
     ];
+    const queryOriginal = state.flags.canQuerySubmission
+        && (state.flags.submissionPending || state.flags.originalDownloadFailed);
+    if (queryOriginal) list.unshift(mk('query-video-submission',
+        state.flags.originalDownloadFailed ? '取回原视频' : '核对原提交', {
+            cls: 'query-video-submission-btn',
+            idle: '查询原提交并取回已完成的视频，不重新生成',
+        }));
     if (isReady) list.unshift(slotAction('preview-slot', '播放', {
         cls: 'preview-slot-btn', idle: '打开并播放这段视频', busy: false,
     }));
-    const primary = isReady ? 'preview-slot' : 'retry-video';
+    const primary = isReady ? 'preview-slot' : queryOriginal ? 'query-video-submission' : 'retry-video';
     return list.map(a => Object.assign(a, { primary: a.act === primary }));
 }
 
 // ── 状态构造 ────────────────────────────────────────────────────────
-// ctx: { seq, busy, pending }
+// ctx: { seq, busy, pending, videoProvider }
 //   busy    该创意的同类任务正在跑 → 所有按钮画成禁用态
 //   pending 这一格在当前任务的目标范围内、只是还没轮到 → 画等待中而非"未生成"
 //           （单帧重试时其余槽位服务端压根没碰，画等待中会误导，见
 //            2026-07-20 实机事故记录）
 
 /** 等待/进行中占位（生成中、重试中、修复中、上传中……），文案由调用方给。 */
-function slotPendingState(type, seq, text) {
+function slotPendingState(type, seq, text, activity) {
     const label = type === 'video'
         ? `第 ${padSlot(seq)} 段视频 (${text})`
         : `第 ${padSlot(seq)} 帧 (${text})`;
     return {
         type, seq, kind: 'pending', label,
+        activity: activity || (type === 'video' ? (/等待/.test(text) ? 'queued' : 'active') : ''),
         statusText: '', title: '', url: '',
         badges: [], actions: [], flags: {}, draggable: false,
     };
@@ -451,6 +501,11 @@ function videoSlotLabel(seq, isHero) {
 function videoSlotState(video, ctx) {
     const seq = Number(ctx.seq);
 
+    // 只有当前任务事件能确认正在执行；旧清单里的 running 不代表任务仍存活。
+    if (ctx.activity === 'active' || ctx.activity === 'queued') {
+        return slotPendingState('video', seq, ctx.activity === 'active' ? '生成中...' : '等待中', ctx.activity);
+    }
+
     if (!video) {
         if (ctx.pending) return slotPendingState('video', seq, '等待中');
         const st = {
@@ -464,6 +519,23 @@ function videoSlotState(video, ctx) {
     const isHero = slotIsHero(video);
     const label = videoSlotLabel(Number(video.slot) || seq, isHero);
     const url = video.url || video.file;
+    const attempt = video.last_attempt || {};
+    const directRetry = slotVideoAllowsDirectRetry(video, ctx.videoProvider);
+    const canQuerySubmission = slotVideoCanQuerySubmission(video);
+    const submissionPending = attempt.submission_pending === true;
+    const originalDownloadFailed = attempt.confirmed === true && attempt.recovery_state === 'recovery_failed';
+
+    if (submissionPending && (video.status !== 'success' || !url)) {
+        const st = {
+            type: 'video', seq, kind: 'submission-pending', label, url: '',
+            statusText: '原提交结果待确认',
+            title: canQuerySubmission ? '原提交尚未核实，请先核对原提交并取回已完成的视频。'
+                : '原提交尚未核实，请在原生成服务查看原任务。',
+            badges: [], flags: { hero: isHero, submissionPending: true, directRetry, canQuerySubmission }, draggable: false,
+        };
+        st.actions = videoActions(st, ctx);
+        return st;
+    }
 
     // 硬切占位槽（旧单专属）：2026-07-30 起 [CUT] 槽照常生成视频（正文是普通的过门
     // 跨越镜头），只有切换前落盘的旧单仍会回 skipped_cut——该槽不生成视频，成片在此处
@@ -483,8 +555,8 @@ function videoSlotState(video, ctx) {
     if (video.status === 'failed' || !url) {
         const st = {
             type: 'video', seq, kind: 'failed', label, url: '',
-            statusText: '生成失败', title: video.error || '生成失败',
-            badges: [], flags: { hero: isHero }, draggable: false,
+            statusText: originalDownloadFailed ? '原视频取回未完成' : '生成失败', title: video.error || '生成失败',
+            badges: [], flags: { hero: isHero, originalDownloadFailed, directRetry, canQuerySubmission }, draggable: false,
         };
         st.actions = videoActions(st, ctx);
         return st;
@@ -492,15 +564,19 @@ function videoSlotState(video, ctx) {
 
     const flags = {
         hero: isHero,
+        submissionPending,
+        originalDownloadFailed,
+        directRetry,
+        canQuerySubmission,
         manualUpload: video.source === 'manual_upload',
         swappedFrom: slotSwappedFrom(video, 'swapped_from_slot'),
     };
     const st = {
         type: 'video', seq, kind: 'ready', label, url,
         statusText: '', flags, cardCls: '',
-        badges: collectBadges(VIDEO_BADGE_DEFS, video),
-        title: `播放 ${label}`,
-        draggable: true,
+        badges: collectBadges(VIDEO_BADGE_DEFS, video, ctx),
+        title: `播放 ${label}${submissionPending ? '（原提交结果待确认，保留原片）' : ''}`,
+        draggable: !submissionPending || directRetry,
     };
     st.actions = videoActions(st, ctx);
     return st;
@@ -515,8 +591,8 @@ function summarizeSlotStates(states) {
     return {
         total: list.length,
         ready: list.filter(s => s.kind === 'ready').length,
-        pending: list.filter(s => s.kind === 'pending').length,
-        missing: list.filter(s => s.kind === 'missing' || s.kind === 'failed').length,
+        pending: list.filter(s => s.kind === 'pending' || (s.flags && s.flags.submissionPending)).length,
+        missing: list.filter(s => ['missing', 'failed', 'submission-pending'].includes(s.kind)).length,
         flagged: list.filter(s => (s.badges || []).some(b => b.isIssue !== false)).length,
     };
 }
@@ -525,6 +601,7 @@ function summarizeSlotStates(states) {
 if (typeof module !== 'undefined' && module.exports) {
     module.exports = {
         padSlot, slotIsStale, slotIsHero, frameIsFixable,
+        slotVideoAllowsDirectRetry, slotVideoCanQuerySubmission,
         frameSlotState, videoSlotState, slotPendingState,
         videoSlotLabel, summarizeSlotStates,
         FRAME_BADGE_DEFS, VIDEO_BADGE_DEFS,

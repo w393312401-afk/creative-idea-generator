@@ -26,6 +26,14 @@ def accepts_gzip(header):
     return preferences.get('gzip', preferences.get('*', 0.0)) > 0
 
 
+def compress_response(raw, accept_encoding):
+    """Negotiate bounded responses; streams and media use their own delivery paths."""
+    if len(raw) < 1024 or not accepts_gzip(accept_encoding):
+        return raw, None
+    encoded = gzip.compress(raw, compresslevel=6, mtime=0)
+    return (encoded, 'gzip') if len(encoded) < len(raw) else (raw, None)
+
+
 def gzip_body(stream, path, stat):
     """Use the opened file's identity; atomic replacement invalidates old entries."""
     global _CACHE_BYTES

@@ -17,6 +17,7 @@ import time
 from server_common import (
     frame_content_hash, read_manifest, write_manifest, manifest_lock, log,
     resolve_cover_reference, GenerationCancelled,
+    reviews_disabled,
 )
 from prompt_pipeline import (
     check_beat_consistency,
@@ -54,11 +55,15 @@ _HALT_MODES = ('halt', 'autofix')
 
 def guard_autofix_enabled(guard_mode) -> bool:
     """该档位是否要在检出结构级问题后就地自动修复。"""
+    if reviews_disabled():
+        return False
     return guard_mode in _AUTOFIX_MODES
 
 
 def guard_halt_enabled(guard_mode) -> bool:
     """该档位是否允许把"检出结构级问题"升级成停链。"""
+    if reviews_disabled():
+        return False
     return guard_mode in _HALT_MODES
 
 
@@ -123,7 +128,7 @@ def classify_chain_impact(config, texts, timeout=30, on_error='chain', layer=Non
     pipeline_orchestrator._sequence_consistency_review）：那里分级不决定任何动作，
     一次调用失败就把整单标成"会传染下游"是在编造判定，不如如实标成"未分级"。
     """
-    if not texts:
+    if reviews_disabled(config) or not texts:
         return []
     user_text = (
         "Classify the following violations:\n"
@@ -169,6 +174,8 @@ def guard_beat(config, title, prompt_block, beat, project_dir, on_progress=None,
         'inline_record': {...}
       }
     """
+    if reviews_disabled(config):
+        return {'verdict': 'retired', 'retired': True, 'issues': [], 'halt': False}
     prev_seq = beat
     target_seq = beat + 1
     frames_dir = os.path.join(project_dir, 'frames')
@@ -339,6 +346,8 @@ def guard_anchor(config, title, prompt_block, project_dir, on_progress=None,
         'inline_record': {...}
       }
     """
+    if reviews_disabled(config):
+        return {'verdict': 'retired', 'retired': True, 'issues': [], 'halt': False}
     frames_dir = os.path.join(project_dir, 'frames')
     target_path = os.path.join(frames_dir, 'img_001.webp')
     if not os.path.exists(target_path):
@@ -485,6 +494,10 @@ def run_anchor_guard(config, title, prompt_block, project_dir, *, guard_mode,
       'prompt_block': 自动修复可能改写过的正文（没改就是传进来那份）,
     }
     """
+    if reviews_disabled(config):
+        return {'verdict': 'retired', 'retired': True, 'halt': False,
+                'issues': [], 'prompt_block': prompt_block}
+
     def _sync():
         if on_manifest_dirty:
             on_manifest_dirty()

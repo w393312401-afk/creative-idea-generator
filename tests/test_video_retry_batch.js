@@ -19,11 +19,14 @@ function setup(options = {}) {
         done: [], toasts: [], feeds: [], frames: [], merges: 0, synced: [],
         persisted: [], reloaded: [], renders: [] };
     const owner = { id: 'owner', title: 'Original project', prompt_block: 'prompts' };
+    if (options.videos) owner.frameRun = { videos: options.videos };
     const elements = { 'videos-progress': { style: {} }, 'videos-meta': {} };
     let active = !!options.busy;
     let rec = null;
     const context = {
-        console: { error() {} }, AbortController, crypto: require('crypto').webcrypto, config: {}, currentIdea: owner,
+        console: { error() {} }, AbortController, crypto: require('crypto').webcrypto,
+        ...(options.recovery ? { ProgressModel: require('../js/progress_model.js') } : {}),
+        config: options.config || {}, currentIdea: owner,
         getIdeaTaskRecord: () => active ? rec : null,
         handleManualInterventionEvent: (...args) => records.feeds.push(args),
         slotToolbarState: { video: { selected: new Set(options.selected || [4, 2, 3]) },
@@ -57,12 +60,29 @@ function setup(options = {}) {
         mergeVideos: async () => records.merges++,
         fetch: async (url, req) => {
             records.requests.push({ url, body: JSON.parse(req.body) });
+            if (url === '/api/video-operation/reconcile') return { ok: true, json: async () => ({
+                status: 'ok', outcomes: [{ slot: 3, state: 'pending', message: '原任务结果仍待确认' }] }) };
+            if (options.submissionPending) return { ok: false, status: 409, text: async () => JSON.stringify({
+                status: 'error', failure_code: 'SUBMISSION_PENDING', message: '原提交结果待确认',
+                pending_submissions: [{ slot: 3, task_id: 'original-task', request_id: 'original-request' }] }) };
             if (options.httpError) return { ok: false, status: 400, text: async () => 'unavailable' };
             return { ok: true, json: async () => ({ task_id: 'one-batch' }) };
         },
         watchTaskUntilTerminal: async (_taskId, callbacks) => {
             const slots = records.requests.at(-1).body.target_slots;
             assert.deepStrictEqual(Array.from(rec.targetSlots), slots);
+            if (options.recovery) {
+                for (const index of slots) callbacks.onEvent('video_error', { index, total: slots.length, message: 'temporary failure' });
+                for (const phase of ['querying', 'waiting', 'retrying']) {
+                    callbacks.onEvent('video_recovery', { phase, slots, completed_slots: [],
+                        retry_round: 2, next_retry_at: 2000000000, message: '后台自动恢复' });
+                    assert.strictEqual(active, true, '恢复不能释放当前视频任务');
+                    assert.strictEqual(rec.progressInfo.current, 0);
+                    assert(rec.progressInfo.percent < 100);
+                    assert.strictEqual(rec.progressState.recoveryPhase, phase);
+                    assert.strictEqual(records.requests.length, 1, '前端不能另发补跑请求');
+                }
+            }
             if (options.disconnected) return { status: 'disconnected', error: 'lost connection' };
             if (options.cancelled) return { status: 'cancelled' };
             if (options.switchOwner) context.currentIdea = { id: 'other' };
@@ -83,6 +103,16 @@ function setup(options = {}) {
 }
 
 (async () => {
+    for (const cancelled of [false, true]) {
+        const { context, records, active } = setup({ recovery: true, cancelled });
+        const result = await context.retryVideoSlots([2, 3, 4]);
+        assert.strictEqual(result.status, cancelled ? 'cancelled' : 'completed');
+        assert.strictEqual(records.requests.length, 1);
+        assert.strictEqual(records.ends.length, 1);
+        assert.strictEqual(active(), false);
+        assert(records.renders.some(render => render.active), '恢复阶段即时重画等待卡');
+        assert(records.persisted.some(rec => rec.progressState && rec.progressState.recoveryActive), '刷新缓存保留恢复阶段');
+    }
     {
         const { context, records, active } = setup();
         const result = await context.bulkRetrySlots('video');
@@ -126,6 +156,84 @@ function setup(options = {}) {
         assert.strictEqual(records.failed.length, 3, 'request failure must settle every selected pending card');
         assert.strictEqual(active(), false);
         assert(!records.toasts.some(([, level]) => level === 'success'));
+    }
+    {
+        const { context, records, active, owner } = setup({ submissionPending: true });
+        const result = await context.retryVideoSlots([3]);
+        assert.strictEqual(result.status, 'submission_pending');
+        assert.strictEqual(result.failed, 0, '未确认提交不能计为生成失败');
+        assert.strictEqual(records.failed.length, 0, '不能重画生成失败卡');
+        assert.strictEqual(records.requests.length, 1, '409不能自动重发新生成');
+        assert.strictEqual(active(), false, '清掉的是本次被拒绝的请求，不假冒原任务仍在运行');
+        assert.strictEqual(owner.frameRun.videos[0].last_attempt.task_id, 'original-task');
+        assert(owner.frameRun.videos[0].last_attempt.submission_pending);
+        assert(records.toasts.every(([, level]) => level === 'warning'));
+        assert(!records.toasts.some(([message]) => message.includes('HTTP') || message.includes('failure_code')));
+        await context.retryVideoSlots([3]);
+        assert.strictEqual(records.requests.length, 1, '已知待确认卡不再提交生成请求');
+    }
+    for (const record of [
+        { provider: 'flow2api', last_attempt: { submission_pending: true } },
+        { last_attempt: { provider: 'flow2api', submission_pending: true } },
+        { last_attempt: { submission_id: 'legacy-flow', submission_pending: true } },
+        { provider: 'flow2api', status: 'success', url: '/old.mp4',
+            last_attempt: { status: 'failed', submission_pending: true } },
+        { provider: 'flow2api', last_attempt: { confirmed: true, recovery_state: 'recovery_failed' } },
+    ]) {
+        const video = { slot: 3, status: 'failed', ...record };
+        const { context, records } = setup({ videos: [video] });
+        const result = await context.retrySingleVideo(3);
+        assert.strictEqual(result.status, 'completed', 'Flow2API旧待确认/取回失败允许普通单段重试');
+        assert.deepStrictEqual(records.requests[0].body.target_slots, [3]);
+        assert.strictEqual(records.requests[0].url, '/api/generate_videos');
+        assert.strictEqual(records.requests.length, 1);
+        assert(!records.toasts.some(([message]) => message.includes('核对')));
+    }
+    {
+        const { context, records } = setup({ videos: [
+            { slot: 2, provider: 'flow2api', status: 'failed', last_attempt: { submission_pending: true } },
+            { slot: 3, status: 'failed', last_attempt: { submission_id: 'legacy-flow', submission_pending: true } },
+        ] });
+        const result = await context.bulkRetrySlots('video');
+        assert.strictEqual(result.status, 'completed');
+        assert.strictEqual(records.requests.length, 1, 'Flow2API待确认槽位也合并成一个重试请求');
+        assert.deepStrictEqual(records.requests[0].body.target_slots, [2, 3, 4]);
+    }
+    for (const record of [
+        { provider: 'google_fx', last_attempt: { fixed_video_account: true, submission_pending: true } },
+        { provider: 'flow2api', last_attempt: { provider: 'google_fx', fixed_video_account: true, submission_pending: true } },
+        { last_attempt: { provider: 'other_provider', submission_id: 'other', submission_pending: true } },
+    ]) {
+        const { context, records } = setup({ videos: [{ slot: 3, status: 'failed', ...record }] });
+        const result = await context.retryVideoSlots([3]);
+        assert.strictEqual(result.status, 'submission_pending', '保留固定原生账号和其他通道的原提交保护');
+        assert.strictEqual(records.requests.length, 0);
+    }
+    for (const provider of ['flow2api', 'google_fx']) {
+        const original = { slot: 3, provider: 'google_fx', status: 'success', url: '/old.mp4',
+            last_attempt: { provider: 'google_fx', fixed_video_account: true,
+                submission_id: 'native-pending', submission_pending: true } };
+        const { context, records } = setup({ config: { videoProvider: provider }, videos: [original] });
+        const result = await context.bulkRetrySlots('video');
+        assert.strictEqual(result.status, provider === 'flow2api' ? 'completed' : 'submission_pending');
+        assert.strictEqual(records.requests.length, provider === 'flow2api' ? 1 : 0,
+            '当前Flow2API允许换通道直接重试；当前固定原生账号仍保留保护');
+        if (provider === 'flow2api') {
+            assert.strictEqual(records.requests[0].url, '/api/generate_videos');
+            assert.strictEqual(records.requests[0].body.config.videoProvider, 'flow2api');
+            assert.deepStrictEqual(records.requests[0].body.target_slots, [2, 3, 4]);
+        }
+        assert.strictEqual(original.last_attempt.submission_pending, true, '重试不伪造旧回执结清');
+    }
+    {
+        const { context, records } = setup({ videos: [{ slot: 3, provider: 'flow2api', status: 'failed',
+            last_attempt: { submission_pending: true } }] });
+        const result = await context.reconcileVideoSubmission(3);
+        assert.strictEqual(result.status, 'ok', 'Flow2API核对只查询原提交');
+        assert.strictEqual(records.requests[0].url, '/api/video-operation/reconcile');
+        assert.strictEqual(records.requests.length, 1);
+        assert.strictEqual(records.reloaded.length, 1, '核对后重新读取服务端最新清单');
+        assert.strictEqual(records.pending.length, 0, '查询原提交不渲染新生成占位');
     }
     {
         const { context, records, active } = setup({ disconnected: true });
@@ -208,11 +316,16 @@ function setup(options = {}) {
             findIdeaObjectById: id => ({ id }),
             streamVideosProgress: (...args) => calls.push(args),
         };
+        const persistence = api.slice(api.indexOf('function saveActiveBackgroundTasksToLocalStorage('),
+            api.indexOf('// 后端 server_common.log()'));
         vm.createContext(context);
-        vm.runInContext(api.slice(api.indexOf('function saveActiveBackgroundTasksToLocalStorage('),
-            api.indexOf('// 后端 server_common.log()')), context);
+        vm.runInContext(persistence, context);
         context.saveActiveBackgroundTasksToLocalStorage();
-        context.resumeActiveBackgroundTasksIfExists();
+        // 刷新会创建新页面上下文，只共享持久化 storage，不继承旧页活动登记/缓存。
+        const refreshed = { ...context, ideaTasksById: {} };
+        vm.createContext(refreshed);
+        vm.runInContext(persistence, refreshed);
+        refreshed.resumeActiveBackgroundTasksIfExists();
         assert.strictEqual(calls.length, 1);
         assert.strictEqual(calls[0][0], 'batch-id');
         assert.deepStrictEqual(Array.from(calls[0][2]), [2, 3, 4], 'refresh restore must retain selected subset');

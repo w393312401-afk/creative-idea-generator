@@ -31,16 +31,18 @@ function setup(storedConfig) {
 }
 
 const currentGpt = ['gpt-6.1-sol', 'gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna'];
-for (const legacy of ['claude-sonnet-4-6', 'Claude-Opus-4-6-Thinking', 'gpt-5.5', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-4o', 'gpt-4.1', 'gpt-3.5-turbo']) {
+const currentClaude = ['claude-opus-5-5', 'claude-sonnet-5-5', 'claude-fable-5-1', 'claude-haiku-5-5'];
+for (const legacy of ['gpt-5.5', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-4o', 'gpt-4.1', 'gpt-3.5-turbo']) {
     const { context, picker, stored } = setup({
-        model: legacy, cheapModel: 'gpt-5.5', auxModel: 'claude-sonnet-4-6',
+        model: legacy, cheapModel: 'gpt-5.5', auxModel: 'gpt-4o',
         reviewModel: 'gemini-3.7-flash-high', imageModel: 'gpt-image-2.5',
         videoModel: 'Omni Flash', imageAspectRatio: '16:9',
     });
     context.loadConfig();
     assert.equal(picker.value, 'gpt-6.1-sol', legacy);
-    assert.deepEqual(picker.children.map(group => group.label), ['GPT', 'Gemini']);
+    assert.deepEqual(picker.children.map(group => group.label), ['GPT', 'Claude', 'Gemini']);
     assert.deepEqual(picker.children[0].children.map(option => option.value), currentGpt);
+    assert.deepEqual(picker.children[1].children.map(option => option.value), currentClaude);
     const persisted = JSON.parse(stored.get('spark_config'));
     assert.equal(persisted.model, 'gpt-6.1-sol');
     assert.equal(persisted.cheapModel, 'gpt-6.1-sol');
@@ -52,9 +54,32 @@ for (const legacy of ['claude-sonnet-4-6', 'Claude-Opus-4-6-Thinking', 'gpt-5.5'
 
     const options = context.projectsModelOptions(legacy);
     assert.match(options, /value="gpt-6\.1-sol" selected/);
-    assert.doesNotMatch(options, /claude|gpt-5\.|gemini-3\.7|历史模型/);
+    assert.doesNotMatch(options, /gpt-5\.|gemini-3\.7|历史模型/);
+    assert.match(options, /<optgroup label="Claude">/);
     context.loadConfig();
     assert.equal(picker.children[0].children.length, 4, 'repeat loading does not duplicate options');
+}
+
+// Claude 已重新接入：选中的型号原样保留（不再被改写成 gpt-6.1-sol），自定义 claude-* 归入 Claude 分组。
+for (const model of currentClaude) {
+    const { context, picker, stored } = setup({ model, cheapModel: 'claude-haiku-5-5', auxModel: 'claude-sonnet-4-6' });
+    context.loadConfig();
+    assert.equal(picker.value, model, 'current Claude selection survives loading');
+    const persisted = JSON.parse(stored.get('spark_config'));
+    assert.equal(persisted.model, model);
+    assert.equal(persisted.cheapModel, 'claude-haiku-5-5');
+    assert.equal(persisted.auxModel, 'claude-sonnet-4-6');
+    assert.match(context.projectsModelOptions(model), new RegExp(`value="${model}" selected`));
+}
+{
+    const { context } = setup({ model: 'claude-opus-5-5' });
+    context.loadConfig();
+    const options = context.projectsModelOptions('Claude-Opus-4-6-Thinking');
+    const claudeGroup = options.split('<optgroup').find(part => part.includes('label="Claude"'));
+    assert.match(claudeGroup, /value="Claude-Opus-4-6-Thinking" selected/);
+    assert.match(claudeGroup, /自定义/);
+    assert.equal(context.normalizeLlmModel('Claude-Opus-4-6-Thinking'), 'Claude-Opus-4-6-Thinking');
+    assert.equal(context.normalizeLlmModel('claude-sonnet-4-6'), 'claude-sonnet-4-6');
 }
 
 for (const model of currentGpt) {

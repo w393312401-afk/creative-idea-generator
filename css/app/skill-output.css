@@ -1417,6 +1417,41 @@ html:not([data-theme="dark"]) #prompt-box .action-btn.primary {
     align-items: center;
 }
 
+.frames-auto-video-controls {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px 16px;
+}
+
+.frames-auto-video-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    color: var(--text-primary);
+    font-size: var(--fs-sm);
+    cursor: pointer;
+}
+
+.frames-auto-video-toggle input {
+    accent-color: var(--neon-cyan);
+}
+
+.frames-auto-video-status {
+    flex: 1 1 280px;
+    margin: 0;
+    color: var(--text-muted);
+    font-size: var(--fs-xs);
+    line-height: 1.6;
+    word-break: break-word;
+}
+
+.frames-auto-video-status[data-status="blocked"],
+.frames-auto-video-status[data-status="partial_failed"],
+.frames-auto-video-status[data-status="completed_with_warnings"] {
+    color: var(--warning, #fbbf24);
+}
+
 .frames-desc {
     color: var(--text-secondary);
     font-size: var(--fs-md);
@@ -2053,6 +2088,19 @@ body.slot-merged-view .slot-toolbar[data-slot-type="video"] .slot-merge-btn {
     width: 20px;
     height: 20px;
     margin-bottom: 0;
+}
+
+.slot-card.placeholder-frame-card.slot-video-active {
+    border: 1px solid var(--neon-cyan, #7c8cff);
+}
+
+.slot-card.slot-video-active .slot-label {
+    color: var(--neon-cyan, #7c8cff);
+}
+
+.slot-card.slot-video-queued .slot-queue-icon {
+    font-size: 20px;
+    opacity: 0.5;
 }
 
 .slot-card .video-preview-wrapper {

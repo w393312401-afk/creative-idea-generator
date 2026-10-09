@@ -474,7 +474,7 @@
     width: 180px;
     max-width: 100%;
     aspect-ratio: 9 / 16;
-    object-fit: cover;
+    object-fit: contain;  /* 成片不能裁切：非 9:16 成片也要完整显示 */
     border-radius: var(--radius-md);
     background: #03050c;
     border: 1px solid var(--border-color);

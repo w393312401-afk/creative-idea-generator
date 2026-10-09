@@ -350,6 +350,13 @@ def _load_server_config():
         'baseUrl': 'SPARK_BASE_URL', 'apiKey': 'SPARK_API_KEY', 'model': 'SPARK_MODEL',
         'imageModel': 'SPARK_IMAGE_MODEL', 'accessCode': 'SPARK_ACCESS_CODE',
         'codexApiKey': 'CODEX_API_KEY', 'codexBaseUrl': 'CODEX_BASE_URL',
+        'claudeApiKey': 'SPARK_CLAUDE_API_KEY', 'claudeBaseUrl': 'SPARK_CLAUDE_BASE_URL',
+        'videoProvider': 'SPARK_VIDEO_PROVIDER',
+        'flow2apiBaseUrl': 'SPARK_FLOW2API_BASE_URL',
+        'flow2apiApiKey': 'SPARK_FLOW2API_API_KEY',
+        'flow2apiVideoTimeoutSeconds': 'SPARK_FLOW2API_VIDEO_TIMEOUT_SECONDS',
+        'flow2apiVideoConcurrency': 'SPARK_FLOW2API_VIDEO_CONCURRENCY',
+        'videoRetryCount': 'SPARK_VIDEO_RETRY_COUNT',
     }
     for k, env in env_map.items():
         v = os.environ.get(env)
@@ -457,157 +464,33 @@ def http_access_logging():
 
 
 # ════════════════════════════════════════════════════════════════════
-# 质量门禁配置总表（GATE_SETTINGS）—— 单一真源
-# ════════════════════════════════════════════════════════════════════
-# 门禁项此前散在四处手工同步：① 各消费点自己读 config.get()、② effective_config
-# 的托管模式白名单、③ js/state.js 的前端默认值、④ server_config.example.json 的
-# 注释。任何一处漏掉，就是一次"配了但从未生效"的静默失效——qaGateLevel /
-# imageEditTransport / skillProfile 都各栽过一次（见 effective_config 上方注释），
-# 而 videoProcessVlmReview 与 strictGates 到 2026-08-10 为止仍漏在白名单外：
-# 托管模式（配了 apiKey 即是）下请求 config 带的这两项会被 effective_config 整个
-# 丢掉，只有 server_config.json 能生效。strictGates 还被 SERVER_CONFIG 兜底掩盖着，
-# 看起来"能用"，实际是那条 config 分支永远走不到。
-#
-# 现在这张表是唯一真源：白名单由它派生（_GATE_KEYS），前端默认值与开关面板由
-# /api/mode 下发它渲染，example 配置的注释也照它生成。新增门禁项只改这里。
-#
-# 字段：
-#   key      —— config / server_config.json 的键名
-#   type     —— 'bool' | 'enum' | 'int'
-#   default  —— 缺省值（三处 fallback 都用它，不要在别处再写一份）
-#   env      —— 可选的环境变量覆盖（优先级最低，仅无头/脚本调用用）
-#   options  —— enum 的合法值；非法值一律回退 default，不报错
-#   min/max  —— int 的夹取区间
-#   section  —— 前端开关面板的分组
-#   label/hint —— 前端渲染用的中文文案
-#
-# 刻意**不**收进这张表的（别加）：
-#   · _ANCHOR_MAD_THRESHOLD / _PAIR_*_MAD / _FROZEN_CLIP_MAD / _ANCHOR_INERTIA_MAD
-#     等阈值常量——每一个都挂着实测标定数据（见各自定义处的注释）。改成 25 不会
-#     报错，只会让串片静默通过。要给用户的是**档位**（内部映射一组标定过的阈值），
-#     不是裸数字。
-# 本地冻结/节奏/惯性检测不另设单项开关；reviewsDisabled 总开关会一起跳过。
-GATE_SETTINGS = (
-    {
-        'key': 'reviewsDisabled', 'type': 'bool', 'default': False,
-        'env': 'SPARK_REVIEWS_DISABLED',
-        'section': 'env', 'label': '一键关闭所有审查',
-        'hint': '开启后跳过全部质量审查、提示词优化、自动重试和本地告警检查。'
-                '各单项设置会保留，关闭总开关后恢复原设置。',
-    },
-    {
-        'key': 'qaGateLevel', 'type': 'enum', 'default': 'standard',
-        'env': 'SPARK_QA_GATE_LEVEL',
-        'options': ('standard', 'lenient', 'off'),
-        'section': 'video', 'label': '视频质检门档位',
-        'option_labels': {
-            'standard': 'standard（硬伤拒收重试）',
-            'lenient': 'lenient（硬伤只告警放行）',
-            'off': 'off（整套质检门跳过）',
-        },
-        'hint': '视频段内过程门的总开关。off 会连本地冻结/节奏检测一起跳过；'
-                'lenient 把「拒收删片重试」降级成「告警放行 + manifest 留痕」。'
-                '同时也作用于手动一致性审查。',
-    },
-    {
-        'key': 'videoProcessVlmReview', 'type': 'bool', 'default': True,
-        'section': 'video', 'label': '视频段内 VLM 复审',
-        'hint': '视频下载后抽中段帧交给 VLM 判「两锚点之间是否真的发生了描述的过程」'
-                '（空心片段 / 无关内容）。烧多模态额度，误判会删片重来，所以留了开关。'
-                '关掉后本地冻结/节奏检测照跑——那两条零成本，不受本项管辖。',
-    },
-    {
-        'key': 'videoAnchorVerify', 'type': 'bool', 'default': True,
-        'section': 'video', 'label': '视频首尾锚点校验',
-        'hint': '视频落盘后抽首尾帧与该槽位锚点图比对，挡住 Flow 画布 tile 追踪串片'
-                '（实测错位段 MAD 28+，匹配段 1.5~10.3）。纯本地零成本，'
-                '**正常生成不要关**；只在离线复现/调试串片本身时才需要关。',
-    },
-    {
-        'key': 'optimizeVideoPromptsBeforeGen', 'type': 'bool', 'default': True,
-        'env': 'SPARK_OPTIMIZE_VIDEO_PROMPTS',
-        'section': 'video', 'label': '视频生成前画面差量提示词优化',
-        'hint': '在生成视频序列前，自动依据真实渲染落盘的相邻首末帧画面差量，'
-                '通过多模态 VLM 优化并重写所有视频提示词，彻底防止画面跳变与幽灵建造。'
-                '关掉后跳过视觉差量优化门，直接使用初始视频提示词生成。',
-    },
-    {
-        'key': 'anchorInertiaAutoRetry', 'type': 'bool', 'default': True,
-        'section': 'frame', 'label': '桥接帧惯性自动重渲',
-        'hint': '桥接/换族帧渲出来与参考帧近乎相同（i2i 参考惯性压过了「进入新空间」的'
-                '文本指令）时，自动加强图生图指令重渲一次。烧一次生图额度。'
-                '关掉后仍然检测、仍然留痕，只是不自动重渲。'
-                '（Google FX 链路本来就只留痕不重渲，本项对其无效。）',
-    },
-    {
-        'key': 'chainGuardMode', 'type': 'enum', 'default': 'autofix',
-        'options': ('off', 'report', 'halt', 'autofix', 'autofix_soft'),
-        'section': 'frame', 'label': '生成期链上逐拍守卫',
-        'option_labels': {
-            'off': 'off（关闭）',
-            'report': 'report（只记账不阻断）',
-            'halt': 'halt（结构级问题停链等人）',
-            'autofix': 'autofix（默认，结构级问题就地自动修复后继续）',
-            'autofix_soft': 'autofix_soft（自动修复，修不好也不停链、只记账）',
-        },
-        'hint': '生成循环中每渲完一帧立即执行逐拍一致性审查与分级。'
-                'autofix 档检出结构级问题时就地走一遍「修复此帧问题」（定向重写提示词 + '
-                '4选1 重渲），复审通过就接着往下渲，连修 2 次仍不过才停链等人；'
-                'halt 档一检出就停链；report 档仅记录留痕不停链。'
-                '错误顺着 i2i 往下传的代价是整条链，所以默认不放行。'
-                'autofix_soft 与 autofix 只差最后一步：修满次数仍不过时不停链，'
-                '照旧往下渲，问题帧仍会被标成「一致性审查未过」并汇进收尾的质量风险'
-                '清单。要「一趟渲完整条序列、事后人工挑着修」时用它——代价是问题'
-                '确实会顺着 i2i 传给下游帧。',
-    },
-    {
-        'key': 'frameContinuityMode', 'type': 'enum', 'default': 'balanced',
-        'options': ('off', 'balanced', 'strict'),
-        'section': 'frame', 'label': '帧连续性检查档位',
-        'option_labels': {
-            'off': 'off（关闭）',
-            'balanced': 'balanced（默认，重试 1 次）',
-            'strict': 'strict（更敏感，重试 2 次）',
-        },
-        'hint': '渲完每一帧后本地判「锁定机位是否漂移 / 声明的变化区是否真的动了」，'
-                '要两个独立硬信号才判失败。失败自动重渲，重渲仍失败则中断整条链'
-                '避免污染后续帧。注意：开启时 Google FX 链路的批大小会被强制降到 1。',
-    },
-    {
-        'key': 'frameContinuityMaxRetries', 'type': 'int', 'default': 1,
-        'min': 0, 'max': 3,
-        'section': 'frame', 'label': '帧连续性自动重试次数',
-        'hint': '留空/非法值时按档位取默认（balanced=1，strict=2）。夹取区间 0~3。',
-    },
-    {
-        'key': 'strictFrameStateContract', 'type': 'bool', 'default': True,
-        'section': 'prompt', 'label': '帧状态契约严格模式',
-        'hint': 'before/delta/after 帧状态不合法时是否阻断提示词交付。默认开启；'
-                '关闭仅用于对比旧提示词包的诊断，不要用于正式出片。',
-    },
-    {
-        'key': 'autoSplitHighRiskBeats', 'type': 'bool', 'default': False,
-        'section': 'prompt', 'label': '高风险拍自动拆分',
-        'hint': '跨度过大的拍在提示词交付前自动插入一张正式锚点拍拆成两拍。'
-                '严格清单模式下永远跳过（保持「拍数=清单条数」）。',
-    },
-    {
-        'key': 'strictGates', 'type': 'bool', 'default': False,
-        'env': 'SPARK_STRICT_GATES',
-        'section': 'env', 'label': '门禁 fail-closed',
-        'hint': '判定环境异常（ffmpeg / numpy / PIL 缺失，VLM 网关挂了）时怎么办：'
-                '关=放行但在 manifest 记 auto_approved_degraded 留痕；'
-                '开=按判定失败处理。开启可防「环境退化悄悄关掉了串片检测」，'
-                '代价是环境一抖就中断生成。',
-    },
+# 质量审查已永久退役。历史键仅供旧调用方和历史记录兼容，不能重新启用。
+QUALITY_REVIEWS_RETIRED = True
+_RETIRED_GATE_DEFINITIONS = (
+    ('reviewsDisabled', 'bool', True, 'env', '质量审查已退役'),
+    ('qaGateLevel', 'enum', 'off', 'video', '视频质检门档位'),
+    ('videoProcessVlmReview', 'bool', False, 'video', '视频段内 VLM 复审'),
+    ('videoAnchorVerify', 'bool', False, 'video', '视频首尾锚点校验'),
+    ('optimizeVideoPromptsBeforeGen', 'bool', False, 'video', '视频提示词画面差量优化'),
+    ('anchorInertiaAutoRetry', 'bool', False, 'frame', '桥接帧惯性自动重渲'),
+    ('chainGuardMode', 'enum', 'off', 'frame', '生成期链上逐拍守卫'),
+    ('frameContinuityMode', 'enum', 'off', 'frame', '帧连续性检查'),
+    ('frameContinuityMaxRetries', 'int', 0, 'frame', '帧连续性质量重试'),
+    ('strictFrameStateContract', 'bool', False, 'prompt', '帧状态契约内容审查'),
+    ('autoSplitHighRiskBeats', 'bool', False, 'prompt', '高风险拍审查拆分'),
+    ('strictGates', 'bool', False, 'env', '质量门禁 fail-closed'),
 )
-
+GATE_SETTINGS = tuple({
+    'key': key, 'type': kind, 'default': value, 'section': section, 'label': label,
+    'hint': '已永久退役；旧配置、环境变量和请求值不再启用该规则。',
+    'retired': True, 'editable': False,
+    **({'options': ('off',), 'option_labels': {'off': '已退役'}} if kind == 'enum' else {}),
+    **({'min': 0, 'max': 0} if kind == 'int' else {}),
+} for key, kind, value, section, label in _RETIRED_GATE_DEFINITIONS)
 _GATE_BY_KEY = {item['key']: item for item in GATE_SETTINGS}
-# effective_config 白名单据此派生——门禁项漏进白名单这个 bug 类别到此为止。
-_GATE_KEYS = tuple(item['key'] for item in GATE_SETTINGS)
-
-# 兼容旧引用（qa_gate_level 的合法值此前是模块级常量，外部有 import）。
-QA_GATE_LEVELS = _GATE_BY_KEY['qaGateLevel']['options']
+_GATE_KEYS = tuple(_GATE_BY_KEY)
+# 旧档位枚举仅保留为历史解析兼容；运行时始终返回 off。
+QA_GATE_LEVELS = ('standard', 'lenient', 'off')
 
 
 def _coerce_gate_value(spec, raw):
@@ -633,57 +516,32 @@ def _coerce_gate_value(spec, raw):
 
 
 def _configured_gate_setting(key, config=None):
-    """读取用户保存的单项偏好，不应用全部审查总开关。
-
-    优先级统一为：请求 config > server_config.json > 环境变量 > 表里的 default。
-    请求 config 优先是因为一次生成任务要能临时放宽/收紧而不改服务端配置；环境
-    变量垫底是给不带 config 的无头/脚本调用用的。
-
-    注意 config 里显式写 false 与"没写"是两回事：前者要生效（用 `in` 判断而不是
-    truthy 判断），否则「本次任务关掉 VLM 复审」这种请求永远关不掉。"""
+    """兼容旧读取方：退休规则固定返回关闭值，不接受配置覆盖。"""
     spec = _GATE_BY_KEY.get(key)
     if spec is None:
-        raise KeyError(f'未知的门禁配置项：{key}（请先加进 GATE_SETTINGS）')
-    if isinstance(config, dict) and config.get(key) is not None:
-        return _coerce_gate_value(spec, config[key])
-    if SERVER_CONFIG.get(key) is not None:
-        return _coerce_gate_value(spec, SERVER_CONFIG[key])
-    env_key = spec.get('env')
-    if env_key and os.environ.get(env_key) is not None:
-        return _coerce_gate_value(spec, os.environ[env_key])
+        raise KeyError(f'未知的历史门禁配置项：{key}')
     return spec['default']
 
 
 def reviews_disabled(config=None):
-    """是否显式跳过全部审查；请求值优先，支持服务端与环境变量兜底。"""
-    return bool(_configured_gate_setting('reviewsDisabled', config))
+    """全部质量审查永久退役，包括显式传入 reviewsDisabled=false 的旧客户端。"""
+    return True
 
 
 def gate_setting(key, config=None):
-    """读取运行时门禁值，总开关优先于所有单项设置但不改写保存的偏好。"""
-    value = _configured_gate_setting(key, config)
-    if key == 'reviewsDisabled' or not reviews_disabled(config):
-        return value
-    kind = _GATE_BY_KEY[key]['type']
-    if kind == 'bool':
-        return False
-    if kind == 'enum':
-        return 'off'
-    return 0
+    """历史门禁键的兼容入口；全部规则固定关闭。"""
+    return _configured_gate_setting(key, config)
 
 
 def gate_settings_report():
-    """/api/mode 下发用：表结构 + 当前服务端生效值。前端据此渲染开关面板，
-    不必在 JS 里再抄一份默认值/选项列表（那正是白名单漂移的老路）。"""
+    """只读退役清单；旧保存值不作为有效设置下发。"""
     items = []
     for spec in GATE_SETTINGS:
-        item = {k: v for k, v in spec.items() if k != 'env'}
+        item = dict(spec)
         if 'options' in item:
             item['options'] = list(item['options'])
-        # 下发保存的偏好；总开关暂时关闭审查时不能把所有单项都写成 off，
-        # 否则用户再关掉总开关后无法恢复原来的设置。
-        item['server_value'] = _configured_gate_setting(spec['key'])
-        item['server_pinned'] = SERVER_CONFIG.get(spec['key']) is not None
+        item['server_value'] = spec['default']
+        item['server_pinned'] = True
         items.append(item)
     return items
 
@@ -1484,11 +1342,14 @@ def stamp_manifest_capabilities(manifest, stage):
 # "悄悄劣化 → 清单上写着"的思路，只是这里劣化的是代码本身，不是依赖/契约。
 SERVICE_START_TIME = time.time()
 
+# 根目录的 *.py 全部是服务进程会 import 的模块。只列举几个文件名的话，
+# video_generation_recovery.py 这类后加的模块改了既不触发自动重载、也不报过期，
+# 修复落了盘却一直跑旧代码。
 _CORE_SOURCE_GLOBS = (
-    'server.py', 'server_common.py', 'frame_generator.py', 'frame_continuity.py',
-    'pipeline_orchestrator.py', 'video_generator.py', 'video_operations.py', 'project_archive.py',
+    '*.py',
     os.path.join('prompt_pipeline', '*.py'),
     os.path.join('prompt_pipeline', 'composers', '*.py'),
+    os.path.join('beat_pack', '*.py'),
     os.path.join('integrations', 'google_fx', '*.py'),
     os.path.join('integrations', 'google_fx', 'services', '*.py'),
     os.path.join('integrations', 'google_fx', 'utils', '*.py'),
@@ -1789,6 +1650,22 @@ def _select_pool_account(config, pool):
     优先级：手动 googleFxUserId > 锁定的序列默认环境 > 已打开且可用的浏览器
     > 未锁定的序列默认环境 > 号池自动选号。默认环境不可用时如实降级到自动选号并
     打一行原因——静默换号会让用户以为序列一直跑在他钉的那个环境上。"""
+    fixed = config.get('videoFixedUserId')
+    if fixed:
+        fixed = validate_video_fixed_user_id(fixed, pool=pool)
+        account = next(a for a in _selection_account_snapshot(pool) if str(a.get('user_id')) == fixed)
+        minimum = config.get('videoAccountPoolMinCredit', 1)
+        if account.get('disabled'):
+            raise RuntimeError('本次指定的视频环境已禁用，未切换其他环境')
+        if _account_in_cooldown(account):
+            raise RuntimeError('本次指定的视频环境处于冷却期，未切换其他环境')
+        if account.get('credit') is None or not _account_has_credit(account, minimum):
+            raise RuntimeError('本次指定的视频环境积分不足或未确认，未切换其他环境')
+        from integrations.google_fx.utils import lease_registry
+        if not lease_registry.claim(fixed):
+            raise RuntimeError('本次指定的视频环境或其出口正被占用，未切换其他环境')
+        config['googleFxUserId'] = fixed
+        return fixed
     manual_override = str(config.get('googleFxUserId') or '').strip()
     if manual_override:
         return None
@@ -1862,6 +1739,16 @@ def _select_pool_account(config, pool):
         raise RuntimeError('号池暂时没有可用账号，请在「号池管理」里检查积分、禁用、冷却和探测状态后重试')
     config['googleFxUserId'] = chosen['user_id']
     return chosen['user_id']
+
+
+def validate_video_fixed_user_id(value, pool=None):
+    """Validate an explicit video-only binding without opening any browser."""
+    if not isinstance(value, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,80}', value):
+        raise ValueError('videoFixedUserId 必须是有效的 AdsPower 环境 ID')
+    pool = pool if pool is not None else _get_account_pool_service()
+    if not any(str(a.get('user_id')) == value for a in _selection_account_snapshot(pool)):
+        raise ValueError('指定的视频环境不在已登记号池中，未提交生成')
+    return value
 
 
 def failover_and_select_next_account(config, pool, failed_user_id: str, reason: str = "failed", exclude=None):
@@ -2117,14 +2004,15 @@ _COMPOSE_RUNTIME_KEYS = (
 )
 
 _SERVER_AUTHORITATIVE_KEYS = frozenset({
-    'videoModel', 'googleFxImageModel', 'videoDuration', 'videoResolution', 'videoRefMode',
+    'videoProvider', 'videoModel', 'googleFxImageModel', 'videoDuration', 'videoResolution', 'videoRefMode',
+    'flow2apiVideoConcurrency', 'videoRetryCount', 'videoContinuousGeneration',
 }) | frozenset(_COMPOSE_RUNTIME_KEYS)
 
 # 托管模式（配了 apiKey 即是）下允许从浏览器/请求 config 透传的键。门禁那一段由
 # GATE_SETTINGS 派生，其余是模型/画幅/激发参考等非门禁项。
 _PASSTHROUGH_CLIENT_KEYS = (
     'imageAspectRatio', 'imageQuality', 'imageBackend', 'googleFxImageModel',
-    'videoModel', 'videoDuration', 'videoResolution', 'videoRefMode', 'adsPowerPort',
+    'videoProvider', 'videoFramePairing', 'videoModel', 'videoDuration', 'videoResolution', 'videoRefMode', 'videoRetryCount', 'adsPowerPort',
     'adsPowerSilentMode', 'adsPowerWindowPosition', 'adsPowerHeadless',
     'videoAccountPoolMinCredit', 'frameContinuityLocalEdit',
     'ideationTrendUrls', 'ideationSearchQuery', 'coverReferencePath', 'skillProfile',
@@ -2146,11 +2034,36 @@ _FX_POOL_SERVER_KEYS = (
 )
 
 
+_FLOW2API_DEFAULT_BASE_URL = 'http://127.0.0.1:38000/v1'
+_VIDEO_SERVICE_PUBLIC_KEYS = (
+    'videoProvider', 'videoModel', 'videoDuration', 'videoResolution', 'videoRefMode',
+    'flow2apiVideoConcurrency', 'videoRetryCount', 'videoContinuousGeneration',
+)
+
+
+def video_service_config_report():
+    """Public video settings only; never expose the separate gateway credentials."""
+    from fx_console import FX_CONFIG_SPEC, normalize_flow2api_video_concurrency, normalize_video_retry_count
+    report = {
+        key: SERVER_CONFIG.get(key) or FX_CONFIG_SPEC[key]['default']
+        for key in _VIDEO_SERVICE_PUBLIC_KEYS
+    }
+    report['flow2apiVideoConcurrency'] = normalize_flow2api_video_concurrency(
+        SERVER_CONFIG.get('flow2apiVideoConcurrency'))
+    report['videoRetryCount'] = normalize_video_retry_count(SERVER_CONFIG.get('videoRetryCount'))
+    report['videoContinuousGeneration'] = SERVER_CONFIG.get('videoContinuousGeneration', True) is True
+    report['flow2apiConfigured'] = bool(str(SERVER_CONFIG.get('flow2apiApiKey') or '').strip())
+    return report
+
+
 def effective_config(client_config):
     client_config = dict(client_config or {})
     # 默认环境与换号节拍只有一个权威来源：Google FX 服务管理中心写入的服务端配置。
     # 即使浏览器还缓存着旧前端，也不能再让历史字段覆盖统一配置。
     client_config.pop('googleFxUserId', None)
+    # This pin is accepted only at a video endpoint after profile validation;
+    # generic client configuration must not change image tasks or global defaults.
+    client_config.pop('videoFixedUserId', None)
     client_config.pop('googleFxIpRotateRequests', None)
     from integrations.google_fx.model_catalog import normalize_google_fx_image_model
     if not SERVER_MANAGED:
@@ -2236,10 +2149,29 @@ def _normalize_chat_model_config(config):
             config[key] = resolve_chat_model(config[key])
     if isinstance(config.get('imageModel'), str):
         config['imageModel'] = resolve_image_model(config['imageModel'])
+    # 旧配置无法复活已退役的审查。普通网络失败重试、文件检查与项目互斥独立保留。
+    config.update({spec['key']: spec['default'] for spec in GATE_SETTINGS})
+    config['reviewsRetired'] = True
+    config['strictPromptPipelineV2'] = False
     # Image transport capabilities are enabled only by the server operator.
     config.pop('codexImageResponsesModels', None)
     if isinstance(SERVER_CONFIG.get('codexImageResponsesModels'), list):
         config['codexImageResponsesModels'] = list(SERVER_CONFIG['codexImageResponsesModels'])
+    # Video has its own gateway. Even in non-managed mode, a browser cannot
+    # replace its address/credentials or select a provider the operator did not save.
+    config['videoProvider'] = SERVER_CONFIG.get('videoProvider') or 'google_fx'
+    config['flow2apiBaseUrl'] = (
+        str(SERVER_CONFIG.get('flow2apiBaseUrl') or _FLOW2API_DEFAULT_BASE_URL).rstrip('/')
+    )
+    config['flow2apiApiKey'] = SERVER_CONFIG.get('flow2apiApiKey') or ''
+    config['flow2apiVideoTimeoutSeconds'] = SERVER_CONFIG.get('flow2apiVideoTimeoutSeconds') or 1800
+    from fx_console import normalize_flow2api_video_concurrency, normalize_video_retry_count
+    config['flow2apiVideoConcurrency'] = normalize_flow2api_video_concurrency(
+        SERVER_CONFIG.get('flow2apiVideoConcurrency'))
+    config['videoRetryCount'] = normalize_video_retry_count(SERVER_CONFIG.get('videoRetryCount'))
+    config['videoContinuousGeneration'] = SERVER_CONFIG.get('videoContinuousGeneration', True) is True
+    from video_generation_recovery import max_slot_attempts
+    config['videoMaxSlotAttempts'] = max_slot_attempts(SERVER_CONFIG)
     return config
 
 
@@ -2430,12 +2362,31 @@ def get_image_gateway_model_catalog(config=None):
         return _copy_image_gateway_catalog(result)
 
 
+def is_claude_model(model_name):
+    """Claude 型号（claude-opus-5-5 / claude-sonnet-5-5 / claude-fable-5-1 …）。
+
+    网关路由、请求体整形与联网工具声明都依据它：Claude 走自己的网关配置
+    （claudeBaseUrl / claudeApiKey），并且不接受自定义采样参数。"""
+    return bool(re.match(r'^claude(?:[-.]|$)', str(model_name or '').strip(), re.IGNORECASE))
+
+
 def resolve_gateway(model_name, config):
     base_url = (config.get('baseUrl') or 'http://127.0.0.1:8046/v1').rstrip('/')
     api_key = config.get('apiKey') or ''
-    # 先迁移再选网关：旧 Claude 配置现在发送 GPT，不能继续使用 Gemini 凭据。
+    # 先迁移再选网关：已下架的旧 GPT 配置会被改写成当前型号，网关要跟着改写后的型号走。
     m_lower = resolve_chat_model(model_name).lower()
-    if 'gpt-5' in m_lower or 'gpt-6' in m_lower or 'codex' in m_lower or 'gpt-image-2' in m_lower:
+    if is_claude_model(m_lower):
+        claude_base = str(config.get('claudeBaseUrl') or SERVER_CONFIG.get('claudeBaseUrl') or '').strip()
+        claude_key = str(config.get('claudeApiKey') or SERVER_CONFIG.get('claudeApiKey') or '').strip()
+        if claude_base:
+            # 单独配置了 Claude 网关：密钥也只能用它自己的，绝不把主网关的密钥发给另一台主机。
+            base_url, api_key = claude_base.rstrip('/'), claude_key
+            if not api_key and sys.stdout:
+                print("Warning: claude-routed model requested but no claudeApiKey configured in server_config.json")
+        elif claude_key:
+            # 没有单独地址时 Claude 由主网关提供，只换密钥。
+            api_key = claude_key
+    elif 'gpt-5' in m_lower or 'gpt-6' in m_lower or 'codex' in m_lower or 'gpt-image-2' in m_lower:
         base_url = (config.get('codexBaseUrl')
                     or SERVER_CONFIG.get('codexBaseUrl')
                     or _CODEX_BASE_URL_DEFAULT).rstrip('/')
@@ -2446,19 +2397,47 @@ def resolve_gateway(model_name, config):
 
 
 def resolve_chat_model(model_name):
-    """Migrate retired text models while preserving current/custom and image models."""
+    """Migrate retired text models while preserving current/custom and image models.
+
+    Claude 型号原样放行：用户选了什么就发什么，由 claudeBaseUrl 指向的网关决定是否可用。"""
     m = (model_name or '').strip()
     lower = m.lower()
     if 'image' in lower:
         return m
-    if re.match(r'^claude(?:[-.]|$)', lower) or re.match(
-            r'^gpt-(?:3\.5|4o?|4\.\d+|5(?:\.\d+)?)(?:-|$)', lower):
+    if re.match(r'^gpt-(?:3\.5|4o?|4\.\d+|5(?:\.\d+)?)(?:-|$)', lower):
         return 'gpt-6.1-sol'
     if re.fullmatch(
             r'gemini-(?:3-flash(?:-agent)?|3\.1-pro(?:-[a-z-]+)?|'
             r'3\.[567]-flash(?:-[a-z-]+)?)', lower):
         return 'gemini-3.8-flash-high'
     return m
+
+
+def claude_max_output_tokens(model_name):
+    """Claude 单次回复的输出上限（经 OpenAI 兼容网关时 max_tokens 超限会被直接 400）。"""
+    lower = str(model_name or '').strip().lower()
+    if re.search(r'(?:fable|opus|sonnet|haiku)-5(?:[-.]|$)', lower) or re.search(
+            r'(?:opus-4-[678]|sonnet-4-6)(?:[-.]|$)', lower):
+        return 128000
+    return 64000
+
+
+def shape_chat_payload(model_name, payload):
+    """按模型修整 /chat/completions 请求体（原地修改并返回）。
+
+    Claude 5 系列不接受自定义 temperature / top_p / top_k（非默认值会 400），
+    且 max_tokens 有上限；其余模型原样不动。"""
+    if not is_claude_model(model_name):
+        return payload
+    for key in ('temperature', 'top_p', 'top_k'):
+        payload.pop(key, None)
+    cap = claude_max_output_tokens(model_name)
+    try:
+        if payload.get('max_tokens') is not None and int(payload['max_tokens']) > cap:
+            payload['max_tokens'] = cap
+    except (TypeError, ValueError):
+        payload['max_tokens'] = cap
+    return payload
 
 
 def _safe_project_name(title):
@@ -4670,24 +4649,42 @@ def manifest_lock(project_dir):
 # 丢失"。这里按项目目录做互斥占位：同一时刻只允许一个 worker 持有。
 _ACTIVE_FRAME_RUNS = {}
 _ACTIVE_FRAME_RUNS_LOCK = threading.Lock()
+_FRAME_RUNS_UNTIL_RELEASED = set()
 
 
-def claim_frame_run(project_dir, task_id):
+def claim_frame_run(project_dir, task_id, *, until_released=False):
     """尝试为 project_dir 声明一次帧渲染运行权。
 
     成功返回 None；已有其他运行中 worker 占用该项目时返回占用者的 task_id
     （调用方应把它当 already_running 转告前端重新挂流，不得再起第二个
     worker）。占用者若已终态（异常路径漏调 release_frame_run），视为陈旧
-    占位自动收回，避免把项目永久锁死。
+    占位自动收回，避免把项目永久锁死。until_released 用于无浏览器串行锁的
+    Flow2API 管线：取消只改变任务状态，必须等真实 worker 的 finally 释放。
     """
     key = os.path.normcase(os.path.abspath(project_dir))
     with _ACTIVE_FRAME_RUNS_LOCK:
         holder = _ACTIVE_FRAME_RUNS.get(key)
+        if holder and key in _FRAME_RUNS_UNTIL_RELEASED:
+            return holder
         if holder and holder != task_id:
             holder_task = ACTIVE_TASKS.get(holder)
-            if holder_task and holder_task.get('status') == 'running':
+            if until_released or (holder_task and holder_task.get('status') == 'running'):
                 return holder
         _ACTIVE_FRAME_RUNS[key] = task_id
+        if until_released:
+            _FRAME_RUNS_UNTIL_RELEASED.add(key)
+        return None
+
+
+def transfer_frame_run(project_dir, from_task_id, to_task_id):
+    """Move an image run's project ownership to its video child atomically."""
+    key = os.path.normcase(os.path.abspath(project_dir))
+    with _ACTIVE_FRAME_RUNS_LOCK:
+        holder = _ACTIVE_FRAME_RUNS.get(key)
+        if holder and holder != from_task_id:
+            return holder
+        _ACTIVE_FRAME_RUNS[key] = to_task_id
+        _FRAME_RUNS_UNTIL_RELEASED.add(key)
         return None
 
 
@@ -4698,6 +4695,7 @@ def release_frame_run(project_dir, task_id):
     with _ACTIVE_FRAME_RUNS_LOCK:
         if _ACTIVE_FRAME_RUNS.get(key) == task_id:
             del _ACTIVE_FRAME_RUNS[key]
+            _FRAME_RUNS_UNTIL_RELEASED.discard(key)
 
 
 # 一致性审查真正跑出来的两种结论（区别于"没审成"/"还没轮到审"）。帧内容变了要作废的

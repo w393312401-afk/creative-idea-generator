@@ -1,6 +1,7 @@
 import os
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from PIL import Image, ImageDraw, ImageEnhance
 
@@ -25,6 +26,10 @@ def _scene(path, *, shift=(0, 0), floor_fill=None, brightness=1.0):
 
 class FrameContinuityTests(unittest.TestCase):
     def setUp(self):
+        # Historical pixel math only; runtime retirement has a separate regression suite.
+        retired = patch.object(fc, '_reviews_retired', return_value=False)
+        retired.start()
+        self.addCleanup(retired.stop)
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.ref = os.path.join(self.tmp.name, 'ref.png')

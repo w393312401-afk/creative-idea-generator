@@ -19,6 +19,88 @@ const SKILL_PROFILE_CHOICES = [
 window.SKILL_PROFILE_RULES = window.SKILL_PROFILE_RULES || null;
 window.SKILL_PROFILE_DEFAULT = window.SKILL_PROFILE_DEFAULT || 'base';
 
+// /api/mode supplies only these public fields. Gateway addresses and credentials
+// stay on the server and are never persisted in browser storage.
+let flow2apiConfigured = null;
+const VIDEO_SERVICE_PUBLIC_KEYS = ['videoProvider', 'videoModel', 'videoDuration', 'videoResolution', 'videoRefMode', 'flow2apiVideoConcurrency', 'videoRetryCount', 'videoContinuousGeneration'];
+
+function applyServerVideoConfig(report) {
+    if (!report || typeof report !== 'object') return;
+    for (const key of VIDEO_SERVICE_PUBLIC_KEYS) {
+        if (key === 'flow2apiVideoConcurrency') {
+            const count = Number(report[key]);
+            if (Number.isInteger(count) && count >= 1 && count <= 10) config[key] = count;
+        } else if (key === 'videoRetryCount') {
+            const count = report[key] === '' || report[key] == null ? NaN : Number(report[key]);
+            if (Number.isInteger(count) && count >= 0 && count <= 10) config[key] = count;
+        } else if (key === 'videoContinuousGeneration') {
+            if (typeof report[key] === 'boolean') config[key] = report[key];
+        } else if (typeof report[key] === 'string' && report[key]) config[key] = report[key];
+    }
+    if (typeof report.flow2apiConfigured === 'boolean') flow2apiConfigured = report.flow2apiConfigured;
+    // Remove historical/custom connection values rather than forwarding them.
+    delete config.flow2apiBaseUrl;
+    delete config.flow2apiApiKey;
+    delete config.flow2apiVideoTimeoutSeconds;
+    const fields = {
+        videoProvider: 'settings-video-provider', videoModel: 'settings-fx-video-model',
+        videoDuration: 'settings-fx-video-duration', videoResolution: 'settings-fx-video-resolution',
+        videoRefMode: 'settings-fx-video-ref-mode',
+        flow2apiVideoConcurrency: 'settings-flow2api-video-concurrency',
+        videoRetryCount: 'settings-video-retry-count',
+        videoContinuousGeneration: 'settings-video-continuous-generation',
+    };
+    for (const [key, id] of Object.entries(fields)) {
+        const select = document.getElementById(id);
+        if (select) select.value = String(config[key] ?? DEFAULT_CONFIG[key]);
+    }
+    try { localStorage.setItem('spark_config', JSON.stringify(config)); } catch (_) {}
+    updateFxVideoDurationVisibility();
+    syncIdeationSkillProfilePicker();
+}
+
+function updateVideoProviderStatus() {
+    const provider = document.getElementById('settings-video-provider');
+    const model = document.getElementById('settings-fx-video-model');
+    const reference = document.getElementById('settings-fx-video-ref-mode');
+    const ratio = document.getElementById('settings-image-ratio');
+    const status = document.getElementById('video-provider-status');
+    const isFlow = (provider ? provider.value : config.videoProvider) === 'flow2api';
+    const concurrencyGroup = document.getElementById('flow2api-video-concurrency-group');
+    if (concurrencyGroup) concurrencyGroup.style.display = isFlow ? '' : 'none';
+    if (model) {
+        for (const option of model.options || []) {
+            option.disabled = isFlow && option.value !== 'Omni Flash';
+        }
+    }
+    if (reference) {
+        for (const option of reference.options || []) {
+            option.disabled = isFlow && option.value !== 'VIDEO_FRAMES';
+        }
+    }
+    if (!status) return;
+    const selectedModel = model ? model.value : config.videoModel;
+    const incompatible = isFlow && selectedModel !== 'Omni Flash';
+    const unsupportedReference = isFlow && (reference ? reference.value : config.videoRefMode) !== 'VIDEO_FRAMES';
+    const selectedRatio = ratio ? ratio.value : config.imageAspectRatio;
+    const unsupportedRatio = isFlow && !['16:9', '9:16'].includes(selectedRatio);
+    status.dataset.state = incompatible || unsupportedReference || unsupportedRatio || (isFlow && flow2apiConfigured === false) ? 'error' : 'info';
+    if (!isFlow) {
+        status.textContent = '通过 AdsPower 中的 Flow 账号生成视频。';
+    } else if (incompatible) {
+        status.textContent = '当前模型不受 Flow2API 支持，请选择 Omni Flash；服务不会自动替换模型。';
+    } else if (unsupportedReference) {
+        status.textContent = 'Flow2API 当前仅支持「帧（首尾帧）」参考模式；请在高级设置中修改，服务不会将素材模式改为首尾帧提交。';
+    } else if (unsupportedRatio) {
+        status.textContent = 'Flow2API 视频当前仅支持 16:9 或 9:16；当前画幅已保留，请选择支持的画幅后生成。';
+    } else if (flow2apiConfigured === false) {
+        status.textContent = 'Flow2API 连接尚未配置，请在服务端配置 API Key。';
+    } else {
+        const connection = flow2apiConfigured ? '服务端连接已配置。' : '连接配置由服务端管理。';
+        status.textContent = `Flow2API：${connection}使用下方时长、分辨率、参考模式和当前画幅；不支持的组合会明确报错。`;
+    }
+}
+
 /** auto 模式下当前实际会走哪条链路；规则表还没到手时返回 null（不猜）。 */
 function resolveAutoSkillProfile() {
     const rules = window.SKILL_PROFILE_RULES;
@@ -39,6 +121,7 @@ function syncSettingsSkillProfilePicker() {
 
 const LLM_MODEL_PICKER_FAMILIES = [
     { key: 'gpt', label: 'GPT' },
+    { key: 'claude', label: 'Claude' },
     { key: 'gemini', label: 'Gemini' },
 ];
 
@@ -48,7 +131,8 @@ function normalizeLlmModel(value) {
     const model = String(value || '').trim();
     const lower = model.toLowerCase();
     if (lower.includes('image')) return model;
-    if (/^claude(?:[-.]|$)/.test(lower) || /^gpt-(?:3\.5|4o?|4\.\d+|5(?:\.\d+)?)(?:-|$)/.test(lower)) {
+    // Claude 型号原样放行（走服务端 claudeBaseUrl 网关）；只有已下架的旧 GPT 迁移到当前型号。
+    if (/^gpt-(?:3\.5|4o?|4\.\d+|5(?:\.\d+)?)(?:-|$)/.test(lower)) {
         return 'gpt-6.1-sol';
     }
     if (/^gemini-3-flash(?:-agent)?$/.test(lower)
@@ -268,6 +352,12 @@ function loadConfig() {
         }
     }
     
+    // 审查规则永久退役：旧 localStorage 也不能覆盖退役状态。
+    if (typeof normalizeRetiredGateConfig === 'function' && normalizeRetiredGateConfig(config)) {
+        try { localStorage.setItem('spark_config', JSON.stringify(config)); }
+        catch (error) { console.error('Failed to migrate retired review settings', error); }
+    }
+
     // Fill settings inputs
     // （Base URL / API Key 输入框已移除：托管模式下 effective_config 不透传
     //   浏览器端的这两项，密钥与网关地址由 server_config.json 统一管理；
@@ -285,6 +375,19 @@ function loadConfig() {
     if (fxImageModelSelect) {
         fxImageModelSelect.value = normalizeGoogleFxImageModel(config.googleFxImageModel);
     }
+    const videoProviderSelect = document.getElementById('settings-video-provider');
+    if (videoProviderSelect) {
+        videoProviderSelect.value = config.videoProvider || DEFAULT_CONFIG.videoProvider;
+        videoProviderSelect.onchange = updateVideoProviderStatus;
+    }
+    const flow2apiConcurrencySelect = document.getElementById('settings-flow2api-video-concurrency');
+    if (flow2apiConcurrencySelect) {
+        flow2apiConcurrencySelect.value = String(config.flow2apiVideoConcurrency || DEFAULT_CONFIG.flow2apiVideoConcurrency);
+    }
+    const videoRetrySelect = document.getElementById('settings-video-retry-count');
+    if (videoRetrySelect) videoRetrySelect.value = String(config.videoRetryCount ?? DEFAULT_CONFIG.videoRetryCount ?? 5);
+    const continuousVideoSelect = document.getElementById('settings-video-continuous-generation');
+    if (continuousVideoSelect) continuousVideoSelect.value = String(config.videoContinuousGeneration ?? true);
     const fxVideoModelSelect = document.getElementById('settings-fx-video-model');
     if (fxVideoModelSelect) {
         fxVideoModelSelect.value = config.videoModel || 'Veo 3.1 - Lite [Lower Priority]';
@@ -305,6 +408,7 @@ function loadConfig() {
     const fxVideoRefModeSelect = document.getElementById('settings-fx-video-ref-mode');
     if (fxVideoRefModeSelect) {
         fxVideoRefModeSelect.value = config.videoRefMode || DEFAULT_CONFIG.videoRefMode;
+        fxVideoRefModeSelect.onchange = updateVideoProviderStatus;
     }
     const trendUrlsInput = document.getElementById('settings-ideation-trend-urls');
     if (trendUrlsInput) {
@@ -321,6 +425,7 @@ function loadConfig() {
     const imageRatioSelect = document.getElementById('settings-image-ratio');
     if (imageRatioSelect) {
         imageRatioSelect.value = config.imageAspectRatio || '9:16';
+        imageRatioSelect.onchange = updateVideoProviderStatus;
     }
 
     // Load quality/clarity option
@@ -363,13 +468,13 @@ function loadConfig() {
     syncSettingsApiImageModelPicker();
     syncSettingsLlmModelPicker();
     syncSettingsSkillProfilePicker();
+    updateVideoProviderStatus();
 }
 
 // 显隐一律用空串还原（而不是写死 'block'）：配置中心的字段行是 CSS grid
 // （.settings-field），内联 display:block 会把 label/控件/说明拍回竖排。
 // 「帧序列生成方式」只决定生图走哪条路，所以只切生图模型那两行：api → API 生图模型
-// （IMAGE_MODELS，含 gpt-image-2.5），google_fx → FX 生图模型。视频三行始终显示，
-// 视频生成任何时候都走 AdsPower/google_fx。
+// （IMAGE_MODELS，含 gpt-image-2.5），google_fx → FX 生图模型。视频服务独立选择。
 function updateFxImageModelVisibility() {
     const backendSelect = document.getElementById('settings-image-backend');
     const apiImageGroup = document.getElementById('api-image-model-group');
@@ -415,6 +520,7 @@ function updateFxVideoDurationVisibility() {
     if (durationGroup) durationGroup.style.display = isOmni ? '' : 'none';
     if (resolutionGroup) resolutionGroup.style.display = isOmni ? '' : 'none';
     if (isOmni) updateOmniCreditEstimate();
+    updateVideoProviderStatus();
 }
 
 // 把配置中心表单里的值收进 config 对象（不落盘）。saveConfig 与
@@ -445,6 +551,23 @@ function applySettingsFormToConfig() {
     const fxVideoModelSelect = document.getElementById('settings-fx-video-model');
     if (fxVideoModelSelect) {
         config.videoModel = fxVideoModelSelect.value;
+    }
+    const videoProviderSelect = document.getElementById('settings-video-provider');
+    if (videoProviderSelect) {
+        config.videoProvider = videoProviderSelect.value;
+    }
+    const flow2apiConcurrencySelect = document.getElementById('settings-flow2api-video-concurrency');
+    if (flow2apiConcurrencySelect && flow2apiConcurrencySelect.value) {
+        config.flow2apiVideoConcurrency = parseInt(flow2apiConcurrencySelect.value, 10) || DEFAULT_CONFIG.flow2apiVideoConcurrency;
+    }
+    const videoRetrySelect = document.getElementById('settings-video-retry-count');
+    if (videoRetrySelect) {
+        const count = videoRetrySelect.value === '' ? NaN : Number(videoRetrySelect.value);
+        config.videoRetryCount = Number.isInteger(count) && count >= 0 && count <= 10 ? count : 5;
+    }
+    const continuousVideoSelect = document.getElementById('settings-video-continuous-generation');
+    if (continuousVideoSelect && ['true', 'false'].includes(continuousVideoSelect.value)) {
+        config.videoContinuousGeneration = continuousVideoSelect.value === 'true';
     }
     const fxVideoDurationSelect = document.getElementById('settings-fx-video-duration');
     if (fxVideoDurationSelect) {
@@ -511,7 +634,7 @@ function setSettingsSaveState(state, message) {
     }
 }
 
-const _FX_SERVER_SYNC_KEYS = ['videoModel', 'googleFxImageModel', 'videoDuration', 'videoResolution', 'videoRefMode'];
+const _FX_SERVER_SYNC_KEYS = ['videoProvider', 'videoModel', 'googleFxImageModel', 'videoDuration', 'videoResolution', 'videoRefMode', 'flow2apiVideoConcurrency', 'videoRetryCount', 'videoContinuousGeneration'];
 let _fxSyncPending = null;
 let _fxSyncQueued = null;
 let _fxSyncInFlight = false;
@@ -561,6 +684,7 @@ function syncFxModelToServer(revision = _settingsSaveRevision) {
 
 function autoSaveConfig() {
     applySettingsFormToConfig();
+    if (typeof normalizeRetiredGateConfig === 'function') normalizeRetiredGateConfig(config);
     const revision = ++_settingsSaveRevision;
     try {
         localStorage.setItem('spark_config', JSON.stringify(config));
@@ -585,6 +709,15 @@ function resetConfig() {
     config.model = DEFAULT_CONFIG.model;
     config.imageModel = DEFAULT_CONFIG.imageModel;
     config.googleFxImageModel = DEFAULT_CONFIG.googleFxImageModel;
+    config.videoProvider = DEFAULT_CONFIG.videoProvider;
+    const videoProviderSelect = document.getElementById('settings-video-provider');
+    if (videoProviderSelect) videoProviderSelect.value = DEFAULT_CONFIG.videoProvider;
+    const flow2apiConcurrencySelect = document.getElementById('settings-flow2api-video-concurrency');
+    if (flow2apiConcurrencySelect) flow2apiConcurrencySelect.value = String(DEFAULT_CONFIG.flow2apiVideoConcurrency);
+    const videoRetrySelect = document.getElementById('settings-video-retry-count');
+    if (videoRetrySelect) videoRetrySelect.value = String(DEFAULT_CONFIG.videoRetryCount ?? 5);
+    const continuousVideoSelect = document.getElementById('settings-video-continuous-generation');
+    if (continuousVideoSelect) continuousVideoSelect.value = String(DEFAULT_CONFIG.videoContinuousGeneration ?? true);
     const imageBackendSelect = document.getElementById('settings-image-backend');
     if (imageBackendSelect) {
         imageBackendSelect.value = DEFAULT_CONFIG.imageBackend;
@@ -637,10 +770,7 @@ function resetConfig() {
     // 必须先把刚写回表单的默认值收回 config——上面几段只改了 DOM，
     // 直接持久化 config 会把用户的旧值原样存回去。
     applySettingsFormToConfig();
-    // 门禁项没有静态表单，恢复默认 = 把本地存过的整个删掉退回服务端下发的生效值
-    // （见 js/gate_settings.js：前端不留第二份默认值）。必须排在
-    // applySettingsFormToConfig 之后——那一步不碰门禁项，但顺序颠倒会让人误以为
-    // 它会把删掉的键再写回来。
+    // 恢复默认也保持所有审查规则的永久退役状态。
     if (typeof resetGateSettings === 'function') resetGateSettings();
     syncSettingsLlmModelPicker();
     syncSettingsSkillProfilePicker();
@@ -679,6 +809,8 @@ function switchSettingsSection(name) {
         if (typeof loadAccountPool === 'function') loadAccountPool();
         if (typeof loadAccountPoolAdspowerProfiles === 'function') loadAccountPoolAdspowerProfiles();
     }
+    // 成片引导：设置在服务端，每次进来重读（可能在另一台设备上改过）
+    if (target === 'cta' && window.EngagementCtaSettings) window.EngagementCtaSettings.load();
 }
 
 function findSettingsFields(query) {
@@ -802,6 +934,8 @@ function initSettingsCenter() {
             if (!el.matches('input, select, textarea')) return;
             if (el.closest('.account-pool-manage-body')) return;
             if (el.closest('[data-settings-navigation]')) return;
+            // 自己直接写服务端的分区（成片引导）不进 localStorage 的 config
+            if (el.closest('[data-own-save]')) return;
             autoSaveConfig();
         });
     }
@@ -979,7 +1113,7 @@ if (typeof window !== 'undefined') {
         try {
             const updated = JSON.parse(e.newValue);
             let dirty = false;
-            for (const key of ['videoModel', 'googleFxImageModel', 'videoDuration', 'videoResolution', 'videoRefMode']) {
+            for (const key of _FX_SERVER_SYNC_KEYS) {
                 if (key in updated && config[key] !== updated[key]) {
                     config[key] = updated[key];
                     dirty = true;
@@ -987,6 +1121,14 @@ if (typeof window !== 'undefined') {
             }
             if (dirty) {
                 // 刷新主界面的相关 UI 选择器
+                const videoProviderSelect = document.getElementById('settings-video-provider');
+                if (videoProviderSelect) videoProviderSelect.value = config.videoProvider || DEFAULT_CONFIG.videoProvider;
+                const flow2apiConcurrencySelect = document.getElementById('settings-flow2api-video-concurrency');
+                if (flow2apiConcurrencySelect) flow2apiConcurrencySelect.value = String(config.flow2apiVideoConcurrency || DEFAULT_CONFIG.flow2apiVideoConcurrency);
+                const videoRetrySelect = document.getElementById('settings-video-retry-count');
+                if (videoRetrySelect) videoRetrySelect.value = String(config.videoRetryCount ?? DEFAULT_CONFIG.videoRetryCount ?? 5);
+                const continuousVideoSelect = document.getElementById('settings-video-continuous-generation');
+                if (continuousVideoSelect) continuousVideoSelect.value = String(config.videoContinuousGeneration ?? true);
                 const fxVideoModelSelect = document.getElementById('settings-fx-video-model');
                 if (fxVideoModelSelect) fxVideoModelSelect.value = config.videoModel || '';
                 const fxImageModelSelect = document.getElementById('settings-fx-image-model');
@@ -1211,9 +1353,14 @@ async function loadCurrentIdeaState() {
     const recoveryId = (loadedIdea || {}).id || storedId;
     if (recoveryId) {
         try {
-            const response = await fetch(`/api/library/item?id=${encodeURIComponent(recoveryId)}`);
-            const latest = response.ok ? await response.json() : null;
-            if (latest && latest.archived) loadedIdea = latest;
+            let latest;
+            if (typeof ensureLibraryIdea === 'function') {
+                latest = await ensureLibraryIdea(recoveryId, { refresh: true });
+            } else {
+                const response = await fetch(`/api/library/item?id=${encodeURIComponent(recoveryId)}`);
+                latest = response.ok ? await response.json() : null;
+            }
+            if (latest && latest.id) loadedIdea = { ...(loadedIdea || {}), ...latest };
         } catch (e) { /* Existing offline recovery still applies. */ }
     }
     if (loadedIdea && loadedIdea.archived) {
@@ -1226,6 +1373,10 @@ async function loadCurrentIdeaState() {
 
     if (loadedIdea) {
         currentIdea = loadedIdea;
+        if (typeof cacheLibraryIdea === 'function' && typeof libraryEntries === 'function'
+            && libraryEntries().some(item => String(item.id) === String(loadedIdea.id))) {
+            cacheLibraryIdea(loadedIdea);
+        }
         renderIdea(loadedIdea);
         
         const placeholderView = document.getElementById('output-placeholder-view');
@@ -1241,49 +1392,6 @@ async function loadCurrentIdeaState() {
         
         updateActiveGenerationBanner();
 
-        // 若当前渲染的是精简存根或存在服务端 ID，尝试在后台增量补全最新完整数据
-        if (loadedIdea.id) {
-            fetch(`/api/library/item?id=${encodeURIComponent(loadedIdea.id)}`)
-                .then(r => r.ok ? r.json() : null)
-                .then(fullItem => {
-                    if (fullItem && fullItem.id === loadedIdea.id && currentIdea && currentIdea.id === loadedIdea.id) {
-                        if (fullItem.archived) {
-                            currentIdea = null;
-                            saveCurrentIdeaState();
-                            if (typeof openArchivedProject === 'function') openArchivedProject(fullItem.project_key);
-                            return;
-                        }
-                        currentIdea = { ...loadedIdea, ...fullItem };
-                        renderIdea(currentIdea);
-                    }
-                })
-                .catch(() => {});
-        }
-    } else if (storedId) {
-        // 如果 localStorage 中 idea 被清理但存有 ID，尝试从服务端拉取恢复
-        fetch(`/api/library/item?id=${encodeURIComponent(storedId)}`)
-            .then(r => r.ok ? r.json() : null)
-            .then(fullItem => {
-                if (fullItem && fullItem.id) {
-                    if (fullItem.archived) {
-                        currentIdea = null;
-                        saveCurrentIdeaState();
-                        if (typeof openArchivedProject === 'function') openArchivedProject(fullItem.project_key);
-                        return;
-                    }
-                    currentIdea = fullItem;
-                    renderIdea(fullItem);
-                    const placeholderView = document.getElementById('output-placeholder-view');
-                    const contentView = document.getElementById('output-content-view');
-                    const loadingView = document.getElementById('output-loading-view');
-                    if (placeholderView) placeholderView.classList.remove('active');
-                    if (loadingView) loadingView.classList.remove('active');
-                    if (contentView) contentView.classList.add('active');
-                    const lastTab = localStorage.getItem('spark_active_tab') || 'overview';
-                    switchTab(lastTab);
-                    updateActiveGenerationBanner();
-                }
-            })
-            .catch(() => {});
+        // 完整记录已在上方 await 后恢复；不再异步替换 owner 对象，避免抹掉接流期间的增量结果。
     }
 }

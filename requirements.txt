@@ -15,6 +15,8 @@ numpy>=1.24
 # 其余出站请求走标准库 urllib
 # SOCKS5 出口验证需要 PySocks；只安装 requests 会在换 IP 时抛 InvalidSchema。
 requests[socks]>=2.31
+# Flow2API 视频流式调用与可取消下载。
+httpx>=0.27,<1
 
 # Google FX UI 自动化：通过 AdsPower 提供的 CDP 地址连接已安装浏览器。
 playwright>=1.45

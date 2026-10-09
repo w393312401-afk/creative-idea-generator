@@ -45,7 +45,8 @@ def _get_file_fingerprint(file_path):
             return None
 
 
-def _get_slot_delta_fingerprint(start_path, end_path, video_meta=None, spatial_contract=None):
+def _get_slot_delta_fingerprint(start_path, end_path, video_meta=None, spatial_contract=None,
+                                frame_anchors=None):
     """计算槽位差量优化的环境指纹。当起止帧内容或元数据变化时，指纹改变。"""
     fp_start = _get_file_fingerprint(start_path)
     fp_end = _get_file_fingerprint(end_path)
@@ -57,15 +58,64 @@ def _get_slot_delta_fingerprint(start_path, end_path, video_meta=None, spatial_c
         dim = spatial_contract.get('carrier_envelope', {})
         if dim:
             contract_str = json.dumps(dim, sort_keys=True)
-    return f"s:{fp_start}|e:{fp_end}|m:{meta_str}|c:{contract_str}"
+    fingerprint = f"s:{fp_start}|e:{fp_end}|m:{meta_str}|c:{contract_str}"
+    if frame_anchors is not None:
+        # Different numbered anchors can have identical image bytes. The cached
+        # prompt still names those anchors, so automatic pairing must compare IDs.
+        fingerprint += f"|a:{frame_anchors[0]}>{frame_anchors[1]}"
+    return fingerprint
 
 
-def _persist_optimization_results(project_dir, title, prompt_block, optimizations):
+def _normalize_optimized_frame_anchors(prompt, start_seq, end_seq):
+    """Keep auto-resolved anchors explicit after the VLM rewrites a video's body."""
+    ref = r'(?:IMAGE|IMG|FRAME|图片|图像|画面)\s*\d+'
+    role = r'as\s+(?:the\s+)?(?:actual\s+)?(?:first|last|starting|ending)[- ]frame(?:\s+image)?'
+    body = str(prompt or '').strip()
+    statements = (
+        r'Use\s+the\s+provided\s+first\s+frame\s+and\s+last\s+frame\s+as\s+exact\s+composition\s+anchors[.]?',
+        r'Use\s+the\s+provided\s+image\s+as\s+the\s+exact\s+starting\s+composition\s+and\s+environment\s+anchor[.]?',
+        rf'(?:Use\s+(?:the\s+provided\s+)?)?{ref}\s+{role}(?:\s+and\s+{ref}\s+{role})?[.]?',
+        rf'(?:使用|以)?\s*{ref}\s*(?:作为|为)?\s*(?:起始|首|第一|结束|尾|最后)[- ]?帧',
+        rf'{ref}\s*(?:->|→|—>|-->|至|到)\s*{ref}',
+        # A stray single-frame declaration would win over the new pair in the
+        # anchor parser. Remove its role phrase without deleting nearby actions.
+        r'sole\s+starting[- ]frame(?:\s+anchor)?',
+    )
+    for statement in statements:
+        body = re.sub(statement, '', body, flags=re.IGNORECASE)
+    body = re.sub(r'[ \t]{2,}', ' ', body).lstrip(' .;,。；，').rstrip()
+    opening = (
+        "Use the provided first frame and last frame as exact composition anchors. "
+        f"Use IMAGE {start_seq} as the actual first-frame image and IMAGE {end_seq} "
+        "as the actual last-frame image."
+    )
+    return f"{opening} {body}".strip()
+
+
+def _persist_optimization_results(project_dir, title, prompt_block, optimizations,
+                                  original_prompt_block=None, target_slots=None):
     """原子持久化优化结果至 manifest.json 和 .stepped_pipeline.json。"""
     try:
-        from prompt_pipeline import prompt_slots_list
+        from prompt_pipeline import prompt_slots_list, _parse_prompt_slots, _format_prompt_block
         with server_common.manifest_lock(project_dir):
             cur_manifest = server_common.read_manifest(project_dir) or {'title': title, 'frames': []}
+            if original_prompt_block is not None and cur_manifest.get('prompt_block'):
+                # Images keep rendering while the video VLM is busy. Commit only
+                # the selected video edits whose source prompt is still current.
+                images, current_videos = _parse_prompt_slots(cur_manifest['prompt_block'])
+                _, previous_videos = _parse_prompt_slots(original_prompt_block)
+                _, optimized_videos = _parse_prompt_slots(prompt_block)
+                records = dict(cur_manifest.get('video_prompt_optimizations') or {})
+                for slot in (target_slots or []):
+                    if slot not in optimized_videos or current_videos.get(slot) not in (
+                            previous_videos.get(slot), optimized_videos.get(slot)):
+                        continue
+                    current_videos[slot] = optimized_videos[slot]
+                    record = optimizations.get(str(slot)) or optimizations.get(slot)
+                    if record is not None:
+                        records[str(slot)] = record
+                prompt_block = _format_prompt_block(images, current_videos)
+                optimizations = records
             cur_manifest['prompt_block'] = prompt_block
             cur_manifest['prompt_slots'] = prompt_slots_list(prompt_block)
             cur_manifest['video_prompt_optimizations'] = optimizations
@@ -88,6 +138,7 @@ def _persist_optimization_results(project_dir, title, prompt_block, optimization
     except Exception as e:
         if sys.stdout:
             print(f"[VIDEO OPTIMIZER] Warning: failed to sync stepped state: {e}")
+    return prompt_block
 
 
 def resolve_optimizer_profile(config, manifest_data=None):
@@ -359,6 +410,13 @@ def optimize_video_prompts_for_sequence(config, title, prompt_block, on_progress
 
     # 读取空间契约与 manifest 中已持久化的差量优化记录
     manifest_data = server_common.read_manifest(project_dir) or {}
+    persisted_prompt_at_start = manifest_data.get('prompt_block') or prompt_block
+    pairing_config = config
+    if 'videoFramePairing' not in config and manifest_data.get('video_frame_pairing'):
+        pairing_config = dict(config, videoFramePairing=manifest_data['video_frame_pairing'])
+    auto_pairing = str(pairing_config.get('videoFramePairing', '')).strip().lower() == 'auto'
+    if auto_pairing:
+        from video_generator import resolve_video_frame_anchors
     spatial_contract = manifest_data.get('spatial_contract')
     profile = resolve_optimizer_profile(config, manifest_data)
     existing_optimizations = manifest_data.get('video_prompt_optimizations') or {}
@@ -369,13 +427,24 @@ def optimize_video_prompts_for_sequence(config, title, prompt_block, on_progress
     wanted_slots = set(target_slots) if target_slots else set(videos.keys())
     slots_to_vlm = []
     slot_fingerprints = {}
+    slot_frames = {}
     cached_results = {}
 
     for slot_idx in sorted(videos.keys()):
         if slot_idx not in wanted_slots:
             continue
-        start_seq = slot_idx
-        end_seq = slot_idx + 1
+        video_item = videos[slot_idx]
+        anchors = (resolve_video_frame_anchors(slot_idx, video_item, pairing_config)
+                   if auto_pairing else {
+                       'start_anchor_slot': slot_idx,
+                       'end_anchor_slot': slot_idx + 1,
+                   })
+        start_seq = anchors['start_anchor_slot']
+        end_seq = anchors['end_anchor_slot']
+        # A single-frame clip has no visual delta to optimize. Keep its declared
+        # start frame and avoid turning it into a two-frame interpolation prompt.
+        if end_seq is None:
+            continue
         start_path = _find_frame_file(project_dir, start_seq)
         end_path = _find_frame_file(project_dir, end_seq)
         
@@ -383,17 +452,24 @@ def optimize_video_prompts_for_sequence(config, title, prompt_block, on_progress
         if not start_path or not end_path:
             continue
 
-        video_item = videos[slot_idx]
         meta = video_item.get('meta', '') if isinstance(video_item, dict) else ''
-        fp = _get_slot_delta_fingerprint(start_path, end_path, meta, spatial_contract)
+        fp = _get_slot_delta_fingerprint(
+            start_path, end_path, meta, spatial_contract,
+            frame_anchors=(start_seq, end_seq) if auto_pairing else None,
+        )
         if not fp:
             continue
         slot_fingerprints[slot_idx] = fp
+        slot_frames[slot_idx] = dict(anchors, start_frame_path=start_path, end_frame_path=end_path)
 
         # 检查持久化记录是否存在且环境指纹完全匹配
         opt_rec = existing_optimizations.get(str(slot_idx)) or existing_optimizations.get(slot_idx)
         if (not force) and isinstance(opt_rec, dict) and opt_rec.get('fingerprint') == fp and opt_rec.get('optimized_prompt'):
-            cached_results[slot_idx] = opt_rec['optimized_prompt']
+            cached_body = opt_rec['optimized_prompt']
+            cached_results[slot_idx] = (
+                _normalize_optimized_frame_anchors(cached_body, start_seq, end_seq)
+                if auto_pairing else cached_body
+            )
         else:
             slots_to_vlm.append(slot_idx)
 
@@ -416,7 +492,9 @@ def optimize_video_prompts_for_sequence(config, title, prompt_block, on_progress
     if not slots_to_vlm:
         if changed_count > 0:
             new_prompt_block = _format_prompt_block(images, updated_videos)
-            _persist_optimization_results(project_dir, title, new_prompt_block, existing_optimizations)
+            new_prompt_block = _persist_optimization_results(project_dir, title, new_prompt_block,
+                existing_optimizations, original_prompt_block=persisted_prompt_at_start,
+                target_slots=list(cached_results))
             if on_progress:
                 on_progress('prompt_block_updated', {
                     'prompt_block': new_prompt_block,
@@ -447,16 +525,15 @@ def optimize_video_prompts_for_sequence(config, title, prompt_block, on_progress
         video_item = videos[slot_idx]
         body = video_item['body'] if isinstance(video_item, dict) else str(video_item)
         meta = video_item.get('meta', '') if isinstance(video_item, dict) else ''
-        start_path = _find_frame_file(project_dir, slot_idx)
-        end_path = _find_frame_file(project_dir, slot_idx + 1)
+        frames = slot_frames[slot_idx]
         items.append((slot_idx, {
             'config': config,
-            'start_frame_path': start_path,
-            'end_frame_path': end_path,
+            'start_frame_path': frames['start_frame_path'],
+            'end_frame_path': frames['end_frame_path'],
             'original_video_prompt': body,
             'slot_index': slot_idx,
-            'start_seq': slot_idx,
-            'end_seq': slot_idx + 1,
+            'start_seq': frames['start_anchor_slot'],
+            'end_seq': frames['end_anchor_slot'],
             'video_meta': meta,
             'spatial_contract': spatial_contract,
             'profile': profile,
@@ -465,22 +542,34 @@ def optimize_video_prompts_for_sequence(config, title, prompt_block, on_progress
     completed_count = 0
 
     def _worker(arg):
-        return optimize_single_video_prompt(**arg)
+        result = optimize_single_video_prompt(**arg)
+        if auto_pairing and result and str(result).strip():
+            return _normalize_optimized_frame_anchors(result, arg['start_seq'], arg['end_seq'])
+        return result
+
+    def _optimization_record(slot_idx, result):
+        frames = slot_frames[slot_idx]
+        record = {
+            'slot': slot_idx,
+            'fingerprint': slot_fingerprints.get(slot_idx),
+            'optimized_prompt': result,
+            'optimized_at': datetime.now().isoformat(),
+            'start_frame': os.path.basename(frames['start_frame_path']),
+            'end_frame': os.path.basename(frames['end_frame_path']),
+        }
+        if auto_pairing:
+            record.update({
+                'start_anchor_slot': frames['start_anchor_slot'],
+                'end_anchor_slot': frames['end_anchor_slot'],
+                'frame_pairing_source': frames.get('source'),
+            })
+        return record
 
     def _on_slot_done(slot_idx, result):
         nonlocal completed_count
         completed_count += 1
         if result and str(result).strip():
-            start_p = _find_frame_file(project_dir, slot_idx)
-            end_p = _find_frame_file(project_dir, slot_idx + 1)
-            existing_optimizations[str(slot_idx)] = {
-                'slot': slot_idx,
-                'fingerprint': slot_fingerprints.get(slot_idx),
-                'optimized_prompt': result,
-                'optimized_at': datetime.now().isoformat(),
-                'start_frame': os.path.basename(start_p) if start_p else None,
-                'end_frame': os.path.basename(end_p) if end_p else None,
-            }
+            existing_optimizations[str(slot_idx)] = _optimization_record(slot_idx, result)
         if on_progress:
             on_progress('video_optimization_slot', {
                 'slot': slot_idx,
@@ -513,22 +602,15 @@ def optimize_video_prompts_for_sequence(config, title, prompt_block, on_progress
                 updated_videos[slot_idx] = new_body
             changed_count += 1
 
-        start_path = _find_frame_file(project_dir, slot_idx)
-        end_path = _find_frame_file(project_dir, slot_idx + 1)
-        existing_optimizations[str(slot_idx)] = {
-            'slot': slot_idx,
-            'fingerprint': slot_fingerprints.get(slot_idx),
-            'optimized_prompt': new_body,
-            'optimized_at': datetime.now().isoformat(),
-            'start_frame': os.path.basename(start_path) if start_path else None,
-            'end_frame': os.path.basename(end_path) if end_path else None,
-        }
+        existing_optimizations[str(slot_idx)] = _optimization_record(slot_idx, new_body)
 
     # 组装新 prompt_block
     new_prompt_block = _format_prompt_block(images, updated_videos)
 
     # 原子写回 manifest.json 与 stepped_state
-    _persist_optimization_results(project_dir, title, new_prompt_block, existing_optimizations)
+    new_prompt_block = _persist_optimization_results(project_dir, title, new_prompt_block,
+        existing_optimizations, original_prompt_block=persisted_prompt_at_start,
+        target_slots=sorted(set(cached_results) | set(optimized_results)))
 
     if on_progress:
         on_progress('prompt_block_updated', {
@@ -542,4 +624,3 @@ def optimize_video_prompts_for_sequence(config, title, prompt_block, on_progress
         })
 
     return new_prompt_block
-
