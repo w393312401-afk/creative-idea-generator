@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import os
 import sys
 import json
@@ -21,23 +22,168 @@ except ImportError:
 from server_common import (
     SERVER_CONFIG, SERVER_MANAGED, resolve_gateway, effective_config,
     OUTPUT_ROOT, SKILL_DIR, _get_project_dir, _safe_project_name,
-    IMG2IMG_CONTROL_PROMPT, IMG2IMG_BRIDGE_CONTROL_PROMPT, IMG2IMG_BRIDGE_TURN_CONTROL_PROMPT,
-    IMG2IMG_RAW_STATE_CONTROL_PROMPT, IMG2IMG_COVER_REFERENCE_CONTROL_PROMPT,
-    resolve_cover_reference,
+    IMG2IMG_CONTROL_PROMPT, IMG2IMG_CAMERA_CUT_CONTROL_PROMPT,
+    IMG2IMG_CROSSING_REVEAL_CONTROL_PROMPT,
+    resolve_cover_reference, project_cover_path,
     IMAGE_TASKS, IMAGE_TASKS_LOCK,
-    apply_google_fx_runtime_overrides, fx_cancel_context,
-    read_manifest, write_manifest, GenerationCancelled, log,
-    gpt_image_pixel_size, drop_stale_review_verdicts,
+    apply_google_fx_runtime_overrides, fx_cancel_context, fx_request_deadline,
+    read_manifest, write_manifest, manifest_lock, GenerationCancelled, log,
+    gpt_image_pixel_size, is_gpt_image_model, gpt_image_render_quality, resolve_image_model,
+    drop_stale_review_verdicts, stamp_manifest_capabilities,
+    gate_setting, chain_guard_mode, reviews_disabled,
     # 号池轮转口径（帧序列与视频序列共用，见 server_common 的「换 IP 已全局关停」注释）
     _get_account_pool_service, _select_pool_account,
-    _account_switch_interval, _account_rotation_ring,
+    _account_switch_interval, _account_rotation_ring, revalidate_leg_account,
 )
+from frame_continuity import (
+    analyze_frame, changed_grid_cells, continuity_max_retries, continuity_mode,
+    family_map, family_master, is_camera_cut_frame, is_transition_frame,
+    register_family_master,
+    transition_result,
+)
+from cockpit_image_responses import (
+    adapt_cockpit_image_request, ImageResponsesOutputError, ImageResponsesParameterError,
+)
+
+_CHAIN_GUARD_AUTOFIX_ATTEMPTS = 2
 
 
 
 class QuotaExhaustedError(RuntimeError):
     """Raised when the upstream API quota is exhausted; retrying is pointless."""
     pass
+
+
+class FrameContinuityError(RuntimeError):
+    """A rendered frame failed the deterministic continuity gate after retry."""
+
+
+_VIDEO_MANIFEST_FIELDS = (
+    'videos', 'video_generation_stats', 'merged_video', 'merge_error', 'video_collage_url',
+    'generation_channel',
+    'video_prompt_optimizations', 'prompt_block', 'prompt_slots',
+    'auto_video', 'auto_generate_videos', 'auto_generate_videos_preference_explicit', 'video_frame_pairing',
+)
+
+
+def write_frame_manifest(project_dir, manifest, preserve_video_state=False):
+    """Persist image state without overwriting videos generated between frames."""
+    if not preserve_video_state:
+        write_manifest(project_dir, manifest)
+        return
+    with manifest_lock(project_dir):
+        latest = read_manifest(project_dir) or {}
+        merged = dict(manifest)
+        for key in _VIDEO_MANIFEST_FIELDS:
+            if key in latest:
+                merged[key] = latest[key]
+            else:
+                merged.pop(key, None)
+        projects = {**(latest.get('google_fx_projects') or {}),
+                    **(manifest.get('google_fx_projects') or {})}
+        if projects:
+            merged['google_fx_projects'] = projects
+        capabilities = dict(merged.get('capability_degraded') or {})
+        latest_video_capability = (latest.get('capability_degraded') or {}).get('videos')
+        if latest_video_capability:
+            capabilities['videos'] = latest_video_capability
+        else:
+            capabilities.pop('videos', None)
+        if capabilities:
+            merged['capability_degraded'] = capabilities
+        else:
+            merged.pop('capability_degraded', None)
+        write_manifest(project_dir, merged)
+        if read_manifest(project_dir) != merged:
+            raise RuntimeError('帧清单保存失败，已停止自动视频生成，避免使用未提交的帧记录。')
+        manifest.clear()
+        manifest.update(merged)
+
+
+def refresh_committed_frame_records(project_dir, manifest, frames_by_sequence):
+    """Carry guard/autofix changes on every frame into the image worker snapshot."""
+    latest = read_manifest(project_dir) or {}
+    for frame in latest.get('frames') or []:
+        if isinstance(frame, dict) and (frame.get('sequence') or frame.get('slot')):
+            frames_by_sequence[int(frame.get('sequence') or frame.get('slot'))] = frame
+    manifest['frames'] = [frames_by_sequence[seq] for seq in sorted(frames_by_sequence)]
+
+
+def commit_frame_prompt_changes(project_dir, previous_prompt_block, prompt_block):
+    """Commit accepted image fixes without reverting other slots' video edits."""
+    from prompt_pipeline import _parse_prompt_slots, _format_prompt_block, prompt_slots_list
+
+    before_images, before_videos = _parse_prompt_slots(previous_prompt_block)
+    after_images, after_videos = _parse_prompt_slots(prompt_block)
+    changes = [
+        {slot for slot in set(before) | set(after) if before.get(slot) != after.get(slot)}
+        for before, after in ((before_images, after_images), (before_videos, after_videos))
+    ]
+    with manifest_lock(project_dir):
+        latest = read_manifest(project_dir) or {}
+        latest_block = latest.get('prompt_block') or ''
+        if latest_block and not any(changes):
+            return latest_block
+        images, videos = _parse_prompt_slots(latest_block or previous_prompt_block)
+        for destination, after, changed in (
+                (images, after_images, changes[0]), (videos, after_videos, changes[1])):
+            for slot in changed:
+                if slot in after:
+                    destination[slot] = after[slot]
+                else:
+                    destination.pop(slot, None)
+        committed = _format_prompt_block(images, videos)
+        latest['prompt_block'] = committed
+        latest['prompt_slots'] = prompt_slots_list(committed)
+        write_manifest(project_dir, latest)
+        if read_manifest(project_dir) != latest:
+            raise RuntimeError('修复后的提示词保存失败，已停止自动视频生成。')
+        return committed
+
+
+def emit_frame_ready(project_dir, sequence, on_progress, current, total, skipped=False,
+                     prompt_block=None, previous_prompt_block=None):
+    """Announce a committed, settled frame after continuity and guard checks."""
+    if prompt_block is not None:
+        commit_frame_prompt_changes(project_dir, previous_prompt_block or prompt_block, prompt_block)
+    if not on_progress:
+        return
+    manifest = read_manifest(project_dir) or {}
+    frame = next((item for item in manifest.get('frames') or []
+                  if isinstance(item, dict)
+                  and int(item.get('sequence') or item.get('slot') or 0) == int(sequence)), None)
+    if not frame:
+        return
+    raw = str(frame.get('file') or '')
+    paths = [raw, os.path.join(os.path.dirname(os.path.abspath(__file__)), raw.lstrip('/')),
+             os.path.join(project_dir, 'frames', os.path.basename(raw))]
+    if not any(path and os.path.isfile(path) and os.path.getsize(path) > 0 for path in paths):
+        return
+    on_progress('frame_ready', {
+        'sequence': int(sequence), 'slot': int(frame.get('slot') or sequence),
+        'frame': dict(frame), 'current': current, 'total': total, 'skipped': bool(skipped),
+        'prompt_block': manifest.get('prompt_block') or '',
+    })
+
+
+_CONTINUITY_RETRY_CONTROL = (
+    "CONTINUITY CORRECTION RETRY. The attached reference is authoritative. Preserve the exact "
+    "camera position, crop, perspective, horizon, architecture, terrain, fixed landmarks, object "
+    "identity, scale, lighting direction, and every surface outside the declared work area. Apply "
+    "only the requested construction delta inside its named area; do not redraw the whole scene."
+)
+
+# 该拍在规划阶段已经声明好 changed_grid_cells（3x3 网格坐标，见 frame_continuity.
+# changed_grid_cells），此前这份数据只用来做生成后的连续性 QA 比对，从未喂给生成
+# 请求本身——控制指令只有"锁定相机、除声明变化外像素保真"这种泛泛的话。这里把
+# 已经算好的具体网格坐标直接写进控制指令，把"哪块允许变"从模糊描述收紧成坐标。
+_REGION_LOCK_TEMPLATE = (
+    " REGION LOCK: this beat's declared change is confined to grid cell(s) {cells} (3x3 grid, "
+    "columns A-C left-to-right, rows 1-3 top-to-bottom). Only pixels inside {cells} may change. "
+    "Every pixel outside {cells} — including all locked anchor landmarks — must remain "
+    "pixel-identical to the source frame in position, scale, material, and lighting, not merely "
+    "similar."
+)
 
 
 class ImageTaskCancelled(GenerationCancelled):
@@ -113,6 +259,90 @@ def _interruptible_sleep(seconds, cancel_fn=None):
             raise ImageTaskCancelled("任务已被用户取消（退避期间检测到取消）")
 
 
+def _annotate_unreachable_gateway(err, req):
+    """把「本地网关没在跑」这类 URLError 补成能直接照着修的一句话。
+
+    原样抛出时前端和日志里只剩 `<urlopen error [Errno 61] Connection refused>`——
+    看不出是哪个网关（本机有两个：baseUrl 的 8046 和 codexBaseUrl 的 codex 网关），
+    也看不出该去启哪个进程。实测封面任务撞过：模型是 gpt-image-2、被路由到
+    codexBaseUrl，而那个网关进程已经退了，报错却完全没提这两件事。
+    只在「连不上」这一类上加注（拒绝/超时/DNS），其他 URLError 原样返回。
+    """
+    reason = getattr(err, 'reason', None)
+    if not isinstance(reason, (ConnectionRefusedError, socket.gaierror, socket.timeout, TimeoutError)):
+        return err
+    try:
+        url = req.full_url if hasattr(req, 'full_url') else str(req)
+        parsed = urllib.parse.urlparse(url)
+        origin = f'{parsed.scheme}://{parsed.netloc}'
+    except Exception:
+        origin = '上游网关'
+    which = ('codexBaseUrl（gpt-5 / gpt-image-2 / codex 系列走这个网关）'
+             if _is_codex_origin(origin) else
+             'claudeBaseUrl（claude 系列走这个网关）' if _is_claude_origin(origin) else 'baseUrl')
+    return urllib.error.URLError(
+        f'{reason} —— 连不上本地网关 {origin}；'
+        f'请确认该网关进程在跑，或把 server_config.json 的 {which} 改成它当前的端口'
+    )
+
+
+def _is_claude_origin(origin):
+    try:
+        from server_common import SERVER_CONFIG
+        claude = (SERVER_CONFIG.get('claudeBaseUrl') or '')
+    except Exception:
+        claude = ''
+    return bool(claude) and origin and origin in claude
+
+
+def _is_codex_origin(origin):
+    try:
+        from server_common import SERVER_CONFIG
+        codex = (SERVER_CONFIG.get('codexBaseUrl') or '')
+    except Exception:
+        codex = ''
+    return bool(codex) and origin and origin in codex
+
+
+def _safe_upstream_error_detail(raw_detail, req):
+    """Expose error fields, excluding echoed request configuration and credentials."""
+    credentials = []
+    if hasattr(req, 'header_items'):
+        for key, value in req.header_items():
+            if re.search(r'authorization|api[-_]?key|access[-_]?code|token|password', key, re.I):
+                credentials.extend((value, value.removeprefix('Bearer ').removeprefix('bearer ')))
+
+    def clean(value):
+        text = str(value)
+        for credential in credentials:
+            if credential:
+                text = text.replace(credential, '[redacted]')
+        text = re.sub(r'(?i)\bBearer\s+[^\s"\',;}]+', '[redacted]', text)
+        text = re.sub(r'\bsk-[A-Za-z0-9_-]{8,}', '[redacted]', text)
+        text = re.sub(
+            r'(?i)((?:\bconfig\b|\b(?:request|payload)\b(?:\s+body)?)["\'\s]*[:=]\s*)'
+            r'[\{\[].*', r'\1[redacted]', text, flags=re.DOTALL)
+        text = re.sub(
+            r'(?i)(["\']?(?:authorization|api[-_]?key|access[-_]?code|password|token)["\']?'
+            r'\s*[:=]\s*)["\']?[^\s"\',;}]+', r'\1[redacted]', text)
+        return text[:800]
+
+    try:
+        body = json.loads(raw_detail)
+    except (ValueError, TypeError):
+        return clean(raw_detail)
+    if isinstance(body, dict):
+        error = body.get('error', body)
+        if isinstance(error, dict):
+            fields = {key: clean(value) for key, value in error.items()
+                      if key in ('message', 'code', 'type', 'status', 'quotaResetDelay')
+                      and isinstance(value, (str, int, float))}
+            return json.dumps({'error': fields}, ensure_ascii=False) if fields else 'Upstream rejected the request'
+        if isinstance(error, str):
+            return clean(error)
+    return 'Upstream rejected the request'
+
+
 def _execute_request_with_retry(req, opener=None, timeout=None, max_attempts=2, initial_delay=2.0, cancel_check=None, on_attempt=None, emit_quota_failure=True):
     """emit_quota_failure=False：配额耗尽照常抛 QuotaExhaustedError，但不往进度流
     广播「上游报错」。只给「调用方撞到这堵墙时有等价的路可换、换完这一帧照渲」的
@@ -126,6 +356,9 @@ def _execute_request_with_retry(req, opener=None, timeout=None, max_attempts=2, 
     # 显式传入的 cancel_check 优先；否则退回 worker 通过 set_cancel_check_sink
     # 注册的线程局部默认值，见该函数的说明。
     check_cancel = cancel_check or getattr(_CANCEL_SINK, 'fn', None)
+    if check_cancel and check_cancel():
+        raise ImageTaskCancelled("任务已被用户取消")
+    req, normalize_image_response = adapt_cockpit_image_request(req)
 
     last_exception = None
     delay = initial_delay
@@ -145,14 +378,30 @@ def _execute_request_with_retry(req, opener=None, timeout=None, max_attempts=2, 
             log('DEBUG', 'HTTP', f"发送请求 {url_str}", attempt=f"{attempt+1}/{max_attempts}")
 
             with opener.open(req, timeout=timeout) as resp:
-                return resp.read()
+                raw_response = resp.read()
+                return normalize_image_response(raw_response) if normalize_image_response else raw_response
+        except ImageResponsesOutputError:
+            # HTTP succeeded; a missing/failed tool result must not trigger paid rerenders.
+            raise
         except urllib.error.HTTPError as e:
-            last_exception = e
             detail = ''
             try:
-                detail = e.read().decode('utf-8')[:800]
+                detail = _safe_upstream_error_detail(e.read().decode('utf-8', errors='replace'), req)
             except Exception:
                 pass
+            # 保留 HTTPError 类型，同时让 str(error) 和调用方第二次 read() 都有真实原因。
+            message = detail
+            try:
+                message = json.loads(detail).get('error', {}).get('message') or detail
+            except (ValueError, AttributeError):
+                pass
+            reason = _safe_upstream_error_detail(str(e.msg), req)
+            if message:
+                reason = f'{reason}: {message}'
+            e = urllib.error.HTTPError(e.url, e.code, reason, e.headers,
+                                       io.BytesIO(detail.encode('utf-8')))
+            e.upstream_detail = detail
+            last_exception = e
 
             log('WARN', 'HTTP', f"尝试 {attempt+1}/{max_attempts} 失败 HTTP {e.code}: {detail[:200]}")
             
@@ -227,7 +476,7 @@ def _execute_request_with_retry(req, opener=None, timeout=None, max_attempts=2, 
                 _interruptible_sleep(sleep_time, check_cancel)
                 continue
             _emit_upstream_failure(attempt + 1, max_attempts, f'连接失败: {e.reason}')
-            raise e
+            raise _annotate_unreachable_gateway(e, req)
         except socket.timeout as e:
             last_exception = e
             log('WARN', 'HTTP', f"尝试 {attempt+1}/{max_attempts} 失败：socket timeout")
@@ -265,8 +514,138 @@ def _get_file_hash(filepath):
         return ""
 
 
-def update_manifest_stale_status(manifest, project_dir, regenerated_sequences=None, finalize=False):
-    """帧内容变了 → 已合并视频/视频清单作废（旧行为，任何调用都执行）。
+def _continuity_beat(manifest, sequence):
+    """Return the structured beat whose terminal anchor is IMAGE ``sequence``."""
+    if sequence <= 1:
+        return None
+    beats = (manifest or {}).get('spatial_beats') or []
+    target = sequence - 1
+    for beat in beats:
+        if not isinstance(beat, dict):
+            continue
+        try:
+            if int(beat.get('index') or 0) == target:
+                return beat
+        except (TypeError, ValueError):
+            continue
+    if target - 1 < len(beats) and isinstance(beats[target - 1], dict):
+        return beats[target - 1]
+    return None
+
+
+def _threshold_reveal_context(manifest, sequence, frames_dir):
+    """过门落点帧 IMAGE ``sequence`` 的前情：这个空间进来过没有、上次离开时是什么状态、
+    上次看见它的那张真实帧在哪。
+
+    拍号换算与 ``_continuity_beat`` 同款：IMAGE N 由第 N-1 拍产出，反过来第 i 拍的终点
+    帧是 IMAGE i+1。
+
+    读不到 spatial_beats（老 manifest、或没跑过规划的分步任务）时返回首次进门的空前情，
+    等价于改动前的行为。
+    """
+    beats = (manifest or {}).get('spatial_beats') or []
+    if not beats or sequence <= 1:
+        return {'first_entry': True, 'inherited_state': '', 'carried_structural': ''}
+    try:
+        from prompt_pipeline.frame_state import space_entry_context
+        ctx = dict(space_entry_context(beats, int(sequence) - 1))
+    except Exception:
+        # 前情缺失只该让这一拍退回改动前的行为，绝不该炸掉整条渲染链。
+        return {'first_entry': True, 'inherited_state': '', 'carried_structural': ''}
+
+    last_index = ctx.get('last_seen_index')
+    if last_index:
+        candidate = os.path.join(frames_dir, f'img_{int(last_index) + 1:03d}.webp')
+        if os.path.exists(candidate) and os.path.getsize(candidate) > 0:
+            ctx['last_seen_image_path'] = candidate
+    return ctx
+
+
+def _continuity_family_maps(prompts_by_seq, videos):
+    return family_map([int(s) for s in (prompts_by_seq or {})], videos or {},
+                      prompts_by_seq or {})
+
+
+def _continuity_family_id(families, sequence):
+    return (families or {}).get(int(sequence), 'family-1')
+
+
+def _incoming_video_meta(videos, sequence):
+    incoming = (videos or {}).get(int(sequence) - 1)
+    return str(incoming.get('meta', '') if isinstance(incoming, dict) else '')
+
+
+def _continuity_result(config, project_dir, manifest, families, videos, sequence,
+                       item, reference_path, candidate_path, on_progress=None):
+    """Evaluate one candidate and maintain the immutable family-master sidecar."""
+    mode = continuity_mode(config)
+    family_id = _continuity_family_id(families, sequence)
+    beat = _continuity_beat(manifest, sequence)
+    image_meta = str(item.get('meta', '') if isinstance(item, dict) else '')
+    incoming_meta = _incoming_video_meta(videos, sequence)
+    transition = is_transition_frame(sequence, image_meta, incoming_meta, beat)
+    master = family_master(project_dir, family_id)
+    master_path = master.get('image_path') if isinstance(master, dict) else None
+    if (isinstance(master, dict) and master_path and os.path.exists(master_path)
+            and master.get('image_sha256') != _get_file_hash(master_path)):
+        # Upload/drag/restore may overwrite the family-head file outside the renderer.  Refresh
+        # the sidecar lazily before the next comparison so a stale fingerprint never becomes the
+        # visual authority for a new lineage.
+        master = register_family_master(
+            project_dir, family_id, int(master.get('sequence') or sequence), master_path)
+        master_path = master.get('image_path')
+
+    if mode == 'off':
+        return {'version': 'frame-continuity-v1', 'status': 'skipped',
+                'reason': 'continuity mode is off'}, family_id
+    if on_progress:
+        on_progress('frame_continuity_check', {
+            'sequence': sequence, 'slot': sequence,
+            'message': f'正在检查 IMG {sequence:03d} 场景一致性…',
+        })
+    if transition or not reference_path:
+        registered = register_family_master(project_dir, family_id, sequence, candidate_path)
+        result = transition_result(reference_path, registered.get('image_path'),
+                                   'declared camera-family transition or family head')
+        result['family_id'] = family_id
+        return result, family_id
+
+    if not master_path or not os.path.exists(master_path):
+        master = register_family_master(project_dir, family_id, sequence - 1, reference_path)
+        master_path = master.get('image_path')
+    result = analyze_frame(
+        reference_path, candidate_path,
+        prompt=str(item.get('prompt', '') if isinstance(item, dict) else item or ''),
+        beat=beat, master_path=master_path, mode=mode,
+    )
+    result['family_id'] = family_id
+    return result, family_id
+
+
+def _continuity_color_reference(config, project_dir, families, sequence, fallback_path=None):
+    if continuity_mode(config) != 'off':
+        master = family_master(project_dir, _continuity_family_id(families, sequence))
+        if isinstance(master, dict) and os.path.exists(master.get('image_path', '')):
+            return master['image_path']
+    return fallback_path
+
+
+def _continuity_should_retry(result, retry_no, max_retries):
+    return bool(
+        retry_no < max_retries
+        and isinstance(result, dict)
+        and (result.get('status') == 'failed' or result.get('retry_recommended'))
+    )
+
+
+def update_manifest_stale_status(manifest, project_dir, regenerated_sequences=None, finalize=False,
+                                 frames_changed=True):
+    """帧内容变了 → 已合并视频/视频清单作废（默认任何调用都执行）。
+
+    frames_changed=False 表示这一轮没有任何帧被真正重新生成（整轮都复用了磁盘上的
+    现成帧）。此时视频所依据的首尾帧没变，不能清空 videos / merged_video，否则只是
+    重跑一遍"复用旧帧"的帧序列，就会把已交付视频的记录抹掉，下次整单视频任务据此
+    把已经付费生成的段落当成没做过而重新提交。
 
     finalize=True 时（帧生成整轮成功收尾处调用）额外维护 i2i 链的血统标记：
     部分重生（regenerated_sequences 为槽位子集）后，位于最早重生帧之后、又没被本轮
@@ -274,16 +653,21 @@ def update_manifest_stale_status(manifest, project_dir, regenerated_sequences=No
     识别；被本轮重生的帧清除标记。整单全量重生（regenerated_sequences=None）时链条
     重新连续，清空全部标记。
 
-    finalize 时还会顺手作废"所看帧图已经变过"的一致性审查结论
-    （server_common.drop_stale_review_verdicts）：这是所有渲染路径的共同收尾点，放在
-    这里才能保证单帧重试/定向修复/整单重渲都不会在 manifest 上留下过期的
-    sequence_reviewed_pass。"""
-    if 'merged_video' in manifest:
-        del manifest['merged_video']
-    if 'videos' in manifest:
-        manifest['videos'] = []
+    finalize 时还会顺手做两件同属"收尾"的事——这是所有渲染路径的共同收尾点，放在这里
+    才能保证单帧重试/定向修复/整单重渲都不漏：
+      1. 作废"所看帧图已经变过"的一致性审查结论（server_common.drop_stale_review_verdicts），
+         否则 manifest 上会留下过期的 sequence_reviewed_pass；
+      2. 盖上运行时能力印章（server_common.stamp_manifest_capabilities）：numpy/ffmpeg/
+         技能契约缺失时本地视觉探针整套静默跳过，"这单压根没做内容级校验"必须是清单上
+         的一行，而不是靠人回忆当时的环境。"""
+    if frames_changed:
+        if 'merged_video' in manifest:
+            del manifest['merged_video']
+        if 'videos' in manifest:
+            manifest['videos'] = []
     if not finalize:
         return
+    stamp_manifest_capabilities(manifest, 'frames')
     dropped = drop_stale_review_verdicts(manifest, project_dir)
     if dropped and sys.stdout:
         print(f"[REVIEW] 帧内容已变化，IMG {dropped} 的一致性审查结论已作废")
@@ -301,28 +685,8 @@ def update_manifest_stale_status(manifest, project_dir, regenerated_sequences=No
             continue
     if not regen:
         return
-    # i2i 链在声明式硬切帧（meta 含 CUT 的图片槽位 = t2i 新链头）处断开：血统标记按
-    # 链段独立计算——重生切点前的帧不会让切点后的帧过期（它们不派生自旧链），反之亦然。
-    cut_head_seqs = sorted({
-        fr.get('sequence') for fr in frames
-        if isinstance(fr, dict) and isinstance(fr.get('sequence'), int)
-        and 'CUT' in str(fr.get('meta', '')).upper()
-        and 'BRIDGE' not in str(fr.get('meta', '')).upper()
-    })
-
-    def _segment_head(seq):
-        head = 1
-        for h in cut_head_seqs:
-            if seq >= h:
-                head = h
-            else:
-                break
-        return head
-
-    regen_start_by_segment = {}
-    for r in regen:
-        seg = _segment_head(r)
-        regen_start_by_segment[seg] = min(r, regen_start_by_segment.get(seg, r))
+    # Every frame belongs to one continuous i2i lineage, including CUT beats.
+    regen_start = min(regen)
     for fr in frames:
         if not isinstance(fr, dict):
             continue
@@ -332,13 +696,12 @@ def update_manifest_stale_status(manifest, project_dir, regenerated_sequences=No
         if seq in regen:
             fr.pop('stale_lineage', None)
             continue
-        seg_start = regen_start_by_segment.get(_segment_head(seq))
-        if seg_start is not None and seq > seg_start:
+        if seq > regen_start:
             fr['stale_lineage'] = True
 
 
 def call_image_llm(config, prompt_content):
-    base_model = config.get('imageModel') or 'gemini-3.1-flash-image'
+    base_model = resolve_image_model(config.get('imageModel') or 'gemini-3.1-flash-image')
     if 'nano-banana-2' in base_model:
         base_model = base_model.replace('nano-banana-2', 'gemini-3.1-flash-image')
 
@@ -347,14 +710,14 @@ def call_image_llm(config, prompt_content):
     
     # 1. Aspect Ratio suffix
     aspect_ratio = config.get('imageAspectRatio')
-    if aspect_ratio:
+    if aspect_ratio and not is_gpt_image_model(base_model):
         # replace ':' with '-' to convert '9:16' to '9-16'
         ratio_suffix = aspect_ratio.replace(':', '-')
         model = f"{model}-{ratio_suffix}"
 
     # 2. Quality suffix
     quality = config.get('imageQuality')
-    if quality:
+    if quality and not is_gpt_image_model(base_model):
         q_lower = quality.lower()
         if q_lower in ('2k', 'medium'):
             model = f"{model}-2k"
@@ -389,14 +752,39 @@ def call_image_llm(config, prompt_content):
     return body['choices'][0]['message'].get('content') or ''
 
 
-def _quality_to_images_api(quality):
+def _quality_to_images_api(quality, model=None):
+    if is_gpt_image_model(model):
+        # imageQuality 是分辨率；细分 GPT 型号使用自己的默认渲染精度。
+        return gpt_image_render_quality(model, quality)
     return _image_quality_to_label(quality)
 
 
-def _image_size_to_api_size(aspect_ratio, model=None):
-    if model == 'gpt-image-2':
-        return gpt_image_pixel_size(aspect_ratio)
+def _image_size_to_api_size(aspect_ratio, model=None, resolution=None):
+    if is_gpt_image_model(model):
+        return gpt_image_pixel_size(aspect_ratio, resolution, model)
     return aspect_ratio or '9:16'
+
+
+def _image_edit_api_size(aspect_ratio):
+    """Windows 8046 `/images/edits` 已验证的顶层 size 参数。
+
+    generations/chat 接口可接受比例字符串，但当前 Windows edits 路由用像素尺寸最稳定：
+    2026-07-29 实测 720x1280 + image_size=2K 返回 1536x2752。未知比例保留原值，
+    避免把调用方已经传入的网关扩展比例静默改成方图。
+    """
+    value = str(aspect_ratio or '9:16').strip().lower()
+    if re.fullmatch(r'\d+x\d+', value):
+        return value
+    return {
+        '1:1': '1024x1024',
+        '16:9': '1280x720',
+        '9:16': '720x1280',
+        '4:3': '1216x896',
+        '3:4': '896x1216',
+        '3:2': '1264x848',
+        '2:3': '848x1264',
+        '21:9': '1584x672',
+    }.get(value, value)
 
 
 def _measure_image_pixels(path):
@@ -419,11 +807,11 @@ def _image_quality_to_label(quality):
 
 
 def _image_generation_model(config):
-    model = config.get('imageModel') or 'gemini-3.1-flash-image'
+    model = resolve_image_model(config.get('imageModel') or 'gemini-3.1-flash-image')
     if 'nano-banana-2' in model:
         model = model.replace('nano-banana-2', 'gemini-3.1-flash-image')
-    if model == 'gpt-image-2':
-        return model
+    if is_gpt_image_model(model):
+        return model.strip()
     if re.search(r'-\d+-\d+(?:-\d+k)?$', model.lower()):
         return model
 
@@ -440,8 +828,9 @@ def _image_generation_model(config):
 
 
 def _image_generation_model_for_request(model, size, quality):
-    if model == 'gpt-image-2':
-        return model
+    model = resolve_image_model(model)
+    if is_gpt_image_model(model):
+        return model.strip()
     if re.search(r'-\d+-\d+(?:-\d+k)?$', model.lower()):
         return model
 
@@ -458,11 +847,11 @@ def _image_generation_model_for_request(model, size, quality):
 
 
 def _image_edit_model(config):
-    model = config.get('imageModel') or 'gemini-3.1-flash-image'
+    model = resolve_image_model(config.get('imageModel') or 'gemini-3.1-flash-image')
     if 'nano-banana-2' in model:
         model = model.replace('nano-banana-2', 'gemini-3.1-flash-image')
-    if model == 'gpt-image-2':
-        return model
+    if is_gpt_image_model(model):
+        return model.strip()
     if re.search(r'-\d+-\d+(?:-\d+k)?$', model.lower()):
         return model
 
@@ -550,10 +939,11 @@ def _persist_data_url_image(data_url, title, prefix='cover'):
     if ext == 'jpeg':
         ext = 'jpg'
 
-    out_dir = os.path.join(OUTPUT_ROOT, 'covers')
-    os.makedirs(out_dir, exist_ok=True)
-    filename = f"{_safe_project_name(title)}_{prefix}_{int(time.time() * 1000)}.{ext}"
-    target_path = os.path.join(out_dir, filename)
+    # 与封面任务同一处落盘（项目目录内），不再进全局封面池
+    target_path = project_cover_path(title, ext=ext)
+    if prefix != 'cover':
+        target_path = os.path.join(os.path.dirname(target_path),
+                                   f"{prefix}_{int(time.time() * 1000)}.{ext}")
     with open(target_path, 'wb') as f:
         f.write(base64.b64decode(encoded))
 
@@ -574,6 +964,25 @@ def _extract_image_prompts(block):
         meta = slot.get('meta', '') if isinstance(slot, dict) else ''
         items.append({'index': idx, 'prompt': body, 'meta': meta})
     return items
+
+
+def _write_image_bytes_atomic(target_path, image_bytes):
+    """Publish only complete images so readers cannot cache a partial file."""
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode='wb', dir=os.path.dirname(os.path.abspath(target_path)),
+            prefix=f'.{os.path.basename(target_path)}.', suffix='.tmp', delete=False,
+        ) as temporary:
+            temporary_path = temporary.name
+            temporary.write(image_bytes)
+        os.replace(temporary_path, target_path)
+    finally:
+        if temporary_path is not None:
+            try:
+                os.unlink(temporary_path)
+            except OSError:
+                pass
 
 
 def _decode_or_download_image(data_item, target_path, config):
@@ -607,14 +1016,12 @@ def _decode_or_download_image(data_item, target_path, config):
             # ~1254x1254 方图，闭源改不了——落盘前按配置比例居中裁剪兜底，
             # 否则方帧混进 9:16 链，i2v 配对/合成必然构图跳变。比例已一致时是 no-op。
             img = _crop_to_aspect_ratio(img, config.get('imageAspectRatio') or '9:16')
-            img.save(target_path, format='WEBP', quality=80)
+            encoded = io.BytesIO()
+            img.save(encoded, format='WEBP', quality=80)
+            image_bytes = encoded.getvalue()
         except Exception as e:
             print(f"Failed to convert image to WebP: {e}. Saving raw bytes instead.")
-            with open(target_path, 'wb') as f:
-                f.write(image_bytes)
-    else:
-        with open(target_path, 'wb') as f:
-            f.write(image_bytes)
+    _write_image_bytes_atomic(target_path, image_bytes)
 
 
 def _save_image_station_result(resp_data):
@@ -726,10 +1133,10 @@ def _post_multipart(base_url, api_key, path, fields, file_field, file_path, time
     return json.loads(resp_bytes.decode('utf-8'))
 
 
-def _generate_text_image(config, prompt, target_path):
+def _generate_text_image(config, prompt, target_path, *, allow_text=False):
     model = _image_generation_model(config)
     base_url, api_key = resolve_gateway(model, config)
-    clean_render_prompt = (
+    clean_render_prompt = prompt if allow_text else (
         "Render a clean photorealistic image with no visible text, captions, labels, grid lines, "
         "measurement guides, letters, numbers, or percentages. Any terms such as Grid A2, Grid B1, "
         "coordinates, or percentage heights in the scene description are invisible composition "
@@ -737,13 +1144,15 @@ def _generate_text_image(config, prompt, target_path):
         f"{prompt}"
     )
     payload = {
-        'model': _image_generation_model(config),
+        'model': model,
         'prompt': clean_render_prompt,
-        'size': _image_size_to_api_size(config.get('imageAspectRatio'), model),
-        'quality': _quality_to_images_api(config.get('imageQuality')),
-        'image_size': _image_quality_to_label(config.get('imageQuality')),
-        'response_format': 'b64_json',
+        'size': _image_size_to_api_size(config.get('imageAspectRatio'), model,
+                                       config.get('imageQuality')),
+        'quality': _quality_to_images_api(config.get('imageQuality'), model),
     }
+    if not is_gpt_image_model(model):
+        payload['image_size'] = _image_quality_to_label(config.get('imageQuality'))
+        payload['response_format'] = 'b64_json'
     data = _post_json(base_url, api_key, '/images/generations', payload, timeout=300)
     if not data.get('data'):
         raise RuntimeError('text-to-image response contained no image data')
@@ -896,9 +1305,11 @@ def _generate_image_edit(config, prompt, reference_path, target_path, control_pr
             ref_bytes = f.read()
         ref_mime = _detect_image_mime_from_path(reference_path)
 
-    # Ensure clean model name (no suffixes like -9-16-2k)
-    clean_model = re.sub(r'-\d+-\d+(?:-\d+k)?$', '', model, flags=re.IGNORECASE)
-    clean_model = re.sub(r'-(?:2k|4k)(?:-\d+x\d+)?$', '', clean_model, flags=re.IGNORECASE)
+    # 官方 GPT 型号后缀和日期必须完整保留；仅其他网关清理比例/画质魔法后缀。
+    clean_model = model
+    if not is_gpt_image_model(model):
+        clean_model = re.sub(r'-\d+-\d+(?:-\d+k)?$', '', model, flags=re.IGNORECASE)
+        clean_model = re.sub(r'-(?:2k|4k)(?:-\d+x\d+)?$', '', clean_model, flags=re.IGNORECASE)
 
     transport_mode = (config.get('imageEditTransport') or 'auto').strip().lower()
     chat_model = _chat_transport_model(clean_model)
@@ -941,10 +1352,18 @@ def _generate_image_edit(config, prompt, reference_path, target_path, control_pr
             fields = {
                 'model': clean_model,
                 'prompt': full_prompt,
-                'aspect_ratio': aspect_ratio,
-                'image_size': _image_quality_to_label(config.get('imageQuality')),
-                'response_format': 'b64_json',
+                # Windows 8046 的 multipart edits 路由实测认顶层像素 size；继续发旧的
+                # aspect_ratio 会让比例控制依赖网关版本。image_size 独立控制 1K/2K/4K：
+                # size=720x1280 + image_size=2K 实际返回 1536x2752。
+                'size': (gpt_image_pixel_size(aspect_ratio, config.get('imageQuality'), clean_model)
+                         if is_gpt_image_model(clean_model)
+                         else _image_edit_api_size(aspect_ratio)),
             }
+            if is_gpt_image_model(clean_model):
+                fields['quality'] = _quality_to_images_api(config.get('imageQuality'), clean_model)
+            else:
+                fields['image_size'] = _image_quality_to_label(config.get('imageQuality'))
+                fields['response_format'] = 'b64_json'
 
             for k, v in fields.items():
                 body_data.extend(f"--{boundary}\r\n".encode('utf-8'))
@@ -963,7 +1382,8 @@ def _generate_image_edit(config, prompt, reference_path, target_path, control_pr
             if sys.stdout:
                 print(
                     f"[FRAME SEQUENCE] Image-to-Image edit via /images/edits (multipart) (attempt {attempt_no}/{max_attempts}): "
-                    f"{os.path.basename(reference_path)} ({len(ref_bytes)} bytes) -> {clean_model}"
+                    f"{os.path.basename(reference_path)} ({len(ref_bytes)} bytes) -> {clean_model} "
+                    f"size={fields['size']} quality={fields.get('quality') or fields.get('image_size')}"
                 )
 
             req = urllib.request.Request(
@@ -986,6 +1406,8 @@ def _generate_image_edit(config, prompt, reference_path, target_path, control_pr
             _decode_or_download_image(data['data'][0], target_path, config)
             return None  # 走的是 /images/edits 正常通道
 
+        except (ImageResponsesOutputError, ImageResponsesParameterError):
+            raise
         except QuotaExhaustedError as quota_err:
             if use_chat:
                 # chat 通道自己也没额度了：没有第三条路，就地停在配额耗尽这个真因上
@@ -1036,8 +1458,8 @@ def _generate_image_edit(config, prompt, reference_path, target_path, control_pr
 #   · 单次批量 ≤5 张，批内自动链式图生图（第 N+1 张自动挂第 N 张为参考）；
 #   · 跨批次/单帧重试的续链：FX 运行时挂参考只认「文件名里的画布 UUID」，
 #     所以每帧除 webp 外把原始 jpg（文件名含 UUID）留档到 frames/fx_src/；
-#   · 每次调用用唯一临时 output_path，避免命中运行时的 dedupe 结果缓存；
-#   · 与 API 路径一致：逐帧 VLM QA，失败改写提示词单帧重生（≤2 次）。
+#   · 每次调用用唯一临时 output_path，避免命中运行时的 dedupe 结果缓存。
+# 渲染期不做任何视觉判定（2026-08-05 起逐帧 VLM 闸已移除），帧一律直出落盘。
 # 改动 FX 运行时或本文件都需重启 SPARK 进程。
 
 _FX_CHUNK_SIZE = 5  # FX 运行时单次批量上限（google_fx_image 内部 prompts[:5]）
@@ -1097,33 +1519,128 @@ def plan_fx_chunks(seqs, chunk_size=_FX_CHUNK_SIZE):
     return chunks
 
 
-def plan_frame_chunk_accounts(chunks, ring, switch_interval):
-    """给每个链式批次分配号池账号（纯函数，可单测）。
+def _fx_bridge_meta(seq, prompts_by_seq, videos):
+    """Return the bridge tag that governs IMAGE ``seq`` (normally VIDEO seq-1)."""
+    item = (prompts_by_seq or {}).get(seq) or {}
+    item_meta = str(item.get('meta', '') if isinstance(item, dict) else '').upper()
+    incoming = (videos or {}).get(seq - 1)
+    incoming_meta = str(
+        incoming.get('meta', '') if isinstance(incoming, dict) else ''
+    ).upper()
+    combined = f'{item_meta} {incoming_meta}'.strip()
+    return combined if 'BRIDGE' in combined else ''
 
-    返回与 chunks 等长的 [{'user_id': ...}, ...]。所有批次都跑在同一个 IP 上——换 IP
-    已全局关停，见 server_common 的「换 IP 已全局关停」注释。
 
-    与视频序列（video_generator.plan_generation_legs 直接按请求数硬切）的差别在于帧的
-    批次边界是既定的：一个 chunk 就是外部脚本一次开浏览器、批内按提交顺序链式续图，
-    中途换不了号，所以只能整批整批地分配。「每 switch_interval 个请求换一个号」这个
-    节拍照旧，只是落到最近的批次边界上——累计够 switch_interval 帧才轮到下一个账号。
+def fx_bridge_target_sequences(prompts_by_seq, videos):
+    """IMAGE slots reached by an incoming [BRIDGE]/[BRIDGE TURN] video slot."""
+    return {
+        int(seq) for seq in (prompts_by_seq or {})
+        if _fx_bridge_meta(int(seq), prompts_by_seq, videos)
+    }
 
-    可换的账号 ≤1 个（含手动指定账号/空号池）时全部返回 user_id=None，沿用调用方已经
-    设好的账号。
-    """
-    if len(ring) <= 1:
-        return [{'user_id': None} for _ in chunks]
-    interval = max(1, switch_interval)
-    plans = []
-    leg_idx = 0
-    leg_frames = 0
+
+def fx_threshold_target_sequences(prompts_by_seq, videos):
+    """Target images that need the existing doorway/threshold grounding step."""
+    heads = fx_bridge_target_sequences(prompts_by_seq, videos)
+    for video_index, video in (videos or {}).items():
+        meta = str(video.get('meta', '') if isinstance(video, dict) else '').upper()
+        if 'CUT' in meta and 'BRIDGE' not in meta:
+            heads.add(int(video_index) + 1)
+    return heads
+
+
+def fx_camera_cut_target_sequences(prompts_by_seq):
+    """Generic viewpoint changes split FX batches without implying a doorway."""
+    return {
+        int(seq) for seq, item in (prompts_by_seq or {}).items()
+        if is_camera_cut_frame(item.get('meta', '') if isinstance(item, dict) else '')
+    }
+
+
+def split_fx_chunks_at_heads(chunks, heads):
+    """Start a fresh Flow batch at every declared transition target frame."""
+    heads = {int(s) for s in (heads or ())}
+    result = []
     for chunk in chunks:
-        if leg_frames >= interval and plans:
-            leg_idx += 1
-            leg_frames = 0
-        plans.append({'user_id': ring[leg_idx % len(ring)]})
-        leg_frames += len(chunk)
-    return plans
+        current = []
+        for seq in chunk:
+            if seq in heads and current:
+                result.append(current)
+                current = []
+            current.append(seq)
+        if current:
+            result.append(current)
+    return result
+
+
+def fx_prompt_with_bridge_control(seq, item, prompts_by_seq, videos):
+    """Inline declared viewpoint changes because FX has no control_prompt channel."""
+    body = str(item.get('prompt', '') if isinstance(item, dict) else item or '').strip()
+    bridge_meta = _fx_bridge_meta(seq, prompts_by_seq, videos)
+    image_meta = str(item.get('meta', '') if isinstance(item, dict) else '')
+    if not bridge_meta and not is_camera_cut_frame(image_meta):
+        return body
+    # Doorway crossings keep their existing dedicated control when both signals exist.
+    control = (IMG2IMG_CROSSING_REVEAL_CONTROL_PROMPT if bridge_meta
+               else IMG2IMG_CAMERA_CUT_CONTROL_PROMPT)
+    if control in body:
+        return body
+    return f'{control}\n\n{body}'.strip()
+
+
+def _fx_frame_canvas_binding(frame, manifest=None):
+    """Return the account/project pair that owns an existing Flow frame.
+
+    Targeted regeneration is an *iteration of an existing frame*, not a new
+    generation leg.  Re-selecting the richest pool account here opens that
+    account's newest/empty canvas and loses the original frame's Flow history.
+    New manifests stamp the ownership on every frame; older manifests fall
+    back to the project-level binding.
+    """
+    frame = frame if isinstance(frame, dict) else {}
+    manifest = manifest if isinstance(manifest, dict) else {}
+    account_id = str(
+        frame.get('fx_account_id')
+        or manifest.get('google_fx_project_account_id')
+        or ''
+    ).strip()
+    project_url = str(
+        frame.get('fx_project_url')
+        or (manifest.get('google_fx_projects') or {}).get(account_id)
+        or manifest.get('google_fx_project_url')
+        or ''
+    ).strip()
+    return account_id, project_url
+
+
+def split_fx_chunks_by_canvas(chunks, existing_frames, manifest=None):
+    """Split targeted chunks whenever adjacent frames belong to different canvases."""
+    result = []
+    for chunk in chunks:
+        current = []
+        current_binding = None
+        for seq in chunk:
+            binding = _fx_frame_canvas_binding(existing_frames.get(seq), manifest)
+            # Missing ownership is allowed to share the caller-selected leg.  A
+            # known binding, however, must never be batched across another one.
+            binding_key = binding if any(binding) else None
+            if current and binding_key != current_binding:
+                result.append(current)
+                current = []
+            current.append(seq)
+            current_binding = binding_key
+        if current:
+            result.append(current)
+    return result
+
+
+def plan_frame_chunk_accounts(chunks, ring, switch_interval):
+    """批次沿用当前可用账号，额度耗尽时由生成服务换号。
+
+    保留旧参数供调用方兼容；分批与旧换号节拍不再触发新浏览器。
+    user_id=None 让后续批次跟随实际账号，包括批次中途刚换到的账号。
+    """
+    return [{'user_id': None} for _ in chunks]
 
 
 def _fx_src_dir(frames_dir):
@@ -1140,10 +1657,44 @@ def _fx_find_ref_for(frames_dir, seq):
     if not os.path.isdir(src_dir):
         return None
     prefix = f'img_{seq - 1:03d}_'
+    matches = []
     for name in sorted(os.listdir(src_dir)):
         if name.startswith(prefix) and name.lower().endswith('.jpg') and _fx_extract_uuid(name):
-            return os.path.join(src_dir, name)
+            matches.append(os.path.join(src_dir, name))
+    if matches:
+        return matches[-1]
     return None
+
+
+def _fx_heal_frame_uuid(frames_dir, seq, uuid_str):
+    """把第 seq 帧的 fx_src 留档改名成带 UUID 的形式，返回是否真的改了。
+
+    用在「参考图只能靠上传挂载」之后：上传完成的那一刻，这张图**已经在画布上**并
+    拿到了自己的 UUID，只是本地留档还叫 img_NNN_nouuid.jpg。不改名的话
+    _fx_find_ref_for 下次仍然认不出它，同一张图会被反复上传——每渲一次下一帧、
+    每点一次「修复此帧问题」都白传一遍。
+
+    UUID 丢失的源头在上游（中选候选的媒体 URL 里没有 UUID 可解析，见
+    _fx_store_frame 的 "nouuid" 兜底）；这里管不到源头，但能保证代价只付一次。
+    """
+    if not uuid_str or not _FX_UUID_RE.fullmatch(str(uuid_str)):
+        return False
+    src_dir = _fx_src_dir(frames_dir)
+    prefix = f'img_{seq:03d}_'
+    target = os.path.join(src_dir, f'{prefix}{uuid_str}.jpg')
+    if os.path.exists(target):
+        return False
+    for name in sorted(os.listdir(src_dir)):
+        if not (name.startswith(prefix) and name.lower().endswith('.jpg')):
+            continue
+        if _fx_extract_uuid(name):
+            return False          # 已经有正经 UUID 留档，不动它
+        try:
+            os.replace(os.path.join(src_dir, name), target)
+            return True
+        except OSError:
+            return False
+    return False
 
 
 def _fx_cover_ref_jpg(cover_path, frames_dir):
@@ -1154,10 +1705,110 @@ def _fx_cover_ref_jpg(cover_path, frames_dir):
     return target
 
 
+def _fx_local_frame_ref_jpg(frame_path, frames_dir, seq):
+    """Convert a rendered frame into a Flow-uploadable i2i reference."""
+    target = os.path.join(_fx_src_dir(frames_dir), f'chain_ref_{seq:03d}.jpg')
+    with Image.open(frame_path) as img:
+        img.convert('RGB').save(target, format='JPEG', quality=92)
+    return target
+
+
+def _fx_clear_frame_reference(frames_dir, seq):
+    """Archive every cached FX reference for one replaced frame slot without deleting.
+
+    A manual upload replaces ``img_NNN.webp`` but has no Flow canvas UUID. Archiving the old
+    ``img_NNN_<uuid>.jpg`` prevents the next frame from mounting the pre-upload image while
+    preserving all files on disk in the pool.
+    """
+    src_dir = os.path.join(frames_dir, 'fx_src')
+    if not os.path.isdir(src_dir):
+        return []
+    prefixes = (f'img_{int(seq):03d}_', f'chain_ref_{int(seq):03d}.jpg')
+    archived = []
+    for name in os.listdir(src_dir):
+        if not (name.startswith(prefixes[0]) or name == prefixes[1]):
+            continue
+        path = os.path.join(src_dir, name)
+        if not os.path.isfile(path):
+            continue
+        arch_name = f'archived_{name}'
+        arch_path = os.path.join(src_dir, arch_name)
+        try:
+            os.replace(path, arch_path)
+            archived.append(arch_path)
+        except OSError:
+            pass
+    return archived
+
+
+def _fx_slot_reference_files(src_dir, seq):
+    """该槽位现存的 UUID 留档文件名（正常只有一个，多了也按序返回）。"""
+    prefix = f'img_{int(seq):03d}_'
+    return [n for n in sorted(os.listdir(src_dir))
+            if n.startswith(prefix) and n.lower().endswith('.jpg')]
+
+
+def _fx_relocate_frame_reference(frames_dir, from_seq, to_seq, mode='swap'):
+    """图换格之后，把 fx_src 里的 UUID 留档跟着搬到新格。
+
+    ``_fx_find_ref_for`` 是靠 ``fx_src/img_NNN_<uuid>.jpg`` 给第 NNN+1 帧挂参考的。
+    img_NNN.webp 换了格而留档留在原位，下一次生成就会照着换位前的那张老图续链。
+
+    mode='copy' 时目标格拿到源格留档的副本（两格是同一张图，UUID 也该是同一个），
+    源格原样保留；swap / 搬运则两格互换留档（空的一边把另一边也换空）。
+    返回 {槽位号: 该格现在的留档绝对路径或 None}。
+    """
+    from_seq, to_seq = int(from_seq), int(to_seq)
+    result = {from_seq: None, to_seq: None}
+    src_dir = os.path.join(frames_dir, 'fx_src')
+    if not os.path.isdir(src_dir):
+        return result
+
+    def _renamed(name, seq):
+        m = re.match(r'^img_\d+_(.+)$', name)
+        return f'img_{seq:03d}_{m.group(1)}' if m else name
+
+    src_names = _fx_slot_reference_files(src_dir, from_seq)
+    dst_names = _fx_slot_reference_files(src_dir, to_seq)
+
+    if mode == 'copy':
+        for name in dst_names:
+            try:
+                os.replace(os.path.join(src_dir, name), os.path.join(src_dir, f'archived_{name}'))
+            except OSError:
+                pass
+        for name in src_names:
+            shutil.copyfile(os.path.join(src_dir, name),
+                            os.path.join(src_dir, _renamed(name, to_seq)))
+    else:
+        # 两格互换：先全部挪进临时名，避免 img_002_x → img_003_x 覆盖掉还没挪走的对家
+        staged = []
+        for name, seq in ([(n, to_seq) for n in src_names]
+                          + [(n, from_seq) for n in dst_names]):
+            tmp = os.path.join(src_dir, name + '.relocate.tmp')
+            os.replace(os.path.join(src_dir, name), tmp)
+            staged.append((tmp, os.path.join(src_dir, _renamed(name, seq))))
+        for tmp, final in staged:
+            os.replace(tmp, final)
+
+    # chain_ref_NNN.jpg 只是该格 webp 的本地转档缓存，画面换了就作废（用时按新图重建）
+    for seq in ((to_seq,) if mode == 'copy' else (from_seq, to_seq)):
+        cached = os.path.join(src_dir, f'chain_ref_{seq:03d}.jpg')
+        if os.path.isfile(cached):
+            try:
+                os.replace(cached, os.path.join(src_dir, f'archived_chain_ref_{seq:03d}.jpg'))
+            except OSError:
+                pass
+
+    for seq in (from_seq, to_seq):
+        found = _fx_slot_reference_files(src_dir, seq)
+        result[seq] = os.path.join(src_dir, found[0]) if found else None
+    return result
+
+
 def _fx_store_frame(src_path, frames_dir, seq):
     """外部脚本下载的原始 jpg → frames/img_NNN.webp，原始文件按
-    img_NNN_<uuid>.jpg 留档到 frames/fx_src/（同槽位旧档先清掉，防止
-    重试后按前缀找参考时命中旧 UUID）。返回 (webp_path, fx_src_path, uuid)。"""
+    img_NNN_<uuid>.jpg 留档到 frames/fx_src/。同槽位旧档归档至 candidates 池中保留。返回 (webp_path, fx_src_path, uuid)。"""
     target_path = os.path.join(frames_dir, f'img_{seq:03d}.webp')
     with Image.open(src_path) as img:
         img.convert('RGB').save(target_path, format='WEBP', quality=80)
@@ -1165,14 +1816,29 @@ def _fx_store_frame(src_path, frames_dir, seq):
     uuid_str = _fx_extract_uuid(src_path)
     src_dir = _fx_src_dir(frames_dir)
     prefix = f'img_{seq:03d}_'
+
+    # 将同槽位旧档安全移入候选池目录保留，绝不物理删除
+    cand_dir = os.path.join(frames_dir, 'candidates', f'frame_{seq:03d}')
     for old in os.listdir(src_dir):
         if old.startswith(prefix):
+            old_path = os.path.join(src_dir, old)
             try:
-                os.remove(os.path.join(src_dir, old))
+                os.makedirs(cand_dir, exist_ok=True)
+                dest_cand = os.path.join(cand_dir, old)
+                if old_path != dest_cand:
+                    if not os.path.exists(dest_cand):
+                        os.replace(old_path, dest_cand)
+                    else:
+                        os.remove(old_path)
             except Exception:
                 pass
-    fx_src_path = os.path.join(src_dir, f'{prefix}{uuid_str or "nouuid"}.jpg')
-    shutil.copyfile(src_path, fx_src_path)
+
+    if uuid_str:
+        fx_src_path = os.path.join(src_dir, f'{prefix}{uuid_str}.jpg')
+    else:
+        fx_src_path = os.path.join(src_dir, f'{prefix}nouuid_{int(time.time() * 1000)}.jpg')
+    if src_path != fx_src_path:
+        shutil.copyfile(src_path, fx_src_path)
     return target_path, fx_src_path, uuid_str
 
 
@@ -1202,7 +1868,10 @@ def _fx_cancelled_result(result):
     return '任务已取消' in str((result or {}).get('message') or '')
 
 
-def _fx_generate_batch(google_fx, models, config, prompt_texts, ref_path, cancel_fn=None):
+def _fx_generate_batch(google_fx, models, config, prompt_texts, ref_path, cancel_fn=None,
+                       excluded_media_uuids=None, excluded_image_paths=None,
+                       canvas_session=None, max_attempts=3, attempt_state=None,
+                       allow_account_switch=True):
     """调用外部批量生图脚本一次，返回 (本地文件路径列表, 临时目录)。
 
     ref_path：上一帧留档 jpg（首帧/无续链传 None）。
@@ -1214,37 +1883,110 @@ def _fx_generate_batch(google_fx, models, config, prompt_texts, ref_path, cancel
     调用方负责在把图片转存后 shutil.rmtree 临时目录。
     """
     temp_out = tempfile.mkdtemp(prefix='spark_fx_img_')
+    from integrations.google_fx.utils import account_binding
+    account_id = account_binding.resolve_account(
+        fallback=config.get('googleFxUserId') if isinstance(config, dict) else None
+    )
+    projects_by_account = (
+        canvas_session.setdefault('projects_by_account', {})
+        if isinstance(canvas_session, dict) and account_id
+        else ((canvas_session or {}).get('projects_by_account') or {})
+    )
+    project_url = projects_by_account.get(account_id)
+    if not project_url and isinstance(canvas_session, dict):
+        legacy_owner = canvas_session.get('project_account_id')
+        if not legacy_owner or legacy_owner == account_id:
+            project_url = canvas_session.get('project_url')
+    # 本任务在这个账号上还没开过画布 → 浏览器里停着的那块是**上一个任务**的，必须新建。
+    # AdsPower 跨任务不关浏览器，沿用它就是把新任务跑进旧任务的画布（2026-08-05 事故：
+    # 悬崖石屋任务把榕树树洞任务的 6b857588 当成自己的 IMG 001 落了盘）。
+    # 没有 project_url 不等于没开过画布：部分 Flow 变体的工作台没有 /project/ 路由，
+    # 这种账号的画布只能靠 opened_accounts 记账，否则同一任务的每个 chunk 都会重开画布、
+    # 把 i2i 续链打断成一次次重新上传。
+    opened_accounts = (canvas_session or {}).get('opened_accounts') or []
+    require_fresh_canvas = bool(
+        not project_url and account_id and account_id not in opened_accounts
+    )
     req = models.ImageBatchRequest(
         prompts=list(prompt_texts),
         images=[ref_path] if ref_path else [],
+        excluded_media_uuids=list(excluded_media_uuids or []),
+        excluded_image_paths=list(excluded_image_paths or []),
         ratio=config.get('imageAspectRatio') or '9:16',
         model=_fx_image_model(config),
         output_path=temp_out,  # 每次唯一，绕开外部 dedupe 缓存（同提示词重试不会拿到旧图）
+        project_url=project_url,
+        require_fresh_canvas=require_fresh_canvas,
+        max_attempts=max(1, int(max_attempts or 1)),
+        allow_account_switch=bool(allow_account_switch),
     )
-    with fx_cancel_context(cancel_fn):
+    # deadline 必须显式传：不传的话 CancelState.deadline 是 None，脚本里那些
+    # deadline_exceeded() 检查恒为 False（见 server_common.fx_request_deadline）。
+    with fx_cancel_context(cancel_fn, deadline=fx_request_deadline()):
         result = google_fx._generate_images_batch_google_fx(req)
-    if not isinstance(result, dict) or result.get('status') != 'success':
+    actual_account_id = account_binding.resolve_account(
+        fallback=config.get('googleFxUserId') if isinstance(config, dict) else None
+    )
+    if actual_account_id and isinstance(config, dict):
+        # 换号绑定在本批次作用域结束时会还原；保存实际账号供下一批续用。
+        config['googleFxUserId'] = actual_account_id
+    returned_project_url = (result or {}).get('project_url') if isinstance(result, dict) else None
+    if isinstance(attempt_state, dict):
+        try:
+            attempt_state['used'] = max(1, int((result or {}).get('attempts_used') or 1))
+        except (TypeError, ValueError):
+            attempt_state['used'] = 1
+        attempt_state['account_id'] = actual_account_id
+    if returned_project_url and canvas_session is not None:
+        canvas_session['project_url'] = returned_project_url
+        if actual_account_id:
+            canvas_session['project_account_id'] = actual_account_id
+            projects_by_account[actual_account_id] = returned_project_url
+    result_status = result.get('status') if isinstance(result, dict) else None
+    # 画布已经为本任务开出来了：后续 chunk 只管复用，不再重开——重开会丢掉 i2i 续链的
+    # 画布上下文。只在这一批真的出了图时记账；画布都没开成的失败（FLOW_CANVAS_UNAVAILABLE）
+    # 必须让下一次重试继续要求新画布，否则重试就会退回沿用旧任务画布的老路。
+    if (isinstance(canvas_session, dict) and actual_account_id
+            and result_status in ('success', 'partial')):
+        opened = canvas_session.setdefault('opened_accounts', [])
+        if actual_account_id not in opened:
+            opened.append(actual_account_id)
+    if result_status not in ('success', 'partial'):
         shutil.rmtree(temp_out, ignore_errors=True)
         if _fx_cancelled_result(result) or (cancel_fn and cancel_fn()):
             raise ImageTaskCancelled("帧序列生成已被用户取消（外部批量生图脚本已停）")
         raise RuntimeError(f"Google FX 批量生图失败: {(result or {}).get('message') or '未知错误'}")
     paths = [p for p in (result.get('image_urls') or []) if isinstance(p, str) and os.path.exists(p)]
-    if len(paths) < len(prompt_texts):
+    if result_status == 'success' and len(paths) < len(prompt_texts):
         shutil.rmtree(temp_out, ignore_errors=True)
         raise RuntimeError(
-            f"Google FX 批量生图不完整: 期望 {len(prompt_texts)} 张，实际落盘 {len(paths)} 张，"
-            f"已放弃本批结果（批内链式对应关系无法修复）"
+            f"Google FX 批量生图返回成功但数量不完整: 期望 {len(prompt_texts)} 张，"
+            f"实际落盘 {len(paths)} 张"
+        )
+    if result_status == 'partial' and not paths:
+        shutil.rmtree(temp_out, ignore_errors=True)
+        raise RuntimeError(
+            f"Google FX 批量生图从首张即失败: {(result or {}).get('message') or '未知错误'}"
         )
     return paths, temp_out
 
 
-def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=None, target_sequences=None):
+def text_only_anchor_allowed(config):
+    """本次渲染是否允许首帧在没有封面时退化为纯文生图。"""
+    if not isinstance(config, dict):
+        return False
+    return bool(config.get('allowTextOnlyAnchor') or config.get('skipCoverReference') or config.get('coverReferencePath') == 'none')
+
+
+def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=None, target_sequences=None, chain_guard_review=True):
     import builtins
     # 纯 SPARK 内部旗标：AdsPower 侧早已删掉这个进程级全局标志，外部脚本不再读它
     # （真正送进脚本的取消信号见 _fx_batch_cancel_fn / fx_cancel_context）。
     builtins.google_fx_cancelled = False
     apply_google_fx_runtime_overrides(config)
-    from prompt_pipeline import _parse_prompt_slots
+    from prompt_pipeline import (
+        _parse_prompt_slots, ground_threshold_reveal_prompt,
+        threshold_reveal_continuity_clause)
     images, videos = _parse_prompt_slots(prompt_block)
 
     prompts = []
@@ -1255,6 +1997,9 @@ def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=
         prompts.append({'index': idx, 'prompt': body, 'meta': meta})
     if not prompts:
         raise RuntimeError('未在 prompt_block 中找到任何 图片 N: 提示词')
+    prompts_by_seq = {int(item['index']): item for item in prompts}
+    continuity_families = _continuity_family_maps(prompts_by_seq, videos)
+    continuity_retries = continuity_max_retries(config)
 
     def _check_cancel():
         if on_progress and on_progress('cancel_check', None):
@@ -1282,20 +2027,116 @@ def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=
     if pool_account_id:
         apply_google_fx_runtime_overrides(config)
 
-    def _run_chunk_batch(chunk_prompts, ref_path, leg):
-        """跑一批：先绑这一批的号池账号，再交给外部批量脚本。"""
-        user_id = (leg or {}).get('user_id')
+    canvas_session = {}
+
+    checkpointed_seqs = set()
+    generated_account_by_path = {}
+
+    def _run_chunk_batch(chunk_prompts, ref_path, leg, chunk_sequences=None,
+                         cover_reference=None):
+        # Run chunk batch and save prefix, resume from first failed prompt.
+        user_id = (leg or {}).get('user_id') or config.get('googleFxUserId') or pool_account_id
         if user_id:
             config['googleFxUserId'] = user_id
             apply_google_fx_runtime_overrides(config)
-        return _fx_generate_batch(google_fx, fx_models, config, chunk_prompts, ref_path,
-                                  cancel_fn=cancel_fn)
+        from integrations.google_fx.utils import account_binding
+        excluded_media_uuids = {
+            str(frame.get('fx_uuid')).lower()
+            for frame in manifest_frames_by_seq.values()
+            if isinstance(frame, dict) and frame.get('fx_uuid')
+        }
+        excluded_image_paths = [
+            _webp_path(seq)
+            for seq in all_seqs
+            if _frame_exists(seq)
+        ]
+        aggregate_out = tempfile.mkdtemp(prefix='spark_fx_chunk_')
+        aggregate_paths = []
+        remaining = list(chunk_prompts)
+        next_ref = ref_path
+        retry_budget = 3
+        try:
+            with account_binding.bound_task_account(user_id):
+                while remaining:
+                    if retry_budget <= 0:
+                        raise RuntimeError('Google FX 本批共享重试预算已耗尽')
+                    remaining_before = len(remaining)
+                    aggregate_before = len(aggregate_paths)
+                    attempt_state = {}
+                    prefix_paths, attempt_out = _fx_generate_batch(
+                        google_fx, fx_models, config, remaining, next_ref,
+                        cancel_fn=cancel_fn,
+                        excluded_media_uuids=excluded_media_uuids,
+                        excluded_image_paths=excluded_image_paths + aggregate_paths,
+                        canvas_session=canvas_session,
+                        max_attempts=retry_budget,
+                        attempt_state=attempt_state,
+                        allow_account_switch=not bool(
+                            target_sequences is not None
+                            and chunk_sequences
+                            and any(_fx_frame_canvas_binding(
+                                manifest_frames_by_seq.get(chunk_sequences[0]), manifest
+                            ))
+                        ),
+                    )
+                    retry_budget -= max(1, int(attempt_state.get('used') or 1))
+                    try:
+                        for src in prefix_paths:
+                            suffix = os.path.basename(src)
+                            dest = os.path.join(
+                                aggregate_out,
+                                f'{len(aggregate_paths):03d}_{suffix}',
+                            )
+                            shutil.move(src, dest)
+                            aggregate_paths.append(dest)
+                            generated_account_by_path[dest] = attempt_state.get('account_id') or user_id
+                    finally:
+                        shutil.rmtree(attempt_out, ignore_errors=True)
+
+                    completed = len(prefix_paths)
+                    if completed <= 0:
+                        raise RuntimeError('Google FX 批次未产生可恢复的成功前缀')
+                    remaining = remaining[completed:]
+                    next_ref = aggregate_paths[-1]
+                    # A partial result is already paid for and its prompt↔frame
+                    # mapping is still exact.  Persist it immediately so a later
+                    # remainder failure/process restart resumes from this prefix
+                    # instead of regenerating it.  The final normal processing
+                    # loop skips these checkpointed sequences.
+                    if completed < remaining_before and chunk_sequences:
+                        new_paths = aggregate_paths[aggregate_before:]
+                        for rel_idx, saved_path in enumerate(new_paths):
+                            seq = int(chunk_sequences[aggregate_before + rel_idx])
+                            item = prompts_by_seq[seq]
+                            _, fx_src_path, fx_uuid = _fx_store_frame(saved_path, frames_dir, seq)
+                            if seq > 1 and _frame_exists(1):
+                                _match_color_lab(_webp_path(seq), _webp_path(1), _webp_path(seq))
+                            _record_frame(
+                                seq, item, fx_src_path, fx_uuid,
+                                'retired', None,
+                                cover_reference=(cover_reference if seq == 1 else None),
+                                fx_account_id=generated_account_by_path.get(saved_path),
+                            )
+                            checkpointed_seqs.add(seq)
+                    if remaining and on_progress:
+                        on_progress('fx_batch_resume', {
+                            'completed_prefix': len(aggregate_paths),
+                            'remaining': len(remaining),
+                            'retry_budget_remaining': retry_budget,
+                            'message': (f'Google FX 本批已保留前 {len(aggregate_paths)} 张成功结果，'
+                                        f'从下一张继续剩余 {len(remaining)} 张'),
+                        })
+            return aggregate_paths, aggregate_out
+        except Exception:
+            shutil.rmtree(aggregate_out, ignore_errors=True)
+            raise
 
     manifest_path = os.path.join(project_dir, 'manifest.json')
     manifest = {
         'title': title,
         'created_at': time.strftime('%Y-%m-%d %H:%M:%S'),
         'method': 'A_single_chain',
+        'generation_mode': 'standard',
         'backend': 'google_fx',
         'aspect_ratio': config.get('imageAspectRatio') or '9:16',
         'image_size': _image_quality_to_label(config.get('imageQuality')),
@@ -1307,22 +2148,57 @@ def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=
             with open(manifest_path, 'r', encoding='utf-8') as f:
                 existing_manifest = json.load(f)
             if isinstance(existing_manifest, dict) and 'frames' in existing_manifest:
-                manifest['frames'] = existing_manifest['frames']
+                if isinstance(existing_manifest['frames'], list):
+                    manifest['frames'] = [f for f in existing_manifest['frames'] if isinstance(f, dict)]
                 manifest['created_at'] = existing_manifest.get('created_at', manifest['created_at'])
-                # 未知键保留：检查点重锚定/校准记录（reanchors、anchor_recalibrations）等
-                # 是在分段渲染的间隙写入的，重建 manifest 时丢掉它们会让下一段渲染的
-                # 逐帧落盘把这些记录抹掉（videos/merged_video 仍由 stale 逻辑显式清理）
+                # 未知键保留：spatial_contract / 手动审查留痕等由别的写入方落进 manifest
+                # 的键，重建 manifest 时丢掉它们会让本轮的逐帧落盘把它们抹掉
+                # （videos/merged_video 仍由 stale 逻辑显式清理）
                 for _k, _v in existing_manifest.items():
                     if _k not in manifest:
                         manifest[_k] = _v
+                # generation_mode 是「这一单的模式」而非「这一趟的链路」（后者看
+                # method）：硬写 'standard' 会把 4选1 的记录抹平，同 API 路径的说明。
+                _prev_mode = existing_manifest.get('generation_mode')
+                if isinstance(_prev_mode, str) and _prev_mode.strip():
+                    manifest['generation_mode'] = _prev_mode
         except Exception:
             pass
 
-    manifest_frames_by_seq = {f['sequence']: f for f in manifest['frames']}
+    manifest.pop('halted_at_beat', None)
+    manifest.pop('halted_at_sequence', None)
+
+    if isinstance(manifest.get('google_fx_projects'), dict):
+        canvas_session['projects_by_account'] = dict(manifest['google_fx_projects'])
+    if manifest.get('google_fx_project_url'):
+        canvas_session['project_url'] = manifest['google_fx_project_url']
+        canvas_session['project_account_id'] = manifest.get('google_fx_project_account_id')
+
+    manifest_frames_by_seq = {
+        int(f.get('sequence') or f.get('slot')): f
+        for f in manifest.get('frames', [])
+        if isinstance(f, dict) and (f.get('sequence') or f.get('slot'))
+    }
+    # Per-frame ownership is the authoritative map for later iteration.  Fold
+    # it back into the session as well so manifests written before
+    # google_fx_projects existed can still reopen the exact original canvas.
+    for _frame in manifest_frames_by_seq.values():
+        _account_id, _project_url = _fx_frame_canvas_binding(_frame, manifest)
+        if _account_id and _project_url:
+            canvas_session.setdefault('projects_by_account', {}).setdefault(
+                _account_id, _project_url
+            )
     # 按提示词块里的真实槽位号建索引（与 API 路径同一修复）：
     # 枚举位置在子集渲染时与槽位号错位，目标帧会静默漏渲
     prompts_by_seq = {int(item['index']): item for item in prompts}
     all_seqs = sorted(prompts_by_seq.keys())
+
+    # FX/Flow has no separate control_prompt channel.  Put the movement directive in the
+    # actual IMAGE prompt (and therefore in the manifest) before batching, so a bridge target
+    # cannot silently render with the ordinary locked-camera edit contract.
+    for _seq, _item in prompts_by_seq.items():
+        _item['prompt'] = fx_prompt_with_bridge_control(
+            _seq, _item, prompts_by_seq, videos)
 
     def _webp_path(seq):
         return os.path.join(frames_dir, f'img_{seq:03d}.webp')
@@ -1330,6 +2206,22 @@ def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=
     def _frame_exists(seq):
         p = _webp_path(seq)
         return os.path.exists(p) and os.path.getsize(p) > 0
+
+    def _align_frame_color(seq):
+        # Align newly rendered frame to current shot family master or fallback to frame 1.
+        if seq <= 1:
+            return
+        item = prompts_by_seq.get(seq) or {}
+        if is_transition_frame(
+                seq, item.get('meta', ''), _incoming_video_meta(videos, seq),
+                _continuity_beat(manifest, seq)):
+            return
+        target_path = _webp_path(seq)
+        first_frame_path = _webp_path(1)
+        color_reference = _continuity_color_reference(
+            config, project_dir, continuity_families, seq, first_frame_path)
+        if color_reference and os.path.exists(color_reference) and os.path.exists(target_path):
+            _match_color_lab(target_path, color_reference, target_path)
 
     # 任务分解：full run = 已有帧直接复用（断点续传），缺失帧成批生成；
     # target 模式 = 只重生指定序号，其余帧不动也不发事件（与 API 路径一致）。
@@ -1347,24 +2239,31 @@ def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=
 
     def _save_manifest():
         manifest['frames'] = [manifest_frames_by_seq[s] for s in sorted(manifest_frames_by_seq.keys())]
-        write_manifest(project_dir, manifest)
+        write_frame_manifest(project_dir, manifest, preserve_video_state=bool(config.get('_auto_generate_videos')))
 
     generated_count = 0
 
-    def _emit_frame(frame_info):
+    # 这个事件里的 quality_gate 是**守卫跑之前**的读数（4选1 优选 / 初始态），前端
+    # 却拿它打"完成（质检通过）"那一行。链上守卫在本帧落盘之后才审，于是用户先看到
+    # 一行绿的、过一会儿卡片又变红——"当时说通过、后来说有问题"就是这么来的。
+    # guard_pending 如实告诉前端"后面还有一道审查"，让它把结论那句话留给守卫自己说。
+    def _guard_will_run(seq):
+        if (chain_guard_mode(config) if chain_guard_review else 'off') == 'off':
+            return False
+        # 与下面的守卫分支同一判据：首帧走锚点审查，其余拍要有上一帧才审得了。
+        return seq == 1 or os.path.exists(_webp_path(seq - 1))
+
+    def _emit_frame(frame_info, guard_pending=False):
         nonlocal generated_count
         generated_count += 1
         if on_progress:
-            on_progress('frame', {'frame': frame_info, 'current': generated_count, 'total': total_to_generate})
-
-    def _run_vlm_qa(seq, item, is_bridge, ref_path):
-        """不再逐帧质检——一致性审查移到整套序列渲染完成后，对着真实画面统一跑一次
-        （见 pipeline_orchestrator._sequence_consistency_review）。'pending_manual_review'
-        是 manifest 里已有的合法值，前端对它没有特殊徽标，渲染成普通帧。"""
-        return 'pending_manual_review', None
+            on_progress('frame', {'frame': frame_info, 'current': generated_count,
+                                  'total': total_to_generate,
+                                  'guard_pending': bool(guard_pending)})
 
     def _record_frame(seq, item, fx_src_path, fx_uuid, quality_gate, vlm_reason,
-                      cover_reference=None):
+                      cover_reference=None, fx_account_id=None, continuity_check=None,
+                      family_id=None, retry_count=0):
         webp = _webp_path(seq)
         rel_path = os.path.relpath(webp, os.path.dirname(os.path.abspath(__file__))).replace('\\', '/')
         prev_path = _webp_path(seq - 1) if seq > 1 else None
@@ -1385,45 +2284,60 @@ def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=
             'fx_src': os.path.relpath(fx_src_path, os.path.dirname(os.path.abspath(__file__))).replace('\\', '/') if fx_src_path else None,
             'aspect_ratio': config.get('imageAspectRatio') or '9:16',
             'image_size': _image_quality_to_label(config.get('imageQuality')),
-            'retry_count': 0,
+            'retry_count': retry_count,
             'quality_gate': quality_gate,
             'vlm_qa_reason': vlm_reason,
             'parent_hash': "" if cover_reference else (_get_file_hash(reference) if reference else ""),
         }
+        if continuity_check is not None:
+            frame_info['continuity_check'] = continuity_check
+        if family_id:
+            frame_info['family_id'] = family_id
+        if fx_account_id:
+            frame_info['fx_account_id'] = fx_account_id
+            frame_project = (canvas_session.get('projects_by_account') or {}).get(fx_account_id)
+            if frame_project:
+                frame_info['fx_project_url'] = frame_project
         if cover_reference:
             frame_info['anchor_reference'] = 'cover'
         manifest_frames_by_seq[seq] = frame_info
         _save_manifest()  # 浏览器批量任务动辄数分钟，逐帧落盘保证进度可恢复
-        _emit_frame(frame_info)
+        _emit_frame(frame_info, guard_pending=_guard_will_run(seq))
+        return frame_info
 
-    chunks = plan_fx_chunks(gen_seqs)
-    # 声明式硬切（[CUT] 视频槽）：切点后的首帧是新链头——FX 链上表现为该帧必须
-    # 另起一批且不带上一帧参考（否则 Flow UI 链式参考把切点前的外部画面串进室内）。
-    cut_heads = set()
-    for _v_idx, _v in (videos or {}).items():
-        _vm = str(_v.get('meta', '') if isinstance(_v, dict) else '').upper()
-        if 'CUT' in _vm and 'BRIDGE' not in _vm:
-            cut_heads.add(int(_v_idx) + 1)
-    if cut_heads:
-        _split = []
-        for _c in chunks:
-            _cur = []
-            for _s in _c:
-                if _s in cut_heads and _cur:
-                    _split.append(_cur)
-                    _cur = []
-                _cur.append(_s)
-            if _cur:
-                _split.append(_cur)
-        chunks = _split
+    chunks = plan_fx_chunks(
+        gen_seqs, chunk_size=(1 if config.get('_auto_generate_videos') or continuity_mode(config) != 'off' else _FX_CHUNK_SIZE))
+    if target_sequences is not None:
+        chunks = split_fx_chunks_by_canvas(chunks, manifest_frames_by_seq, manifest)
+    # 声明式硬切和过门目标帧都另起一批。新批仍显式挂载上一帧作为参考，所以空间
+    # 血统不断；但外景帧不会再与过门帧挤在同一个 Flow 批内链里，把批内参考惯性放大。
+    threshold_heads = fx_threshold_target_sequences(prompts_by_seq, videos)
+    transition_heads = threshold_heads | fx_camera_cut_target_sequences(prompts_by_seq)
+    chunks = split_fx_chunks_at_heads(chunks, transition_heads)
     chunk_by_start = {c[0]: c for c in chunks}
-    # 批次边界定下来之后才能分账号：按换号节拍，每批绑号池里的下一个号（IP 始终不变）
+    # 批次沿用当前账号，余额耗尽才换号；轮转环仅作故障恢复的候选集合。
     ring = _account_rotation_ring(config, account_pool, pool_account_id) if pool_account_id else []
     leg_by_chunk_start = {
         c[0]: leg for c, leg in zip(chunks, plan_frame_chunk_accounts(
             chunks, ring, _account_switch_interval(config)))
     }
+    if target_sequences is not None:
+        for _chunk in chunks:
+            _owner_account, _owner_project = _fx_frame_canvas_binding(
+                manifest_frames_by_seq.get(_chunk[0]), manifest
+            )
+            if _owner_account:
+                # Iteration must run as the account that owns the target frame;
+                # Flow project URLs are account-scoped and cannot be reopened by
+                # whichever pool account happens to have the highest balance.
+                leg_by_chunk_start[_chunk[0]] = {'user_id': _owner_account, 'pinned': True}
+            if _owner_account and _owner_project:
+                canvas_session.setdefault('projects_by_account', {})[
+                    _owner_account
+                ] = _owner_project
     current_account_id = pool_account_id
+    # 复核换号时用来排除"这条序列已经用过的号"，口径与视频序列的 used_account_ids 一致
+    used_account_ids = [pool_account_id] if pool_account_id else []
     done_seqs = set()
 
     for seq in all_seqs:
@@ -1445,11 +2359,16 @@ def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=
                     'fx_src': os.path.relpath(own_src, os.path.dirname(os.path.abspath(__file__))).replace('\\', '/') if own_src else None,
                     'aspect_ratio': config.get('imageAspectRatio') or '9:16',
                     'image_size': _image_quality_to_label(config.get('imageQuality')),
-                    'retry_count': 0, 'quality_gate': 'pending_manual_review',
+                    'retry_count': 0, 'quality_gate': 'retired',
                     'vlm_qa_reason': None, 'parent_hash': '',
                 }
                 manifest_frames_by_seq[seq] = existing
+            _save_manifest()
             _emit_frame(existing)
+            if chain_guard_review:
+                emit_frame_ready(project_dir, seq, on_progress, generated_count, total_to_generate,
+                                 skipped=True,
+                                 prompt_block=prompt_block if config.get('_auto_generate_videos') else None)
             done_seqs.add(seq)
             continue
 
@@ -1459,34 +2378,82 @@ def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=
         _check_cancel()
 
         cover_ref_src = None
-        if chunk[0] in cut_heads:
-            # 硬切新链头：刻意不带参考起链（一致性靠提示词里的 Scene DNA 复述）
-            ref_path = None
-            if sys.stdout:
-                print(f"[FRAME SEQUENCE][FX] 第 {chunk[0]} 帧是声明式硬切新链头，本批以无参考模式起链（既定语义）")
-        else:
-            ref_path = _fx_find_ref_for(frames_dir, chunk[0])
-            if chunk[0] > 1 and not ref_path and sys.stdout:
-                print(
-                    f"[FRAME SEQUENCE][FX] 第 {chunk[0]} 帧找不到上一帧的 UUID 留档 "
-                    f"(frames/fx_src/img_{chunk[0]-1:03d}_*.jpg)，本批将以无参考模式起链，画面连续性可能下降"
-                )
+        ref_path = _fx_find_ref_for(frames_dir, chunk[0])
 
-        chunk_prompts = [prompts_by_seq[s]['prompt'] for s in chunk]
-        if chunk[0] == 1 and not ref_path:
-            cover_src = resolve_cover_reference(config, title)
+        if chunk[0] == 1:
+            _fx_clear_frame_reference(frames_dir, 1)
+            cover_src = resolve_cover_reference(config, title, project_dir=project_dir)
             if cover_src:
                 ref_path = _fx_cover_ref_jpg(cover_src, frames_dir)
                 cover_ref_src = cover_src
-                # The appended instruction remains the parsed 图片 1 prompt. The cover never
-                # contributes its generation prompt; it is only the uploaded reference image.
-                chunk_prompts[0] = (
-                    f"{IMG2IMG_COVER_REFERENCE_CONTROL_PROMPT}\n\n"
-                    f"IMAGE 1 PROMPT:\n{chunk_prompts[0]}"
+                # The cover is the image reference only. Send the parsed IMAGE 1 prompt verbatim.
+            else:
+                # 链头无封面：纯文生图，不带任何图参考。
+                ref_path = None
+                if on_progress:
+                    on_progress('cover_reference_skipped', {
+                        'sequence': 1,
+                        'message': 'IMG 001 无封面可用，链头改为纯文本生成',
+                    })
+        elif not ref_path:
+            previous_webp = _webp_path(chunk[0] - 1)
+            if not _frame_exists(chunk[0] - 1):
+                raise RuntimeError(
+                    f'无法生成第 {chunk[0]} 帧：缺少上一帧参考图，帧序列禁止退回文生图'
                 )
+            ref_path = _fx_local_frame_ref_jpg(previous_webp, frames_dir, chunk[0] - 1)
+
+        # 过门/硬切目标帧组稿时还没有任何像素可看，只能凭文字空想门后长什么样。
+        # 真正的过门前一帧此刻已经落盘（就是上面刚解出来的 ref_path）——改用它给
+        # 模型看图联想，替掉组稿阶段那份没见过参考图的猜测（2026-08-07 复盘）。
+        if chunk[0] in threshold_heads and ref_path and os.path.exists(ref_path):
+            target_item = prompts_by_seq[chunk[0]]
+            reveal_ctx = _threshold_reveal_context(manifest, chunk[0], frames_dir)
+            # 组稿产物是**状态的唯一权威**（它带着整份梯子写出来，本函数只见得到一张
+            # 闭着门的参考图）。传进去让模型就地订正材质，而不是另写一条把它替换掉。
+            grounded_body = ground_threshold_reveal_prompt(
+                config, ref_path, target_item.get('prompt'),
+                first_entry=reveal_ctx.get('first_entry', True),
+                inherited_state=reveal_ctx.get('inherited_state', ''),
+                carried_structural=reveal_ctx.get('carried_structural', ''),
+                last_seen_image_path=reveal_ctx.get('last_seen_image_path'))
+            if grounded_body:
+                # 拍表送得到时再补一段硬性延续声明；送不到就只有上面那次材质订正，
+                # 状态照样由组稿产物自己守着。
+                clause = threshold_reveal_continuity_clause(
+                    reveal_ctx.get('inherited_state', ''),
+                    reveal_ctx.get('carried_structural', ''))
+                merged = f'{grounded_body}\n\n{clause}'.strip() if clause else grounded_body
+                target_item['prompt'] = fx_prompt_with_bridge_control(
+                    chunk[0], {'prompt': merged}, prompts_by_seq, videos)
+                if on_progress:
+                    on_progress('threshold_reveal_grounded', {
+                        'sequence': chunk[0],
+                        'first_entry': bool(reveal_ctx.get('first_entry', True)),
+                        'message': f'IMG {chunk[0]:03d} 已照过门前一帧的实际画面订正材质（状态按组稿产物保留）',
+                    })
+
+        chunk_prompts = [prompts_by_seq[s]['prompt'] for s in chunk]
         leg = leg_by_chunk_start.get(chunk[0])
+        # 切腿前复核积分：ring 按缓存值一次排定，前面几批烧掉的积分没人记账。
+        # pinned 的腿不动——那是画布归属账号，换号就打不开那块画布。
+        if leg and leg.get('user_id') and not leg.get('pinned') \
+                and leg['user_id'] != current_account_id and pool_account_id:
+            verified = revalidate_leg_account(
+                config, account_pool, leg['user_id'], ring, used_account_ids)
+            if verified and verified != leg['user_id']:
+                if on_progress:
+                    on_progress('account_switch', {
+                        'user_id': verified,
+                        'message': (f"复核积分：原定账号 {leg['user_id']} 已不够用，"
+                                    f"帧 {chunk[0]}~{chunk[-1]} 改用 {verified}"),
+                    })
+                leg = dict(leg, user_id=verified)
+                leg_by_chunk_start[chunk[0]] = leg
         if leg and leg.get('user_id') and leg['user_id'] != current_account_id:
             current_account_id = leg['user_id']
+            if current_account_id not in used_account_ids:
+                used_account_ids.append(current_account_id)
             if on_progress:
                 on_progress('account_switch', {
                     'user_id': leg['user_id'],
@@ -1504,18 +2471,40 @@ def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=
         if sys.stdout:
             print(f"[FRAME SEQUENCE][FX] Google FX 批量生图: 帧 {chunk[0]}~{chunk[-1]} ({len(chunk)} 张), ref={'有' if ref_path else '无'}")
         try:
-            local_paths, temp_out = _run_chunk_batch(chunk_prompts, ref_path, leg)
+            local_paths, temp_out = _run_chunk_batch(
+                chunk_prompts, ref_path, leg, chunk_sequences=chunk,
+                cover_reference=cover_ref_src,
+            )
         except ConnectionError:
             raise
         except Exception as e:
-            if sys.stdout:
-                print(f"[FRAME SEQUENCE][FX] 批量生图失败，3 秒后整批重试一次: {e}")
-            _check_cancel()
-            time.sleep(3.0)
-            local_paths, temp_out = _run_chunk_batch(chunk_prompts, ref_path, leg)
+            saved_prefix = [s for s in chunk if s in checkpointed_seqs]
+            if saved_prefix:
+                raise RuntimeError(
+                    f"Google FX 本批已保存成功前缀 IMG "
+                    f"{'、'.join(f'{s:03d}' for s in saved_prefix)}，"
+                    f"剩余帧生成失败；下次重试会从首个缺失帧继续: {e}"
+                ) from e
+            # Retry ownership lives in google_fx_image and consumes the shared
+            # budget passed by _run_chunk_batch.  Retrying the whole chunk here
+            # used to multiply four service attempts into as many as eight and
+            # regenerated already-paid prefix frames.
+            raise
+
+        if canvas_session.get('project_url'):
+            manifest['google_fx_project_url'] = canvas_session['project_url']
+            manifest['google_fx_project_account_id'] = canvas_session.get('project_account_id')
+        if canvas_session.get('projects_by_account'):
+            manifest['google_fx_projects'] = dict(canvas_session['projects_by_account'])
+        if canvas_session.get('project_url') or canvas_session.get('projects_by_account'):
+            _save_manifest()
 
         try:
             for offset, s in enumerate(chunk):
+                prompt_before_frame = prompt_block
+                if s in checkpointed_seqs:
+                    done_seqs.add(s)
+                    continue
                 item = prompts_by_seq[s]
                 # Only VIDEO slots carry [BRIDGE] tags per the delivery contract; the
                 # incoming transition (VIDEO s-1) is the real signal for IMAGE s.
@@ -1524,17 +2513,14 @@ def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=
                     'BRIDGE' in item.get('meta', '').upper()
                     or 'BRIDGE' in (incoming_video.get('meta', '') if isinstance(incoming_video, dict) else '').upper()
                 )
-                _, fx_src_path, fx_uuid = _fx_store_frame(local_paths[offset], frames_dir, s)
-                if s > 1:
-                    first_frame_path = _webp_path(1)
-                    target_path = _webp_path(s)
-                    if os.path.exists(first_frame_path) and os.path.exists(target_path):
-                        _match_color_lab(target_path, first_frame_path, target_path)
-                prev_ref = _fx_find_ref_for(frames_dir, s)
-                quality_gate, vlm_reason = _run_vlm_qa(s, item, is_bridge, prev_ref)
-                # P1 换族锚点惯性检测（FX 链路只留痕不自动重渲：本批后续帧已链在该帧
-                # 上，中途按 t2i 重渲会与同批链式产物脱节；API 路径有全自动 t2i 兜底）
-                if is_bridge and s > 1 and not vlm_reason:
+                render_src = local_paths[offset]
+                _, fx_src_path, fx_uuid = _fx_store_frame(render_src, frames_dir, s)
+                _align_frame_color(s)
+                quality_gate, vlm_reason = 'retired', None
+
+                # P1 换族锚点惯性检测（本地像素 MAD，不是视觉判定）：FX 链路只留痕
+                # 不自动重渲，本批后续帧已链在该帧上。
+                if is_bridge and s > 1 and not reviews_disabled(config):
                     _stuck, _inertia_mad = detect_anchor_inertia(_webp_path(s), _webp_path(s - 1))
                     if _stuck:
                         vlm_reason = (f"anchor_inertia: 桥接帧与参考帧近乎相同"
@@ -1547,22 +2533,245 @@ def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=
                                 'sequence': s, 'mad': round(_inertia_mad, 2),
                                 'message': f"⚠️ IMG {s:03d} 桥接帧疑似被 i2i 惯性卡死（MAD={_inertia_mad:.2f}），已留痕",
                             })
-                # QA 重生会替换留档，重新定位当前帧的 fx_src
-                cur_ref = _fx_find_ref_for(frames_dir, s + 1)
-                if cur_ref:
-                    fx_src_path, fx_uuid = cur_ref, _fx_extract_uuid(cur_ref)
-                _record_frame(s, item, fx_src_path, fx_uuid, quality_gate, vlm_reason,
-                              cover_reference=(cover_ref_src if s == 1 else None))
+                reference_for_check = cover_ref_src if s == 1 else _webp_path(s - 1)
+                continuity_check, family_id = _continuity_result(
+                    config, project_dir, manifest, continuity_families, videos, s,
+                    item, reference_for_check, _webp_path(s), on_progress=on_progress)
+                continuity_retry_no = 0
+                while _continuity_should_retry(
+                        continuity_check, continuity_retry_no, continuity_retries):
+                    continuity_retry_no += 1
+                    if on_progress:
+                        on_progress('frame_continuity_retry', {
+                            'sequence': s, 'slot': s, 'attempt': continuity_retry_no,
+                            'reason': continuity_check.get('reason'),
+                            'message': (f'IMG {s:03d} 发现场景漂移或推进不足，'
+                                        f'正在通过 Google FX 自动重试 '
+                                        f'{continuity_retry_no}/{continuity_retries}…'),
+                        })
+                    retry_prompt = f'{_CONTINUITY_RETRY_CONTROL}\n\n{item["prompt"]}'.strip()
+                    retry_paths, retry_out = _run_chunk_batch(
+                        [retry_prompt], ref_path, leg, chunk_sequences=[s],
+                        cover_reference=(cover_ref_src if s == 1 else None))
+                    try:
+                        retry_src = retry_paths[0]
+                        _, fx_src_path, fx_uuid = _fx_store_frame(retry_src, frames_dir, s)
+                        render_src = retry_src
+                        _align_frame_color(s)
+                        continuity_check, family_id = _continuity_result(
+                            config, project_dir, manifest, continuity_families, videos, s,
+                            item, reference_for_check, _webp_path(s), on_progress=on_progress)
+                    finally:
+                        shutil.rmtree(retry_out, ignore_errors=True)
+
+                if continuity_check.get('status') == 'failed':
+                    quality_gate = 'frame_continuity_failed'
+                    vlm_reason = continuity_check.get('reason') or '场景连续性检查失败'
+                elif continuity_check.get('status') == 'warned':
+                    vlm_reason = 'CONTINUITY WARN: ' + (
+                        continuity_check.get('reason') or '本地连续性检查留痕')
+                _record_frame(
+                    s, item, fx_src_path, fx_uuid, quality_gate, vlm_reason,
+                    cover_reference=(cover_ref_src if s == 1 else None),
+                    fx_account_id=generated_account_by_path.get(render_src),
+                    continuity_check=continuity_check, family_id=family_id,
+                    retry_count=continuity_retry_no)
                 done_seqs.add(s)
+                if quality_gate == 'frame_continuity_failed':
+                    if on_progress:
+                        on_progress('frame_continuity_failed', {
+                            'sequence': s, 'slot': s,
+                            'message': (f'IMG {s:03d} 连续性检查在自动重试后仍失败，'
+                                        '已暂停续链，避免污染后续帧。'),
+                            'reason': continuity_check.get('reason'),
+                        })
+                    raise FrameContinuityError(
+                        f'IMG {s:03d} 场景连续性检查失败：{continuity_check.get("reason")}')
+
+                # 链上逐拍守卫审查（生成一张审一张）
+                guard_mode = chain_guard_mode(config) if chain_guard_review else 'off'
+                if guard_mode != 'off':
+                    if s == 1:
+                        try:
+                            from chain_guard import run_anchor_guard
+
+                            def _resync_fx_from_disk():
+                                updated_manifest = read_manifest(project_dir)
+                                if updated_manifest and 'frames' in updated_manifest:
+                                    manifest['frames'] = updated_manifest['frames']
+                                    for f_entry in manifest['frames']:
+                                        if f_entry.get('sequence') == s:
+                                            manifest_frames_by_seq[s] = f_entry
+                                            break
+
+                            forward_build = (target_sequences is None)
+                            anchor_res = run_anchor_guard(
+                                config, title, prompt_block, project_dir,
+                                guard_mode=guard_mode, forward_build=forward_build,
+                                on_progress=on_progress,
+                                on_manifest_dirty=_resync_fx_from_disk,
+                                autofix_attempts=_CHAIN_GUARD_AUTOFIX_ATTEMPTS,
+                            )
+                            new_block = anchor_res.get('prompt_block')
+                            if new_block:
+                                prompt_block = new_block
+                            # 首帧判废就停在这里：它是整条 i2i 链的地基，接着往下渲
+                            # 等于让一张已知歪掉的图当所有下游帧的底图。
+                            if anchor_res.get('halt'):
+                                manifest['halted_at_beat'] = 0
+                                manifest['halted_at_sequence'] = 1
+                                break
+                        except GenerationCancelled:
+                            # 自动修复途中用户点了取消：必须原样抛出去，被下面的
+                            # 兜底吞掉就成了"点了取消还在接着渲"。
+                            raise
+                        except Exception as e:
+                            log('WARN', 'CHAIN_GUARD', f"IMG 001 锚点审查异常: {e}")
+                    elif s >= 2:
+                        beat = s - 1
+                        prev_seq = s - 1
+                        prev_file = _webp_path(prev_seq)
+                        if os.path.exists(prev_file):
+                            def _resync_fx_from_disk():
+                                updated_manifest = read_manifest(project_dir)
+                                if updated_manifest and 'frames' in updated_manifest:
+                                    manifest['frames'] = updated_manifest['frames']
+                                    for f_entry in manifest['frames']:
+                                        if f_entry.get('sequence') == s:
+                                            manifest_frames_by_seq[s] = f_entry
+                                            break
+
+                            try:
+                                from chain_guard import (
+                                    guard_beat, guard_autofix_enabled, guard_halt_enabled)
+
+                                forward_build = (target_sequences is None)
+                                guard_res = guard_beat(
+                                    config, title, prompt_block, beat, project_dir,
+                                    on_progress=on_progress,
+                                    allow_halt=forward_build,
+                                )
+                                _resync_fx_from_disk()
+
+                                if guard_res.get('halt') and guard_autofix_enabled(guard_mode) and forward_build:
+                                    from pipeline_orchestrator import fix_frame_issue
+                                    for attempt in range(1, _CHAIN_GUARD_AUTOFIX_ATTEMPTS + 1):
+                                        texts = '；'.join(
+                                            i.get('text') or '' for i in (guard_res.get('issues') or [])
+                                            if i.get('severity') == 'chain') or '结构级链式问题'
+                                        if on_progress:
+                                            on_progress('chain_guard_autofix', {
+                                                'beat': beat, 'sequence': s,
+                                                'attempt': attempt, 'max_attempts': _CHAIN_GUARD_AUTOFIX_ATTEMPTS,
+                                                'issues': guard_res.get('issues', []),
+                                                'message': f"🔧 第 {beat} 拍检出结构级问题，正在就地自动修复 "
+                                                           f"IMG {s:03d}（第 {attempt}/{_CHAIN_GUARD_AUTOFIX_ATTEMPTS} 次）：{texts}",
+                                            })
+                                        try:
+                                            fix_res = fix_frame_issue(
+                                                config, title, prompt_block, s,
+                                                on_progress=on_progress, cascade_downstream=False,
+                                                suppress_chain_guard=True,
+                                            )
+                                        except GenerationCancelled:
+                                            raise
+                                        except Exception as fix_err:
+                                            log('WARN', 'CHAIN_GUARD',
+                                                f"IMG {s:03d} 自动修复第 {attempt} 次未跑成，转为停链: {fix_err}")
+                                            break
+
+                                        if (fix_res or {}).get('rolled_back'):
+                                            log('WARN', 'CHAIN_GUARD',
+                                                f"IMG {s:03d} 自动修复第 {attempt} 次被三联屏门禁退回"
+                                                f"（画面已还原），转为停链等人处理")
+                                            if on_progress:
+                                                on_progress('chain_guard_autofix_rolled_back', {
+                                                    'beat': beat, 'sequence': s, 'attempt': attempt,
+                                                    'triptych': (fix_res or {}).get('triptych'),
+                                                    'rejected_fix': (fix_res or {}).get('rejected_fix'),
+                                                    'message': f"↩️ IMG {s:03d} 第 {attempt} 次自动修复被三联屏门禁退回，"
+                                                               f"画面已还原为修复前，转为停链等人处理",
+                                                })
+                                            _resync_fx_from_disk()
+                                            break
+
+                                        new_block = (fix_res or {}).get('prompt_block')
+                                        if new_block:
+                                            prompt_block = new_block
+                                        _resync_fx_from_disk()
+
+                                        guard_res = guard_beat(
+                                            config, title, prompt_block, beat, project_dir,
+                                            on_progress=on_progress, allow_halt=True,
+                                        )
+                                        _resync_fx_from_disk()
+                                        if not guard_res.get('halt'):
+                                            if on_progress:
+                                                on_progress('chain_guard_autofix_done', {
+                                                    'beat': beat, 'sequence': s, 'attempt': attempt,
+                                                    'message': f"✅ IMG {s:03d} 自动修复后复审通过（第 {attempt} 次），继续往下生成",
+                                                })
+                                            break
+
+                                still_flagged = bool(guard_res.get('halt'))
+                                if still_flagged and guard_halt_enabled(guard_mode):
+                                    manifest['halted_at_beat'] = beat
+                                    manifest['halted_at_sequence'] = s
+                                    if on_progress:
+                                        tail = ('' if guard_mode == 'halt'
+                                                else f"（已自动修复 {_CHAIN_GUARD_AUTOFIX_ATTEMPTS} 次仍未通过）")
+                                        on_progress('chain_guard_halt', {
+                                            'beat': beat,
+                                            'sequence': s,
+                                            'issues': guard_res.get('issues', []),
+                                            'autofix_exhausted': guard_autofix_enabled(guard_mode),
+                                            'message': f"第 {beat} 拍（IMG {prev_seq:03d}→{s:03d}）检出结构级链式问题{tail}，生成已自动暂停，请检查并修复此帧问题。",
+                                        })
+                                    break
+                                if still_flagged and guard_mode == 'autofix_soft' and on_progress:
+                                    # 软档：flag 已写进 manifest，链继续往下走。不发这条事件的话
+                                    # 结构级问题在屏幕上完全无声，只剩收尾汇总里一句没头没尾的
+                                    # 「N 帧一致性审查未过」。
+                                    on_progress('chain_guard_soft_continue', {
+                                        'beat': beat,
+                                        'sequence': s,
+                                        'issues': guard_res.get('issues', []),
+                                        'autofix_exhausted': True,
+                                        'message': f"⚠️ 第 {beat} 拍（IMG {prev_seq:03d}→{s:03d}）仍有结构级问题"
+                                                   f"（已自动修复 {_CHAIN_GUARD_AUTOFIX_ATTEMPTS} 次），软档不停链——"
+                                                   f"已记入待复核清单，继续往下渲。",
+                                    })
+                            except Exception as guard_err:
+                                log('WARN', 'CHAIN_GUARD', f"拍 {beat} 链上守卫执行异常: {guard_err}")
+
+                if manifest.get('halted_at_sequence'):
+                    break
+                refresh_committed_frame_records(project_dir, manifest, manifest_frames_by_seq)
+                if chain_guard_review:
+                    emit_frame_ready(project_dir, s, on_progress, generated_count, total_to_generate,
+                                     prompt_block=prompt_block if config.get('_auto_generate_videos') else None,
+                                     previous_prompt_block=prompt_before_frame)
         finally:
             shutil.rmtree(temp_out, ignore_errors=True)
+
+        if manifest.get('halted_at_sequence'):
+            break
 
     update_manifest_stale_status(manifest, project_dir,
                                  regenerated_sequences=target_sequences, finalize=True)
     _save_manifest()
+    if manifest.get('halted_at_sequence'):
+        manifest['manifest'] = '/' + os.path.relpath(manifest_path, os.path.dirname(os.path.abspath(__file__))).replace('\\', '/')
+        manifest['project_dir'] = os.path.abspath(project_dir)
+        return manifest
     manifest['manifest'] = '/' + os.path.relpath(manifest_path, os.path.dirname(os.path.abspath(__file__))).replace('\\', '/')
     manifest['project_dir'] = os.path.abspath(project_dir)
     return manifest
+
+
+# 已经报过的调色失败原因（见 _match_color_lab 末尾的去重）。进程级，不用加锁：
+# 最坏情况是两个线程同时撞上第一次失败、各报一行，比漏报安全得多。
+_COLOR_MATCH_WARNED = set()
 
 
 def _match_color_lab(source_path, reference_path, output_path):
@@ -1649,68 +2858,19 @@ def _match_color_lab(source_path, reference_path, output_path):
         result_bgr = cv2.cvtColor(merged.astype(np.uint8), cv2.COLOR_LAB2BGR)
         _imwrite_unicode(output_path, result_bgr)
     except Exception as e:
-        if sys.stdout:
-            print(f"[COLOR MATCH] Warning: LAB color matching failed: {e}")
-
-
-# P0 门框清除兜底的最大额外推进次数：换族室内侧帧渲出后若门框仍在画面里，
-# 以该帧为参考用推进版控制指令"再往里推一步"，最多推这么多次。
-_DOOR_CLEARANCE_MAX_PUSHES = 2
-
-
-def _door_clearance_push_prompt(dc_reason, final_attempt=False):
-    """定向门框清除推进指令：把上一轮 VLM 判定的具体残留位置（dc_reason）写回
-    控制指令，而不是重复原样的 IMG2IMG_BRIDGE_CONTROL_PROMPT。根因是通用推进指令
-    对每一轮都下发同一句话，i2i 编辑模型给出同样保守的结果——2026-07-16 岩湖贝壳
-    单 img_005 连续两推、每次都换了措辞的失败原因，画面仍残留门框，印证"泛化推进"
-    对已经推不动的模型无效，必须把失败点明确点名让模型针对性纠正。"""
-    reason_text = dc_reason.split(':', 1)[-1].strip() if dc_reason else ''
-    prompt = (
-        IMG2IMG_BRIDGE_CONTROL_PROMPT +
-        "\n\nDOOR CLEARANCE CORRECTION (mandatory, overrides any timid edit): an automated visual "
-        "audit of the attached source image just found it still shows doorway/threshold remnants"
-        + (f" — specifically: {reason_text}." if reason_text else ".") +
-        " Push the camera decisively further past the threshold than the source image shows: "
-        "every door frame, door leaf, jamb, and threshold/sill edge named above must be pushed "
-        "completely out of frame this time. Do not repeat a small, partial, or timid advance — "
-        "interior walls, ceiling, and floor must fill the frame edge to edge with zero doorway "
-        "silhouette remaining anywhere in the shot."
-    )
-    if final_attempt:
-        prompt += (
-            " This is the last correction attempt budgeted for this frame: push further than "
-            "feels natural rather than risk leaving any sliver of the doorway visible."
-        )
-    return prompt
-
-
-# 过门帧「原始度」兜底的最大修正次数：室内首现帧渲出后若仍带人工痕迹/过于整洁，
-# 以该帧自身为参考做定向状态修正，最多修这么多次。比门框清除少一次——这一步不改
-# 构图只改内容，改不动通常是模型不肯加脏，多刷一轮的边际收益很低。
-_RAW_STATE_MAX_FIXES = 1
-
-
-def _raw_state_fix_prompt(rs_reason):
-    """定向「回退到未被触碰状态」指令：把上一轮 VLM 判定的具体问题（rs_reason，例如
-    "地面被扫干净/角落码着整齐的木料"）写回控制指令，而不是只下发通用的
-    IMG2IMG_RAW_STATE_CONTROL_PROMPT——与门框清除加推同一条经验：泛化指令对已经渲成
-    这样的模型没有纠正力，必须点名失败点。"""
-    reason_text = rs_reason.split(':', 1)[-1].strip() if rs_reason else ''
-    return (
-        IMG2IMG_RAW_STATE_CONTROL_PROMPT +
-        "\n\nRAW STATE CORRECTION (mandatory, overrides any timid edit): an automated visual audit "
-        "of the attached source image just found it still reads as touched or tidied"
-        + (f" — specifically: {reason_text}." if reason_text else ".") +
-        " Fix exactly that, decisively: whatever was named above must be gone or undone in the "
-        "returned image, and the space must end up visibly filthier and more derelict than the "
-        "source frame, never cleaner. Keep the camera and composition identical."
-    )
+        # 缺 cv2/numpy 是进程级的环境问题，不是"这一帧"的问题：原样每帧报一次，
+        # 一次生成就刷 41 条一模一样的告警（实测），把日志冲满却只承载一个事实。
+        # 按消息去重，同一种失败原因一个进程只报第一次。
+        key = f"{type(e).__name__}:{e}"
+        if key not in _COLOR_MATCH_WARNED:
+            _COLOR_MATCH_WARNED.add(key)
+            log('WARN', 'FRAMES', f"帧间调色不可用，已跳过（本进程仅提示一次）: {e}")
 
 
 # 换族/桥接锚点帧的 i2i 惯性判据（2026-07-15 盐湖贝壳单标定）：桥接帧与其参考帧的
 # 64px 灰度缩略 MAD——被参考惯性卡死渲成复制帧的 img_005/img_006 为 1.56/2.17，
 # 正常施工推进对最低 4.8，真实换族 47。i2i 参考惯性压过"进入新空间"文本指令时，
-# 提示词修辞救不了，只能丢参考按 t2i 新链头重渲（TBCP 硬切同款语义）。
+# Near-copy detection triggers another i2i push; frame rendering never drops its reference.
 _ANCHOR_INERTIA_MAD = 3.0
 
 
@@ -1734,15 +2894,15 @@ def detect_anchor_inertia(rendered_path, reference_path):
         return False, None
 
 
-def generate_frame_sequence(config, title, prompt_block, on_progress=None, target_sequences=None):
+def generate_frame_sequence(config, title, prompt_block, on_progress=None, target_sequences=None, chain_guard_review=True):
     if (config.get('imageBackend') or 'api').strip().lower() == 'google_fx':
         return _generate_frame_sequence_google_fx(
             config, title, prompt_block,
             on_progress=on_progress, target_sequences=target_sequences,
+            chain_guard_review=chain_guard_review,
         )
     from prompt_pipeline import (
-        _parse_prompt_slots, image_space_family, check_door_clearance_frame,
-        check_first_interior_reveal_raw_state,
+        _parse_prompt_slots, image_space_family, cover_reference_is_same_layer,
     )
     images, videos = _parse_prompt_slots(prompt_block)
 
@@ -1759,6 +2919,9 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
 
     if not prompts:
         raise RuntimeError('未在 prompt_block 中找到任何 图片 N: 提示词')
+    prompts_by_seq = {int(item['index']): item for item in prompts}
+    continuity_families = _continuity_family_maps(prompts_by_seq, videos)
+    continuity_retries = continuity_max_retries(config)
 
     def _check_cancel():
         if on_progress and on_progress('cancel_check', None):
@@ -1773,6 +2936,7 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
         'title': title,
         'created_at': time.strftime('%Y-%m-%d %H:%M:%S'),
         'method': 'A_single_chain',
+        'generation_mode': 'standard',
         'aspect_ratio': config.get('imageAspectRatio') or '9:16',
         'image_size': _image_quality_to_label(config.get('imageQuality')),
         'control_prompt': IMG2IMG_CONTROL_PROMPT,
@@ -1784,25 +2948,43 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
             with open(manifest_path, 'r', encoding='utf-8') as f:
                 existing_manifest = json.load(f)
                 if isinstance(existing_manifest, dict) and 'frames' in existing_manifest:
-                    manifest['frames'] = existing_manifest['frames']
+                    if isinstance(existing_manifest['frames'], list):
+                        manifest['frames'] = [f for f in existing_manifest['frames'] if isinstance(f, dict)]
                     manifest['created_at'] = existing_manifest.get('created_at', manifest['created_at'])
-                    # 未知键保留（与 FX 路径同款）：分段渲染间隙写入的 reanchors/
-                    # anchor_recalibrations 等记录不能被逐帧落盘的重建 manifest 抹掉
+                    # 未知键保留（与 FX 路径同款）：别的写入方落进 manifest 的键
+                    # 不能被逐帧落盘的重建 manifest 抹掉
                     for _k, _v in existing_manifest.items():
                         if _k not in manifest:
                             manifest[_k] = _v
+                    # generation_mode 记的是「这一单是什么模式」，不是「这一趟怎么
+                    # 渲的」（后者看 method）。上面那圈合并救不回它——基础 dict 里
+                    # 已经硬写了 'standard'。误跑一趟标准渲染就把一单 4选1 的记录
+                    # 抹平，服务端此后再也认不出它该走 4选1（见 server_common.
+                    # resolve_candidate_selection_mode 的 manifest 兜底）。
+                    _prev_mode = existing_manifest.get('generation_mode')
+                    if isinstance(_prev_mode, str) and _prev_mode.strip():
+                        manifest['generation_mode'] = _prev_mode
         except Exception:
             pass
 
+    manifest.pop('halted_at_beat', None)
+    manifest.pop('halted_at_sequence', None)
+
+    total_to_generate = len(target_sequences) if target_sequences is not None else len(prompts)
     if on_progress:
-        total_to_generate = len(target_sequences) if target_sequences is not None else len(prompts)
         on_progress('start', {'total': total_to_generate})
 
-    manifest_frames_by_seq = {f['sequence']: f for f in manifest['frames']}
+    manifest_frames_by_seq = {
+        int(f.get('sequence') or f.get('slot')): f
+        for f in manifest.get('frames', [])
+        if isinstance(f, dict) and (f.get('sequence') or f.get('slot'))
+    }
 
     previous_path = None
     generated_count = 0
+    frames_regenerated = False
     for item in prompts:
+        prompt_before_frame = prompt_block
         # 用提示词块里的真实槽位号，绝不能用枚举位置：单帧/子集渲染时
         # prompt_block 可能只含目标槽位，枚举位置永远从 1 开始，
         # 会导致 `seq in target_sequences` 永假 → 一帧不渲染，
@@ -1825,15 +3007,25 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
         # we can skip the external API call and use the existing file immediately.
         already_exists = os.path.exists(target_path) and os.path.getsize(target_path) > 0
         skip_api_call = already_exists and (target_sequences is None)
+        if not skip_api_call:
+            frames_regenerated = True
 
+        # 确保重渲前已有历史帧安全归档入候选池，不被新生成覆盖
+        if not skip_api_call and already_exists:
+            try:
+                from candidate_selection_pipeline import sync_frame_candidates_pool
+                sync_frame_candidates_pool(frames_dir, seq, current_frame=manifest_frames_by_seq.get(seq), auto_archive_current=True)
+            except Exception:
+                pass
+
+        existing_frame = manifest_frames_by_seq.get(seq)
         model = ""
         retries = 0
         vlm_qa_reason = None
         transport = None  # 非 None = 本帧不是走 /images/edits 渲的，见 chat_transport_note
         cover_anchor = False
-        # Only VIDEO slots carry [BRIDGE]/[BRIDGE TURN]/[CUT] tags per the delivery contract;
-        # the incoming transition (VIDEO seq-1) is the real signal for IMAGE seq, not the
-        # image's own tag.
+        # Threshold tags live on the incoming VIDEO; a generic camera cut is
+        # declared on its target IMAGE so it need not imply a door crossing.
         incoming_video = videos.get(seq - 1)
         incoming_meta = (incoming_video.get('meta', '') if isinstance(incoming_video, dict) else '').upper()
         is_bridge = (
@@ -1842,18 +3034,83 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
         )
         # pan 变体的单一过门拍：合并镜头（推进+转向）用合并版控制指令
         is_turn = 'TURN' in incoming_meta
-        # 声明式硬切（[CUT]）：本帧是切点后的室内首帧——不拿上一帧当参考，走 t2i
-        # 新链头（一致性靠提示词里的 Scene DNA 复述），之后的帧从这帧继续 i2i 链
+        # CUT changes the edit instruction, but does not break the image-reference chain.
         is_cut_head = ('CUT' in incoming_meta) and ('BRIDGE' not in incoming_meta)
-        cover_ref = (resolve_cover_reference(config, title)
+        is_camera_cut = is_camera_cut_frame(item.get('meta', ''))
+        is_continuity_transition = is_transition_frame(
+            seq, item.get('meta', ''), incoming_meta, _continuity_beat(manifest, seq))
+        cover_ref = (resolve_cover_reference(config, title, project_dir=project_dir)
                      if seq == 1 and not skip_api_call else None)
+        # 跨空间层守卫（2026-08-02 复盘）：首帧的图参考只能是**同层**的封面。
+        # 封面是"左 before / 右 after"的营销拼接图或用户随手选的一张内景图时，
+        # 参考图的空间语义会压过文本语义——那单 IMAGE 1 写的是空荒原接收基坑的外景，
+        # 封面是内景，出图直接变成舱内，整条 A_single_chain 从第一帧起就换了题材。
+        # 跨层/拼接一律退化为纯文本生成（首帧是链头，它可以没有图参考；后续帧不行）。
+        cover_layer_block = ''
+        if cover_ref:
+            _declared_family = image_space_family(videos, seq)
+            _usable, _layer, _why = cover_reference_is_same_layer(config, cover_ref, _declared_family)
+            if not _usable:
+                cover_layer_block = _why
+                cover_ref = None
+                if sys.stdout:
+                    print(f"[FRAME SEQUENCE] IMG 001 跳过封面参考，改走纯文本生成：{_why}")
+                if on_progress:
+                    on_progress('cover_reference_skipped', {
+                        'sequence': seq, 'cover_layer': _layer,
+                        'declared_family': _declared_family,
+                        'message': f"IMG 001 未复用封面作参考（{_why}），本帧改为纯文本生成",
+                    })
         if not skip_api_call:
             cover_anchor = bool(cover_ref)
-            use_text_generation = (not cover_anchor) and (
-                seq == 1 or is_cut_head
-                or not previous_path or not os.path.exists(previous_path))
-            model = _image_generation_model(config) if use_text_generation else _image_edit_model(config)
-            reference = cover_ref if cover_anchor else (previous_path if not use_text_generation else None)
+            coverless_head = seq == 1 and not cover_ref and not cover_layer_block
+            if coverless_head and on_progress:
+                on_progress('cover_reference_skipped', {
+                    'sequence': seq,
+                    'message': 'IMG 001 无封面可用，链头改为纯文本生成',
+                })
+            reference = cover_ref if cover_anchor else (previous_path if seq > 1 else None)
+            # A targeted/subset prompt block may contain only ``IMAGE N``.  In
+            # that case the loop never visits IMAGE N-1, but the durable chain
+            # parent is still available on disk.  Resolve it by the real slot
+            # number instead of silently treating the subset's first item as
+            # frame 1 (or rejecting a valid retry for lack of ``previous_path``).
+            if not reference and seq > 1:
+                durable_parent = os.path.join(frames_dir, f'img_{seq - 1:03d}.webp')
+                if os.path.exists(durable_parent) and os.path.getsize(durable_parent) > 0:
+                    reference = durable_parent
+            # 跨层守卫放行的首帧是唯一允许无图参考的帧（它本来就是链头）；
+            # 其余帧缺参考仍然是硬错误——退回文生图会直接断掉血统。
+            text_only_head = seq == 1 and (bool(cover_layer_block) or coverless_head)
+            if not text_only_head and (not reference or not os.path.exists(reference)):
+                raise RuntimeError(f'无法生成第 {seq} 帧：缺少上一帧参考图，帧序列禁止退回文生图')
+            # 过门/硬切目标帧组稿时还没有任何像素可看，只能凭文字空想门后长什么样。
+            # 真正的过门前一帧此刻已经落盘（就是上面刚解出来的 reference）——改用它给
+            # 模型看图联想，替掉组稿阶段那份没见过参考图的猜测（2026-08-07 复盘）。
+            if (is_bridge or is_cut_head) and not cover_anchor and reference and os.path.exists(reference):
+                from prompt_pipeline import (
+                    ground_threshold_reveal_prompt, threshold_reveal_continuity_clause)
+                reveal_ctx = _threshold_reveal_context(manifest, seq, frames_dir)
+                # 组稿产物是**状态的唯一权威**：传进去就地订正材质，不再另写一条替换它。
+                grounded_body = ground_threshold_reveal_prompt(
+                    config, reference, item.get('prompt'),
+                    first_entry=reveal_ctx.get('first_entry', True),
+                    inherited_state=reveal_ctx.get('inherited_state', ''),
+                    carried_structural=reveal_ctx.get('carried_structural', ''),
+                    last_seen_image_path=reveal_ctx.get('last_seen_image_path'))
+                if grounded_body:
+                    # 拍表送得到时再补一段硬性延续声明；送不到就只有上面那次材质订正。
+                    clause = threshold_reveal_continuity_clause(
+                        reveal_ctx.get('inherited_state', ''),
+                        reveal_ctx.get('carried_structural', ''))
+                    item['prompt'] = f'{grounded_body}\n\n{clause}'.strip() if clause else grounded_body
+                    if on_progress:
+                        on_progress('threshold_reveal_grounded', {
+                            'sequence': seq,
+                            'first_entry': bool(reveal_ctx.get('first_entry', True)),
+                            'message': f'IMG {seq:03d} 已照过门前一帧的实际画面订正材质（状态按组稿产物保留）',
+                        })
+            model = _image_generation_model(config) if text_only_head else _image_edit_model(config)
             if on_progress:
                 on_progress('frame_start', {
                     'slot': item['index'],
@@ -1863,21 +3120,34 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
 
             ctrl_prompt = IMG2IMG_CONTROL_PROMPT
             try:
-                if use_text_generation:
+                if text_only_head:
+                    # 跨层守卫：首帧无图参考，纯文本生成（唯一允许的 t2i 帧，见上）
                     _generate_text_image(config, item['prompt'], target_path)
                 else:
                     if cover_anchor:
-                        ctrl_prompt = IMG2IMG_COVER_REFERENCE_CONTROL_PROMPT
-                    elif is_turn:
-                        ctrl_prompt = IMG2IMG_BRIDGE_TURN_CONTROL_PROMPT
-                    elif is_bridge:
-                        ctrl_prompt = IMG2IMG_BRIDGE_CONTROL_PROMPT
+                        # No generic prefix or label: send the parsed IMAGE 1 prompt verbatim.
+                        ctrl_prompt = ''
+                    elif is_turn or is_bridge or is_cut_head:
+                        # TBCP v7：过门前一帧的门是关死的，参考图里没有任何室内像素，
+                        # 三种过门（直推/转向/切入）在图像侧因此完全同构——推进版与
+                        # 转向版指令都以"参考帧里有可放大/可旋转的室内"为前提，在闭门
+                        # 参考下只会得到那扇门的裁剪放大。统一走弱参考揭示指令。
+                        ctrl_prompt = IMG2IMG_CROSSING_REVEAL_CONTROL_PROMPT
+                    elif is_camera_cut:
+                        ctrl_prompt = IMG2IMG_CAMERA_CUT_CONTROL_PROMPT
                     else:
+                        # 过门/转向是全画幅相机运动，区域锁在语义上不适用，维持原样；
+                        # 只有静态镜头下的常规拍才用这拍已声明的网格坐标收紧锁定范围。
                         ctrl_prompt = IMG2IMG_CONTROL_PROMPT
+                        _region_cells = changed_grid_cells(
+                            item.get('prompt', ''), _continuity_beat(manifest, seq))
+                        if _region_cells:
+                            ctrl_prompt += _REGION_LOCK_TEMPLATE.format(
+                                cells=', '.join(_region_cells))
                     transport = _generate_image_edit(config, item['prompt'], reference,
                                                      target_path, control_prompt=ctrl_prompt)
                     if transport == CHAT_TRANSPORT and on_progress:
-                        # 换了通道就当场说清楚，不能只在 manifest 里留个字段等人去翻
+                        # This is a transport fallback; the request remains image-to-image.
                         on_progress('transport_fallback', {
                             'sequence': seq, 'transport': transport,
                             'degraded': not _chat_transport_is_full_quality(config),
@@ -1897,214 +3167,126 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
                 # 的逻辑吞掉——否则用户点了取消，这里却把它当成一次普通生成失败去重试。
                 if isinstance(gen_err, GenerationCancelled):
                     raise
-                if use_text_generation or cover_anchor:
-                    retries += 1
-                    log('WARN', 'FRAME_SEQ', f"首帧生成失败，重试文生图: {gen_err}")
-                    _generate_text_image(config, item['prompt'], target_path)
-                    cover_anchor = False
-                    reference = None
-                    model = _image_generation_model(config)
-                else:
-                    log('ERROR', 'FRAME_SEQ', f"第 {seq} 帧图生图失败（后续帧无法回退成文生图）: {gen_err}")
-                    raise RuntimeError(f"第 {seq} 帧图生图失败: {gen_err}")
+                log('ERROR', 'FRAME_SEQ', f"第 {seq} 帧图生图失败（禁止回退文生图）: {gen_err}")
+                raise RuntimeError(f"第 {seq} 帧图生图失败: {gen_err}")
 
-            # Apply LAB color matching to prevent pink drift
-            if seq > 1 and os.path.exists(target_path):
+            # Apply LAB color matching to prevent pink drift.  A new camera family owns a
+            # separate colour baseline; forcing every interior frame toward IMAGE 1's outdoor
+            # palette is itself a continuity defect.
+            if not reviews_disabled(config) and seq > 1 and os.path.exists(target_path):
                 first_frame_path = os.path.join(frames_dir, 'img_001.webp')
-                if os.path.exists(first_frame_path):
+                color_reference = (None if is_continuity_transition else
+                                   _continuity_color_reference(
+                                       config, project_dir, continuity_families, seq,
+                                       first_frame_path))
+                if color_reference and os.path.exists(color_reference):
                     if sys.stdout:
-                        print(f"[COLOR MATCH] Aligning frame {seq} color to baseline first frame.")
-                    _match_color_lab(target_path, first_frame_path, target_path)
+                        print(f"[COLOR MATCH] Aligning frame {seq} color to family baseline.")
+                    _match_color_lab(target_path, color_reference, target_path)
 
             # P1 换族锚点惯性兜底（2026-07-15 盐湖贝壳单）：桥接帧由 i2i 生成时，
             # 参考惯性可能压过"进入新空间"的文本指令，渲出上一帧的近似复制帧——
             # 规划好的过门没执行，新空间在下一帧硬现身造成空间断裂。渲后与参考帧
-            # 本地比对，近乎相同 = 惯性卡死 → 丢参考按 t2i 新链头重渲一次（TBCP
-            # 硬切同款语义，一致性靠提示词里的场景 DNA 复述）；t2i 失败保留原帧留痕。
-            if not use_text_generation and is_bridge:
+            # 本地比对，近乎相同 = 惯性卡死，再以同一参考图做一次更强的 i2i 推进。
+            # anchorInertiaAutoRetry=false 时仍然检测、仍然留痕，只是不自动重渲：
+            # 检测本身是纯本地零成本的客观测量，关掉它等于让"桥接帧被惯性卡死"
+            # 静默发生；有成本、有误判风险的是后面那次加强重渲，开关管的是它。
+            if is_bridge and not reviews_disabled(config):
                 stuck, inertia_mad = detect_anchor_inertia(target_path, previous_path)
+                if stuck and not gate_setting('anchorInertiaAutoRetry', config):
+                    vlm_qa_reason = (f"anchor_inertia: 与参考帧近乎相同（MAD={inertia_mad:.2f}），"
+                                     f"自动重渲已按配置关闭（anchorInertiaAutoRetry=false），"
+                                     f"建议人工重渲该帧及其后续族段")
+                    if sys.stdout:
+                        print(f"[ANCHOR INERTIA] Frame {seq} {vlm_qa_reason}")
+                    if on_progress:
+                        on_progress('anchor_inertia', {
+                            'sequence': seq, 'mad': round(inertia_mad, 2),
+                            'message': (f"⚠️ IMG {seq:03d} 桥接帧疑似被 i2i 惯性卡死"
+                                        f"（MAD={inertia_mad:.2f}），自动重渲已关闭，已留痕"),
+                        })
+                    stuck = False
                 if stuck:
                     if sys.stdout:
                         print(f"[ANCHOR INERTIA] Frame {seq} 与参考帧近乎相同（MAD={inertia_mad:.2f} < "
-                              f"{_ANCHOR_INERTIA_MAD}），i2i 惯性未执行换族——改以 t2i 新链头重渲")
+                              f"{_ANCHOR_INERTIA_MAD}），i2i 惯性未执行换族——加强图生图指令重渲")
                     if on_progress:
                         on_progress('anchor_inertia', {
                             'sequence': seq, 'mad': round(inertia_mad, 2),
                             'message': (f"IMG {seq:03d} 桥接帧被 i2i 参考惯性卡死"
-                                        f"（与参考帧 MAD={inertia_mad:.2f}），正以 t2i 新链头重渲…"),
+                                        f"（与参考帧 MAD={inertia_mad:.2f}），正加强图生图指令重渲…"),
                         })
                     try:
-                        _generate_text_image(config, item['prompt'], target_path)
-                        model = _image_generation_model(config)
+                        transport = _generate_image_edit(
+                            config, item['prompt'], previous_path, target_path,
+                            control_prompt=IMG2IMG_CROSSING_REVEAL_CONTROL_PROMPT)
+                        model = _image_edit_model(config)
                         retries += 1
-                        reference = None  # 本帧已脱链成 t2i 新链头，如实记录
+                        reference = previous_path
                         first_frame_path = os.path.join(frames_dir, 'img_001.webp')
-                        if os.path.exists(first_frame_path):
-                            _match_color_lab(target_path, first_frame_path, target_path)
+                        color_reference = (None if is_continuity_transition else
+                                           _continuity_color_reference(
+                                               config, project_dir, continuity_families, seq,
+                                               first_frame_path))
+                        if color_reference and os.path.exists(color_reference):
+                            _match_color_lab(target_path, color_reference, target_path)
                     except QuotaExhaustedError:
                         # 配额耗尽原样上抛，与主渲染路径同一套处置：不再切兜底模型，
-                        # 也不咽成"t2i 兜底失败"留个复读帧继续往下渲——下一帧照样会
+                        # 也不吞掉失败后继续往下渲——下一帧照样会
                         # 撞同一堵墙，不如就地停在真因上。
                         raise
                     except Exception as inertia_err:
                         vlm_qa_reason = (f"anchor_inertia: 与参考帧近乎相同（MAD={inertia_mad:.2f}）"
-                                         f"且 t2i 兜底失败（{inertia_err}），保留 i2i 原帧待人工重试")
+                                         f"且 i2i 加强重试失败（{inertia_err}），保留原帧待人工重试")
                         if sys.stdout:
-                            print(f"[ANCHOR INERTIA] Frame {seq} t2i 兜底失败（{inertia_err}），保留原帧并留痕")
+                            print(f"[ANCHOR INERTIA] Frame {seq} i2i 加强重试失败（{inertia_err}），保留原帧并留痕")
 
-            # P0 门框清除兜底：单一过门拍产出的室内定格帧由 i2i 保守编辑生成——上一张
-            # 外部参考帧门框占满画面时，编辑模型经常只做保守裁切，门框残留导致室内
-            # 占比过小。渲出后立即对真实像素做单项 VLM 判定，未通过则以刚渲出的帧为
-            # 参考、用推进版控制指令再推一步（把"过门"拆成两次连续推进），最多
-            # _DOOR_CLEARANCE_MAX_PUSHES 次；推完仍不过只留痕，绝不拦渲染（终审交给
-            # 整套序列一致性审查）。
-            if (not use_text_generation and is_bridge
-                    and image_space_family(videos, seq) == 'interior'):
-                for _push in range(_DOOR_CLEARANCE_MAX_PUSHES + 1):
-                    dc_passed, dc_reason = check_door_clearance_frame(config, target_path)
-                    if on_progress:
-                        _verdict = '通过' if dc_passed else '未通过'
-                        _detail = f"（{dc_reason}）" if dc_reason and dc_reason != 'PASS' else ''
-                        on_progress('door_clearance', {
-                            'sequence': seq, 'passed': bool(dc_passed),
-                            'reason': dc_reason, 'push': _push,
-                            'message': f"门框清除检查 IMG {seq:03d}：{_verdict}{_detail}",
-                        })
-                    if dc_passed:
-                        break
-                    if _push >= _DOOR_CLEARANCE_MAX_PUSHES:
-                        vlm_qa_reason = dc_reason
-                        if sys.stdout:
-                            print(f"[DOOR CLEARANCE] Frame {seq} still shows the door frame after "
-                                  f"{_DOOR_CLEARANCE_MAX_PUSHES} extra push(es); keeping the frame "
-                                  f"and recording the reason for the sequence review.")
-                        break
-                    push_ref = target_path + '.doorpush.webp'
-                    is_final_push = (_push == _DOOR_CLEARANCE_MAX_PUSHES - 1)
-                    try:
-                        shutil.copyfile(target_path, push_ref)
-                        if is_final_push:
-                            # 前一轮 i2i 加推已经证实推不动——它仍然是拿同一张已经卡死
-                            # 构图的参考帧去编辑，模型只会给出同样保守的结果（2026-07-22
-                            # 喀斯特洞穴/沙漠花岗岩两单实测：2/2 次门框清除加推全部失败，
-                            # 画面构图几乎原地不动）。最后一次不再编辑卡死的参考图，改成
-                            # 丢参考按 t2i 新链头重渲（一致性靠提示词里的场景 DNA 复述，
-                            # 与 anchor_inertia 卡死兜底同款语义），才有机会真正跳出锁死
-                            # 的构图；t2i 失败会落进下面的 except，保留当前帧并留痕。
-                            if sys.stdout:
-                                print(f"[DOOR CLEARANCE] Frame {seq} failed door clearance twice "
-                                      f"({dc_reason}); i2i pushes from the same stuck reference can't "
-                                      f"break the locked composition — final attempt drops the "
-                                      f"reference and re-renders via t2i.")
-                            _generate_text_image(config, item['prompt'], target_path)
-                            model = _image_generation_model(config)
-                            reference = None
-                        else:
-                            if sys.stdout:
-                                print(f"[DOOR CLEARANCE] Frame {seq} failed door clearance "
-                                      f"({dc_reason}); pushing one more step past the threshold.")
-                            push_transport = _generate_image_edit(
-                                config, item['prompt'], push_ref, target_path,
-                                control_prompt=_door_clearance_push_prompt(
-                                    dc_reason, final_attempt=is_final_push))
-                            # 加推这一步落进降档通道，最终落盘的就是降档帧——照样留痕
-                            if push_transport == CHAT_TRANSPORT:
-                                transport = push_transport
-                        retries += 1
-                        first_frame_path = os.path.join(frames_dir, 'img_001.webp')
-                        if os.path.exists(first_frame_path):
-                            _match_color_lab(target_path, first_frame_path, target_path)
-                    except Exception as push_err:
-                        # 取消信号必须原样穿透，不能被"留痕后继续"吞掉——否则用户点了
-                        # 取消，这个门框清除的加推步骤却把它当成一次普通失败吸收掉，
-                        # 循环会继续渲下一帧，取消形同没生效。
-                        if isinstance(push_err, GenerationCancelled):
-                            raise
-                        # 再推失败：保留当前帧（已通过正常生成路径），留痕后继续
-                        vlm_qa_reason = dc_reason
-                        if sys.stdout:
-                            print(f"[DOOR CLEARANCE] Extra push for frame {seq} failed "
-                                  f"({push_err}); keeping the current frame.")
-                        break
-                    finally:
-                        try:
-                            if os.path.exists(push_ref):
-                                os.remove(push_ref)
-                        except OSError:
-                            pass
+            continuity_check, _family_id = _continuity_result(
+                config, project_dir, manifest, continuity_families, videos, seq,
+                item, reference, target_path, on_progress=on_progress)
+            continuity_retry_no = 0
+            while _continuity_should_retry(
+                    continuity_check, continuity_retry_no, continuity_retries):
+                continuity_retry_no += 1
+                if on_progress:
+                    on_progress('frame_continuity_retry', {
+                        'sequence': seq, 'slot': seq, 'attempt': continuity_retry_no,
+                        'reason': continuity_check.get('reason'),
+                        'message': (f'IMG {seq:03d} 发现场景漂移或推进不足，'
+                                    f'正在自动重试 {continuity_retry_no}/{continuity_retries}…'),
+                    })
+                retry_control = f'{ctrl_prompt}\n\n{_CONTINUITY_RETRY_CONTROL}'.strip()
+                transport = _generate_image_edit(
+                    config, item['prompt'], reference, target_path,
+                    control_prompt=retry_control)
+                retries += 1
+                if seq > 1:
+                    first_frame_path = os.path.join(frames_dir, 'img_001.webp')
+                    color_reference = (None if is_continuity_transition else
+                                       _continuity_color_reference(
+                                           config, project_dir, continuity_families, seq,
+                                           first_frame_path))
+                    if color_reference and os.path.exists(color_reference):
+                        _match_color_lab(target_path, color_reference, target_path)
+                continuity_check, _family_id = _continuity_result(
+                    config, project_dir, manifest, continuity_families, videos, seq,
+                    item, reference, target_path, on_progress=on_progress)
 
-            # P0 过门帧原始度兜底（2026-07-26 用户实测："过门帧有人工痕迹，不够原始"）：
-            # 门框已经出画不代表这一帧对了——i2i 编辑模型进到室内后普遍把空间渲得像被
-            # 布景过（地面扫净、杂物码整齐、表面看着刚修过），而按契约这一帧必须是没人
-            # 进来过的废墟（下一拍的清理工序才动它）。文字契约与事后文本校验都只能管到
-            # 提示词，这里对真实像素把关：未通过则以该帧自身为参考做定向状态修正（镜头
-            # 不动，只改内容），最多 _RAW_STATE_MAX_FIXES 次；修完仍不过只留痕，绝不拦
-            # 渲染（终审交给整套序列一致性审查）。
-            if (not use_text_generation and is_bridge
-                    and image_space_family(videos, seq) == 'interior'):
-                for _fix in range(_RAW_STATE_MAX_FIXES + 1):
-                    rs_passed, rs_reason = check_first_interior_reveal_raw_state(config, target_path)
-                    if on_progress:
-                        _verdict = '通过' if rs_passed else '未通过'
-                        _detail = f"（{rs_reason}）" if rs_reason and rs_reason != 'PASS' else ''
-                        on_progress('raw_state', {
-                            'sequence': seq, 'passed': bool(rs_passed),
-                            'reason': rs_reason, 'fix': _fix,
-                            'message': f"过门帧原始度检查 IMG {seq:03d}：{_verdict}{_detail}",
-                        })
-                    if rs_passed:
-                        break
-                    if _fix >= _RAW_STATE_MAX_FIXES:
-                        # 门框清除若也失败过，它的原因已经写进 vlm_qa_reason——两条都留，
-                        # 序列审查/帧网格要看到的是这一帧全部未通过的项，不是最后一项。
-                        vlm_qa_reason = '; '.join(x for x in (vlm_qa_reason, rs_reason) if x)
-                        if sys.stdout:
-                            print(f"[RAW STATE] Frame {seq} still reads as touched/tidied after "
-                                  f"{_RAW_STATE_MAX_FIXES} correction(s); keeping the frame and "
-                                  f"recording the reason for the sequence review.")
-                        break
-                    fix_ref = target_path + '.rawstate.webp'
-                    try:
-                        shutil.copyfile(target_path, fix_ref)
-                        if sys.stdout:
-                            print(f"[RAW STATE] Frame {seq} failed the raw-state audit "
-                                  f"({rs_reason}); re-editing it back to an untouched ruin.")
-                        fix_transport = _generate_image_edit(
-                            config, item['prompt'], fix_ref, target_path,
-                            control_prompt=_raw_state_fix_prompt(rs_reason))
-                        # 这一步落进降档通道，最终落盘的就是降档帧——照样留痕
-                        if fix_transport == CHAT_TRANSPORT:
-                            transport = fix_transport
-                        retries += 1
-                        first_frame_path = os.path.join(frames_dir, 'img_001.webp')
-                        if os.path.exists(first_frame_path):
-                            _match_color_lab(target_path, first_frame_path, target_path)
-                    except Exception as fix_err:
-                        # 取消信号必须原样穿透（同门框清除加推：不能被"留痕后继续"吞掉）
-                        if isinstance(fix_err, GenerationCancelled):
-                            raise
-                        vlm_qa_reason = '; '.join(x for x in (vlm_qa_reason, rs_reason) if x)
-                        if sys.stdout:
-                            print(f"[RAW STATE] Raw-state correction for frame {seq} failed "
-                                  f"({fix_err}); keeping the current frame.")
-                        break
-                    finally:
-                        try:
-                            if os.path.exists(fix_ref):
-                                os.remove(fix_ref)
-                        except OSError:
-                            pass
-
-            # 不再逐帧质检——一致性审查移到整套序列渲染完成后统一跑一次，对着真实
-            # 画面判断（见 pipeline_orchestrator._sequence_consistency_review）。
-            current_quality_gate = 'pending_manual_review'
+            continuity_failed = continuity_check.get('status') == 'failed'
+            current_quality_gate = (
+                'frame_continuity_failed' if continuity_failed else 'retired')
+            if continuity_check.get('status') == 'warned':
+                _warning = continuity_check.get('reason') or '本地连续性检查留痕'
+                vlm_qa_reason = f'CONTINUITY WARN: {_warning}'
+            elif continuity_failed:
+                vlm_qa_reason = continuity_check.get('reason') or '场景连续性检查失败'
         else:
             reference = previous_path if seq > 1 else None
             existing_frame = manifest_frames_by_seq.get(seq)
             model = existing_frame.get('model', '') if existing_frame else _image_generation_model(config)
             retries = existing_frame.get('retry_count', 0) if existing_frame else 0
             
-            current_quality_gate = existing_frame.get('quality_gate', 'pending_manual_review') if existing_frame else 'pending_manual_review'
+            current_quality_gate = existing_frame.get('quality_gate', 'retired') if existing_frame else 'retired'
             vlm_qa_reason = existing_frame.get('vlm_qa_reason') if existing_frame else None
             # 断点续传复用盘上这一帧时，降档留痕要跟着一起沿用——这一帧还是上一轮那张
             # 降档图，重放一次 manifest 不能把它洗成"正常帧"
@@ -2115,6 +3297,10 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
                 existing_ref = existing_frame.get('reference')
                 if existing_ref:
                     reference = os.path.join(os.path.dirname(os.path.abspath(__file__)), existing_ref)
+            elif seq == 1 and existing_frame and existing_frame.get('anchor_reference') == 'text_only':
+                # 同上：跨层守卫的留痕在断点续传里必须跟着盘上那张图一起沿用，
+                # 否则重放一次 manifest 就把"这帧是纯文本生成的"洗没了。
+                cover_layer_block = existing_frame.get('anchor_reference_reason') or '跨空间层，未复用封面参考'
 
         rel_path = os.path.relpath(target_path, os.path.dirname(os.path.abspath(__file__))).replace('\\', '/')
         
@@ -2123,8 +3309,7 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
             if skip_api_call and existing_frame and existing_frame.get('parent_hash'):
                 p_hash = existing_frame['parent_hash']
             elif reference and previous_path and os.path.exists(previous_path):
-                # t2i 链头（首帧/硬切/惯性兜底重渲）reference=None：血统在此断开，
-                # 不记上一帧哈希——parent_hash 只描述真实的 i2i 派生关系
+                # parent_hash records the durable previous-frame link in the i2i chain.
                 p_hash = _get_file_hash(previous_path)
 
         frame_info = {
@@ -2143,8 +3328,16 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
             'vlm_qa_reason': vlm_qa_reason,
             'parent_hash': p_hash,
         }
+        if not skip_api_call:
+            frame_info['continuity_check'] = continuity_check
+            frame_info['family_id'] = _family_id
         if cover_anchor:
             frame_info['anchor_reference'] = 'cover'
+        elif cover_layer_block:
+            # 跨层守卫命中：这一帧没有图参考，纯文本生成。留痕，让"为什么首帧没挂封面"
+            # 在 manifest 与帧网格上是显式事实，而不是一个看不出来的静默降级。
+            frame_info['anchor_reference'] = 'text_only'
+            frame_info['anchor_reference_reason'] = cover_layer_block
         if transport == CHAT_TRANSPORT:
             # 换过通道的帧如实标注。image_size 记的是"请求的档位"，这里再记一份真实
             # 像素——请求 2K/4K 时 chat 通道只给 1K，不记就会有 1K 帧混进后续挑帧/合成
@@ -2168,10 +3361,106 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
         # 一致性审查的留痕同理：这一帧没重渲，结论与它绑定的帧内容指纹都还成立。
         # 不带过来的话指纹会丢，drop_stale_review_verdicts 之后就再也无法判断这条
         # 结论是否过期（等于永久停在"看着像审过"的状态）。
+        # prompt_dirty（提示词被手动改过、画面还没跟上，见 /api/edit_prompts）同理：
+        # 这一帧没重渲，图与新提示词照旧对不上，标记必须留着；真重渲过的帧不带过来，
+        # 那张图就是按新提示词出的。
         if skip_api_call and existing_frame:
-            for key in ('review_frames_sha256', 'reviewed_at', 'review_issues'):
+            for key in ('review_frames_sha256', 'reviewed_at', 'review_issues',
+                        'continuity_check', 'family_id', 'prompt_dirty', 'prompt_dirty_at'):
                 if existing_frame.get(key) is not None:
                     frame_info[key] = existing_frame[key]
+
+        # 保留全量帧序列产物到候选池（不删除、不覆盖，全量累积）
+        if not skip_api_call and os.path.exists(target_path):
+            cand_dir = os.path.join(frames_dir, 'candidates', f'frame_{seq:03d}')
+            os.makedirs(cand_dir, exist_ok=True)
+            meta_file = os.path.join(cand_dir, 'candidates_meta.json')
+            existing_cands_meta = []
+            if os.path.exists(meta_file):
+                try:
+                    with open(meta_file, 'r', encoding='utf-8') as f:
+                        m_payload = json.load(f)
+                        if isinstance(m_payload, dict) and isinstance(m_payload.get('candidates'), list):
+                            existing_cands_meta = [c for c in m_payload['candidates'] if isinstance(c, dict)]
+                except Exception:
+                    existing_cands_meta = []
+
+            max_c_idx = 0
+            for cm in existing_cands_meta:
+                try:
+                    c_idx = int(cm.get('index') or 0)
+                    if c_idx > max_c_idx:
+                        max_c_idx = c_idx
+                except (TypeError, ValueError):
+                    pass
+            if not existing_cands_meta and os.path.isdir(cand_dir):
+                for fname in os.listdir(cand_dir):
+                    m = re.match(r'^candidate_(\d+)(?:_.*)?\.webp$', fname)
+                    if m:
+                        try:
+                            max_c_idx = max(max_c_idx, int(m.group(1)))
+                        except ValueError:
+                            pass
+
+            new_c_idx = max_c_idx + 1
+            cand_file_dest = os.path.join(cand_dir, f'candidate_{new_c_idx}.webp')
+            try:
+                shutil.copy2(target_path, cand_file_dest)
+            except Exception:
+                pass
+
+            c_model = model or config.get('imageModel') or 'gemini-3.1-flash-image'
+            c_model_display = 'GPT-2' if 'gpt' in str(c_model).lower() else ('Google FX' if ('google_fx' in str(c_model).lower() or (existing_frame and existing_frame.get('fx_uuid'))) else 'Gemini')
+            new_cand_meta = {
+                'index': new_c_idx,
+                'path': cand_file_dest,
+                'raw_src': cand_file_dest,
+                'fx_uuid': existing_frame.get('fx_uuid') if existing_frame else None,
+                'model': c_model,
+                'model_display': c_model_display,
+                'score': 85,
+                'strengths': '标准生成帧',
+                'defects': '',
+            }
+            existing_cands_meta.append(new_cand_meta)
+            try:
+                with open(meta_file, 'w', encoding='utf-8') as f:
+                    json.dump({'sequence': seq, 'candidates': existing_cands_meta}, f, ensure_ascii=False, indent=2)
+            except Exception:
+                pass
+
+            try:
+                from candidate_selection_pipeline import sync_frame_candidates_pool
+                synced_cands, chosen_idx, _ = sync_frame_candidates_pool(
+                    frames_dir, seq,
+                    current_frame={'chosen_candidate_index': new_c_idx, 'candidates': existing_cands_meta, 'model': c_model},
+                    target_path=target_path,
+                    auto_archive_current=False
+                )
+                frame_info['candidates'] = synced_cands
+                frame_info['chosen_candidate_index'] = chosen_idx or new_c_idx
+            except Exception:
+                pass
+        elif skip_api_call and existing_frame and existing_frame.get('candidates'):
+            frame_info['candidates'] = existing_frame['candidates']
+            if existing_frame.get('chosen_candidate_index'):
+                frame_info['chosen_candidate_index'] = existing_frame['chosen_candidate_index']
+
+        # 候选池兜底补齐：无论何种模型（含 gpt-image-2）与复用路径，确保候选池与 manifest 全量同步
+        if not frame_info.get('candidates') or len(frame_info.get('candidates', [])) == 0:
+            try:
+                from candidate_selection_pipeline import sync_frame_candidates_pool
+                synced_cands, chosen_idx, _ = sync_frame_candidates_pool(
+                    frames_dir, seq,
+                    current_frame=existing_frame,
+                    target_path=target_path,
+                    auto_archive_current=True
+                )
+                if synced_cands:
+                    frame_info['candidates'] = synced_cands
+                    frame_info['chosen_candidate_index'] = chosen_idx or (existing_frame.get('chosen_candidate_index') if existing_frame else 1) or 1
+            except Exception:
+                pass
 
         manifest_frames_by_seq[seq] = frame_info
         previous_path = target_path
@@ -2180,18 +3469,258 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
         # 逐帧落盘（与 FX 路径一致）：旧行为只在整轮结束时写一次 manifest，
         # 中途崩溃会丢掉所有逐帧质检门禁记录，劣化帧拦截随之失效
         manifest['frames'] = [manifest_frames_by_seq[s] for s in sorted(manifest_frames_by_seq.keys())]
-        update_manifest_stale_status(manifest, project_dir)
-        write_manifest(project_dir, manifest)
+        update_manifest_stale_status(manifest, project_dir, frames_changed=frames_regenerated)
+        write_frame_manifest(project_dir, manifest, preserve_video_state=bool(config.get('_auto_generate_videos')))
 
         if on_progress:
-            on_progress('frame', {'frame': frame_info, 'current': generated_count, 'total': total_to_generate})
+            # guard_pending：这一帧落盘后还有一道链上守卫要审（见下面的守卫分支）。
+            # 事件里的 quality_gate 是守卫**跑之前**的读数，前端拿它打的"质检通过"
+            # 并不是审查结论——不声明这一点，用户就会先看到绿的、过一会儿卡片变红。
+            _guard_pending = (
+                (chain_guard_mode(config) if chain_guard_review else 'off') != 'off'
+                and (seq == 1 or os.path.exists(os.path.join(frames_dir, f'img_{seq - 1:03d}.webp')))
+            )
+            on_progress('frame', {'frame': frame_info, 'current': generated_count,
+                                  'total': total_to_generate,
+                                  'guard_pending': bool(_guard_pending)})
+
+        if not skip_api_call and current_quality_gate == 'frame_continuity_failed':
+            if on_progress:
+                on_progress('frame_continuity_failed', {
+                    'sequence': seq, 'slot': seq,
+                    'message': (f'IMG {seq:03d} 连续性检查在自动重试后仍失败，'
+                                '已暂停续链，避免污染后续帧。'),
+                    'reason': continuity_check.get('reason'),
+                })
+            raise FrameContinuityError(
+                f'IMG {seq:03d} 场景连续性检查失败：{continuity_check.get("reason")}')
+
+        # 链上逐拍守卫审查（生成一张审一张）
+        guard_mode = chain_guard_mode(config) if chain_guard_review else 'off'
+        if seq == 1 and guard_mode != 'off':
+            # 首帧没有"上一拍"可比，走锚点审查：拿它跟爆款原片首帧/封面对标机位、
+            # 空间尺度与初始毛坯状态。FX 分支与 4选1 分支都有这一段，API 分支漏了——
+            # 而首帧是整条 i2i 链的地基，它歪了后面每一帧都跟着歪。
+            try:
+                from chain_guard import run_anchor_guard
+
+                def _resync_anchor_from_disk():
+                    updated_manifest = read_manifest(project_dir)
+                    if not (updated_manifest and 'frames' in updated_manifest):
+                        return
+                    for f_entry in updated_manifest['frames']:
+                        if f_entry.get('sequence') == 1:
+                            # 守卫是隔着磁盘改 manifest 的；本函数收尾会整份写盘，
+                            # 不把结论搬回内存副本就会被盖掉。
+                            frame_info.update({
+                                k: v for k, v in f_entry.items()
+                                if k in ('inline_anchor_review', 'quality_gate',
+                                         'vlm_qa_reason', 'flag_origin', 'review_issues')
+                            })
+                            manifest_frames_by_seq[1] = frame_info
+                            break
+
+                anchor_res = run_anchor_guard(
+                    config, title, prompt_block, project_dir,
+                    guard_mode=guard_mode,
+                    forward_build=(target_sequences is None),
+                    on_progress=on_progress,
+                    on_manifest_dirty=_resync_anchor_from_disk,
+                    autofix_attempts=_CHAIN_GUARD_AUTOFIX_ATTEMPTS,
+                )
+                new_block = anchor_res.get('prompt_block')
+                if new_block:
+                    prompt_block = new_block
+                # 首帧判废就停在这里：它是整条 i2i 链的地基，接着往下渲等于让一张
+                # 已知歪掉的图当所有下游帧的底图。
+                if anchor_res.get('halt'):
+                    manifest['halted_at_beat'] = 0
+                    manifest['halted_at_sequence'] = 1
+                    break
+            except GenerationCancelled:
+                # 自动修复途中用户点了取消：必须原样抛出去，被下面的兜底吞掉
+                # 就成了"点了取消还在接着渲"。
+                raise
+            except Exception as anchor_err:
+                log('WARN', 'CHAIN_GUARD', f"IMG 001 锚点审查异常: {anchor_err}")
+        elif seq >= 2 and guard_mode != 'off':
+            beat = seq - 1
+            prev_seq = seq - 1
+            prev_file = os.path.join(frames_dir, f'img_{prev_seq:03d}.webp')
+            if os.path.exists(prev_file):
+                try:
+                    from chain_guard import (
+                        guard_beat, guard_autofix_enabled, guard_halt_enabled)
+
+                    def _resync_from_disk():
+                        """守卫与自动修复都是隔着磁盘改 manifest 的，改完必须把这一份
+                        内存副本追上去——否则本函数收尾那次整份写盘会把它们全盖掉。"""
+                        updated_manifest = read_manifest(project_dir)
+                        if updated_manifest and 'frames' in updated_manifest:
+                            manifest['frames'] = updated_manifest['frames']
+                            for f_entry in manifest['frames']:
+                                if f_entry.get('sequence') == seq:
+                                    manifest_frames_by_seq[seq] = f_entry
+                                    break
+
+                    forward_build = (target_sequences is None)
+                    guard_res = guard_beat(
+                        config, title, prompt_block, beat, project_dir,
+                        on_progress=on_progress,
+                        allow_halt=forward_build,
+                    )
+                    _resync_from_disk()
+
+                    # autofix：就地走一遍「修复此帧问题」，复审过了就接着往下渲。
+                    if guard_res.get('halt') and guard_autofix_enabled(guard_mode) and forward_build:
+                        from pipeline_orchestrator import fix_frame_issue
+                        for attempt in range(1, _CHAIN_GUARD_AUTOFIX_ATTEMPTS + 1):
+                            texts = '；'.join(
+                                i.get('text') or '' for i in (guard_res.get('issues') or [])
+                                if i.get('severity') == 'chain') or '结构级链式问题'
+                            if on_progress:
+                                on_progress('chain_guard_autofix', {
+                                    'beat': beat, 'sequence': seq,
+                                    'attempt': attempt, 'max_attempts': _CHAIN_GUARD_AUTOFIX_ATTEMPTS,
+                                    'issues': guard_res.get('issues', []),
+                                    'message': f"🔧 第 {beat} 拍检出结构级问题，正在就地自动修复 "
+                                               f"IMG {seq:03d}（第 {attempt}/{_CHAIN_GUARD_AUTOFIX_ATTEMPTS} 次）：{texts}",
+                                })
+                            try:
+                                fix_res = fix_frame_issue(
+                                    config, title, prompt_block, seq,
+                                    on_progress=on_progress, cascade_downstream=False,
+                                    suppress_chain_guard=True,
+                                )
+                            except GenerationCancelled:
+                                raise
+                            except Exception as fix_err:
+                                log('WARN', 'CHAIN_GUARD',
+                                    f"IMG {seq:03d} 自动修复第 {attempt} 次未跑成，转为停链: {fix_err}")
+                                break
+
+                            if (fix_res or {}).get('rolled_back'):
+                                log('WARN', 'CHAIN_GUARD',
+                                    f"IMG {seq:03d} 自动修复第 {attempt} 次被三联屏门禁退回"
+                                    f"（画面已还原），转为停链等人处理")
+                                if on_progress:
+                                    on_progress('chain_guard_autofix_rolled_back', {
+                                        'beat': beat, 'sequence': seq, 'attempt': attempt,
+                                        'triptych': (fix_res or {}).get('triptych'),
+                                        'rejected_fix': (fix_res or {}).get('rejected_fix'),
+                                        'message': f"↩️ IMG {seq:03d} 第 {attempt} 次自动修复被三联屏门禁退回，"
+                                                   f"画面已还原为修复前，转为停链等人处理",
+                                    })
+                                _resync_from_disk()
+                                break
+
+                            new_block = (fix_res or {}).get('prompt_block')
+                            if new_block:
+                                prompt_block = new_block
+                            _resync_from_disk()
+
+                            guard_res = guard_beat(
+                                config, title, prompt_block, beat, project_dir,
+                                on_progress=on_progress, allow_halt=True,
+                            )
+                            _resync_from_disk()
+                            if not guard_res.get('halt'):
+                                if on_progress:
+                                    on_progress('chain_guard_autofix_done', {
+                                        'beat': beat, 'sequence': seq, 'attempt': attempt,
+                                        'message': f"✅ IMG {seq:03d} 自动修复后复审通过（第 {attempt} 次），继续往下生成",
+                                    })
+                                break
+
+                    still_flagged = bool(guard_res.get('halt'))
+                    if still_flagged and guard_halt_enabled(guard_mode):
+                        manifest['halted_at_beat'] = beat
+                        manifest['halted_at_sequence'] = seq
+                        if on_progress:
+                            tail = ('' if guard_mode == 'halt'
+                                    else f"（已自动修复 {_CHAIN_GUARD_AUTOFIX_ATTEMPTS} 次仍未通过）")
+                            on_progress('chain_guard_halt', {
+                                'beat': beat,
+                                'sequence': seq,
+                                'issues': guard_res.get('issues', []),
+                                'autofix_exhausted': guard_autofix_enabled(guard_mode),
+                                'message': f"第 {beat} 拍（IMG {prev_seq:03d}→{seq:03d}）检出结构级链式问题{tail}，生成已自动暂停，请检查并修复此帧问题。",
+                            })
+                        break
+                    if still_flagged and guard_mode == 'autofix_soft' and on_progress:
+                        # 软档：flag 已写进 manifest，链继续往下走（见入口一同款说明）。
+                        on_progress('chain_guard_soft_continue', {
+                            'beat': beat,
+                            'sequence': seq,
+                            'issues': guard_res.get('issues', []),
+                            'autofix_exhausted': True,
+                            'message': f"⚠️ 第 {beat} 拍（IMG {prev_seq:03d}→{seq:03d}）仍有结构级问题"
+                                       f"（已自动修复 {_CHAIN_GUARD_AUTOFIX_ATTEMPTS} 次），软档不停链——"
+                                       f"已记入待复核清单，继续往下渲。",
+                        })
+                except Exception as guard_err:
+                    log('WARN', 'CHAIN_GUARD', f"拍 {beat} 链上守卫执行异常: {guard_err}")
+
+        refresh_committed_frame_records(project_dir, manifest, manifest_frames_by_seq)
+        if chain_guard_review:
+            emit_frame_ready(project_dir, seq, on_progress, generated_count, total_to_generate,
+                             skipped=skip_api_call,
+                             prompt_block=prompt_block if config.get('_auto_generate_videos') else None,
+                             previous_prompt_block=prompt_before_frame)
 
     manifest['frames'] = [manifest_frames_by_seq[s] for s in sorted(manifest_frames_by_seq.keys())]
     update_manifest_stale_status(manifest, project_dir,
-                                 regenerated_sequences=target_sequences, finalize=True)
+                                 regenerated_sequences=target_sequences, finalize=True,
+                                 frames_changed=frames_regenerated)
+    if manifest.get('halted_at_sequence'):
+        write_frame_manifest(project_dir, manifest, preserve_video_state=bool(config.get('_auto_generate_videos')))
+        manifest['manifest'] = '/' + os.path.relpath(manifest_path, os.path.dirname(os.path.abspath(__file__))).replace('\\', '/')
+        manifest['project_dir'] = os.path.abspath(project_dir)
+        return manifest
+
+    # Beat↔图像 1:1 硬闸（仅在全量渲染时检查——子集/单帧重试天然不会覆盖全集，
+    # 用这条闸会误杀合法的定向重渲）。规划阶段的 outline_one_to_one_violations
+    # 只校验文本层的 beat ladder，这里补上渲染层的收口：落盘的帧号集合必须与
+    # prompt_block 里声明的 IMAGE N 集合完全相等，不多不少、不重不漏。
+    if target_sequences is None:
+        expected_seqs = sorted(prompts_by_seq.keys())
+        actual_seqs = sorted(manifest_frames_by_seq.keys())
+        if actual_seqs != expected_seqs:
+            missing = sorted(set(expected_seqs) - set(actual_seqs))
+            extra = sorted(set(actual_seqs) - set(expected_seqs))
+            raise RuntimeError(
+                f'帧序列与 beat 列表映射失守：期望 {len(expected_seqs)} 帧 {expected_seqs}，'
+                f'实际落盘 {len(actual_seqs)} 帧 {actual_seqs}'
+                + (f'，缺失 {missing}' if missing else '')
+                + (f'，多出 {extra}' if extra else ''))
+
+    # FFmpeg 五宫格拼图质检 + 连续性 QA 报告（仅全量渲染时生成；子集/单帧重试不
+    # 覆盖全集，拼图意义不大，且会用不完整的帧集反复覆盖已有的完整拼图）。
+    # continuity_check 已经在逐帧渲染时算过一次并存进 manifest['frames']，这里只
+    # 汇总，不重新跑 ORB 比对。ffmpeg 缺失或拼图失败按 best-effort 处理，不影响
+    # 渲染任务本身的成败——质检产物缺失本身不该拖垮已经渲完的一整单。
+    if target_sequences is None:
+        try:
+            from pathlib import Path
+            from tools.collage import build_keyframe_collage
+            frame_paths = [
+                Path(frames_dir) / f'img_{s:03d}.webp'
+                for s in sorted(manifest_frames_by_seq.keys())
+            ]
+            frame_paths = [p for p in frame_paths if p.exists()]
+            collage_name = f"{os.path.basename(os.path.normpath(project_dir))}_collage.jpg"
+            collage_path = build_keyframe_collage(frame_paths, Path(project_dir) / collage_name)
+            if collage_path:
+                manifest['collage_url'] = '/' + os.path.relpath(
+                    str(collage_path),
+                    os.path.dirname(os.path.abspath(__file__))).replace('\\', '/')
+
+        except Exception as collage_err:
+            if sys.stdout:
+                print(f"[COLLAGE QA] 拼图生成失败（不影响渲染结果）：{collage_err}")
 
     manifest_path = os.path.join(project_dir, 'manifest.json')
-    write_manifest(project_dir, manifest)
+    write_frame_manifest(project_dir, manifest, preserve_video_state=bool(config.get('_auto_generate_videos')))
     manifest['manifest'] = '/' + os.path.relpath(manifest_path, os.path.dirname(os.path.abspath(__file__))).replace('\\', '/')
     manifest['project_dir'] = os.path.abspath(project_dir)
     return manifest

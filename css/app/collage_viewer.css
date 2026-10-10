@@ -1,0 +1,1135 @@
+/* =====================================================================
+   Interactive 5-Column Collage Viewer & Benchmark Compare Slider Styles
+   ===================================================================== */
+
+.collage-viewer-modal {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: rgba(0, 0, 0, 0.88);
+    backdrop-filter: blur(12px);
+}
+
+.cv-modal-content {
+    background: #0d111a;
+    border: 1px solid rgba(0, 245, 212, 0.3);
+    border-radius: var(--radius-lg);
+    box-shadow: 0 25px 60px rgba(0, 0, 0, 0.8), 0 0 35px rgba(0, 245, 212, 0.15);
+    width: 96vw;
+    height: 94vh;
+    max-width: 1750px;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    animation: cvModalPop 0.22s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+@keyframes cvModalPop {
+    from { opacity: 0; transform: scale(0.97); }
+    to { opacity: 1; transform: scale(1); }
+}
+
+/* ── 头部与工具栏 ────────────────────────────────────────── */
+
+.cv-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 10px 18px;
+    background: rgba(13, 20, 32, 0.95);
+    border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+    gap: 14px;
+    flex-wrap: wrap;
+    z-index: 20;
+}
+
+.cv-header-left {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+.cv-title-icon {
+    font-size: 22px;
+}
+
+.cv-title-text h3 {
+    margin: 0;
+    font-size: var(--fs-base);
+    font-weight: 700;
+    color: #fff;
+    letter-spacing: 0.3px;
+}
+
+.cv-subtitle {
+    font-size: var(--fs-xs);
+    color: #94a3b8;
+}
+
+.cv-toolbar {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+}
+
+.cv-toolgroup {
+    display: inline-flex;
+    align-items: center;
+    background: rgba(255, 255, 255, 0.05);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: var(--radius-sm);
+    padding: 2px;
+    gap: 2px;
+}
+
+.cv-tool-btn {
+    background: transparent;
+    border: none;
+    color: #cbd5e1;
+    font-size: var(--fs-sm);
+    padding: 4px 8px;
+    border-radius: var(--radius-xs);
+    cursor: pointer;
+    transition: all 0.15s ease;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-family: inherit;
+    white-space: nowrap;
+}
+
+.cv-tool-btn:hover {
+    background: rgba(255, 255, 255, 0.1);
+    color: #fff;
+}
+
+.cv-tool-btn.is-active {
+    background: var(--neon-cyan, #00f5d4);
+    color: #0d111a;
+    font-weight: 700;
+    box-shadow: 0 0 10px rgba(0, 245, 212, 0.35);
+}
+
+.cv-zoom-display {
+    font-size: var(--fs-sm);
+    font-family: var(--font-mono, monospace);
+    color: #94a3b8;
+    padding: 0 6px;
+    min-width: 40px;
+    text-align: center;
+}
+
+/* ── 主体区域 ────────────────────────────────────────────── */
+
+.cv-body {
+    flex: 1;
+    position: relative;
+    overflow: hidden;
+    background: #080a10;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+/* ── 5列拼图画布 ─────────────────────────────────────────── */
+
+.cv-canvas-viewport {
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    position: relative;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: grab;
+    user-select: none;
+    touch-action: none;
+}
+
+.cv-canvas-transform {
+    transform-origin: center center;
+    transition: transform 0.04s linear;
+    display: inline-block;
+}
+
+.cv-image-container {
+    position: relative;
+    display: inline-block;
+    box-shadow: 0 10px 40px rgba(0, 0, 0, 0.8);
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    border-radius: var(--radius-xs);
+    overflow: hidden;
+}
+
+.cv-collage-img {
+    display: block;
+    max-width: 100%;
+    max-height: 80vh;
+    object-fit: contain;
+    pointer-events: none;
+}
+
+/* 滤镜效果 */
+.cv-filter-mono {
+    filter: grayscale(100%) contrast(115%);
+}
+
+.cv-filter-contrast {
+    filter: contrast(180%) brightness(95%);
+}
+
+/* ── 5列拼图单帧可点热区 (Collage Frame Hotspots) ── */
+.cv-collage-hotspot-grid {
+    position: absolute;
+    inset: 0;
+    display: grid;
+    pointer-events: auto;
+    z-index: 5;
+}
+
+.cv-collage-hotspot-cell {
+    position: relative;
+    cursor: pointer;
+    border: 1px solid transparent;
+    transition: all 0.18s cubic-bezier(0.4, 0, 0.2, 1);
+    box-sizing: border-box;
+}
+
+.cv-collage-hotspot-cell:hover {
+    border-color: var(--neon-cyan, #00f5d4);
+    background: rgba(0, 245, 212, 0.12);
+    box-shadow: inset 0 0 15px rgba(0, 245, 212, 0.35);
+    z-index: 6;
+}
+
+.cv-hotspot-tag {
+    position: absolute;
+    bottom: 6px;
+    left: 50%;
+    transform: translateX(-50%) translateY(4px);
+    background: rgba(0, 0, 0, 0.85);
+    color: var(--neon-cyan, #00f5d4);
+    border: 1px solid rgba(0, 245, 212, 0.5);
+    padding: 2px 8px;
+    border-radius: var(--radius-xs);
+    font-size: var(--fs-xs);
+    font-weight: 700;
+    font-family: var(--font-mono, monospace);
+    opacity: 0;
+    pointer-events: none;
+    transition: all 0.18s cubic-bezier(0.4, 0, 0.2, 1);
+    white-space: nowrap;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.5);
+}
+
+.cv-collage-hotspot-cell:hover .cv-hotspot-tag {
+    opacity: 1;
+    transform: translateX(-50%) translateY(0);
+}
+
+/* ── 动态多宫格单元格 (Dynamic Grid Cells) ── */
+.cv-dyn-grid {
+    display: grid;
+    grid-template-columns: repeat(5, 240px);
+    gap: 6px;
+    background: #000;
+    padding: 6px;
+    border-radius: var(--radius-sm);
+}
+
+.cv-dyn-cell {
+    position: relative;
+    cursor: pointer;
+    overflow: hidden;
+    border-radius: var(--radius-xs);
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    background: #000;
+    transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+    aspect-ratio: 9/16;
+}
+
+.cv-dyn-cell img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    display: block;
+    pointer-events: none;
+    transition: transform 0.2s ease;
+}
+
+.cv-dyn-cell:hover {
+    border-color: var(--neon-cyan, #00f5d4);
+    transform: scale(1.03);
+    box-shadow: 0 4px 16px rgba(0, 245, 212, 0.35);
+    z-index: 5;
+}
+
+.cv-dyn-cell:hover img {
+    transform: scale(1.02);
+}
+
+.cv-dyn-cell-label {
+    position: absolute;
+    top: 4px;
+    left: 4px;
+    background: rgba(0, 0, 0, 0.75);
+    color: #fff;
+    font-size: var(--fs-2xs);
+    font-weight: 700;
+    font-family: var(--font-mono, monospace);
+    padding: 2px 6px;
+    border-radius: 3px;
+    pointer-events: none;
+}
+
+.cv-dyn-cell-zoom-icon {
+    position: absolute;
+    bottom: 6px;
+    right: 6px;
+    background: rgba(0, 0, 0, 0.85);
+    color: var(--neon-cyan, #00f5d4);
+    border: 1px solid rgba(0, 245, 212, 0.4);
+    font-size: var(--fs-xs);
+    font-weight: 600;
+    padding: 2px 6px;
+    border-radius: var(--radius-xs);
+    opacity: 0;
+    transform: translateY(3px);
+    transition: all 0.18s ease;
+    pointer-events: none;
+}
+
+.cv-dyn-cell:hover .cv-dyn-cell-zoom-icon {
+    opacity: 1;
+    transform: translateY(0);
+}
+
+/* ── 辅助基准线系统 ───────────────────────────────────────── */
+
+.cv-guidelines-layer {
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    z-index: 8;
+}
+
+/* 水平地平基准线 */
+.cv-line-horizon {
+    position: absolute;
+    left: 0;
+    right: 0;
+    height: 2px;
+    background: rgba(0, 245, 212, 0.9);
+    box-shadow: 0 0 8px rgba(0, 245, 212, 0.85);
+    cursor: row-resize;
+    pointer-events: auto;
+    z-index: 12;
+    touch-action: none;
+}
+
+.cv-line-handle {
+    position: absolute;
+    right: 8px;
+    top: -20px;
+    background: rgba(0, 245, 212, 0.95);
+    color: #000;
+    font-size: var(--fs-2xs);
+    font-weight: 700;
+    padding: 1px 6px;
+    border-radius: 3px;
+    font-family: var(--font-mono, monospace);
+    pointer-events: none;
+    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.6);
+}
+
+/* 三分线 */
+.cv-grid-thirds {
+    position: absolute;
+    inset: 0;
+}
+
+.cv-thirds-v {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    width: 1px;
+    background: rgba(255, 255, 255, 0.2);
+    border-right: 1px dashed rgba(0, 245, 212, 0.45);
+}
+
+.cv-thirds-h {
+    position: absolute;
+    left: 0;
+    right: 0;
+    height: 1px;
+    background: rgba(255, 255, 255, 0.2);
+    border-bottom: 1px dashed rgba(0, 245, 212, 0.45);
+}
+
+/* 透视十字线 */
+.cv-crosshair {
+    position: absolute;
+    inset: 0;
+}
+
+.cv-cross-v {
+    position: absolute;
+    left: 50%;
+    top: 0;
+    bottom: 0;
+    width: 1px;
+    background: rgba(239, 68, 68, 0.75);
+    box-shadow: 0 0 4px rgba(239, 68, 68, 0.6);
+}
+
+.cv-cross-h {
+    position: absolute;
+    top: 50%;
+    left: 0;
+    right: 0;
+    height: 1px;
+    background: rgba(239, 68, 68, 0.75);
+    box-shadow: 0 0 4px rgba(239, 68, 68, 0.6);
+}
+
+/* ── 局部放大镜 (Loupe Magnifier) ────────────────────────── */
+
+.cv-loupe-magnifier {
+    position: fixed;
+    width: 180px;
+    height: 180px;
+    border-radius: 50%;
+    border: 3px solid var(--neon-cyan, #00f5d4);
+    box-shadow: 0 0 25px rgba(0, 245, 212, 0.4), inset 0 0 15px rgba(0, 0, 0, 0.6);
+    overflow: hidden;
+    pointer-events: none;
+    z-index: 100;
+    background: #000;
+}
+
+.cv-loupe-canvas-wrap {
+    position: absolute;
+    inset: 0;
+    overflow: hidden;
+}
+
+.cv-loupe-img {
+    position: absolute;
+    pointer-events: none;
+}
+
+.cv-loupe-crosshair {
+    position: absolute;
+    inset: 0;
+    background: radial-gradient(circle, transparent 4px, rgba(0, 245, 212, 0.4) 5px, transparent 6px);
+}
+
+.cv-loupe-crosshair::before,
+.cv-loupe-crosshair::after {
+    content: '';
+    position: absolute;
+    background: rgba(0, 245, 212, 0.6);
+}
+
+.cv-loupe-crosshair::before {
+    left: 50%; top: 0; bottom: 0; width: 1px;
+}
+
+.cv-loupe-crosshair::after {
+    top: 50%; left: 0; right: 0; height: 1px;
+}
+
+.cv-loupe-info {
+    position: absolute;
+    bottom: 6px;
+    left: 50%;
+    transform: translateX(-50%);
+    background: rgba(0, 0, 0, 0.75);
+    color: #00f5d4;
+    font-size: var(--fs-2xs);
+    font-weight: 700;
+    padding: 1px 6px;
+    border-radius: var(--radius-xs);
+    font-family: var(--font-mono, monospace);
+}
+
+/* ── 对比容器与共享 Stage 架构 ─────────────────────────────── */
+
+.cv-compare-container {
+    width: 100%;
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+    padding: 8px 16px;
+    box-sizing: border-box;
+    overflow: hidden;
+}
+
+/* 顶部控制栏 */
+.cv-compare-topbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 4px 10px;
+    margin-bottom: 6px;
+    background: rgba(255, 255, 255, 0.03);
+    border-radius: var(--radius-sm);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.cv-beat-indicator {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.cv-beat-tag {
+    font-size: var(--fs-sm);
+    font-weight: 700;
+    color: #fff;
+    font-family: var(--font-mono, monospace);
+}
+
+.cv-beat-tag b {
+    color: var(--neon-cyan, #00f5d4);
+}
+
+.cv-fade-control {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: var(--fs-sm);
+    color: #94a3b8;
+    font-weight: 600;
+}
+
+.cv-fade-slider {
+    width: 150px;
+    height: 4px;
+    cursor: pointer;
+    accent-color: var(--neon-cyan, #00f5d4);
+}
+
+.cv-blink-btn {
+    border-color: rgba(245, 158, 11, 0.4);
+    color: #f59e0b;
+    font-size: var(--fs-xs);
+}
+
+/* 共享 Stage 视口 */
+.cv-split-viewport {
+    flex: 1;
+    position: relative;
+    overflow: hidden;
+    background: #000;
+    border-radius: var(--radius-md);
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    user-select: none;
+    touch-action: none;
+}
+
+.cv-stage-wrapper {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    max-width: 100%;
+    max-height: 100%;
+    transform-origin: center center;
+    transition: transform 0.04s linear;
+}
+
+/* 共享 9:16 Stage 容器 */
+.cv-stage {
+    position: relative;
+    height: 72vh;
+    max-height: 100%;
+    aspect-ratio: 9 / 16;
+    /* DIFF 形态用 mix-blend-mode，必须把混合关在 stage 内部 */
+    isolation: isolate;
+    background: #000;
+    box-shadow: 0 10px 40px rgba(0, 0, 0, 0.85);
+    border: 1px solid rgba(255, 255, 255, 0.18);
+    border-radius: var(--radius-xs);
+    overflow: hidden;
+}
+
+.cv-stage.cv-mode-split {
+    cursor: ew-resize;
+}
+
+.cv-stage-layer {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
+}
+
+.cv-compare-img {
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+    pointer-events: none;
+}
+
+/* ── 4 种对比形态规则 ────────────────────────────────────────── */
+
+/* 1. SPLIT (滑动裁切) */
+.cv-mode-split .cv-stage-gen {
+    clip-path: inset(0 calc(100% - var(--split, 50%)) 0 0);
+    z-index: 2;
+}
+
+.cv-mode-split .cv-stage-ref {
+    z-index: 1;
+}
+
+/* 2. FADE (透明度渐变) */
+.cv-mode-fade .cv-stage-gen {
+    opacity: calc(1 - var(--fade, 0.5));
+    z-index: 2;
+    transition: opacity 0.05s ease;
+}
+
+.cv-mode-fade .cv-stage-ref {
+    opacity: 1;
+    z-index: 1;
+}
+
+/* 3. DIFF (差异高亮发光) */
+.cv-mode-diff .cv-stage-gen {
+    mix-blend-mode: difference;
+    filter: contrast(190%) brightness(130%);
+    z-index: 2;
+}
+
+.cv-mode-diff .cv-stage-ref {
+    z-index: 1;
+}
+
+/* Space 键瞬时闪烁 */
+.cv-stage.cv-is-blinking .cv-stage-gen {
+    opacity: 0 !important;
+    visibility: hidden !important;
+}
+
+/* 4. SIDE (同步双视口并排)
+   注意是 .cv-stage.cv-mode-side —— cv-mode-side 本身就挂在 .cv-stage 上，
+   写成后代选择器永远匹配不到，并排会被压进 9:16 的窄盒里。 */
+.cv-stage.cv-mode-side {
+    aspect-ratio: auto;
+    height: 72vh;
+    background: transparent;
+    border: none;
+    box-shadow: none;
+}
+
+.cv-side-wrapper {
+    display: flex;
+    gap: 12px;
+    height: 100%;
+    align-items: center;
+    justify-content: center;
+}
+
+.cv-side-pane {
+    position: relative;
+    height: 100%;
+    aspect-ratio: 9 / 16;
+    background: #000;
+    border-radius: var(--radius-xs);
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    overflow: hidden;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    box-shadow: 0 8px 30px rgba(0, 0, 0, 0.7);
+}
+
+.cv-side-pane .cv-stage-img {
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+}
+
+/* 占位缺省提示 */
+.cv-stage-empty {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 100%;
+    height: 100%;
+    background: rgba(15, 23, 42, 0.92);
+    color: #94a3b8;
+    font-size: var(--fs-md);
+    font-family: var(--font-mono, monospace);
+    text-align: center;
+    padding: 16px;
+    box-sizing: border-box;
+}
+
+.cv-stage-empty.gen-empty {
+    border: 2px dashed rgba(0, 245, 212, 0.35);
+    color: #67e8f9;
+}
+
+.cv-stage-empty.ref-empty {
+    border: 2px dashed rgba(245, 158, 11, 0.35);
+    color: #fcd34d;
+}
+
+/* 对比标签 */
+.cv-split-tag {
+    position: absolute;
+    top: 10px;
+    padding: 3px 8px;
+    border-radius: var(--radius-xs);
+    font-size: var(--fs-xs);
+    font-weight: 700;
+    font-family: var(--font-mono, monospace);
+    z-index: 10;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.6);
+}
+
+.cv-tag-clickable {
+    cursor: pointer;
+    transition: transform 0.15s ease, filter 0.15s ease;
+}
+
+.cv-tag-clickable:hover {
+    transform: scale(1.05);
+    filter: brightness(1.15);
+}
+
+.cv-split-tag.tag-a {
+    left: 10px;
+    background: rgba(59, 130, 246, 0.9);
+    color: #fff;
+}
+
+.cv-split-tag.tag-b {
+    right: 10px;
+    background: rgba(245, 158, 11, 0.9);
+    color: #000;
+}
+
+.cv-split-tag.tag-gen {
+    left: 10px;
+    background: rgba(0, 245, 212, 0.92);
+    color: #0d111a;
+    box-shadow: 0 0 10px rgba(0, 245, 212, 0.4);
+}
+
+.cv-split-tag.tag-ref {
+    right: 10px;
+    background: rgba(245, 158, 11, 0.92);
+    color: #0d111a;
+    box-shadow: 0 0 10px rgba(245, 158, 11, 0.4);
+}
+
+/* 双拼图左右并排 */
+.cv-dual-collage-wrap {
+    display: flex;
+    gap: 16px;
+    align-items: center;
+    justify-content: center;
+    padding: 10px;
+    width: max-content;
+}
+
+.cv-dual-collage-col {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 8px;
+}
+
+.cv-dual-collage-title {
+    font-size: var(--fs-md);
+    font-weight: 700;
+    padding: 3px 10px;
+    border-radius: var(--radius-xs);
+    letter-spacing: 0.3px;
+}
+
+.cv-dual-collage-title.gen-title {
+    background: rgba(0, 245, 212, 0.15);
+    color: var(--neon-cyan, #00f5d4);
+    border: 1px solid rgba(0, 245, 212, 0.4);
+}
+
+.cv-dual-collage-title.ref-title {
+    background: rgba(245, 158, 11, 0.15);
+    color: #f59e0b;
+    border: 1px solid rgba(245, 158, 11, 0.4);
+}
+
+.cv-dual-collage-img {
+    max-height: 75vh;
+    border-radius: var(--radius-sm);
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.6);
+}
+
+/* 分割线与把手 */
+.cv-split-divider {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: var(--split, 50%);
+    width: 2px;
+    background: #fff;
+    box-shadow: 0 0 10px rgba(255, 255, 255, 0.85);
+    z-index: 10;
+    cursor: ew-resize;
+    transform: translateX(-50%);
+    outline: none;
+    touch-action: none;
+}
+
+.cv-split-divider:focus-visible {
+    box-shadow: 0 0 0 2px var(--neon-cyan, #00f5d4), 0 0 12px rgba(0, 245, 212, 0.8);
+}
+
+.cv-divider-handle {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    width: 34px;
+    height: 34px;
+    border-radius: 50%;
+    background: #fff;
+    color: #000;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: var(--fs-2xs);
+    font-weight: 900;
+    box-shadow: 0 0 15px rgba(0, 0, 0, 0.6);
+    pointer-events: none;
+}
+
+/* ── 审查结论带与就地处置 ──────────────────────────────────── */
+
+.cv-issue-bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 5px 12px;
+    margin-top: 6px;
+    background: rgba(13, 20, 32, 0.95);
+    border-radius: var(--radius-sm);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    gap: 12px;
+    min-height: 36px;
+    box-sizing: border-box;
+}
+
+.cv-issue-info {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex: 1;
+    overflow: hidden;
+}
+
+.cv-issue-badge {
+    font-size: var(--fs-xs);
+    font-weight: 700;
+    padding: 2px 8px;
+    border-radius: var(--radius-xs);
+    white-space: nowrap;
+    font-family: var(--font-mono, monospace);
+}
+
+.cv-issue-badge.badge-clean {
+    background: rgba(16, 185, 129, 0.15);
+    color: #10b981;
+    border: 1px solid rgba(16, 185, 129, 0.35);
+}
+
+.cv-issue-badge.badge-failed {
+    background: rgba(239, 68, 68, 0.2);
+    color: #ef4444;
+    border: 1px solid rgba(239, 68, 68, 0.45);
+}
+
+.cv-issue-badge.badge-dirty {
+    background: rgba(249, 115, 22, 0.2);
+    color: #f97316;
+    border: 1px solid rgba(249, 115, 22, 0.45);
+}
+
+.cv-issue-badge.badge-stale {
+    background: rgba(245, 158, 11, 0.2);
+    color: #f59e0b;
+    border: 1px solid rgba(245, 158, 11, 0.45);
+}
+
+.cv-issue-badge.badge-warned {
+    background: rgba(234, 179, 8, 0.2);
+    color: #eab308;
+    border: 1px solid rgba(234, 179, 8, 0.45);
+}
+
+.cv-issue-badge.badge-missing {
+    background: rgba(148, 163, 184, 0.15);
+    color: #94a3b8;
+    border: 1px solid rgba(148, 163, 184, 0.35);
+}
+
+.cv-issue-text {
+    font-size: var(--fs-sm);
+    color: #cbd5e1;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.cv-issue-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.cv-btn-fix {
+    background: rgba(245, 158, 11, 0.15);
+    color: #f59e0b;
+    border: 1px solid rgba(245, 158, 11, 0.5);
+    font-weight: 700;
+}
+
+.cv-btn-retry {
+    background: rgba(0, 245, 212, 0.12);
+    color: var(--neon-cyan, #00f5d4);
+    border: 1px solid rgba(0, 245, 212, 0.4);
+    font-weight: 700;
+}
+
+.cv-btn-gen {
+    background: rgba(59, 130, 246, 0.15);
+    color: #60a5fa;
+    border: 1px solid rgba(59, 130, 246, 0.5);
+    font-weight: 700;
+}
+
+/* ── 底部双行胶片条导航 (Filmstrip) ───────────────────────── */
+
+.cv-filmstrip {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    padding: 6px 14px;
+    background: rgba(8, 10, 16, 0.98);
+    border-top: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.cv-filmstrip-toolbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    font-size: var(--fs-xs);
+    color: #94a3b8;
+}
+
+.cv-strip-title {
+    font-weight: 600;
+}
+
+.cv-strip-filters {
+    display: flex;
+    gap: 4px;
+}
+
+.cv-strip-filter-btn {
+    background: rgba(255, 255, 255, 0.05);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 3px;
+    font-size: var(--fs-xs);
+    color: #94a3b8;
+    padding: 1px 6px;
+    cursor: pointer;
+    transition: all 0.15s ease;
+}
+
+.cv-strip-filter-btn:hover {
+    background: rgba(255, 255, 255, 0.12);
+    color: #fff;
+}
+
+.cv-strip-filter-btn.is-active {
+    background: var(--neon-cyan, #00f5d4);
+    color: #000;
+    font-weight: 700;
+    border-color: var(--neon-cyan, #00f5d4);
+}
+
+.cv-filmstrip-track {
+    display: flex;
+    gap: 6px;
+    overflow-x: auto;
+    overflow-y: hidden;
+    padding: 2px 2px 6px 2px;
+    scrollbar-width: thin;
+    scroll-behavior: smooth;
+}
+
+.cv-strip-col {
+    display: flex;
+    flex-direction: column;
+    width: 44px;
+    flex-shrink: 0;
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    border-radius: var(--radius-xs);
+    cursor: pointer;
+    transition: all 0.15s ease;
+    position: relative;
+    overflow: hidden;
+}
+
+.cv-strip-col:hover {
+    border-color: rgba(0, 245, 212, 0.6);
+    transform: translateY(-2px);
+}
+
+.cv-strip-col.is-active {
+    border-color: var(--neon-cyan, #00f5d4);
+    box-shadow: 0 0 10px rgba(0, 245, 212, 0.5);
+    background: rgba(0, 245, 212, 0.08);
+}
+
+.cv-strip-header {
+    font-size: var(--fs-2xs);
+    font-weight: 700;
+    font-family: var(--font-mono, monospace);
+    text-align: center;
+    background: rgba(0, 0, 0, 0.6);
+    color: #94a3b8;
+    padding: 1px 0;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.cv-strip-col.is-active .cv-strip-header {
+    color: var(--neon-cyan, #00f5d4);
+    font-weight: 900;
+}
+
+.cv-strip-cell {
+    height: 38px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
+    background: #000;
+    position: relative;
+}
+
+.cv-strip-cell img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    pointer-events: none;
+}
+
+.cv-strip-cell.cv-strip-gen {
+    border-bottom: 1px dashed rgba(255, 255, 255, 0.15);
+}
+
+.cv-strip-placeholder {
+    font-size: var(--fs-2xs);
+    color: #64748b;
+    text-align: center;
+    pointer-events: none;
+}
+
+/* 猜出来的帧路径加载失败时的就地降级（见 cvMarkBrokenImage） */
+.cv-strip-cell.cv-img-broken::after {
+    content: '缺帧';
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: var(--fs-2xs);
+    color: #64748b;
+    background: rgba(15, 23, 42, 0.9);
+    border: 1px dashed rgba(148, 163, 184, 0.35);
+    box-sizing: border-box;
+}
+
+.cv-stage-layer.cv-img-broken::after,
+.cv-side-pane.cv-img-broken::after {
+    content: '画面文件缺失';
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: var(--fs-md);
+    font-family: var(--font-mono, monospace);
+    color: #67e8f9;
+    background: rgba(15, 23, 42, 0.92);
+    border: 2px dashed rgba(0, 245, 212, 0.35);
+    box-sizing: border-box;
+}
+
+.cv-strip-placeholder.ref-none {
+    color: #475569;
+}
+
+/* 严重度左侧指示条 */
+.cv-strip-col.border-failed {
+    border-left: 3px solid #ef4444;
+}
+
+.cv-strip-col.border-dirty {
+    border-left: 3px solid #f97316;
+}
+
+.cv-strip-col.border-warned {
+    border-left: 3px solid #eab308;
+}
+
+.cv-strip-col.border-ok {
+    border-left: 3px solid #10b981;
+}
+
+.cv-strip-col.border-missing {
+    border-left: 3px dashed #64748b;
+}
+
+.cv-strip-empty-hint {
+    font-size: var(--fs-xs);
+    color: #64748b;
+    padding: 10px;
+    text-align: center;
+}
+
+/* ── 底部状态栏 ──────────────────────────────────────────── */
+
+.cv-footer {
+    display: flex;
+    flex-direction: column;
+    background: rgba(13, 20, 32, 0.98);
+    border-top: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.cv-footer-bottom {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 6px 18px;
+    font-size: var(--fs-sm);
+    color: #94a3b8;
+}
+
+.cv-footer-stats b {
+    color: var(--neon-cyan, #00f5d4);
+}

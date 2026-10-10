@@ -1,0 +1,4 @@
+interface:
+  display_name: "02 视频节拍阶梯"
+  short_description: "反推与优化建造改造视频，检查开场、可见进度、比例和结尾，制作完整提示词"
+  default_prompt: "使用 $video-beat-ladder 反推参考视频节拍，检查开场吸引力、可见改造量、过程因果、空间比例与结尾回报，并按需优化、发散创意和制作完整 Omni 提示词。"

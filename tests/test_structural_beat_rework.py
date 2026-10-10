@@ -50,11 +50,15 @@ def _milestone_beat(**overrides):
         'after_state': 'all eight timber rafters meet at the central roof hub',
         'completion_extent': 'all eight rafters across the full roof circle',
         'changed_grid_cells': ['Grid A2', 'Grid B2'],
-        'package_operations': ['framing'],
+        # 一个普通施工拍申报 2~3 道紧密工序（_MIN/_MAX_PACKAGE_OPERATIONS）。
+        # framing + insulation 正是 schema 第 13 条点名的参考组合。
+        'package_operations': ['framing', 'insulation'],
         'primary_progress': 'the radial skeleton grows from zero to all eight rafters',
         'secondary_progress': 'the leaned timber bundle drains from eight pieces to none',
         'persistent_traces': ['sunk nail heads', 'pale sawdust bands'],
         'preserve_state': 'the five-course stone wall and doorway remain unchanged',
+        'introduced_objects': [],
+        'removed_objects': [],
     }
     beat.update(overrides)
     return beat
@@ -79,6 +83,17 @@ class TestVisibleMilestonePlanningGate(unittest.TestCase):
         errors = pp.milestone_ladder_violations([beat])
         self.assertTrue(any('weak/local' in error for error in errors))
 
+    def test_single_cell_terminal_component_milestone_passes(self):
+        beat = _milestone_beat(
+            operation='framing',
+            milestone_name='bulkhead doorway framing complete',
+            after_state='the steel bulkhead doorway is framed and sealed',
+            completion_extent='doorway framing finished from sill to lintel',
+            changed_grid_cells=['B2'],
+            package_operations=['framing', 'insulation'],
+        )
+        self.assertEqual(pp.milestone_ladder_violations([beat]), [])
+
     def test_coherent_closeout_package_is_allowed(self):
         beat = _milestone_beat(
             operation='repair',
@@ -95,6 +110,192 @@ class TestVisibleMilestonePlanningGate(unittest.TestCase):
         errors = pp.milestone_ladder_violations([beat])
         self.assertTrue(any('incompatible construction phases' in error for error in errors))
 
+    def test_missing_object_lifecycle_keys_are_a_hard_violation(self):
+        """空数组是合法答案（这一拍没有新增/拆除任何可数物体），但**完全不声明**这个键
+        不是——那等于场景状态表压根没有数据可校验（见 scene_state.py）。"""
+        beat = _milestone_beat()
+        del beat['introduced_objects']
+        del beat['removed_objects']
+        errors = pp.milestone_ladder_violations([beat])
+        self.assertTrue(any('introduced_objects' in e and 'removed_objects' in e for e in errors))
+        self.assertEqual(pp.hard_milestone_violations(errors), errors)
+
+    def test_declared_empty_object_lifecycle_lists_are_not_a_violation(self):
+        beat = _milestone_beat(introduced_objects=[], removed_objects=[])
+        self.assertEqual(pp.milestone_ladder_violations([beat]), [])
+
+    # ── 材料层跨阶段判据只看「这一拍干了什么」（2026-08-01 run 1785597123956 修复）
+    # before_state / description 按 schema 必然点名被覆盖的那一层，扫进去等于把
+    # 「起点层 -> 终点层」误判成「一拍跨两层」，覆盖拍全灭。
+    def test_covering_beat_may_name_the_layer_it_conceals(self):
+        """封板/饰面/家具覆盖拍在场景状态里点名既有下层不算跨阶段。"""
+        for label, overrides in (
+            ('board closure over rough-in', dict(
+                operation='drywall',
+                description='crews screw plasterboard over the exposed wiring and vapour barrier',
+                milestone_name='full wall plasterboard closure complete',
+                before_state='the vapour barrier and wiring runs sit exposed between the open studs',
+                after_state='plasterboard fully closes the entire wall',
+                package_operations=['drywall'])),
+            ('finish over framing', dict(
+                operation='painting',
+                description='rollers lay two coats of finish paint across the boarded walls',
+                milestone_name='all four walls painted',
+                before_state='bare battens and furring strips are still visible at the ceiling line',
+                after_state='painting is complete across all four walls',
+                package_operations=['painting'])),
+            ('furnishing onto a finished floor', dict(
+                operation='furnishing',
+                description='the galley cabinetry is carried onto the finished flooring and bolted down',
+                milestone_name='all six cabinetry units installed',
+                before_state='the tiling and flooring are complete and the room stands empty',
+                after_state='all six cabinetry units stand on the already finished flooring',
+                package_operations=['furnishing'])),
+        ):
+            with self.subTest(label):
+                errors = pp.milestone_ladder_violations([_milestone_beat(**overrides)])
+                self.assertEqual(
+                    [e for e in errors if 'material-layer' in e], [],
+                    f'{label} 是合格的单层覆盖拍，不该被跨阶段判据打回：{errors}')
+
+    def test_genuine_multi_layer_bundle_still_rejected(self):
+        """真·一拍打包隐蔽层+封板+饰面仍要拦下（package 明确申报，扫得到）。"""
+        beat = _milestone_beat(
+            operation='drywall',
+            description='crews staple the vapour barrier, panel over it and roll on finish paint',
+            milestone_name='wall membrane, panelling and painting complete',
+            before_state='the bare shell stands open',
+            after_state='the vapour barrier is stapled, the panelling closed and the paint rolled on',
+            package_operations=['rough-in', 'drywall', 'painting'])
+        errors = pp.milestone_ladder_violations([beat])
+        self.assertTrue(any('material-layer' in error for error in errors), errors)
+
+    # ── milestone_name 同理（2026-08-02）：它按 schema 第 10 条是「这一拍**终结在
+    # 什么产物上**」，不是「干了什么」。产物名天然要带上它所依附/覆盖的基层，
+    # 扫进去与扫 before_state 是同一个误判。实测这是压垮第 4 次重排的头号原因。
+    def test_milestone_name_may_name_the_substrate_it_sits_on(self):
+        for label, overrides in (
+            ('finish floor over the framed cavity', dict(
+                operation='flooring',
+                milestone_name='plank flooring laid over the insulated joists',
+                package_operations=['flooring'])),
+            ('board closure over the services', dict(
+                operation='drywall',
+                milestone_name='wall lining screwed over the wiring runs',
+                package_operations=['drywall'])),
+            ('furniture anchored to the finished floor', dict(
+                operation='furnishing',
+                milestone_name='built-in bunk anchored to the finished flooring',
+                package_operations=['furnishing'])),
+            # nested_space_payoff 的 summary 自己点名要求的那一拍：'fixture' 在
+            # 清运拍里是**被拆掉的对象**，不是软装相位。
+            ('strip-out of seats and fixtures', dict(
+                operation='clearing',
+                milestone_name='seat and fixture strip-out complete',
+                package_operations=['clearing'])),
+        ):
+            with self.subTest(label):
+                errors = pp.milestone_ladder_violations([_milestone_beat(**overrides)])
+                self.assertEqual(
+                    [e for e in errors if 'material-layer' in e], [],
+                    f'{label} 是合格的单层拍，不该被跨阶段判据打回：{errors}')
+
+
+class TestMilestoneViolationSeverity(unittest.TestCase):
+    """硬（合成侧依赖）/ 软（质量评判）分级。最后一次重排只有硬违规才让整单失败。"""
+
+    def test_missing_fields_are_hard(self):
+        beat = _milestone_beat()
+        beat.pop('completion_extent')
+        errors = pp.milestone_ladder_violations([beat])
+        self.assertTrue(pp.hard_milestone_violations(errors), errors)
+
+    def test_quality_only_violations_are_soft(self):
+        for label, overrides in (
+            ('cross-phase package', dict(package_operations=['demolition', 'painting'])),
+            ('too many grid cells', dict(
+                changed_grid_cells=['Grid A1', 'Grid B1', 'Grid C1', 'Grid D1'])),
+            ('weak wording', dict(
+                milestone_name='one small section begins to receive rafters',
+                completion_extent='one small section')),
+        ):
+            with self.subTest(label):
+                errors = pp.milestone_ladder_violations([_milestone_beat(**overrides)])
+                self.assertTrue(errors, f'{label} 本身仍要报出来')
+                self.assertEqual(
+                    pp.hard_milestone_violations(errors), [],
+                    f'{label} 只是质量问题，不该让整单硬失败：{errors}')
+
+    def test_clean_ladder_has_neither(self):
+        self.assertEqual(pp.milestone_ladder_violations([_milestone_beat()]), [])
+        self.assertEqual(pp.hard_milestone_violations([]), [])
+
+
+class TestDeterministicBeatLadderFallback(unittest.TestCase):
+    def test_standard_fallback_is_schema_complete(self):
+        ladder = pp.deterministic_fallback_beat_ladder(
+            {'mode': 'Standard'}, 8, 'coaxial', {'turn_degrees': 0})
+        self.assertEqual([beat['index'] for beat in ladder], list(range(1, 9)))
+        self.assertEqual(ladder[-1]['operation'], 'reward')
+        self.assertEqual(pp.hard_milestone_violations(
+            pp.milestone_ladder_violations(ladder)), [])
+
+    def test_hard_cut_fallback_keeps_one_crossing_and_cleanout(self):
+        ladder = pp.deterministic_fallback_beat_ladder(
+            {'mode': 'Threshold'}, 9, 'hard_cut',
+            {'turn_degrees': 90, 'turn_direction': 'left'})
+        cuts = [i for i, beat in enumerate(ladder) if beat.get('hard_cut')]
+        self.assertEqual(cuts, [2])
+        self.assertEqual(ladder[3]['operation'], 'clearing')
+        self.assertFalse(any(beat.get('bridge_stage') for beat in ladder))
+
+    @patch('prompt_pipeline.space_reset_cut_required', return_value=True)
+    def test_nested_fallback_keeps_bridge_reset_and_second_cleanout(self, _reset):
+        ladder = pp.deterministic_fallback_beat_ladder(
+            {'mode': 'Threshold'}, 14, 'coaxial',
+            {'turn_degrees': 0, 'turn_direction': 'none'})
+        bridge = [i for i, beat in enumerate(ladder) if beat.get('bridge_stage') == 1]
+        reset = [i for i, beat in enumerate(ladder) if beat.get('hard_cut')]
+        self.assertEqual(bridge, [2])
+        self.assertEqual(len(reset), 1)
+        self.assertEqual(ladder[bridge[0] + 1]['operation'], 'clearing')
+        self.assertEqual(ladder[reset[0] + 1]['operation'], 'clearing')
+
+
+class TestTemplateCroppingBeatBinding(unittest.TestCase):
+    TEMPLATES = """
+## IMAGE 2+
+GENERIC IMAGE
+## Interior IMAGE
+INTERIOR IMAGE
+## Threshold Bridge
+BRIDGE VIDEO
+## Ordinary Construction VIDEO
+ORDINARY VIDEO
+## Final IMAGE
+FINAL IMAGE
+## Final Reward VIDEO N
+FINAL VIDEO
+## IMAGE Checklist
+IMAGE CHECKS
+## VIDEO Checklist
+VIDEO CHECKS
+"""
+
+    def test_threshold_beat_is_passed_into_crossing_detection(self):
+        cropped = pp.get_cropped_templates(
+            self.TEMPLATES, 3, 8, 'Threshold', 1,
+            family='interior', beat={'operation': 'threshold', 'bridge_stage': 1})
+        self.assertIn('BRIDGE VIDEO', cropped)
+        self.assertIn('INTERIOR IMAGE', cropped)
+
+    def test_non_crossing_threshold_mode_uses_ordinary_video(self):
+        cropped = pp.get_cropped_templates(
+            self.TEMPLATES, 4, 8, 'Threshold', None,
+            family='interior', beat={'operation': 'clearing'})
+        self.assertIn('ORDINARY VIDEO', cropped)
+        self.assertNotIn('BRIDGE VIDEO', cropped)
+
 
 class TestMilestonePromptSkeleton(unittest.TestCase):
     def test_image_requires_after_state_extent_and_two_traces(self):
@@ -107,6 +308,40 @@ class TestMilestonePromptSkeleton(unittest.TestCase):
         self.assertEqual(pp.check_milestone_image_prompt(good, beat), [])
         bad = 'One small section begins to show a timber change while everything else remains.'
         self.assertTrue(pp.check_milestone_image_prompt(bad, beat))
+
+    def test_trace_requirement_never_exceeds_what_the_beat_declared(self):
+        """门槛按本拍**实际声明了几条**痕迹取，不能无条件写死 2。
+
+        2026-08-06：只声明 1 条（或 0 条）痕迹的拍，无论重写多少轮都凑不出 2 个命中，
+        这道硬门就成了死门——实测一单卡在 Beat 9 上连"整拍重试"都用同一句报错原地
+        打转，最后整单 BEAT_GENERATION_FAILED。
+        """
+        one_trace = _milestone_beat(persistent_traces=['sunk nail heads'])
+        good = (
+            'The scene is the eight-rafter roof skeleton complete anchor. All eight timber rafters '
+            'meet at the central roof hub across the full roof circle. The five-course stone wall '
+            'and doorway remain unchanged. Sunk nail heads remain visible.'
+        )
+        self.assertEqual(pp.check_milestone_image_prompt(good, one_trace), [])
+
+        no_traces = _milestone_beat(persistent_traces=[])
+        self.assertEqual(
+            [e for e in pp.check_milestone_image_prompt(good, no_traces)
+             if 'persistent contact traces' in e], [])
+
+    def test_missing_trace_error_names_the_traces_that_are_absent(self):
+        """回炉的模型必须知道**哪几条**痕迹没写进去；只说"至少两条"它无从下手。"""
+        beat = _milestone_beat()
+        partial = (
+            'The scene is the eight-rafter roof skeleton complete anchor. All eight timber rafters '
+            'meet at the central roof hub across the full roof circle. The five-course stone wall '
+            'and doorway remain unchanged. Sunk nail heads remain visible.'
+        )
+        errors = [e for e in pp.check_milestone_image_prompt(partial, beat)
+                  if 'persistent contact traces' in e]
+        self.assertTrue(errors)
+        self.assertIn('pale sawdust bands', errors[0])
+        self.assertNotIn('sunk nail heads', errors[0])
 
     def test_video_requires_both_progress_lines_and_material_path(self):
         beat = _milestone_beat()
@@ -139,6 +374,47 @@ class TestSplitStructuralVideoErrors(unittest.TestCase):
     def test_empty_and_none_input(self):
         self.assertEqual(pp.split_structural_video_errors([]), ([], []))
         self.assertEqual(pp.split_structural_video_errors(None), ([], []))
+
+
+class TestGhostWorkAgentVocabulary(unittest.TestCase):
+    """幽灵施工判据的词表必须认得合成器自己指定的施工主体称呼（2026-08-22）。
+
+    合成器的着装规则（THEME-ADAPTIVE ATTIRE RULE）**指定**模型写 "one lone craftsman ..."，
+    packet 的 worker_choreography 也照此存盘；可 _WORKER_AGENT_WORDS 里从来没有
+    craftsman（\bman\b 匹配不到 crafts|man 的词内位置）。后果不是漏判而是纯误判：
+    工人明明写了却被判成幽灵施工 → 每拍烧掉最多 2 次定向回炉 → 回炉稿复用同一句
+    choreography 又再判一次不过 → 原稿原样保留。实测三条真实复刻单 51 拍里 19 拍中招，
+    是回炉 71% 失败率的单一主因，也是提示词合成整体偏慢的大头之一。
+    """
+
+    def _clip(self, agent_phrase):
+        return (ANCHOR + f" {agent_phrase} is fastening tongue-and-groove panels row by row, "
+                "tapping each board home with a rubber mallet, coverage sweeping steadily "
+                "across the wall until the far end is fully clad. Near-field sound carries "
+                "mallet knocks over steady shell resonance. "
+                "continuous construction time-lapse, not real-time footage.")
+
+    def test_composer_mandated_craftsman_wording_is_a_visible_agent(self):
+        for phrase in ('One lone craftsman in a solid olive-drab work t-shirt',
+                       'One lone artisan in a dark cap',
+                       'A single installer in dark cargo pants',
+                       'One lone technician in a pale shirt',
+                       'One lone tradesman in work boots'):
+            with self.subTest(phrase=phrase):
+                self.assertEqual(pp.check_video_process_content(self._clip(phrase)), [])
+
+    def test_the_original_worker_wording_still_passes(self):
+        self.assertEqual(
+            pp.check_video_process_content(self._clip('One lone worker in a pale shirt')), [])
+
+    def test_真的没有施工主体时仍然判幽灵施工(self):
+        # 扩词只让检测器多认出一个主体，绝不能让它对真正无主体的正文放行
+        ghost = (ANCHOR + " Tongue-and-groove panels are fastened row by row and each board is "
+                 "tapped home with a rubber mallet until the far wall is fully clad. Near-field "
+                 "sound carries mallet knocks. continuous construction time-lapse, not "
+                 "real-time footage.")
+        errs = pp.check_video_process_content(ghost)
+        self.assertTrue(any('ghost work' in e for e in errs), errs)
 
 
 class TestReworkStructuralVideoBeat(unittest.TestCase):
@@ -562,111 +838,14 @@ class TestReworkDecayPlaceholderBeat(unittest.TestCase):
         self.assertEqual(out, STERILE_IMAGE)
 
 
-# --- FIRST INTERIOR REVEAL 强制衰败措辞事后校验（2026-07-21 水磨坊实测：过门后室内
-# 首现拍 (is_first_interior_reveal) 本该强制展示≥2类衰败痕迹的条款被 LLM 静默跳过，
-# 渲成了 "Completely sterile."——此前完全没有事后校验能抓到这个) ---
-
-FIRST_REVEAL_STERILE = (
-    "Static wide 18mm interior tripod shot, camera height 1.6m, locked eye-level "
-    "perspective down the central loft axis; camera pitch locked level; central "
-    "vanishing axis centered. Completely sterile. Locked anchors: historic cast-iron "
-    "drive gear hub at Grid B2 holding 45 percent of frame height."
-)
-
-FIRST_REVEAL_ONE_CATEGORY = (
-    "Static wide 18mm interior tripod shot, camera height 1.6m, locked eye-level "
-    "perspective down the central loft axis; camera pitch locked level. Rust streaks "
-    "down the cast-iron gear hub. Locked anchors: historic cast-iron drive gear hub at "
-    "Grid B2 holding 45 percent of frame height."
-)
-
-FIRST_REVEAL_TWO_CATEGORIES = (
-    "Static wide 18mm interior tripod shot, camera height 1.6m, locked eye-level "
-    "perspective down the central loft axis; camera pitch locked level. Rust streaks "
-    "down the cast-iron gear hub above a floor strewn with fallen debris. Locked "
-    "anchors: historic cast-iron drive gear hub at Grid B2 holding 45 percent of frame height."
-)
-
-FIRST_REVEAL_GOOD = (
-    "Static wide 18mm interior tripod shot, camera height 1.6m, locked eye-level "
-    "perspective down the central loft axis; camera pitch locked level. Rust streaks "
-    "down the cast-iron gear hub beside a thick patch of moss spreading across the "
-    "collapsed roof section overhead. Locked anchors: historic cast-iron drive gear hub "
-    "at Grid B2 holding 45 percent of frame height."
-)
-
-
-class TestCheckFirstInteriorRevealDecay(unittest.TestCase):
-    def test_not_first_reveal_is_noop_even_if_sterile(self):
-        self.assertEqual(pp.check_first_interior_reveal_decay(FIRST_REVEAL_STERILE, False), [])
-
-    def test_first_reveal_with_zero_categories_is_flagged(self):
-        errs = pp.check_first_interior_reveal_decay(FIRST_REVEAL_STERILE, True)
-        self.assertTrue(errs)
-        self.assertIn('FIRST INTERIOR REVEAL', errs[0])
-
-    def test_first_reveal_with_only_one_category_is_flagged(self):
-        errs = pp.check_first_interior_reveal_decay(FIRST_REVEAL_ONE_CATEGORY, True)
-        self.assertTrue(errs)
-
-    def test_first_reveal_with_three_categories_passes(self):
-        # 锈迹(surface) + 苔藓(vegetation) + 塌陷(structural)
-        self.assertEqual(pp.check_first_interior_reveal_decay(FIRST_REVEAL_GOOD, True), [])
-
-    def test_first_reveal_with_only_two_categories_is_flagged(self):
-        # 2026-07-26 加严：门槛从 2 类提到 3 类，与 IMAGE 1 自己的 GENUINE DAMAGE 审计对齐
-        errs = pp.check_first_interior_reveal_decay(FIRST_REVEAL_TWO_CATEGORIES, True)
-        self.assertTrue(errs)
-        self.assertIn('3+ decay categories', errs[0])
-
-    def test_empty_prompt_is_noop(self):
-        self.assertEqual(pp.check_first_interior_reveal_decay('', True), [])
-
-
-class TestFirstInteriorRevealInterventionEvidence(unittest.TestCase):
-    """2026-07-26 用户实测："过门帧有人工痕迹、不够原始"。首现帧按契约是没人进来过的
-    废墟，正文里出现梯子/工具/码放整齐的材料/刚清理过的地面 = 契约被违反；但契约本身
-    又鼓励写"no ladders, no tools anywhere in frame"这类澄清句（VLM 反馈修复更是主动
-    加这种句子），所以否定式表述必须放行。"""
-
-    def test_asserted_intervention_evidence_is_flagged(self):
-        prompt = FIRST_REVEAL_GOOD + " An aluminium ladder leans against the far wall beside neatly stacked timber."
-        errs = pp.check_first_interior_reveal_decay(prompt, True)
-        self.assertTrue(any('zero intervention evidence' in e for e in errs))
-        self.assertTrue(any('ladder' in e for e in errs))
-
-    def test_negated_absence_clause_is_not_flagged(self):
-        prompt = (FIRST_REVEAL_GOOD +
-                  " No ladders, no tools, no scaffolding and no staged materials anywhere in frame; "
-                  "every surface is untouched original decay.")
-        self.assertEqual(pp.check_first_interior_reveal_decay(prompt, True), [])
-
-    def test_intervention_check_is_skipped_for_other_beats(self):
-        prompt = FIRST_REVEAL_GOOD + " A ladder leans against the far wall."
-        self.assertEqual(pp.check_first_interior_reveal_decay(prompt, False), [])
-
-
-class TestReworkFirstInteriorRevealDecayBeat(unittest.TestCase):
-    def test_valid_rewrite_is_adopted(self):
-        errs = pp.check_first_interior_reveal_decay(FIRST_REVEAL_STERILE, True)
-        with patch.object(pp, '_chat', return_value=FIRST_REVEAL_GOOD):
-            out, adopted = pp.rework_first_interior_reveal_decay_beat({}, 4, FIRST_REVEAL_STERILE, errs)
-        self.assertTrue(adopted)
-        self.assertEqual(out, FIRST_REVEAL_GOOD)
-
-    def test_rewrite_still_insufficient_is_rejected(self):
-        errs = pp.check_first_interior_reveal_decay(FIRST_REVEAL_STERILE, True)
-        with patch.object(pp, '_chat', return_value=FIRST_REVEAL_ONE_CATEGORY):
-            out, adopted = pp.rework_first_interior_reveal_decay_beat({}, 4, FIRST_REVEAL_STERILE, errs)
-        self.assertFalse(adopted)
-        self.assertEqual(out, FIRST_REVEAL_STERILE)
-
-    def test_llm_exception_keeps_original(self):
-        errs = pp.check_first_interior_reveal_decay(FIRST_REVEAL_STERILE, True)
-        with patch.object(pp, '_chat', side_effect=RuntimeError('gateway down')):
-            out, adopted = pp.rework_first_interior_reveal_decay_beat({}, 4, FIRST_REVEAL_STERILE, errs)
-        self.assertFalse(adopted)
-        self.assertEqual(out, FIRST_REVEAL_STERILE)
+# --- FIRST INTERIOR REVEAL 强制衰败措辞校验：已于 2026-08-24 整条删除 ---
+#
+# 原本这里有三组用例（衰败类目计数、人工痕迹判定、定向回炉），守的是「过门后室内首现
+# 帧必须是没人碰过的废墟」那条硬规则。这条线现在跑的全是爆款复刻——门后是什么样由原片
+# 说了算，模板不再有权规定——check_first_interior_reveal_decay /
+# rework_first_interior_reveal_decay_beat 与 'decay' 那路缺陷回炉一并删除，用例随之退役。
+# 仍然生效、并且仍有用例覆盖的是防倒退那一半（见 test_envelope_seal_monotonicity.py 的
+# test_first_interior_reveal_scopes_untouched_to_unworked_surfaces）。
 
 
 # --- 相似度免检清单不再豁免 'sterile'（2026-07-21）：之前 'sterile' 在

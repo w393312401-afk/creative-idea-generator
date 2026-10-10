@@ -86,6 +86,10 @@ class FakeAdsPower:
                     time.sleep(owner.hang_seconds)
                 if self.path.startswith('/api/v1/user/list'):
                     self._json(owner._user_list(self.path))
+                elif self.path.startswith('/api/v1/browser/local-active'):
+                    self._json({'code': 0, 'data': {'list': []}})
+                elif self.path.startswith('/api/v1/browser/active'):
+                    self._json({'code': 0, 'data': {'status': 'Inactive'}})
                 elif self.path.startswith('/api/v1/browser/start'):
                     self._json(owner._browser_start())
                 elif self.path.startswith('/api/v1/browser/stop'):
@@ -187,7 +191,7 @@ class DeadListener:
 
 def flow_page_html(prompt_input=True, generate_button=True, config_button=True,
                    account_menu=True, credit_text='1050 Google Flow credits',
-                   pricing_noise=True, new_project_button=True):
+                   pricing_noise=True, new_project_button=True, add_media_button=True):
     """生成一份能被 UI_SELECTORS 命中的最小 Flow 页面。
 
     每个开关关掉一个元素，用来复现"Flow 改版后某个选择器族失效"。
@@ -206,6 +210,11 @@ def flow_page_html(prompt_input=True, generate_button=True, config_button=True,
         parts.append("<button aria-label='Account'><img class='avatar'/></button>")
         if credit_text:
             parts.append(f"<div role='dialog'><span class='credits'>{credit_text}</span></div>")
+    if add_media_button:
+        # 顶部上传入口。此前夹具没有它，add_media_btn 族是靠泛化的
+        # button[aria-haspopup='dialog'] 误中下面的配置按钮才"命中"的。
+        parts.append("<button aria-label='Add media menu' aria-haspopup='menu'>"
+                     "<i class='google-symbols'>add</i></button>")
     if config_button:
         parts.append("<button aria-haspopup='dialog'>Nano Banana 2 · Portrait · 1x</button>")
     if prompt_input:

@@ -1,0 +1,572 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>片尾互动引导</title>
+<!--
+  9:16 关注、点赞、评论、收藏、分享引导动画（按 TikTok 右侧互动栏定位，默认无文字）。
+
+  直接用浏览器打开 = 预览（可拖进度、切换背景检查亮底可读性）。
+  tools/engagement_cta.py 用无头 Chromium 逐帧调用 renderAt(t) 截透明 PNG，再交给 FFmpeg
+  出 ProRes 4444 / 绿幕 MP4 / VP9 透明 WebM——所以这里的每一帧都必须只由 t 决定：
+  不用 CSS transition/animation，不读 Date.now()，粒子方向用固定种子。
+-->
+<style>
+  :root {
+    --w: 1080px;
+    --h: 1920px;
+    --red: #fe2c55;
+    --yellow: #ffc300;
+    --cyan: #20d5ec;
+    --ink: #161823;
+    --shadow: drop-shadow(0 2px 5px rgba(0, 0, 0, .38));
+    /* 自定义文案的无衬线字体 */
+    --font: -apple-system, "SF Pro Display", "Helvetica Neue", Inter, Roboto, Arial,
+            "PingFang SC", "Hiragino Sans GB", "Noto Sans CJK SC", "Microsoft YaHei", sans-serif;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { background: #0d0e12; color: #fff; font-family: var(--font); }
+
+  /* ── 预览外壳（导出时整块隐藏） ───────────────────────────── */
+  body.preview {
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 14px;
+    padding: 16px;
+  }
+  .viewport { position: relative; overflow: hidden; border-radius: 18px; box-shadow: 0 20px 60px rgba(0, 0, 0, .45); }
+  .controls {
+    display: flex; align-items: center; gap: 12px;
+    width: min(100%, 420px);
+    font-size: 13px; color: #c9cad3;
+  }
+  .controls button, .controls select {
+    font: inherit; color: #fff; background: #23252e; border: 1px solid #343744;
+    border-radius: 8px; padding: 6px 10px; cursor: pointer;
+  }
+  .controls input[type=range] { flex: 1; accent-color: var(--red); }
+  .controls .time { font-variant-numeric: tabular-nums; min-width: 64px; text-align: right; }
+
+  .stage { position: absolute; left: 0; top: 0; width: var(--w); height: var(--h); transform-origin: 0 0; overflow: hidden; }
+  .stage[data-bg=dark]  { background: linear-gradient(170deg, #4b5d6e 0%, #2a3440 45%, #6b5a45 100%); }
+  .stage[data-bg=light] { background: linear-gradient(170deg, #f4efe6 0%, #e6dccb 55%, #cdbb9c 100%); }
+  .stage[data-bg=checker] {
+    background: repeating-conic-gradient(#4a4d57 0 25%, #3a3d46 0 50%) 0 0 / 48px 48px;
+  }
+
+  /* 嵌入（配置中心预览）：去掉外壳，舞台铺满 iframe */
+  body.embed { padding: 0; gap: 0; height: 100vh; min-height: 0; overflow: hidden; }
+  body.embed .controls { display: none; }
+  body.embed .viewport { border-radius: 0; box-shadow: none; }
+
+  /* ── 导出：舞台贴左上角，背景全透明 ─────────────────────── */
+  html.export, html.export body { background: transparent; }
+  html.export .controls { display: none; }
+  html.export .viewport { border-radius: 0; box-shadow: none; width: var(--w); height: var(--h); }
+  html.export .stage { background: transparent !important; }
+
+  /* ── 互动栏 ─────────────────────────────────────────────── */
+  .layer { position: absolute; inset: 0; will-change: opacity; }
+  .rail { position: absolute; left: 0; top: 0; transform-origin: 0 0; }
+  .item { position: absolute; left: 0; top: 0; }
+  .item > .icon { position: absolute; transform-origin: 50% 50%; filter: var(--shadow); }
+  .item > .icon svg { display: block; width: 100%; height: 100%; overflow: visible; }
+  .item > .count {
+    position: absolute; left: 0; top: 0; width: 220px; margin-left: -110px;
+    text-align: center; font-size: 29px; font-weight: 600; line-height: 1; letter-spacing: .2px;
+    text-shadow: 0 1px 4px rgba(0, 0, 0, .55);
+  }
+
+  .avatar {
+    position: absolute; border-radius: 50%; overflow: hidden;
+    border: 4px solid #fff; background: transparent;   /* 不给头像时框内全透明，透出底下的画面 */
+    box-shadow: 0 2px 8px rgba(0, 0, 0, .35);
+  }
+  .avatar img { width: 100%; height: 100%; display: block; object-fit: cover; }
+  .badge { position: absolute; transform-origin: 50% 50%; filter: drop-shadow(0 1px 3px rgba(0, 0, 0, .3)); }
+  .badge svg { display: block; width: 100%; height: 100%; overflow: visible; }
+
+  .fx { position: absolute; left: 0; top: 0; pointer-events: none; }
+  .fx > * { position: absolute; left: 0; top: 0; }
+
+  .pill {
+    position: absolute; left: 0; top: 0; white-space: nowrap;
+    padding: 0 30px 0 28px; height: 70px; line-height: 70px; border-radius: 35px;
+    font-size: 36px; font-weight: 700; letter-spacing: .4px;
+    box-shadow: 0 6px 18px rgba(0, 0, 0, .28);
+    transform-origin: 100% 50%;
+  }
+  .pill::after {
+    content: ""; position: absolute; right: -13px; top: 50%; margin-top: -11px;
+    border-style: solid; border-width: 11px 0 11px 15px;
+    border-color: transparent transparent transparent var(--pill-bg);
+  }
+
+  .headline {
+    position: absolute; left: 56px; right: 240px; top: 0;
+    font-size: 58px; font-weight: 800; line-height: 1.2; letter-spacing: .3px;
+    text-shadow: 0 3px 12px rgba(0, 0, 0, .55);
+  }
+
+  .hand { position: absolute; left: 0; top: 0; filter: drop-shadow(0 8px 12px rgba(0, 0, 0, .35)); }
+  .hand svg { display: block; overflow: visible; }
+  .ripple { position: absolute; left: 0; top: 0; border-radius: 50%; border: 6px solid rgba(255, 255, 255, .95); }
+</style>
+</head>
+<body>
+<div class="viewport" id="viewport">
+  <div class="stage" id="stage" data-bg="dark">
+    <div class="layer" id="layer"></div>
+  </div>
+</div>
+<div class="controls" id="controls">
+  <button id="play" type="button" aria-label="播放或暂停">❚❚</button>
+  <input id="scrub" type="range" min="0" max="1000" value="0" aria-label="时间进度">
+  <span class="time" id="time">0.00s</span>
+  <select id="bg" aria-label="预览背景">
+    <option value="dark">深色</option>
+    <option value="light">浅色</option>
+    <option value="checker">透明格</option>
+  </select>
+</div>
+
+<script>
+(() => {
+  'use strict';
+
+  // ── 配置 ───────────────────────────────────────────────────
+  // engagement_cta.py 通过 window.CTA_CONFIG 注入；预览时也可用 URL 参数临时覆盖同名字段，
+  // 例如 ?labels=关注,点赞,评论,收藏,分享&counts=43K,360,3576,1495
+  const DEFAULTS = {
+    width: 1080,
+    height: 1920,
+    // 默认只显示图标和手势；可显式指定五个点击提示或四个计数，纯数字点击后会 +1。
+    labels: [],
+    counts: [],
+    avatar: '',            // 头像图片 URL / data URL；留空则只有白色圆框、框内透明
+    headline: '',          // 可选自定义大标题
+    scale: 1,              // 互动栏整体缩放
+    railRight: 80,         // 画布右边缘 → 互动栏中线（px，1080 宽基准）
+    railBottom: 198,       // 画布下边缘 → 分享图标视图盒底部；与可选文字无关
+    duration: 5,           // 总时长（秒）；默认对齐「精剪成片最后 5 秒」，点击间隔由它反推
+    hold: 0.3,             // 手势退场后保持全亮状态的时长（秒）
+  };
+
+  const params = new URLSearchParams(location.search);
+  const fromQuery = {};
+  for (const [key, value] of params) {
+    if (!(key in DEFAULTS)) continue;
+    fromQuery[key] = Array.isArray(DEFAULTS[key]) ? value.split(',')
+      : typeof DEFAULTS[key] === 'number' ? Number(value) : value;
+  }
+  const C = Object.assign({}, DEFAULTS, window.CTA_CONFIG || {}, fromQuery);
+  const W = C.width, H = C.height, S = C.scale;
+  const EXPORT = window.CTA_EXPORT === true;
+  if (EXPORT) document.documentElement.classList.add('export');
+  else document.body.classList.add('preview');
+
+  // ── 时间线（秒） ───────────────────────────────────────────
+  // 片头：栏入场 0–0.3，手势入场 0.2–0.55，0.65 第一次点击；
+  // 片尾：最后一次点击后 0.35–0.7 手势退场 → 停留 hold → 0.37 淡出 → 0.1 透明尾帧。
+  // 总时长固定为 C.duration，中间五次点击均分剩余时间。
+  const DURATION = Number(C.duration);
+  const STEP = (DURATION - 0.65 - 0.7 - 0.47 - C.hold) / 4;
+  if (!(STEP >= 0.5)) window.CTA_ERROR = `duration ${DURATION}s too short for hold ${C.hold}s`;
+  const T = { railIn: [0, 0.3], handIn: [0.2, 0.55], firstTap: 0.65 };
+  T.taps = [0, 1, 2, 3, 4].map(i => T.firstTap + i * STEP);
+  T.handOut = [T.taps[4] + 0.35, T.taps[4] + 0.7];
+  T.fadeOut = [T.handOut[1] + C.hold, T.handOut[1] + C.hold + 0.37];
+
+  // ── 数学 ───────────────────────────────────────────────────
+  const clamp = (v, a = 0, b = 1) => Math.min(b, Math.max(a, v));
+  const lerp = (a, b, p) => a + (b - a) * p;
+  const prog = (t, a, b) => clamp((t - a) / (b - a));
+  const easeOut = p => 1 - Math.pow(1 - p, 3);
+  const easeInOut = p => (p < .5 ? 4 * p * p * p : 1 - Math.pow(-2 * p + 2, 3) / 2);
+  const easeOutBack = p => { const c = 1.7; return 1 + (c + 1) * Math.pow(p - 1, 3) + c * Math.pow(p - 1, 2); };
+  // 分段关键帧：[[时间, 值], ...]，段内用 ease
+  function kf(t, frames, ease = easeInOut) {
+    if (t <= frames[0][0]) return frames[0][1];
+    for (let i = 1; i < frames.length; i++) {
+      const [t1, v1] = frames[i];
+      if (t <= t1) {
+        const [t0, v0] = frames[i - 1];
+        return lerp(v0, v1, ease((t - t0) / (t1 - t0)));
+      }
+    }
+    return frames[frames.length - 1][1];
+  }
+  const mix = (c1, c2, p) => {
+    const a = c1.match(/\w\w/g).map(h => parseInt(h, 16));
+    const b = c2.match(/\w\w/g).map(h => parseInt(h, 16));
+    return '#' + a.map((v, i) => Math.round(lerp(v, b[i], p)).toString(16).padStart(2, '0')).join('');
+  };
+  // 固定种子，保证每次导出的粒子完全一致
+  let seed = 20261007;
+  const rand = () => ((seed = (seed * 1664525 + 1013904223) >>> 0) / 4294967296);
+
+  // ── 图标（48×48 视图盒） ───────────────────────────────────
+  const ICON = {
+    heart: 'M24 42.6c-.9 0-1.8-.3-2.5-.9C12.4 34.2 4 27 4 17.6 4 11.2 8.9 6 15.1 6c3.7 0 6.9 1.9 8.9 4.8C26 7.9 29.2 6 32.9 6 39.1 6 44 11.2 44 17.6c0 9.4-8.4 16.6-17.5 24.1-.7.6-1.6.9-2.5.9z',
+    comment: 'M24 4.5C35.3 4.5 44 12.3 44 22s-8.7 17.5-20 17.5c-2.1 0-4.2-.3-6.1-.8L9.8 43c-.9.5-2-.3-1.7-1.3l1.9-6.6C6.3 31.9 4 27.2 4 22 4 12.3 12.7 4.5 24 4.5z',
+    bookmark: 'M13 5h22c2.2 0 4 1.8 4 4v32.1c0 1.7-2 2.6-3.3 1.6L24 34l-11.7 8.7c-1.3 1-3.3.1-3.3-1.6V9c0-2.2 1.8-4 4-4z',
+    share: 'M27 8.6c0-1.3 1.6-2 2.6-1.1l14 12.9c.7.6.7 1.7 0 2.3l-14 12.9c-1 .9-2.6.2-2.6-1.1V28c-9.6 0-16.6 2.8-21.3 9.6-.6.9-2 .4-1.9-.7C5.3 24.6 13 16.6 27 15.4V8.6z',
+  };
+  const STAR = 'M12 1.5l2.9 6.6 7.1.7-5.4 4.8 1.6 7-6.2-3.7-6.2 3.7 1.6-7L2 8.8l7.1-.7z';
+  const HEART_SMALL = ICON.heart;
+
+  // 指向手势：多块圆角形拼成，先整体描深色粗边、再整体填白 → 只剩外轮廓
+  const HAND_W = 124, HAND_SCALE = HAND_W / 100;
+  const HAND_TIP = { x: 36 * HAND_SCALE, y: 5 * HAND_SCALE };   // 指尖在手势 SVG 内的位置
+  const handShapes = `
+    <rect x="24" y="5" width="24" height="70" rx="12"/>
+    <rect x="44" y="43" width="21" height="36" rx="10.5"/>
+    <rect x="60" y="49" width="20" height="32" rx="10"/>
+    <rect x="74" y="57" width="16" height="28" rx="8"/>
+    <rect x="20" y="56" width="68" height="64" rx="26"/>
+    <rect x="4" y="62" width="22" height="40" rx="11" transform="rotate(-32 15 82)"/>`;
+  const HAND_SVG = `<svg width="${HAND_W}" height="${130 * HAND_SCALE}" viewBox="0 0 100 130">
+    <g fill="#2a2b31" stroke="#2a2b31" stroke-width="7" stroke-linejoin="round">${handShapes}</g>
+    <g fill="#fff">${handShapes}</g>
+    <g fill="none" stroke="#c9ccd3" stroke-width="2.4" stroke-linecap="round">
+      <path d="M62 54v12M76 62v11M30 62h12"/>
+      <path d="M31 14q5 -3 10 0" stroke="#dfe1e6"/>
+    </g>
+  </svg>`;
+
+  // ── 布局（以头像中心为原点，单位 px，再乘 scale） ───────────
+  // 用户 TikTok 预览截图中，9:16 视频区域为 (0,77)–(828,1549)。
+  // 换算到 1080×1920：中线 x=1000；头像 y=1128；动作中心 y=1278/1410/1542/1674。
+  const AVATAR_D = 126, BADGE_D = 44, ICON_D = 96;
+  const ROWS = [
+    { key: 'follow', y: 0 },
+    { key: 'like', y: 150, icon: 'heart', on: 'var(--red)', onHex: 'fe2c55' },
+    { key: 'comment', y: 282, icon: 'comment' },
+    { key: 'favorite', y: 414, icon: 'bookmark', on: 'var(--yellow)', onHex: 'ffc300' },
+    { key: 'share', y: 546, icon: 'share' },
+  ];
+  const COUNT_DY = 70;              // 图标中心 → 文字中心
+  const RAIL_BOTTOM_EXTENT = ROWS[4].y + ICON_D / 2;
+  const railX = W - C.railRight * S;
+  const railY = H - C.railBottom - RAIL_BOTTOM_EXTENT * S;
+  // 每一行在画布上的中心点（手势与提示条都用画布坐标）
+  const at = (row, dx = 0, dy = 0) => ({ x: railX + dx * S, y: railY + (row.y + dy) * S });
+
+  const PILL_STYLE = [
+    { bg: '#fe2c55', fg: '#fff' },
+    { bg: '#fe2c55', fg: '#fff' },
+    { bg: '#ffffff', fg: '#161823' },
+    { bg: '#ffc300', fg: '#161823' },
+    { bg: '#20d5ec', fg: '#08343b' },
+  ];
+  // 手指落点：略偏右下，图标主体仍露在指尖上方
+  const TAP_OFFSET = [[6, 62], [10, 16], [10, 16], [10, 18], [8, 16]];
+
+  // ── 构建 DOM ───────────────────────────────────────────────
+  const $ = (html) => { const t = document.createElement('template'); t.innerHTML = html.trim(); return t.content.firstElementChild; };
+  const stage = document.getElementById('stage');
+  const layer = document.getElementById('layer');
+  const rail = $('<div class="rail"></div>');
+  rail.style.transform = `translate(${railX}px, ${railY}px) scale(${S})`;
+  layer.appendChild(rail);
+
+  const el = {};
+
+  // 头像 + 关注徽标
+  const followItem = $('<div class="item"></div>');
+  const avatar = $('<div class="avatar"></div>');
+  Object.assign(avatar.style, { width: AVATAR_D + 'px', height: AVATAR_D + 'px', left: -AVATAR_D / 2 + 'px', top: -AVATAR_D / 2 + 'px' });
+  const avatarSrc = String(C.avatar || '');
+  if (avatarSrc) {
+    const img = new Image();
+    img.src = avatarSrc;
+    img.alt = '';
+    avatar.appendChild(img);
+    el.avatarImg = img;
+  }
+  const badge = $(`<div class="badge"><svg viewBox="0 0 44 44">
+      <circle cx="22" cy="22" r="22" fill="#fe2c55"/>
+      <g class="plus" stroke="#fff" stroke-width="4.4" stroke-linecap="round"><path d="M22 13v18M13 22h18"/></g>
+      <path class="check" d="M13.5 22.5l6 6 11-12" fill="none" stroke="#fff" stroke-width="4.4" stroke-linecap="round" stroke-linejoin="round" pathLength="1" stroke-dasharray="1" stroke-dashoffset="1"/>
+    </svg></div>`);
+  Object.assign(badge.style, { width: BADGE_D + 'px', height: BADGE_D + 'px', left: -BADGE_D / 2 + 'px', top: AVATAR_D / 2 - BADGE_D / 2 + 'px' });
+  followItem.append(avatar, badge);
+  rail.appendChild(followItem);
+  el.badge = badge;
+  el.plus = badge.querySelector('.plus');
+  el.check = badge.querySelector('.check');
+
+  // 四个动作图标
+  el.rows = ROWS.map((row, i) => {
+    if (!row.icon) return null;
+    const item = $('<div class="item"></div>');
+    item.style.transform = `translate(0px, ${row.y}px)`;
+    const icon = $(`<div class="icon"><svg viewBox="0 0 48 48"><path d="${ICON[row.icon]}" fill="#fff"/>${
+      row.icon === 'comment' ? '<g fill="#22232b"><circle cx="15" cy="22" r="3"/><circle cx="24" cy="22" r="3"/><circle cx="33" cy="22" r="3"/></g>' : ''
+    }</svg></div>`);
+    Object.assign(icon.style, { width: ICON_D + 'px', height: ICON_D + 'px', left: -ICON_D / 2 + 'px', top: -ICON_D / 2 + 'px' });
+    const raw = String((C.counts || [])[i - 1] ?? '');
+    const count = raw.trim() ? $(`<div class="count"></div>`) : null;
+    if (count) {
+      count.textContent = raw;
+      count.style.top = COUNT_DY - 15 + 'px';
+    }
+    const fx = $('<div class="fx"></div>');
+    item.append(fx, icon);
+    if (count) item.appendChild(count);
+    rail.appendChild(item);
+    return {
+      icon, count, fx, raw,
+      numeric: /^\d+$/.test(raw),
+      path: icon.querySelector('path'),
+      dots: [...icon.querySelectorAll('circle')],
+    };
+  });
+
+  // 特效：每行一个冲击环 + 若干粒子（点赞=小心形，收藏=星星，其余=圆点）
+  // arc 给定时粒子只在该角度范围内散开（y 轴向下：0=右，π/2=下）
+  function buildFx(fxHost, kind, color, count, arc = null) {
+    const ring = $('<div></div>');
+    Object.assign(ring.style, { borderRadius: '50%', border: `8px solid ${color}` });
+    fxHost.appendChild(ring);
+    const parts = [];
+    for (let k = 0; k < count; k++) {
+      const base = arc ? arc[0] + (arc[1] - arc[0]) * (k / (count - 1))
+        : (k / count) * Math.PI * 2 - Math.PI / 2;
+      const angle = base + (rand() - .5) * .5;
+      const dist = 92 + rand() * 34;
+      const size = kind === 'dot' ? 12 + rand() * 6 : 20 + rand() * 10;
+      const tint = kind === 'heart' ? ['#fe2c55', '#ff7a95', '#ffb3c1'][k % 3]
+        : kind === 'star' ? ['#ffc300', '#ffe066', '#fff3b0'][k % 3] : color;
+      const node = kind === 'dot'
+        ? $(`<div style="width:${size}px;height:${size}px;border-radius:50%;background:${tint}"></div>`)
+        : $(`<svg width="${size}" height="${size}" viewBox="${kind === 'heart' ? '0 0 48 48' : '0 0 24 24'}"><path d="${kind === 'heart' ? HEART_SMALL : STAR}" fill="${tint}"/></svg>`);
+      fxHost.appendChild(node);
+      parts.push({ node, angle, dist, size, spin: (rand() - .5) * 120 });
+    }
+    return { ring, parts };
+  }
+  const followFx = $('<div class="fx"></div>');
+  followFx.style.transform = `translate(0px, ${AVATAR_D / 2}px)`;
+  followItem.insertBefore(followFx, avatar);
+  el.fx = [
+    buildFx(followFx, 'dot', '#fe2c55', 7, [-0.25, Math.PI + 0.25]),
+    buildFx(el.rows[1].fx, 'heart', '#fe2c55', 9),
+    buildFx(el.rows[2].fx, 'dot', '#ffffff', 8),
+    buildFx(el.rows[3].fx, 'star', '#ffc300', 8),
+    buildFx(el.rows[4].fx, 'dot', '#20d5ec', 8),
+  ];
+
+  // 左侧提示条
+  el.pills = (C.labels || []).slice(0, 5).flatMap((text, i) => {
+    if (!String(text ?? '').trim()) return [];
+    const pill = $('<div class="pill"></div>');
+    pill.textContent = text;
+    pill.style.background = PILL_STYLE[i].bg;
+    pill.style.color = PILL_STYLE[i].fg;
+    pill.style.setProperty('--pill-bg', PILL_STYLE[i].bg);
+    layer.appendChild(pill);
+    return [{ pill, index: i }];
+  });
+
+  if (C.headline) {
+    el.headline = $('<div class="headline"></div>');
+    el.headline.textContent = C.headline;
+    layer.appendChild(el.headline);
+  }
+
+  el.ripple = $('<div class="ripple"></div>');
+  el.hand = $(`<div class="hand">${HAND_SVG}</div>`);
+  el.hand.style.transformOrigin = `${HAND_TIP.x}px ${HAND_TIP.y}px`;
+  layer.append(el.ripple, el.hand);
+
+  // ── 逐帧渲染 ───────────────────────────────────────────────
+  const tapPoint = (i) => at(ROWS[i], TAP_OFFSET[i][0], TAP_OFFSET[i][1]);
+
+  function renderFx(fx, te, ringFrom, ringTo) {
+    const p = prog(te, 0.02, 0.5);
+    const visible = p > 0 && p < 1;
+    const r = lerp(ringFrom, ringTo, easeOut(p));
+    Object.assign(fx.ring.style, {
+      display: visible ? 'block' : 'none',
+      width: r * 2 + 'px', height: r * 2 + 'px',
+      transform: `translate(${-r}px, ${-r}px)`,
+      borderWidth: lerp(9, 1, p) + 'px',
+      opacity: 1 - easeInOut(p),
+    });
+    const q = prog(te, 0.05, 0.62);
+    for (const part of fx.parts) {
+      const d = lerp(ringFrom * 0.9, part.dist, easeOut(q));
+      const x = Math.cos(part.angle) * d - part.size / 2;
+      const y = Math.sin(part.angle) * d - part.size / 2;
+      Object.assign(part.node.style, {
+        display: q > 0 && q < 1 ? 'block' : 'none',
+        transform: `translate(${x}px, ${y}px) rotate(${part.spin * q}deg) scale(${lerp(1.1, 0.35, q)})`,
+        opacity: q < 0.55 ? 1 : 1 - (q - 0.55) / 0.45,
+      });
+    }
+  }
+
+  function renderAt(t) {
+    // 整体淡入淡出
+    const railIn = easeOut(prog(t, ...T.railIn));
+    const fade = 1 - prog(t, ...T.fadeOut);
+    layer.style.opacity = Math.min(railIn, fade);
+    rail.style.transform = `translate(${railX + (1 - railIn) * 70}px, ${railY}px) scale(${S})`;
+    if (el.headline) {
+      const hp = easeOutBack(prog(t, 0.15, 0.6));
+      el.headline.style.transform = `translate(0px, ${railY + 40 * S}px) scale(${lerp(0.9, 1, hp)})`;
+      el.headline.style.opacity = clamp(hp);
+    }
+
+    const te = T.taps.map(tap => t - tap);   // 相对每次点击的时间
+
+    // ① 关注：+ 转成 ✓，随后徽标缩没（已关注）
+    const f = te[0];
+    el.plus.style.opacity = 1 - prog(f, 0.02, 0.16);
+    el.plus.style.transformOrigin = '22px 22px';
+    el.plus.style.transform = `rotate(${90 * easeInOut(prog(f, 0, 0.22))}deg)`;
+    el.check.setAttribute('stroke-dashoffset', 1 - easeOut(prog(f, 0.1, 0.32)));
+    const badgeScale = f < 0 ? 1 : kf(f, [[0, 1], [0.08, 0.8], [0.22, 1.2], [0.34, 1], [0.62, 1], [0.86, 0]]);
+    el.badge.style.transform = `scale(${badgeScale})`;
+
+    // ②~⑤ 图标：按下回弹 + 激活色
+    for (let i = 1; i <= 4; i++) {
+      const row = el.rows[i], r = ROWS[i], e = te[i];
+      const pop = e < 0 ? 1 : kf(e, [[0, 1], [0.08, 0.78], [0.22, 1.24], [0.38, 0.96], [0.5, 1]]);
+      let tx = 0, rot = 0;
+      if (r.key === 'share' && e >= 0) {
+        tx = kf(e, [[0, 0], [0.16, 12], [0.34, -4], [0.5, 0]]);
+        rot = kf(e, [[0, 0], [0.16, -12], [0.34, 4], [0.5, 0]]);
+      }
+      row.icon.style.transform = `translate(${tx}px, 0px) rotate(${rot}deg) scale(${pop})`;
+      if (r.onHex) row.path.setAttribute('fill', mix('ffffff', r.onHex, prog(e, 0.03, 0.14)));
+      if (r.key === 'comment') {
+        row.dots.forEach((dot, k) => {
+          const b = prog(e, 0.08 + k * 0.07, 0.3 + k * 0.07);
+          dot.setAttribute('cy', 22 - Math.sin(b * Math.PI) * 4.5);
+        });
+      }
+      if (row.numeric) row.count.textContent = String(Number(row.raw) + (e >= 0.05 ? 1 : 0));
+    }
+
+    // 特效
+    renderFx(el.fx[0], te[0], 18, 50);
+    renderFx(el.fx[1], te[1], 30, 70);
+    renderFx(el.fx[2], te[2], 30, 66);
+    renderFx(el.fx[3], te[3], 30, 70);
+    renderFx(el.fx[4], te[4], 30, 66);
+
+    // 提示条：点击时从图标左侧弹出，下一次点击前收起；最后一条保留到整体淡出
+    el.pills.forEach(({ pill, index: i }) => {
+      const e = te[i];
+      const inP = prog(e, 0.02, 0.3);
+      const outP = i < 4 ? prog(e, STEP - 0.14, STEP - 0.02) : 0;
+      const s = inP <= 0 ? 0 : lerp(0.4, 1, easeOutBack(inP)) * lerp(1, 0.85, outP);
+      const anchor = at(ROWS[i], i === 0 ? -AVATAR_D / 2 - 34 : -ICON_D / 2 - 34, i === 0 ? 0 : 0);
+      pill.style.display = inP > 0 && outP < 1 ? 'block' : 'none';
+      pill.style.opacity = clamp(inP * 3) * (1 - outP);
+      const pw = pill.offsetWidth, ph = pill.offsetHeight;
+      pill.style.transform = `translate(${anchor.x - pw + (1 - inP) * 24}px, ${anchor.y - ph / 2}px) scale(${s})`;
+    });
+
+    // 手势：入场 → 逐个点击（按下缩小 + 涟漪）→ 退场
+    const start = tapPoint(0);
+    let pos = { x: start.x + 150, y: start.y + 420 };
+    let handOpacity = 0;
+    if (t >= T.handIn[0]) {
+      const p = easeInOut(prog(t, ...T.handIn));
+      pos = { x: lerp(start.x + 150, start.x, p), y: lerp(start.y + 420, start.y, p) };
+      handOpacity = clamp(prog(t, T.handIn[0], T.handIn[0] + 0.2));
+    }
+    for (let i = 0; i < 4; i++) {
+      const a = tapPoint(i), b = tapPoint(i + 1);
+      const m0 = T.taps[i] + 0.28, m1 = T.taps[i] + STEP - 0.12;
+      if (t >= m0) {
+        const p = easeInOut(prog(t, m0, m1));
+        pos = { x: lerp(a.x, b.x, p) - Math.sin(p * Math.PI) * 26, y: lerp(a.y, b.y, p) };
+      }
+    }
+    if (t >= T.handOut[0]) {
+      const last = tapPoint(4), p = easeInOut(prog(t, ...T.handOut));
+      pos = { x: lerp(last.x, last.x + 170, p), y: lerp(last.y, last.y + 460, p) };
+      handOpacity = 1 - prog(t, T.handOut[0] + 0.15, T.handOut[1]);
+    }
+    let press = 1;
+    for (const tap of T.taps) press = Math.min(press, kf(t - tap, [[-0.1, 1], [0, 0.86], [0.14, 1]]));
+    el.hand.style.opacity = handOpacity;
+    el.hand.style.transform = `translate(${pos.x - HAND_TIP.x}px, ${pos.y - HAND_TIP.y}px) rotate(8deg) scale(${press * S})`;
+
+    // 指尖涟漪
+    let rip = null;
+    T.taps.forEach((tap, i) => { const e = t - tap; if (e >= 0 && e < 0.45) rip = { e, p: tapPoint(i) }; });
+    if (rip) {
+      const p = rip.e / 0.45, r = lerp(12, 62, easeOut(p)) * S;
+      Object.assign(el.ripple.style, {
+        display: 'block', width: r * 2 + 'px', height: r * 2 + 'px',
+        transform: `translate(${rip.p.x - r}px, ${rip.p.y - r}px)`,
+        borderWidth: lerp(7, 1.5, p) + 'px', opacity: 0.9 * (1 - p),
+      });
+    } else {
+      el.ripple.style.display = 'none';
+    }
+  }
+
+  // ── 对外接口（导出脚本使用） ───────────────────────────────
+  window.renderAt = renderAt;
+  window.CTA_DURATION = DURATION;
+  window.CTA_SIZE = { width: W, height: H };
+
+  const ready = [document.fonts ? document.fonts.ready : Promise.resolve()];
+  if (el.avatarImg) ready.push(el.avatarImg.decode().catch(() => { throw new Error('avatar image failed to load'); }));
+  Promise.all(ready).then(() => { renderAt(0); window.CTA_READY = true; })
+    .catch(err => { window.CTA_ERROR = String(err && err.message || err); });
+
+  if (EXPORT) {
+    document.getElementById('viewport').style.cssText = `width:${W}px;height:${H}px`;
+    return;
+  }
+
+  // ── 预览：自适应缩放 + 循环播放 + 拖动进度 ───────────────────
+  // ?embed=1：配置中心里的小窗预览，不要控制条和留白；?bg=dark|light|checker 选预览底色
+  const EMBED = params.get('embed') === '1';
+  if (EMBED) document.body.classList.add('embed');
+  const viewport = document.getElementById('viewport');
+  const bgSelect = document.getElementById('bg');
+  if (['dark', 'light', 'checker'].includes(params.get('bg'))) stage.dataset.bg = bgSelect.value = params.get('bg');
+  function fit() {
+    const k = EMBED ? Math.min(innerHeight / H, innerWidth / W)
+      : Math.min((innerHeight - 90) / H, (innerWidth - 32) / W);
+    viewport.style.width = W * k + 'px';
+    viewport.style.height = H * k + 'px';
+    stage.style.transform = `scale(${k})`;
+  }
+  fit();
+  addEventListener('resize', fit);
+
+  const playBtn = document.getElementById('play');
+  const scrub = document.getElementById('scrub');
+  const timeLabel = document.getElementById('time');
+  const LOOP = DURATION + 0.6;
+  let playing = true, cur = 0, last = performance.now();
+  function tick(now) {
+    if (playing) cur = (cur + (now - last) / 1000) % LOOP;
+    last = now;
+    const t = Math.min(cur, DURATION);
+    renderAt(t);
+    scrub.value = Math.round((t / DURATION) * 1000);
+    timeLabel.textContent = t.toFixed(2) + 's';
+    requestAnimationFrame(tick);
+  }
+  requestAnimationFrame(tick);
+  playBtn.addEventListener('click', () => { playing = !playing; playBtn.textContent = playing ? '❚❚' : '▶'; });
+  scrub.addEventListener('input', () => { playing = false; playBtn.textContent = '▶'; cur = (scrub.value / 1000) * DURATION; });
+  bgSelect.addEventListener('change', () => { stage.dataset.bg = bgSelect.value; });
+})();
+</script>
+</body>
+</html>

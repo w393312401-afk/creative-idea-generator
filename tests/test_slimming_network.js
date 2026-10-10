@@ -1,0 +1,10 @@
+'use strict';
+require('../tools/offline_node.js');
+const assert = require('node:assert/strict');
+const blocked = /OFFLINE_GUARD: network disabled/;
+assert.throws(() => require('node:net').connect(50325, '127.0.0.1'), blocked);
+assert.throws(() => require('node:https').get('https://example.invalid'), blocked);
+assert.throws(() => require('node:dgram').createSocket('udp4'), blocked);
+assert.throws(() => require('node:dns').lookup('example.invalid'), blocked);
+assert.throws(() => fetch('http://127.0.0.1:8085'), blocked);
+console.log('offline network guard tests passed');

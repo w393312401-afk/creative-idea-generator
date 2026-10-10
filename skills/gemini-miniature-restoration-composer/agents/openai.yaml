@@ -1,0 +1,9 @@
+interface:
+  display_name: "微缩模型与巨人手建造提示词合成器"
+  short_description: "一键生成微缩沙盘、巨人手手工DIY与娃娃屋剖面延时改造提示词集合"
+
+  default_prompt: >-
+    Use $gemini-miniature-restoration-composer for this request. Read the skill's SKILL.md in full
+    before composing anything and follow it exactly — it is the single authority for the
+    giant hands actor contract, macro diorama optics, cutaway dollhouse architecture, and
+    craft materials protocol. Do not substitute remembered rules for what that file currently says.

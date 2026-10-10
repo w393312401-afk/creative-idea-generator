@@ -8,6 +8,8 @@ refresh_credit 的真实探测部分用 monkeypatch 打桩。
 
 
 
+from datetime import timedelta
+
 import pytest
 from integrations.google_fx.utils import account_pool as ap
 
@@ -16,6 +18,8 @@ from integrations.google_fx.utils import account_pool as ap
 def isolated_state_file(tmp_path, monkeypatch):
     state_file = tmp_path / "account_pool.json"
     monkeypatch.setattr(ap, "_STATE_FILE", state_file)
+    from integrations.google_fx.utils import account_credentials as creds
+    monkeypatch.setattr(creds, "_STATE_FILE", tmp_path / "account_credentials.json")
     yield state_file
 
 
@@ -108,7 +112,73 @@ def test_mark_exhausted_sets_credit_zero_and_cooldown():
 
     accounts = {a["user_id"]: a for a in pool.list_accounts()}
     assert accounts["user_a"]["credit"] == 0
+    assert accounts["user_a"]["disabled"] is True
+    assert accounts["user_a"]["disabled_reason"] == "zero_credit"
     assert accounts["user_a"]["cooldown_until"] is not None
+
+
+def test_zero_credit_probe_automatically_disables_account(monkeypatch):
+    pool = ap.AccountPool()
+    pool.add_account("user_zero")
+
+    from integrations.google_fx.services import google_fx_credit as credit_module
+    monkeypatch.setattr(credit_module, "probe_flow_credit", lambda user_id, port=None: 0)
+
+    result = pool.refresh_credit("user_zero", force=True)
+
+    assert result["credit"] == 0
+    assert result["disabled"] is True
+    assert result["disabled_reason"] == "zero_credit"
+    assert pool.pick_account() is None
+
+
+def test_positive_probe_reenables_only_zero_credit_auto_disabled_account(monkeypatch):
+    pool = ap.AccountPool()
+    pool.add_account("auto_disabled")
+    pool.add_account("manually_disabled")
+
+    state = ap._read_state()
+    state["auto_disabled"].update({
+        "credit": 0,
+        "disabled": True,
+        "disabled_reason": "zero_credit",
+    })
+    state["manually_disabled"].update({"credit": 0, "disabled": True})
+    ap._write_state(state)
+
+    from integrations.google_fx.services import google_fx_credit as credit_module
+    monkeypatch.setattr(credit_module, "probe_flow_credit", lambda user_id, port=None: 100)
+
+    automatic = pool.refresh_credit("auto_disabled", force=True)
+    manual = pool.refresh_credit("manually_disabled", force=True)
+
+    assert automatic["disabled"] is False
+    assert automatic.get("disabled_reason") is None
+    assert manual["disabled"] is True
+
+
+def test_legacy_zero_credit_state_is_disabled_on_read():
+    pool = ap.AccountPool()
+    pool.add_account("legacy_zero")
+    state = ap._read_state()
+    state["legacy_zero"]["credit"] = 0
+    state["legacy_zero"]["disabled"] = False
+    ap._write_state(state)
+
+    account = pool.list_accounts(heal=False)[0]
+    assert account["disabled"] is True
+    assert account["disabled_reason"] == "zero_credit"
+
+
+def test_zero_credit_account_cannot_be_manually_reenabled():
+    pool = ap.AccountPool()
+    pool.add_account("zero")
+    pool.mark_exhausted("zero")
+
+    result = pool.set_disabled("zero", False)
+
+    assert result["disabled"] is True
+    assert result["disabled_reason"] == "zero_credit"
 
 
 def test_pick_account_falls_back_when_stale_leader_turns_out_exhausted(monkeypatch):
@@ -227,6 +297,97 @@ def test_refresh_credit_marks_login_required_on_login_page(monkeypatch):
     assert result["cooldown_reason"] == "login_required"
     assert result["cooldown_until"] is not None
 
+
+def test_successful_probe_releases_the_login_cooldown(monkeypatch):
+    """掉登录冷却必须随"探测成功"一起解开，不能只清 reason 留着 cooldown_until。
+
+    自动登录让这个疏漏变得要命：探针撞上登录页 → 自动登进去 → 读到积分 →
+    账号明明已经可用，却因为冷却时间没到，pick_account 继续跳过它整整两小时。
+    """
+    pool = ap.AccountPool()
+    pool.add_account("user_login")
+    pool.mark_login_required("user_login", cooldown_hours=2.0)
+    assert pool.list_accounts(heal=False)[0]["cooldown_until"] is not None
+
+    from integrations.google_fx.services import google_fx_credit as credit_module
+    monkeypatch.setattr(credit_module, "probe_flow_credit", lambda user_id, port=None: 800)
+
+    result = pool.refresh_credit("user_login", force=True)
+    assert result["credit"] == 800
+    assert result["cooldown_until"] is None
+    assert result.get("cooldown_reason") is None
+    assert pool.pick_account() is not None, "登录恢复后账号应立刻可被选中"
+
+
+def test_exhaustion_cooldown_survives_a_successful_probe(monkeypatch):
+    """额度耗尽的 24h 冷却有它自己的语义，不该被一次积分探测顺手撤掉——
+    只有 login_required 那把锁才随探测成功一起解。"""
+    pool = ap.AccountPool()
+    pool.add_account("user_dry")
+    pool.mark_exhausted("user_dry", cooldown_hours=24.0)
+
+    from integrations.google_fx.services import google_fx_credit as credit_module
+    monkeypatch.setattr(credit_module, "probe_flow_credit", lambda user_id, port=None: 5)
+
+    result = pool.refresh_credit("user_dry", force=True)
+    assert result["cooldown_until"] is not None
+
+
+# ── 自动登录凭据在号池里的呈现 ────────────────────────────────────────────────
+
+def test_list_accounts_reports_credential_presence_without_leaking_plaintext(tmp_path, monkeypatch):
+    """list_accounts() 的结果会被 /api/account-pool 整份发给浏览器。
+    密码/2FA 密钥漏进去 = 把 Google 密码发给了前端。"""
+    from integrations.google_fx.utils import account_credentials as creds
+    monkeypatch.setattr(creds, "_STATE_FILE", tmp_path / "account_credentials.json")
+
+    pool = ap.AccountPool()
+    pool.add_account("user_a", "配了凭据的号")
+    pool.add_account("user_b", "没配凭据的号")
+    creds.save("user_a", email="me@example.com", password="hunter2",
+               totp_secret="GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ")
+
+    rows = {a["user_id"]: a for a in pool.list_accounts(heal=False)}
+
+    assert rows["user_a"]["auto_login_ready"] is True
+    assert rows["user_a"]["has_totp"] is True
+    assert rows["user_a"]["login_email"] == "me@example.com"
+    assert rows["user_b"]["auto_login_ready"] is False
+    assert rows["user_b"]["has_password"] is False
+
+    serialized = json.dumps(list(rows.values()), ensure_ascii=False, default=str)
+    assert "hunter2" not in serialized
+    assert "GEZDGNBVGY3TQOJQ" not in serialized
+
+
+def test_email_only_credentials_are_not_reported_as_ready(tmp_path, monkeypatch):
+    """只填了邮箱的号自动登录会在密码页原地卡死。报成"已就绪"会让用户以为
+    配好了，直到某天夜里掉登录才发现没用。"""
+    from integrations.google_fx.utils import account_credentials as creds
+    monkeypatch.setattr(creds, "_STATE_FILE", tmp_path / "account_credentials.json")
+
+    pool = ap.AccountPool()
+    pool.add_account("user_a")
+    creds.save("user_a", email="me@example.com")
+
+    assert pool.list_accounts(heal=False)[0]["auto_login_ready"] is False
+
+
+def test_removing_an_account_also_deletes_its_stored_password(tmp_path, monkeypatch):
+    """不跟着删就会在 runtime/ 下留一条谁也看不见、谁也不会再清理的明文密码：
+    号池里已经没有这个账号，控制台自然也不会再显示它还存着凭据。"""
+    from integrations.google_fx.utils import account_credentials as creds
+    cred_file = tmp_path / "account_credentials.json"
+    monkeypatch.setattr(creds, "_STATE_FILE", cred_file)
+
+    pool = ap.AccountPool()
+    pool.add_account("user_a")
+    creds.save("user_a", email="me@example.com", password="hunter2")
+
+    pool.remove_account("user_a")
+
+    assert creds.get("user_a") is None
+    assert "hunter2" not in cred_file.read_text(encoding="utf-8")
 
 
 # ── AdsPower 本地 API 限频重试 ────────────────────────────────────────────────
@@ -406,4 +567,128 @@ def test_account_pool_credit_sorting(monkeypatch):
     assert [a["user_id"] for a in accs_asc] == ["user_low", "user_high"]
 
 
+def test_credit_below_min_threshold_automatically_disables_account(monkeypatch):
+    pool = ap.AccountPool()
+    pool.add_account("user_low_credit")
 
+    from integrations.google_fx.services import google_fx_credit as credit_module
+    # Probing 14 credits (< 15 threshold) should automatically disable account
+    monkeypatch.setattr(credit_module, "probe_flow_credit", lambda user_id, port=None: 14)
+    result = pool.refresh_credit("user_low_credit", force=True)
+
+    assert result["credit"] == 14
+    assert result["disabled"] is True
+    assert result["disabled_reason"] == "zero_credit"
+    assert pool.pick_account(min_credit=15) is None
+
+    # Probing 15 credits (>= 15 threshold) should re-enable account
+    monkeypatch.setattr(credit_module, "probe_flow_credit", lambda user_id, port=None: 15)
+    result2 = pool.refresh_credit("user_low_credit", force=True)
+
+    assert result2["credit"] == 15
+    assert result2["disabled"] is False
+    assert result2.get("disabled_reason") is None
+    assert pool.pick_account(min_credit=15)["user_id"] == "user_low_credit"
+
+
+def test_tasks_since_check_triggers_stale_probe(monkeypatch):
+    pool = ap.AccountPool()
+    pool.add_account("user_active")
+
+    # Set initial credit to 180 probed earlier
+    state = ap._read_state()
+    state["user_active"]["credit"] = 180
+    state["user_active"]["last_checked_at"] = "2026-08-23T08:00:00+08:00"
+    # But later at 09:00 it executed tasks and succeeded
+    state["user_active"]["last_success_at"] = "2026-08-23T09:00:00+08:00"
+    ap._write_state(state)
+
+    # Even though STALE_AFTER_SECONDS is huge (e.g. 6 hours), tasks_since_check should trigger a refresh!
+    monkeypatch.setattr(ap, "STALE_AFTER_SECONDS", 21600)
+    probed = []
+    from integrations.google_fx.services import google_fx_credit as credit_module
+    monkeypatch.setattr(credit_module, "probe_flow_credit", lambda user_id, port=None: (probed.append(user_id) or 0))
+
+    chosen = pool.pick_account(min_credit=15)
+    # The active account should have been probed because tasks ran since last check, found to have 0 credits, and skipped
+    assert "user_active" in probed
+    assert chosen is None
+
+
+# ── 探测退避：修"积分探测一直刷新"（2026-09-05）───────────────────
+# 失败的探测不写 last_checked_at，_credit_is_stale() 只看 last_checked_at，
+# 于是探不动的账号永远"过期"——每次选号/复核都真开一次浏览器重探，无限循环。
+
+
+def _fail_probe(monkeypatch, counter):
+    from integrations.google_fx.services import google_fx_credit as credit_module
+    monkeypatch.setattr(credit_module, "probe_flow_credit",
+                        lambda user_id, port=None: (counter.append(user_id), None)[1])
+
+
+def test_failed_probe_is_not_reprobed_within_backoff(monkeypatch):
+    """连着选两次号，探不动的账号只该真探一次——第二次走退避。"""
+    monkeypatch.setattr(ap, "PROBE_RETRY_AFTER_SECONDS", 600)
+    pool = ap.AccountPool()
+    pool.add_account("dead")
+    probed = []
+    _fail_probe(monkeypatch, probed)
+
+    assert pool.pick_account(min_credit=1) is None
+    assert pool.pick_account(min_credit=1) is None
+    assert pool.pick_account(min_credit=1) is None
+    assert probed == ["dead"]
+
+    # 账号仍然被判为不可用——退避只省掉重复探测，不会把它当成有额度。
+    assert pool.account_is_usable("dead", min_credit=1) is False
+    assert probed == ["dead"]
+
+
+def test_probe_backoff_expires_and_allows_retry(monkeypatch):
+    monkeypatch.setattr(ap, "PROBE_RETRY_AFTER_SECONDS", 600)
+    pool = ap.AccountPool()
+    pool.add_account("dead")
+    probed = []
+    _fail_probe(monkeypatch, probed)
+
+    assert pool.pick_account(min_credit=1) is None
+    # 把上次探测时间推回 20 分钟前：退避窗口过了，就该再探一次。
+    state = ap._read_state()
+    state["dead"]["last_probe_at"] = (ap._now() - timedelta(minutes=20)).isoformat()
+    ap._write_state(state)
+
+    assert pool.pick_account(min_credit=1) is None
+    assert probed == ["dead", "dead"]
+
+
+def test_blocked_probe_uses_shorter_backoff(monkeypatch):
+    """浏览器忙（blocked）不是账号的问题，退避窗口比 failed 短。"""
+    monkeypatch.setattr(ap, "PROBE_RETRY_AFTER_SECONDS", 600)
+    monkeypatch.setattr(ap, "PROBE_BLOCKED_RETRY_AFTER_SECONDS", 120)
+    info = {"last_probe_status": "blocked",
+            "last_probe_at": (ap._now() - timedelta(seconds=200)).isoformat()}
+    assert ap._probe_backoff_remaining(info) == 0.0
+    info["last_probe_status"] = "failed"
+    assert ap._probe_backoff_remaining(info) > 0
+
+
+def test_manual_refresh_ignores_backoff(monkeypatch):
+    """控制台的「立即探测」是人点的，必须真探——退避只挡自动路径。"""
+    monkeypatch.setattr(ap, "PROBE_RETRY_AFTER_SECONDS", 600)
+    pool = ap.AccountPool()
+    pool.add_account("dead")
+    probed = []
+    _fail_probe(monkeypatch, probed)
+
+    pool.refresh_credit("dead", force=True)
+    pool.refresh_credit("dead", force=True)             # 自动路径：被退避挡住
+    assert probed == ["dead"]
+    pool.refresh_credit("dead", force=True, ignore_backoff=True)
+    assert probed == ["dead", "dead"]
+
+
+def test_ok_probe_never_hits_backoff(monkeypatch):
+    """成功探测不设退避：该重探的时候（缓存过期/跑过任务）照常重探。"""
+    monkeypatch.setattr(ap, "PROBE_RETRY_AFTER_SECONDS", 600)
+    info = {"last_probe_status": "ok", "last_probe_at": ap._now_iso()}
+    assert ap._probe_backoff_remaining(info) == 0.0

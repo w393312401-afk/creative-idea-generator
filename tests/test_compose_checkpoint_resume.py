@@ -18,6 +18,15 @@ from unittest.mock import patch
 
 import prompt_pipeline as pp
 
+# 每个相位的同族伴随工序，用来把夹具梯子的 package_operations 补到下限 2 道
+# （pp._MIN_PACKAGE_OPERATIONS）。与 deterministic_fallback_beat_ladder 里的
+# phase_companion 同源；同族配对不会额外触发相位冲突/材料层跨越判据。
+_COMPANION = {
+    'clearing': 'demolition', 'repair': 'placement', 'rough-in': 'wiring',
+    'framing': 'insulation', 'drywall': 'paneling', 'flooring': 'painting',
+    'painting': 'priming', 'furnishing': 'lighting',
+}
+
 
 class TestCheckpointStorage(unittest.TestCase):
     def setUp(self):
@@ -44,6 +53,34 @@ class TestCheckpointStorage(unittest.TestCase):
         pp.clear_compose_checkpoint('fp-a')
         self.assertIsNone(pp.load_compose_checkpoint('fp-a'))
         self.assertEqual(pp.load_compose_checkpoint('fp-b')['title'], 'B')
+
+    def test_clear_compose_caches_takes_the_packets_too(self):
+        """「清理合成缓存」清的是两个文件。只清断点存档是最容易犯的那个错：
+        提示词逐字重生成了，Step 4 却命中旧 packet，空间契约与 camera DNA 还是老的
+        ——从成品上完全看不出来缓存没清干净。"""
+        with patch.object(pp, 'CACHE_PATH', os.path.join(self._tmp_dir, 'packet_cache.json')):
+            pp.save_compose_checkpoint('fp-a', {'title': 'A'})
+            pp.save_compose_checkpoint('fp-b', {'title': 'B'})
+            # packet 的键是「指纹 + 本次梯子哈希」，同一份 brief 会留下好几条。
+            pp.save_packet_cache({'fp-a:1111': {'p': 1}, 'fp-a:2222': {'p': 2},
+                                  'fp-b:3333': {'p': 3}})
+
+            cleared = pp.clear_compose_caches('fp-a')
+
+            self.assertEqual(cleared, {'checkpoint': 1, 'packets': 2})
+            self.assertIsNone(pp.load_compose_checkpoint('fp-a'))
+            self.assertEqual(sorted(pp.load_packet_cache()), ['fp-b:3333'])
+            # 别的任务的缓存不能被顺手清掉——这个页面上同时挂着好几单。
+            self.assertEqual(pp.load_compose_checkpoint('fp-b')['title'], 'B')
+
+    def test_clear_compose_caches_is_a_noop_when_there_is_nothing_to_clear(self):
+        with patch.object(pp, 'CACHE_PATH', os.path.join(self._tmp_dir, 'packet_cache.json')):
+            self.assertEqual(pp.clear_compose_caches('never-seen'),
+                             {'checkpoint': 0, 'packets': 0})
+            # 空指纹要短路：拿它去做前缀匹配会把整个 packet 缓存清光。
+            pp.save_packet_cache({'fp-a:1111': {'p': 1}})
+            self.assertEqual(pp.clear_compose_caches(''), {'checkpoint': 0, 'packets': 0})
+            self.assertEqual(sorted(pp.load_packet_cache()), ['fp-a:1111'])
 
     def test_encode_decode_slots_round_trip(self):
         encoded = pp._checkpoint_encode_slots({1: 'x', 2: 'y'})
@@ -145,19 +182,21 @@ class TestSignatureAnchorFlowsIntoParsedBrief(unittest.TestCase):
              'milestone_name': 'approach fully cleared', 'before_state': 'debris covers the approach',
              'after_state': 'the entire approach is cleared to stable ground',
              'completion_extent': 'the entire visible approach', 'changed_grid_cells': ['Grid B2', 'Grid C2'],
-             'package_operations': ['clearing'], 'primary_progress': 'clear ground expands across the full approach',
+             'package_operations': ['clearing', 'demolition'], 'primary_progress': 'clear ground expands across the full approach',
              'secondary_progress': 'two debris crates fill from empty to full',
              'persistent_traces': ['rake grooves', 'crate drag marks'],
-             'preserve_state': 'the tower shell remains rusted and untouched'},
+             'preserve_state': 'the tower shell remains rusted and untouched',
+             'introduced_objects': [], 'removed_objects': []},
             {'index': 2, 'operation': 'framing', 'description': 'framing interior walls', 'bridge_stage': None, 'stage_scope': 'large',
              'milestone_name': 'all interior framing complete', 'before_state': 'the interior shell has no studs',
              'after_state': 'all declared wall and ceiling studs are installed',
              'completion_extent': 'all interior walls and the ceiling curve',
              'changed_grid_cells': ['Grid A2', 'Grid B2', 'Grid C2'],
-             'package_operations': ['framing'], 'primary_progress': 'stud count grows from zero to twelve',
+             'package_operations': ['framing', 'insulation'], 'primary_progress': 'stud count grows from zero to twelve',
              'secondary_progress': 'the staged timber bundle drains from twelve to zero',
              'persistent_traces': ['screw heads', 'sawdust bands'],
-             'preserve_state': 'the cleared floor and original shell remain unchanged'},
+             'preserve_state': 'the cleared floor and original shell remain unchanged',
+             'introduced_objects': [], 'removed_objects': []},
             {'index': 3, 'operation': 'reward', 'bridge_stage': None,
              'description': 'The cast-iron valve stove hangs suspended above the hearth as warm light fills the finished room.',
              'anchor_keywords': ['cast-iron valve stove']},
@@ -207,41 +246,228 @@ class TestSignatureAnchorFlowsIntoParsedBrief(unittest.TestCase):
         self.assertEqual(reward_beat['operation'], 'reward')
         self.assertEqual(reward_beat['anchor_keywords'], ['cast-iron valve stove'])
 
+    def test_rhythm_advice_cannot_fail_an_otherwise_valid_ladder(self):
+        """Rhythm retries are best-effort when the beat-count ceiling prevents a split."""
+        with patch.object(
+                pp, 'rhythm_ladder_violations',
+                return_value=['Beat 2 is heavier than its neighbour.']):
+            state = pp.compose_anchor_and_packet({}, self.dimensions)
+
+        self.assertEqual(len(state['beat_ladder']), 3)
+        self.assertEqual(state['beat_ladder'][-1]['operation'], 'reward')
+
     def test_no_declared_anchor_leaves_signature_anchor_empty(self):
         self.dimensions['anchors'] = []
         state = pp.compose_anchor_and_packet({}, self.dimensions)
         self.assertEqual(state['parsed_brief']['signature_anchor'], '')
         self.assertNotIn('SIGNATURE ANCHOR RULE', self.captured_beat_system['text'])
 
-    def test_card_beat_outline_reaches_the_ladder_call_as_a_soft_plan(self):
+    def test_card_beat_outline_reaches_the_ladder_call_as_a_hard_rule(self):
         """灵感卡片上展示的工序预览(idea.beat_outline)随 dimensions 传进来后,必须出现在
-        节拍阶梯生成调用里,否则用户挑卡时看到的工序和成片对不上;同时必须明确标成软参考,
-        不能让它盖过真实施工顺序等硬规则。"""
+        节拍阶梯生成调用里,否则用户挑卡时看到的工序和成片对不上。
+
+        2026-08-05 起它是**硬规则**而不是软参考:旧文案标成 "SOFT reference" 并明说
+        "Rewrite, merge, split, or reorder any draft entry",规划器把"改写"理解成
+        "换成我认为更好的工序",用户照着挑的那几条就此静默消失(覆盖率契约只查编号,
+        查不到内容被掉包)。2026-08-07 起进一步收紧为一比一：物理规则仍然优先,但
+        只能让一条工序挪位（决定哪一拍承担穿越动作），不再允许合并/拆分/新增。"""
         self.dimensions['beat_outline'] = ['清运塔内积渣与锈屑', '架设内墙木龙骨', '点亮壁炉,人物入住']
         pp.compose_anchor_and_packet({}, self.dimensions)
 
         beat_user = self.captured_beat_user['text']
         self.assertIn('清运塔内积渣与锈屑', beat_user)
         self.assertIn('架设内墙木龙骨', beat_user)
-        self.assertIn('SOFT reference', beat_user)
-        self.assertIn('every mandatory rule in the system prompt outranks it', beat_user)
+        self.assertIn('CARD WORK PLAN (MANDATORY', beat_user)
+        self.assertNotIn('SOFT reference', beat_user)
+        # 一比一契约：拍数恒等于条目数,逐条对应,禁止合并/拆分/新增
+        self.assertIn('ONE-TO-ONE CONTRACT (mandatory, non-negotiable)', beat_user)
+        self.assertIn('EXACTLY 3 elements', beat_user)
+        self.assertIn('they may NEVER license merging, splitting, adding, deleting, '
+                      'or substituting an entry', beat_user)
+        self.assertIn('DELIVERY RESTATEMENT (mandatory)', beat_user)
         # 编号顺序透传,便于模型对齐用户看到的那一版工序
         self.assertIn('1. 清运塔内积渣与锈屑', beat_user)
         self.assertIn('2. 架设内墙木龙骨', beat_user)
 
-    def test_outline_is_capped_at_the_beat_budget_and_absent_when_not_provided(self):
-        """草案条数不该反过来把拍数预算顶穿:beats_count=2(fixed)时最多 3 条(含 reward)。
-        没传 beat_outline 时整块不出现,手工填维度直出的老路径行为不变。"""
-        pp.compose_anchor_and_packet({}, self.dimensions)
-        self.assertNotIn('Draft plan', self.captured_beat_user['text'])
+    def test_the_whole_draft_reaches_the_planner_even_over_budget(self):
+        """草案**不再按拍数裁剪**(2026-08-05)。没传 beat_outline 时整块不出现,
+        手工填维度直出的老路径行为不变。
 
-        self.dimensions['beat_outline'] = ['A清渣', 'B龙骨', 'C封板', 'D刷漆', 'E入住']
+        2026-08-07 起清单一比一还原是默认行为：有 beat_outline 时最终拍数恒等于
+        清单长度，dimensions.beats_count/beat_count_mode 这个"预算上限"被直接覆盖、
+        不再生效（见 compose_anchor_and_packet 的 _outline_strict 分支）——不存在
+        "超额部分合并消化"这回事了，草案有几条就是几拍，一条不多一条不少。这里把
+        beats_count 故意设成比草案条数更紧的 1（此前测的是 2/fixed ⇒ 上限 3），
+        证明这个上限现在被完全无视。"""
         pp.compose_anchor_and_packet({}, self.dimensions)
+        self.assertNotIn('CARD WORK PLAN', self.captured_beat_user['text'])
+
+        # 三条草案，故意配合本用例桩响应 beat_ladder_json 的固定 3 拍结构。
+        self.dimensions['beat_outline'] = ['A清渣', 'B龙骨', 'C入住']
+        self.dimensions['beats_count'] = 1  # 比草案条数更紧的预算上限，理应被无视
+        state = pp.compose_anchor_and_packet({}, self.dimensions)
         beat_user = self.captured_beat_user['text']
-        self.assertIn('Draft plan', beat_user)
-        self.assertIn('3. C封板', beat_user)
-        self.assertNotIn('D刷漆', beat_user)   # 超出 beats_count + 1 的草案条目被截掉
-        self.assertNotIn('E入住', beat_user)
+        self.assertIn('CARD WORK PLAN', beat_user)
+        for i, text in enumerate(['A清渣', 'B龙骨', 'C入住'], 1):
+            self.assertIn(f'{i}. {text}', beat_user)
+        # 预算上限不再触发合并——这套机制已经整体移除
+        self.assertNotIn('BUDGET COMPRESSION', beat_user)
+        self.assertIn('EXACTLY 3 elements', beat_user)
+        self.assertEqual(len(state['beat_ladder']), 3)
+        # 实际生效的拍数上限回写进 dimensions，供 server.py 的槽位数核对使用
+        self.assertEqual(self.dimensions['beats_count'], 2)
+        self.assertEqual(self.dimensions['beat_count_mode'], 'fixed')
+
+
+class TestOutlineContractBlocksTheLadder(unittest.TestCase):
+    """节拍简介是硬规则(2026-08-05)之后,工序契约不满足必须真的挡住这版梯子。
+
+    改造前它挂在 rhythm 那一档:`retry_for_rhythm` 只在第 1、2 轮成立,于是第 3 轮
+    结构违规一清空就被立刻接受(还剩一整轮修复预算没用),最后一轮更是由
+    `accept_leniently` 无条件放行。用户在卡片上挑的工序就是这么静默消失的。
+
+    但"阻塞"不能退化成掉进确定性兜底梯子——那条梯子按 parsed_brief 生成,跟用户挑的
+    这张卡毫无关系,比一条有瑕疵但认这张卡的梯子更糟。所以耗尽后走
+    `_outline_forced_ladder`:留住最后一版 LLM 梯子并留痕。"""
+
+    OUTLINE = [{'op': 'clearing', 'text': '清运塔内积渣与锈屑'},
+               {'op': 'framing', 'text': '架设内墙木龙骨'},
+               {'op': 'reward', 'text': '点亮壁炉,人物入住'}]
+
+    def setUp(self):
+        self._tmp_dir = tempfile.mkdtemp()
+        self._path_patch = patch.object(
+            pp, 'COMPOSE_CHECKPOINT_PATH', os.path.join(self._tmp_dir, 'compose_checkpoints.json'))
+        self._path_patch.start()
+        self.addCleanup(self._path_patch.stop)
+        self.addCleanup(shutil.rmtree, self._tmp_dir, ignore_errors=True)
+        for p in (patch.object(pp, 'load_reference_file', return_value=''),
+                  patch.object(pp, 'get_cropped_templates', return_value='')):
+            p.start()
+            self.addCleanup(p.stop)
+
+        self.dimensions = {
+            'theme': '高山废弃铁路蒸汽机车注水塔改造成独居御寒暖阁', 'anchors': [],
+            'complexity': '硬核重工', 'budget': '轻奢设计师级', 'ratio': '50%',
+            'creativity': '脑洞大开', 'beats_count': 2, 'beat_count_mode': 'fixed',
+            'beat_outline': self.OUTLINE,
+        }
+        self.planner_calls = []
+
+    def _ladder(self, refs_and_delivery):
+        """两个施工拍 + 一个 reward 拍;refs_and_delivery 逐拍给 (refs, delivery)。"""
+        ops = ['clearing', 'framing', 'reward']
+        milestones = ['tower interior fully cleared', 'all interior studs standing',
+                      'the stove is lit and the room is lived in']
+        beats = []
+        for i, (op, milestone, (refs, delivery)) in enumerate(
+                zip(ops, milestones, refs_and_delivery), 1):
+            beat = {'index': i, 'operation': op, 'bridge_stage': None,
+                    'description': f'{op} work', 'milestone_name': milestone,
+                    'before_state': 'the prior state is visible',
+                    'after_state': f'the entire bay shows the finished {op} result',
+                    'completion_extent': 'the entire visible bay',
+                    'changed_grid_cells': ['Grid B2', 'Grid C2'],
+                    # 普通施工拍要申报 2~3 道紧密工序；同族配对不触发相位冲突判据。
+                    'package_operations': [op, _COMPANION[op]] if op in _COMPANION else [op],
+                    'primary_progress': f'the {op} result spreads across the whole bay',
+                    'secondary_progress': 'the staged material bundle drains to zero',
+                    'persistent_traces': ['screw heads', 'sawdust bands'],
+                    'preserve_state': 'the original shell remains unchanged',
+                    'stage_scope': 'large' if op != 'reward' else None,
+                    'introduced_objects': [], 'removed_objects': [],
+                    'outline_refs': refs, 'outline_delivery': delivery}
+            if op == 'reward':
+                beat['description'] = ('the occupant moves in and the stove lights the '
+                                       'finished room')
+            beats.append(beat)
+        return json.dumps(beats)
+
+    def _run(self, ladder_responses):
+        """ladder_responses 按规划器调用次序逐个返回,用尽后重复最后一个。"""
+        brief_json = json.dumps({
+            'carrier': 'abandoned steam-locomotive water tower', 'env': 'alpine mountainside',
+            'trauma': 'rusted and frost-cracked', 'destiny': 'snug winter refuge den',
+            'destiny_zh': '独居御寒暖阁', 'reward': 'firelight fills the finished room',
+            'mode': 'Standard', 'space_type': 'abandoned property',
+            'carrier_slug': 'steam-locomotive-water-tower',
+        })
+        packet_json = json.dumps({
+            'camera_dna': 'static tripod shot, ultra-wide lens', 'geometry_lock': 'fixed',
+            'primary_landmarks': [{'name': 'tower doorway', 'grid': 'Grid B2',
+                                   'z_depth_scale': '40%'}],
+            'frame_boundaries': {'left': 'B1', 'right': 'B3', 'top': 'A2', 'bottom': 'C2'},
+            'object_ledger': [], 'worker_choreography': 'one lone worker',
+            'lighting_phase_ladder': {str(i): 'ambient only' for i in range(1, 5)},
+            'passive_environment': 'still alpine air', 'interest_budget': {},
+        })
+
+        def fake_chat(config, system, user, **kwargs):
+            if 'scene analysis agent' in system:
+                return brief_json
+            if 'construction planner' in system:
+                self.planner_calls.append(user)
+                idx = min(len(self.planner_calls) - 1, len(ladder_responses) - 1)
+                return ladder_responses[idx]
+            if 'spatial consistency supervisor' in system:
+                return packet_json
+            if 'generate the very first IMAGE prompt' in system:
+                return 'A static wide shot of the derelict water tower, rusted and untouched.'
+            raise AssertionError(f'Unexpected _chat call: {system[:80]!r}')
+
+        with patch.object(pp, '_chat', side_effect=fake_chat):
+            return pp.compose_anchor_and_packet({}, self.dimensions)
+
+    # 三拍全部认领、工序类型对得上、复述齐全 —— 这版应当一次通过
+    CLEAN = [([1], ['haul out the slag and rust scale']),
+             ([2], ['stand the timber wall studs']),
+             ([3], ['light the stove as the occupant moves in'])]
+
+    def test_a_faithful_ladder_is_accepted_on_the_first_draft(self):
+        self._run([self._ladder(self.CLEAN)])
+        self.assertEqual(len(self.planner_calls), 1)
+
+    def test_a_dropped_card_entry_is_retried_instead_of_silently_accepted(self):
+        """第 2 条工序没有任何一拍认领 —— 改造前第 3 轮就会被当作"结构没问题"接受。"""
+        broken = self._ladder([([1], ['haul out the slag and rust scale']),
+                               ([], []),
+                               ([3], ['light the stove as the occupant moves in'])])
+        state = self._run([broken, broken, broken, self._ladder(self.CLEAN)])
+        # 四轮全部用满,而不是第 1、2 轮之后就放行
+        self.assertEqual(len(self.planner_calls), 4)
+        # 违规原文回喂给了规划器,它才有机会自愈
+        self.assertIn('架设内墙木龙骨', self.planner_calls[-1])
+        self.assertEqual([b.get('outline_refs') for b in state['beat_ladder']],
+                         [[1], [2], [3]])
+
+    def test_a_missing_english_restatement_also_blocks(self):
+        broken = self._ladder([([1], []),
+                               ([2], ['stand the timber wall studs']),
+                               ([3], ['light the stove as the occupant moves in'])])
+        self._run([broken, self._ladder(self.CLEAN)])
+        self.assertEqual(len(self.planner_calls), 2)
+        self.assertIn('outline_delivery', self.planner_calls[-1])
+
+    def test_exhausted_retries_keep_the_llm_ladder_not_the_deterministic_fallback(self):
+        """阻塞不等于掉进兜底梯子:兜底梯子跟这张卡毫无关系,比有瑕疵但认卡的梯子更糟。"""
+        broken = self._ladder([([1], ['haul out the slag and rust scale']),
+                               ([], []),
+                               ([3], ['light the stove as the occupant moves in'])])
+        state = self._run([broken])
+        self.assertEqual(len(self.planner_calls), 4)
+        # 采用的是最后一版 LLM 梯子(带 outline_refs),不是 deterministic_fallback_beat_ladder
+        self.assertEqual([b.get('outline_refs') for b in state['beat_ladder']],
+                         [[1], [], [3]])
+        self.assertEqual(state['beat_ladder'][0]['milestone_name'],
+                         'tower interior fully cleared')
+
+    def test_accepted_ladders_carry_the_card_text_onto_each_beat(self):
+        """规划到合成之间此前是断的:工序原文必须钉在拍上,下游提示词才看得到。"""
+        state = self._run([self._ladder(self.CLEAN)])
+        self.assertEqual(state['beat_ladder'][0]['outline_items'],
+                         [{'index': 1, 'text': '清运塔内积渣与锈屑',
+                           'delivery': 'haul out the slag and rust scale'}])
+        self.assertTrue(state['beat_ladder'][-1]['requires_occupant'])
 
 
 class TestComposeRemainingBeatsResume(unittest.TestCase):
@@ -263,6 +489,11 @@ class TestComposeRemainingBeatsResume(unittest.TestCase):
             patch.object(pp, 'validate_beat_prompts', return_value=[]),
             patch.object(pp, 'check_milestone_video_prompt', return_value=[]),
             patch.object(pp, 'check_milestone_image_prompt', return_value=[]),
+            # 2026-08-22：IMAGE 侧缺陷检测改由 pp.collect_image_defects 自己跑（不再
+            # 从 validate_beat_prompts 的结果里切），所以把 validate 桩成 [] 已经不足以
+            # 关掉回炉——夹具里"Image prompt for beat N"逐拍几乎一样，必然触发相似度
+            # 回炉、多打一次 _chat，把这些用例真正要断言的"每拍一次调用"冲掉。
+            patch.object(pp, 'collect_image_defects', return_value={}),
         ]
         for p in patches:
             p.start()
@@ -307,7 +538,7 @@ class TestComposeRemainingBeatsResume(unittest.TestCase):
         number actually generated (from either path) in the order _chat was asked for
         them, same contract the pre-batching tests already relied on. Always returns
         well-formed content — tests that need a mid-run failure inject it via
-        validate_beat_prompts (see _validation_crashes_on), since batching means there's
+        checkpoint commits (see _checkpoint_crashes_on), since batching means there's
         no longer a separate `_chat` "turn" per beat to fail in isolation."""
         def fake_chat(config, system, user, temperature=0.85, max_tokens=16384, timeout=240, on_chunk=None, model=None):
             batch_beats = self._beat_numbers_from_batch_user(user)
@@ -332,35 +563,55 @@ class TestComposeRemainingBeatsResume(unittest.TestCase):
         # 整单成功交付后存档应该被清空
         self.assertIsNone(pp.load_compose_checkpoint(self.fingerprint))
 
+    def test_transport_failure_exposes_cause_and_retains_completed_beats(self):
+        state = self._make_state(total_beats=3)
+
+        def failing_chat(config, system, user, **kwargs):
+            if self._beat_numbers_from_batch_user(user):
+                return '===BEAT 1 VIDEO===\nVideo one\n===BEAT 1 IMAGE===\nImage two'
+            raise RuntimeError('Local LLM proxy timed out after 120 seconds')
+
+        config = {'composeRequestTimeoutSeconds': 120}
+        with patch.object(pp, '_chat', side_effect=failing_chat) as chat:
+            with self.assertRaisesRegex(pp.ComposeFailure, 'Cause: Local LLM proxy timed out'):
+                pp.compose_remaining_beats(config, state)
+        singles = [call for call in chat.call_args_list
+                   if 'Generate prompts for Beat ' in call.args[2]]
+        self.assertEqual(len(singles), 2)
+        self.assertTrue(all(call.kwargs['timeout'] == 120 for call in singles))
+        checkpoint = pp.load_compose_checkpoint(self.fingerprint)
+        self.assertEqual(checkpoint['pass_beats_done'], [1])
+        self.assertEqual(checkpoint['slot_states']['2'], 'failed')
+        self.assertNotIn(3, state['compiled_images'])
+
+        calls = []
+        with patch.object(pp, '_chat', side_effect=self._fake_chat_factory(calls)):
+            pp.compose_remaining_beats(config, state)
+        self.assertEqual(sorted(set(calls)), [2, 3])
+        self.assertIsNone(pp.load_compose_checkpoint(self.fingerprint))
+
     @staticmethod
-    def _validation_crashes_on(beat_num, flag):
-        """validate_beat_prompts side_effect: raises a code-level error for `beat_num`
-        while `flag['value']` is True (simulates a real bug hit while processing that
-        beat's batched result), passes everyone else. Beats are now generated together
-        in one batched _chat call, so a crash can no longer be injected by making _chat
-        itself raise only for one beat's turn (there IS no separate turn) — the
-        equivalent, realistic failure point is a code bug in the per-beat processing
-        that runs after the batch response comes back, which is exactly what the merged
-        parse+commit loop's own NameError-class handling exists to catch."""
-        def side_effect(i, *args, **kwargs):
-            if i == beat_num and flag['value']:
-                raise NameError(f"simulated code bug hitting beat {beat_num}")
-            return []
+    def _checkpoint_crashes_on(beat_num, flag):
+        """Fail the per-beat checkpoint commit without invoking retired quality rules."""
+        save = pp.save_compose_checkpoint
+        def side_effect(fingerprint, checkpoint):
+            if beat_num in checkpoint.get('pass_beats_done', []) and flag['value']:
+                raise RuntimeError(f"simulated checkpoint commit failure at beat {beat_num}")
+            return save(fingerprint, checkpoint)
         return side_effect
 
     def test_crash_mid_run_checkpoints_completed_beats_only(self):
         crash_flag = {'value': True}
         state = self._make_state(total_beats=4)
         calls = []
-        with patch.object(pp, 'validate_beat_prompts', side_effect=self._validation_crashes_on(3, crash_flag)), \
+        with patch.object(pp, 'save_compose_checkpoint', side_effect=self._checkpoint_crashes_on(3, crash_flag)), \
              patch.object(pp, '_chat', side_effect=self._fake_chat_factory(calls)):
             with self.assertRaises(RuntimeError):
-                pp.compose_remaining_beats({}, state)
+                pp.compose_remaining_beats({'composeBatchSize': 3}, state)
 
-        # The one batched _chat call already asked for all of beats 1-4 at once (that's
-        # the whole point of batching) — the crash happens afterward, in per-beat
-        # validation of the batch's own result, when processing reaches beat 3.
-        self.assertEqual(sorted(set(calls)), [1, 2, 3, 4])
+        # 窗口大小显式钉成 3（默认值是 5，会把 4 拍装进同一窗，测不到跨窗那一刀）：
+        # 第一窗覆盖 1-3 拍，崩在提交第 3 拍存档时，第 4 拍所在的第二窗还没发出去。
+        self.assertEqual(sorted(set(calls)), [1, 2, 3])
         checkpoint = pp.load_compose_checkpoint(self.fingerprint)
         self.assertIsNotNone(checkpoint, "a crash mid-loop must still leave a checkpoint behind")
         self.assertEqual(sorted(checkpoint['pass_beats_done']), [1, 2],
@@ -371,7 +622,7 @@ class TestComposeRemainingBeatsResume(unittest.TestCase):
         # 复现步骤 1:第一次跑,处理 beat 3 时崩溃(模拟真实代码 bug),beat 1/2 已经成功。
         crash_flag = {'value': True}
         state = self._make_state(total_beats=4)
-        with patch.object(pp, 'validate_beat_prompts', side_effect=self._validation_crashes_on(3, crash_flag)), \
+        with patch.object(pp, 'save_compose_checkpoint', side_effect=self._checkpoint_crashes_on(3, crash_flag)), \
              patch.object(pp, '_chat', side_effect=self._fake_chat_factory([])):
             with self.assertRaises(RuntimeError):
                 pp.compose_remaining_beats({}, state)
@@ -383,7 +634,7 @@ class TestComposeRemainingBeatsResume(unittest.TestCase):
         # 再次调用 compose_remaining_beats——这次 bug 已修复(crash_flag 关闭)。
         crash_flag['value'] = False
         calls = []
-        with patch.object(pp, 'validate_beat_prompts', side_effect=self._validation_crashes_on(3, crash_flag)), \
+        with patch.object(pp, 'save_compose_checkpoint', side_effect=self._checkpoint_crashes_on(3, crash_flag)), \
              patch.object(pp, '_chat', side_effect=self._fake_chat_factory(calls)):
             output = pp.compose_remaining_beats({}, state)
 
@@ -451,12 +702,14 @@ class TestComposeRemainingBeatsResume(unittest.TestCase):
 
         # beat 2 was attempted (via the individual direct-generation fallback, since the
         # batch response was missing its sections) but never counted as done because no
-        # attempt ever produced both sections, so it fell back to a placeholder.
+        # attempt ever produced both sections, so production mode failed without a placeholder.
         self.assertIn(2, calls)
         checkpoint = pp.load_compose_checkpoint(self.fingerprint)
         self.assertEqual(sorted(checkpoint['pass_beats_done']), [1], "the fallback beat must not be marked done")
-        self.assertEqual(checkpoint['fallback_count'], 1)
-        self.assertIn('static ultra-wide 14mm tripod shot', state['compiled_images'][3], "beat 2 should have shipped its placeholder text for now")
+        self.assertEqual(checkpoint['fallback_count'], 0,
+                         "production fail-closed mode must not count an undelivered placeholder")
+        self.assertNotIn(3, state['compiled_images'],
+                         "production mode must not write a placeholder IMAGE into the slot")
 
         # Resume: beat 2's sections now come back, and the beat-3 crash is gone.
         beat_2_sections_missing['value'] = False
@@ -467,7 +720,7 @@ class TestComposeRemainingBeatsResume(unittest.TestCase):
             output = pp.compose_remaining_beats({}, state)
 
         self.assertEqual(sorted(set(calls)), [2, 3], "resume must retry the fallback beat, not skip it like a completed one")
-        self.assertIn('Image prompt for beat 3', output)  # real beat-2 output replaced the placeholder
+        self.assertIn('Image prompt for beat 3', output)
         self.assertIn('Image prompt for beat 4', output)
         self.assertIsNone(pp.load_compose_checkpoint(self.fingerprint))
 

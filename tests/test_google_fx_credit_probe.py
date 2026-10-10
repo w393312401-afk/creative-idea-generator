@@ -41,11 +41,49 @@ class _Page:
 
 def test_credit_parser_accepts_balance_lines_only():
     assert credit._extract_credit_number('1050 Google Flow credits') == 1050
+    assert credit._extract_credit_number('995 Google Flow credits') == 995
+    assert credit._extract_credit_number('1,050 个 Google Flow 点数') == 1050
     assert credit._extract_credit_number('1,050 credits remaining') == 1050
+    assert credit._extract_credit_number('0 Google Flow credits') == 0
+    assert credit._extract_credit_number('0 个 Google Flow 点数') == 0
+    assert credit._extract_credit_number('0 credits') == 0
+    assert credit._extract_credit_number('0 个点数') == 0
     assert credit._extract_credit_number('剩余 88 积分') == 88
     assert credit._extract_credit_number('860 Google Flow 点数') == 860
+    assert credit._extract_credit_number('Credits display: 995') == 995
+    assert credit._extract_credit_number('点数显示: 1,050') == 1050
     assert credit._extract_credit_number('Pro plan: 1,000 monthly Google Flow credits') is None
     assert credit._extract_credit_number('Daily Bonus: Enjoy 50 extra credits') is None
+
+
+def test_is_credit_exhausted_message():
+    # 英文真实/变体耗尽短语
+    assert credit.is_credit_exhausted_message("0 Google Flow credits") is True
+    assert credit.is_credit_exhausted_message("0 AI credits") is True
+    assert credit.is_credit_exhausted_message("Get AI credits") is True
+    assert credit.is_credit_exhausted_message("Used when you're out of Google Flow credits") is True
+    assert credit.is_credit_exhausted_message("You have 0 credits left") is True
+    assert credit.is_credit_exhausted_message("Insufficient Google Flow credits") is True
+    assert credit.is_credit_exhausted_message("Run out of Flow credits") is True
+    assert credit.is_credit_exhausted_message("Not enough credits for this generation") is True
+    assert credit.is_credit_exhausted_message("Credits: 0") is True
+    assert credit.is_credit_exhausted_message("Google Flow credits: 0") is True
+    # 中文耗尽短语
+    assert credit.is_credit_exhausted_message("积分余额为 0") is True
+    assert credit.is_credit_exhausted_message("当前账号没有足够的积分") is True
+    assert credit.is_credit_exhausted_message("积分已用完，请充值") is True
+    assert credit.is_credit_exhausted_message("0 积分") is True
+    assert credit.is_credit_exhausted_message("无可用积分") is True
+    # 单日上限 / 配额限制短语
+    assert credit.is_credit_exhausted_message("You've reached the daily limit for 🍌 Nano Banana 2 generations. Try using a different model.") is True
+    assert credit.is_credit_exhausted_message("Reached the daily limit") is True
+    assert credit.is_credit_exhausted_message("Daily generation limit reached") is True
+    assert credit.is_credit_exhausted_message("今日生成次数已达上限") is True
+    assert credit.is_credit_exhausted_message("单日配额已用完") is True
+    # 正常带额度/宣传文案不应误判
+    assert credit.is_credit_exhausted_message("100 Google Flow credits") is False
+    assert credit.is_credit_exhausted_message("1500 monthly Google Flow credits") is False
+    assert credit.is_credit_exhausted_message("Generating video...") is False
 
 
 def test_menu_scan_waits_for_two_stable_reads(monkeypatch):
@@ -236,7 +274,8 @@ def test_is_google_login_page():
             if 'accounts.google.com' in url_lower or 'signin/accountchooser' in url_lower:
                 return True
             text = self._inner_text.lower()
-            markers = ['choose an account', 'sign in with google', 'sign in to continue', 'use another account', '选择账号']
+            markers = ['choose an account', 'sign in with google', 'try signing in with a different account',
+                       'sign in to continue', 'use another account', '选择账号']
             return any(m in text for m in markers)
 
     # 包含 Google 登录 URL（如用户截图中显示的 accounts.google.com/v3/signin/accountchooser）
@@ -250,3 +289,209 @@ def test_is_google_login_page():
     # 正常工作台页面
     p3 = DummyPage(url="https://labs.google/fx/tools/flow", inner_text="Create with Google Flow")
     assert is_google_login_page(p3) is False
+
+    # labs.google 的 Auth.js 错误中转页（尚未进入 accounts.google.com）。
+    p4 = DummyPage(
+        url="https://labs.google/fx/tools/flow",
+        inner_text="Try signing in with a different account.",
+    )
+    assert is_google_login_page(p4) is True
+
+
+def test_is_credit_exhausted_message_comprehensive():
+    # 英文关键词与变体
+    assert credit.is_credit_exhausted_message("Out of credits") is True
+    assert credit.is_credit_exhausted_message("You've run out of credits") is True
+    assert credit.is_credit_exhausted_message("You have run out of credits to generate video") is True
+    assert credit.is_credit_exhausted_message("Insufficient credits") is True
+    assert credit.is_credit_exhausted_message("Not enough credits to continue") is True
+    assert credit.is_credit_exhausted_message("No credits left in your account") is True
+    assert credit.is_credit_exhausted_message("0 credits remaining") is True
+    assert credit.is_credit_exhausted_message("Credits: 0") is True
+    assert credit.is_credit_exhausted_message("0 Google Flow credits") is True
+    assert credit.is_credit_exhausted_message("0 credits") is True
+    assert credit.is_credit_exhausted_message("0 credit") is True
+    assert credit.is_credit_exhausted_message("Resource_exhausted: quota exceeded") is True
+    assert credit.is_credit_exhausted_message("Not enough Google Flow and AI credits to perform this action") is True
+
+    # 中文关键词与变体
+    assert credit.is_credit_exhausted_message("当前账号积分不足") is True
+    assert credit.is_credit_exhausted_message("没有足够的积分生成视频") is True
+    assert credit.is_credit_exhausted_message("积分已用完") is True
+    assert credit.is_credit_exhausted_message("点数不足") is True
+    assert credit.is_credit_exhausted_message("点数已用完") is True
+    assert credit.is_credit_exhausted_message("额度不足") is True
+    assert credit.is_credit_exhausted_message("额度耗尽") is True
+    assert credit.is_credit_exhausted_message("配额已耗尽") is True
+    assert credit.is_credit_exhausted_message("剩余 0 积分") is True
+    assert credit.is_credit_exhausted_message("积分: 0") is True
+    assert credit.is_credit_exhausted_message("0 积分") is True
+    assert credit.is_credit_exhausted_message("0积分") is True
+    assert credit.is_credit_exhausted_message("0 点数") is True
+    assert credit.is_credit_exhausted_message("0点数") is True
+    assert credit.is_credit_exhausted_message("0 个 Google Flow 点数") is True
+    assert credit.is_credit_exhausted_message("0 个点数") is True
+    assert credit.is_credit_exhausted_message("点数余额为 0") is True
+    assert credit.is_credit_exhausted_message("积分余额为 0") is True
+    assert credit.is_credit_exhausted_message("无可用积分") is True
+
+    # 正常正数积分（严防以 0 结尾的正数被子串 "0 credits" / "0积分" 误伤）
+    assert credit.is_credit_exhausted_message("1,050 个 Google Flow 点数") is False
+    assert credit.is_credit_exhausted_message("995 Google Flow credits") is False
+    assert credit.is_credit_exhausted_message("100 credits") is False
+    assert credit.is_credit_exhausted_message("100 Google Flow credits") is False
+    assert credit.is_credit_exhausted_message("1000 credits") is False
+    assert credit.is_credit_exhausted_message("500 credits") is False
+    assert credit.is_credit_exhausted_message("50 credits") is False
+    assert credit.is_credit_exhausted_message("200 credits") is False
+    assert credit.is_credit_exhausted_message("10 credits") is False
+    assert credit.is_credit_exhausted_message("1 credit") is False
+    assert credit.is_credit_exhausted_message("100积分") is False
+    assert credit.is_credit_exhausted_message("500积分") is False
+    assert credit.is_credit_exhausted_message("1000 积分") is False
+    assert credit.is_credit_exhausted_message("50 点数") is False
+    assert credit.is_credit_exhausted_message("100点数") is False
+    assert credit.is_credit_exhausted_message("Credits: 100") is False
+    assert credit.is_credit_exhausted_message("Credits: 50") is False
+    assert credit.is_credit_exhausted_message("剩余 100 积分") is False
+    assert credit.is_credit_exhausted_message("积分余额: 500") is False
+
+    # 正常非积分耗尽报错、营销文案与进度数字
+    assert credit.is_credit_exhausted_message("未找到底部配置按钮") is False
+    assert credit.is_credit_exhausted_message("网络连接超时") is False
+    assert credit.is_credit_exhausted_message("Target page is closed") is False
+    assert credit.is_credit_exhausted_message("0% generating") is False
+    assert credit.is_credit_exhausted_message("seed: 0, 1080p, 1 credit") is False
+    assert credit.is_credit_exhausted_message("Daily Bonus: Enjoy 50 extra credits") is False
+    assert credit.is_credit_exhausted_message("Upgrade plan to get more credits") is False
+    assert credit.is_credit_exhausted_message("Rate limit exceeded, please retry in 5s") is False
+    assert credit.is_credit_exhausted_message("") is False
+
+
+def test_detect_page_credit_exhaustion():
+    class DummyDialogPage:
+        def __init__(self, dialog_texts=None, credit_text=None):
+            self.dialog_texts = dialog_texts or []
+            self.credit_text = credit_text
+
+        def evaluate(self, script):
+            return self.dialog_texts
+
+        def locator(self, selector):
+            return _Locator([self.credit_text] if self.credit_text else [])
+
+    # 1. 弹窗命中积分耗尽
+    p1 = DummyDialogPage(dialog_texts=["You've run out of credits\nUpgrade now to continue creating."])
+    res1 = credit.detect_page_credit_exhaustion(p1)
+    assert res1 is not None
+    assert "页面提示积分耗尽" in res1
+    assert "You've run out of credits" in res1
+
+    # 2. 顶栏/菜单显示 0 积分
+    p2 = DummyDialogPage(dialog_texts=[], credit_text="0 Google Flow credits")
+    res2 = credit.detect_page_credit_exhaustion(p2)
+    assert res2 is not None
+    assert "0" in res2
+
+    # 3. 正常正数页面（1050 / 100 / 500 / 50 积分均不能被误判）
+    p3 = DummyDialogPage(dialog_texts=[], credit_text="1050 Google Flow credits")
+    assert credit.detect_page_credit_exhaustion(p3) is None
+
+    p4 = DummyDialogPage(dialog_texts=[], credit_text="100 Google Flow credits")
+    assert credit.detect_page_credit_exhaustion(p4) is None
+
+    p5 = DummyDialogPage(dialog_texts=[], credit_text="500 Google Flow credits")
+    assert credit.detect_page_credit_exhaustion(p5) is None
+
+    p6 = DummyDialogPage(dialog_texts=[], credit_text="50 Google Flow credits")
+    assert credit.detect_page_credit_exhaustion(p6) is None
+
+
+def test_is_manageable_user_page_and_find_or_create_page_exclusion():
+    from integrations.google_fx.utils.browser import _is_manageable_user_page, find_or_create_page
+
+    class DummyPageInternal:
+        def __init__(self, url):
+            self.url = url
+            self.closed = False
+            self.brought_to_front = False
+
+        def is_closed(self):
+            return self.closed
+
+        def close(self):
+            self.closed = True
+
+        def bring_to_front(self):
+            self.brought_to_front = True
+
+        def goto(self, url, **kwargs):
+            self.url = url
+
+    # 1. 验证内部协议页面识别
+    assert _is_manageable_user_page(None) is False
+    assert _is_manageable_user_page(DummyPageInternal("chrome://omnibox-popup.top-chrome/")) is False
+    assert _is_manageable_user_page(DummyPageInternal("chrome-extension://abcdef/popup.html")) is False
+    assert _is_manageable_user_page(DummyPageInternal("devtools://devtools/bundled/inspector.html")) is False
+    assert _is_manageable_user_page(DummyPageInternal("about:blank")) is True
+    assert _is_manageable_user_page(DummyPageInternal("https://labs.google/fx/tools/flow")) is True
+
+    # 2. 验证 find_or_create_page 不会选择内部页面，也不会调用内部页面的 close()
+    omnibox_p1 = DummyPageInternal("chrome://omnibox-popup.top-chrome/")
+    omnibox_p2 = DummyPageInternal("chrome://omnibox-popup.top-chrome/omnibox_popup_aim.html")
+    flow_page = DummyPageInternal("https://labs.google/fx/tools/flow")
+    extra_user_page = DummyPageInternal("https://example.com")
+
+    class DummyContext:
+        def __init__(self, pages):
+            self.pages = list(pages)
+
+        def new_page(self):
+            p = DummyPageInternal("about:blank")
+            self.pages.append(p)
+            return p
+
+    ctx = DummyContext([omnibox_p1, omnibox_p2, flow_page, extra_user_page])
+    chosen = find_or_create_page(ctx, "/fx/tools/flow", auto_login=False)
+
+    assert chosen is flow_page
+    # 内部页面绝不能被 close
+    assert omnibox_p1.closed is False
+    assert omnibox_p2.closed is False
+    # 多余的普通用户页被正常清理
+    assert extra_user_page.closed is True
+
+
+def test_redesigned_angular_panel_chinese_ui():
+    """验证改版后的 Angular 移动端面板（中文 UI: 1,050 个 Google Flow 点数）。"""
+    page = _Page({
+        ".credits-count": _Locator(["1,050 个 Google Flow 点数"]),
+        "a.credits-link": _Locator(["1,050 个 Google Flow 点数"]),
+        "a[href*='flow_ai_credits_page']": _Locator(["1,050 个 Google Flow 点数"]),
+        "div[role='dialog']": _Locator(["ly F\nw393312401@gmail.com\n1,050 个 Google Flow 点数\n升级"]),
+        ".panel.panel-mobile": _Locator(["ly F\nw393312401@gmail.com\n1,050 个 Google Flow 点数\n升级"]),
+    })
+    assert credit._scan_menu_for_credit(page, timeout_seconds=1, poll_interval=0) == 1050
+
+
+def test_redesigned_angular_panel_english_ui():
+    """验证改版后的 Angular 移动端面板（英文 UI: 995 Google Flow credits）。"""
+    page = _Page({
+        ".credits-count": _Locator(["995 Google Flow credits"]),
+        "a.credits-link": _Locator(["995 Google Flow credits"]),
+        "a[href*='flow_ai_credits_page']": _Locator(["995 Google Flow credits"]),
+        "div[role='dialog']": _Locator(["Johnson Michael\nwushi0208.5@gmail.com\n995 Google Flow credits\nUpgrade"]),
+        ".panel.panel-mobile": _Locator(["Johnson Michael\nwushi0208.5@gmail.com\n995 Google Flow credits\nUpgrade"]),
+    })
+    assert credit._scan_menu_for_credit(page, timeout_seconds=1, poll_interval=0) == 995
+
+
+def test_redesigned_angular_panel_surface_fallback():
+    """验证当语义元素选择器由于外部变动未命中时，兜底从 account_menu_surface 提取。"""
+    page = _Page({
+        "div[role='dialog']": _Locator([
+            "Google\nclose\nly F\nw393312401@gmail.com\nSwitch account\n1,050 个 Google Flow 点数\n升级\n创建虚拟形象"
+        ]),
+    })
+    assert credit._scan_menu_for_credit(page, timeout_seconds=1, poll_interval=0) == 1050
+

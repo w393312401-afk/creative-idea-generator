@@ -1,0 +1,378 @@
+// 槽位状态模型（js/slot_model.js）的单测。这个模型是纯函数、无 DOM，所以可以
+// 直接 require——在它出现之前，"这一格是什么状态"的判断散在十几处 innerHTML 里，
+// 没有任何可测的口子。
+//
+// 跑法：node tests/test_slot_model.js
+const assert = require('assert');
+const {
+    padSlot, slotIsStale, slotIsHero, frameIsFixable,
+    frameSlotState, videoSlotState, slotPendingState,
+    videoSlotLabel, summarizeSlotStates,
+} = require('../js/slot_model.js');
+
+const acts = (state) => state.actions.map(a => a.act);
+const badges = (state) => state.badges.map(b => b.id);
+
+// ── 基础 ────────────────────────────────────────────────────────────
+assert.strictEqual(padSlot(3), '003');
+assert.strictEqual(padSlot('12'), '012');
+
+// ── 别名收口：同一语义的多种历史写法必须判成同一件事 ────────────────
+assert.ok(slotIsStale({ stale_lineage: true }), 'stale_lineage 是当前写法');
+assert.ok(slotIsStale({ quality_gate: 'stale' }), 'quality_gate=stale 是旧写法');
+assert.ok(slotIsStale({ stale: true }), 'frame.stale 是更早的写法');
+assert.ok(!slotIsStale({ quality_gate: 'auto_approved' }));
+
+assert.ok(slotIsHero({ is_hero: true }), 'is_hero 是结构化字段');
+assert.ok(slotIsHero({ meta: 'shot HERO panorama' }), 'meta 含 HERO 是旧写法');
+assert.ok(!slotIsHero({ meta: 'ordinary bridge' }));
+
+// ── 图片槽位：各 quality_gate 对应的徽标与操作 ────────────────────────
+const ready = (over) => frameSlotState(
+    Object.assign({ sequence: 3, url: '/outputs/x/frames/img_003.webp' }, over),
+    { seq: 3 });
+
+let s = ready({});
+assert.strictEqual(s.kind, 'ready');
+assert.strictEqual(s.label, 'IMG 003');
+assert.deepStrictEqual(badges(s), []);
+// 无问题的帧没有「修复此帧问题」出口
+assert.deepStrictEqual(acts(s), ['preview-slot', 'describe-frame', 'retry-frame', 'upload-frame', 'delete-slot']);
+
+s = ready({ quality_gate: 'i2i_fallback_degraded' });
+assert.deepStrictEqual(badges(s), ['degraded']);
+assert.ok(s.title.includes('降级为文生图'));
+
+s = ready({ quality_gate: 'sequence_review_flagged', vlm_qa_reason: '空间跳变' });
+assert.deepStrictEqual(badges(s), ['review-failed']);
+assert.ok(acts(s).includes('fix-frame'), '审查未过必须给出定向修复入口');
+assert.ok(s.title.includes('空间跳变'));
+
+s = ready({ quality_gate: 'frame_continuity_failed',
+            continuity_check: { status: 'failed', reason: 'camera, structure' } });
+assert.deepStrictEqual(badges(s), ['continuity-failed']);
+assert.ok(acts(s).includes('fix-frame'));
+assert.ok(s.title.includes('camera, structure'));
+
+s = ready({ quality_gate: 'pending_manual_review',
+            continuity_check: { status: 'warned', reason: 'low texture' } });
+assert.deepStrictEqual(badges(s), ['continuity-warned']);
+
+// 'vlm_qa_failed' 是已停用的逐帧质检门终态，旧 manifest 仍要认
+s = ready({ quality_gate: 'vlm_qa_failed' });
+assert.deepStrictEqual(badges(s), ['review-failed']);
+assert.ok(s.title.includes('跳变或无变化'), '没有 reason 时用兜底文案');
+
+// 人工标记与机器判定并存时只画「人工标记」，但两者都要进 hover 说明
+s = ready({ quality_gate: 'sequence_review_flagged', vlm_qa_reason: 'R', manual_issue: '门开反了' });
+assert.deepStrictEqual(badges(s), ['manual-flagged']);
+assert.ok(s.badges[0].tip.includes('门开反了') && s.badges[0].tip.includes('R'));
+assert.ok(acts(s).includes('fix-frame'));
+assert.ok(s.actions.find(a => a.act === 'describe-frame').label === '改描述');
+
+// 人工标记可以在没跑过审查的帧上单独成立
+s = ready({ manual_issue: '墙面材质不对' });
+assert.deepStrictEqual(badges(s), ['manual-flagged']);
+assert.ok(acts(s).includes('fix-frame'));
+
+// 4选1 候选图智能生成：候选图数量 > 1 时必须画「4选1」徽标并提供「4选1」查看/切换按钮
+s = ready({
+    candidates: [
+        { index: 1, file: 'f1', is_chosen: false },
+        { index: 2, file: 'f2', is_chosen: true },
+        { index: 3, file: 'f3', is_chosen: false },
+        { index: 4, file: 'f4', is_chosen: false }
+    ],
+    chosen_candidate_index: 2
+});
+assert.deepStrictEqual(badges(s), ['candidate-selection']);
+assert.ok(acts(s).includes('view-candidates'), '多候选帧必须提供4选1对比与切换入口');
+assert.ok(s.badges[0].tip.includes('候选 #2'));
+
+// ── 撤销修复：只有真的存下过快照的帧才给这个出口 ─────────────────────
+// 修复是覆盖写同一个帧文件，没有快照就真的退不回去——不能画一枚点了会报错的按钮。
+s = ready({ quality_gate: 'pending_manual_review',
+            fix_backup: { at: '2026-08-02T10:00:00', reason: '塔吊消失' } });
+assert.ok(acts(s).includes('undo-fix'), '有快照就该给撤销入口');
+assert.ok(s.actions.find(a => a.act === 'undo-fix').idleTitle.includes('2026-08-02T10:00:00'),
+          '悬浮说明要写清退回到哪一版');
+assert.ok(!acts(ready({})).includes('undo-fix'), '没修过的帧不给撤销入口');
+assert.ok(!acts(ready({ fix_backup: 'not-an-object' })).includes('undo-fix'));
+
+// ── 待修判定收口：卡片按钮与工具条的「全部修复」必须读同一条 ──────────
+// 工具条不能自己再推一遍"哪些帧要修"，否则一键修出来的名单与画着修复按钮的
+// 格子迟早对不上（见 js/slot_toolbar.js 的 fixableSlotSequences）。
+assert.ok(frameIsFixable({ quality_gate: 'sequence_review_flagged' }));
+assert.ok(frameIsFixable({ quality_gate: 'vlm_qa_failed' }), '旧质检门终态也要认');
+assert.ok(frameIsFixable({ quality_gate: 'frame_continuity_failed' }));
+assert.ok(frameIsFixable({ manual_issue: '门开反了' }));
+assert.ok(!frameIsFixable({ quality_gate: 'auto_approved' }));
+assert.ok(!frameIsFixable({ manual_issue: '   ' }), '空白描述不算人工标记');
+assert.ok(!frameIsFixable(null));
+// flags.fixable 与卡片上的 fix-frame 按钮同进同出
+[{ quality_gate: 'sequence_review_flagged' }, { manual_issue: '门开反了' },
+ { quality_gate: 'auto_approved' }, { quality_gate: 'i2i_fallback_degraded' }].forEach(over => {
+    const st = ready(over);
+    assert.strictEqual(st.flags.fixable, frameIsFixable(Object.assign({ sequence: 3 }, over)));
+    assert.strictEqual(st.flags.fixable, acts(st).includes('fix-frame'));
+});
+
+s = ready({ quality_gate: 'auto_approved_degraded' });
+assert.deepStrictEqual(badges(s), ['unverified']);
+s = ready({ quality_gate: 'sequence_review_skipped' });
+assert.deepStrictEqual(badges(s), ['review-skipped']);
+s = ready({ quality_gate: 'auto_approved', vlm_qa_reason: 'WARN 轻微色偏' });
+assert.deepStrictEqual(badges(s), ['warned']);
+// WARN 必须在开头才算留痕，出现在中间的不算
+s = ready({ quality_gate: 'auto_approved', vlm_qa_reason: '通过，无 WARN' });
+assert.deepStrictEqual(badges(s), []);
+
+// 降档通道产出（2026-07-30）：manifest 里一直写着 degraded_reason，此前没有任何
+// 一处读它——唯一的信号是渲染当时一条会滚走的 toast，事后完全看不出这一单混进过
+// 分辨率更低的帧。
+s = ready({ degraded_reason: 'chat 通道续渲；该通道只出 1K 档，本单请求的是 2K 档' });
+assert.deepStrictEqual(badges(s), ['downscaled']);
+assert.ok(s.badges[0].tip.includes('2K 档'), '徽标要说清降到了什么档');
+assert.ok(s.title.includes('降档通道产出'));
+// 画质无损失时 frame_generator 不写这个字段，自然也不该有徽标
+s = ready({ transport: 'chat', actual_pixels: '768x1376' });
+assert.deepStrictEqual(badges(s), []);
+
+// 多枚徽标同时成立：旧实现靠第二枚硬编码 left:45px，第三枚就没地方放
+s = ready({ quality_gate: 'i2i_fallback_degraded', manual_issue: '透视歪', stale_lineage: true });
+assert.deepStrictEqual(badges(s), ['degraded', 'manual-flagged', 'stale']);
+
+// 结构化违规在 hover 里只留摘要：明细归点徽标展开的弹层（js/review_report.js），
+// 原生 tooltip 装不下多条判定，也不能选中复制
+s = ready({ review_issues: [{ layer: 'global', text: '施工顺序倒置', frames: [3, 4] }] });
+assert.ok(s.title.includes('共 1 条审查违规，点徽标查看明细'));
+assert.ok(!s.title.includes('施工顺序倒置'), 'hover 不再展开违规原文');
+// 复核否决的不计数（后端本来就不落盘，老 manifest 里可能还留着）
+s = ready({
+    review_issues: [
+        { layer: 'global', text: '施工顺序倒置', frames: [3, 4] },
+        { layer: 'local', text: '被推翻的指控', frames: [3], verified: false },
+    ],
+});
+assert.ok(s.title.includes('共 1 条审查违规'));
+
+// 人工换位/上传只进 hover 说明（既有行为，不额外画徽标）
+s = ready({ swapped_from_sequence: 7, source: 'manual_upload' });
+assert.deepStrictEqual(badges(s), []);
+assert.ok(s.title.includes('人工从 IMG 007 拖过来'));
+assert.ok(s.title.includes('人工上传的本地图片'));
+
+// ── 未生成 / 等待中：pending 只在该槽位真在任务范围内时成立 ───────────
+// （2026-07-20 实机事故：重试 IMG 003 时 004-012 全被画成"等待中"）
+s = frameSlotState(null, { seq: 5, pending: false });
+assert.strictEqual(s.kind, 'missing');
+assert.strictEqual(s.statusText, '未生成/已失效');
+assert.deepStrictEqual(acts(s), ['retry-frame', 'upload-frame', 'delete-slot']);
+assert.strictEqual(s.actions[0].label, '生成');
+
+s = frameSlotState(null, { seq: 5, pending: true });
+assert.strictEqual(s.kind, 'pending');
+assert.deepStrictEqual(acts(s), [], '等待中的格子不该有任何操作按钮');
+
+// 只有 file、没有 url 的旧记录也算有图
+s = frameSlotState({ sequence: 2, file: 'outputs/x/frames/img_002.webp' }, { seq: 2 });
+assert.strictEqual(s.kind, 'ready');
+
+// ── busy：影响写操作按钮的 disabled 与 title，只读/元数据操作（4选1、描述问题）在生成中保持可用 ─────────────
+const idle = ready({
+    manual_issue: 'x',
+    candidates: [{ index: 1, file: 'f1' }, { index: 2, file: 'f2' }],
+    chosen_candidate_index: 1,
+});
+const busy = frameSlotState(
+    {
+        sequence: 3,
+        url: '/o/img_003.webp',
+        manual_issue: 'x',
+        candidates: [{ index: 1, file: 'f1' }, { index: 2, file: 'f2' }],
+        chosen_candidate_index: 1,
+    },
+    { seq: 3, busy: true }
+);
+assert.deepStrictEqual(acts(busy), acts(idle), 'busy 不得增删按钮');
+// 生成/写操作在 busy 时禁用
+const mutatingActs = ['fix-frame', 'retry-frame', 'upload-frame', 'delete-slot', 'undo-fix'];
+busy.actions.filter(a => mutatingActs.includes(a.act)).forEach(a => {
+    assert.ok(a.disabled, `${a.act} 在 busy 态下必须 disabled`);
+    assert.ok(a.title.includes('请稍候'), `${a.act} 在 busy 态下必须带有稍候提示`);
+});
+// 只读/元数据操作在 busy 时保持可用
+const nonMutatingActs = ['preview-slot', 'view-candidates', 'describe-frame'];
+busy.actions.filter(a => nonMutatingActs.includes(a.act)).forEach(a => {
+    assert.ok(!a.disabled, `${a.act} 在 busy 态下必须保持可用`);
+});
+assert.ok(idle.actions.every(a => !a.disabled));
+
+// 忙态下也要留着"不忙时该说什么"：网格解禁（setSlotGridButtonsBusy）不重新推导
+// 状态、只改 disabled 与 title，没有 idleTitle 就只能把提示一律置空——跑完一轮
+// 之后每枚按钮的悬浮说明就永久消失了。
+assert.deepStrictEqual(busy.actions.map(a => a.idleTitle), idle.actions.map(a => a.title),
+    'busy 与 idle 的 idleTitle 必须是同一份说明');
+assert.ok(busy.actions.find(a => a.act === 'fix-frame').idleTitle.includes('图生图重渲'));
+assert.ok(idle.actions.every(a => a.idleTitle === a.title), '不忙时 title 就是 idleTitle');
+
+const busyVideo = videoSlotState({ slot: 3, url: '/o/vid_003.mp4' }, { seq: 3, busy: true });
+assert.ok(busyVideo.actions.filter(a => a.act !== 'preview-slot').every(a => a.disabled && a.title.includes('请稍候')));
+assert.ok(!busyVideo.actions.find(a => a.act === 'preview-slot').disabled);
+assert.strictEqual(busyVideo.actions.find(a => a.act === 'upload-video').idleTitle,
+    '手动上传本地视频文件覆盖此槽位');
+
+// ── 视频槽位 ────────────────────────────────────────────────────────
+assert.strictEqual(videoSlotLabel(3, false), 'VID 003 (IMG 003 ➔ IMG 004)');
+assert.strictEqual(videoSlotLabel(11, true), 'VID 011 (英雄展示 · 完工全景)');
+
+let v = videoSlotState({ slot: 3, url: '/outputs/x/videos/vid_003.mp4' }, { seq: 3 });
+assert.strictEqual(v.kind, 'ready');
+assert.strictEqual(v.label, 'VID 003 (IMG 003 ➔ IMG 004)');
+assert.deepStrictEqual(acts(v), ['preview-slot', 'retry-video', 'upload-video', 'delete-slot']);
+assert.ok(v.draggable);
+
+v = videoSlotState({ slot: 11, url: '/o/vid_011.mp4', is_hero: true }, { seq: 11 });
+assert.strictEqual(v.label, 'VID 011 (英雄展示 · 完工全景)');
+
+v = videoSlotState(
+    { slot: 4, url: '/o/vid_004.mp4', source: 'manual_upload', swapped_from_slot: 6 }, { seq: 4 });
+assert.deepStrictEqual(badges(v), ['manual-upload', 'swapped']);
+assert.ok(v.badges[1].tip.includes('VID 006'));
+
+v = videoSlotState({ slot: 2, status: 'failed', error: 'FX 队列超时' }, { seq: 2 });
+assert.strictEqual(v.kind, 'failed');
+assert.strictEqual(v.title, 'FX 队列超时');
+assert.deepStrictEqual(acts(v), ['retry-video', 'upload-video', 'delete-slot']);
+assert.ok(!v.draggable, '失败的格子不能当换位的源');
+
+v = videoSlotState({ slot: 37, provider: 'flow2api', status: 'failed', error: '查询超时',
+    last_attempt: { status: 'failed', submission_pending: true } }, { seq: 37 });
+assert.strictEqual(v.kind, 'submission-pending', '手动重试权限不改变原提交待确认的事实');
+assert.strictEqual(v.statusText, '原提交结果待确认');
+assert.deepStrictEqual(acts(v), ['query-video-submission', 'retry-video', 'upload-video', 'delete-slot']);
+assert.ok(v.actions[0].primary);
+assert.strictEqual(v.actions[0].label, '核对原提交');
+assert.strictEqual(v.actions[1].label, '重新生成');
+assert.ok(v.flags.submissionPending && v.flags.directRetry);
+assert(v.title.includes('先核对原提交'));
+assert.ok(!v.draggable);
+assert.strictEqual(summarizeSlotStates([v]).pending, 1);
+assert.strictEqual(summarizeSlotStates([v]).missing, 1, '尚未交付的待确认片段仍计入缺数');
+
+v = videoSlotState({ slot: 37, provider: 'flow2api', status: 'success', url: '/old.mp4',
+    last_attempt: { status: 'failed', submission_pending: true } }, { seq: 37 });
+assert.strictEqual(v.kind, 'ready', 'Flow2API重试仍保留可播放的原片');
+assert.deepStrictEqual(badges(v), ['submission-pending']);
+assert.deepStrictEqual(acts(v), ['preview-slot', 'query-video-submission', 'retry-video', 'upload-video', 'delete-slot']);
+assert.strictEqual(v.actions.find(a => a.primary).act, 'preview-slot');
+assert.ok(v.draggable, '旧Flow2API待确认标记不再限制换位');
+
+v = videoSlotState({ slot: 37, provider: 'flow2api', status: 'failed', error: 'download unavailable',
+    last_attempt: { confirmed: true, submission_pending: false, recovery_state: 'recovery_failed' } }, { seq: 37 });
+assert.strictEqual(v.statusText, '原视频取回未完成');
+assert.strictEqual(v.actions.find(a => a.primary).act, 'query-video-submission', '已生成的视频优先取回');
+assert.strictEqual(v.actions.find(a => a.primary).label, '取回原视频');
+assert.ok(acts(v).includes('retry-video'), '仍保留显式重新生成权限');
+
+v = videoSlotState({ slot: 37, provider: 'flow2api', status: 'success', url: '/old.mp4',
+    last_attempt: { status: 'failed', confirmed: true, submission_pending: false,
+        recovery_state: 'recovery_failed' } }, { seq: 37 });
+assert.deepStrictEqual(badges(v), ['recovery-failed']);
+assert.strictEqual(v.actions.find(a => a.primary).act, 'preview-slot', '取回失败继续保留原片播放');
+assert.ok(acts(v).includes('query-video-submission'));
+
+for (const record of [
+    { provider: 'flow2api', last_attempt: { submission_pending: true } },
+    { last_attempt: { provider: 'flow2api', submission_pending: true } },
+    { last_attempt: { submission_id: 'legacy-flow', submission_pending: true } },
+]) {
+    v = videoSlotState({ slot: 37, status: 'failed', ...record }, { seq: 37 });
+    assert.strictEqual(v.kind, 'submission-pending', '兼容provider与旧submission_id两种Flow2API标识');
+    assert.strictEqual(v.actions.find(a => a.primary).act, 'query-video-submission');
+    assert.ok(v.flags.submissionPending && v.flags.directRetry);
+}
+
+for (const record of [
+    { provider: 'flow2api', last_attempt: { provider: 'google_fx', submission_pending: true } },
+    { last_attempt: { provider: 'other_provider', submission_id: 'other', submission_pending: true } },
+]) {
+    v = videoSlotState({ slot: 37, status: 'failed', ...record }, { seq: 37 });
+    assert.strictEqual(v.kind, 'submission-pending', '最新回执provider优先，不放开其它通道');
+    assert.deepStrictEqual(acts(v), []);
+}
+
+v = videoSlotState({ slot: 37, provider: 'flow2api', status: 'failed',
+    last_attempt: { fixed_video_account: true, provider: 'google_fx', submission_pending: true } }, { seq: 37 });
+assert.strictEqual(v.kind, 'submission-pending');
+assert.deepStrictEqual(acts(v), [], '原生账号未决记录不能调用Flow2API恢复接口');
+assert(v.title.includes('原生成服务'));
+
+const fixedNativePending = { slot: 37, provider: 'google_fx', status: 'failed',
+    last_attempt: { provider: 'google_fx', fixed_video_account: true, submission_id: 'native-pending',
+        status: 'failed', submission_pending: true } };
+v = videoSlotState(fixedNativePending, { seq: 37, videoProvider: 'flow2api' });
+assert.strictEqual(v.kind, 'submission-pending', '切换生成通道仍如实显示旧原生提交的待确认状态');
+assert.strictEqual(v.actions.find(a => a.primary).act, 'retry-video');
+assert.ok(v.flags.submissionPending && v.flags.directRetry);
+assert.ok(!acts(v).includes('query-video-submission'), 'Flow2API核对接口不能查询旧固定原生账号');
+v = videoSlotState({ ...fixedNativePending, status: 'success', url: '/old.mp4' },
+    { seq: 37, videoProvider: 'flow2api' });
+assert.deepStrictEqual(badges(v), ['submission-pending'], '手动换通道重试权限与未决回执状态分别保留');
+assert.ok(acts(v).includes('retry-video'));
+assert.ok(v.title.includes('待确认'));
+v = videoSlotState(fixedNativePending, { seq: 37, videoProvider: 'google_fx' });
+assert.strictEqual(v.kind, 'submission-pending', '当前原生账号仍保留pending保护');
+assert.deepStrictEqual(acts(v), []);
+v = videoSlotState({ ...fixedNativePending, status: 'success', url: '/old.mp4' },
+    { seq: 37, videoProvider: 'google_fx' });
+assert.deepStrictEqual(badges(v), ['submission-pending']);
+assert.deepStrictEqual(acts(v), ['preview-slot']);
+
+v = videoSlotState({ slot: 37, status: 'failed',
+    last_attempt: { submission_pending: false } }, { seq: 37 });
+assert.strictEqual(v.kind, 'failed');
+assert.ok(acts(v).includes('retry-video'), '核实已结束后恢复正常重试入口');
+
+for (const state of ['refused', 'failed']) {
+    v = videoSlotState({ slot: 37, provider: 'flow2api', status: 'failed',
+        last_attempt: { submission_pending: false, recovery_state: state } }, { seq: 37 });
+    assert.strictEqual(v.kind, 'failed', '上游核对确认的失败按正常失败显示');
+    assert.strictEqual(v.actions.find(a => a.primary).act, 'retry-video');
+    assert.ok(!acts(v).includes('query-video-submission'));
+}
+
+v = videoSlotState(null, { seq: 8, pending: false });
+assert.strictEqual(v.kind, 'missing');
+assert.strictEqual(v.actions[0].label, '生成');
+assert.strictEqual(videoSlotState(null, { seq: 8, pending: true }).kind, 'pending');
+
+// 声明式硬切是"预期缺失"（合并门禁 server.py:1395 同口径），不是失败：
+// 重渲清单时此前会因为没有 url 被当成 failed，画出带重试按钮的失败卡
+['skipped_cut', 'skipped_bridge_hold'].forEach(status => {
+    const cut = videoSlotState({ slot: 5, status }, { seq: 5 });
+    assert.strictEqual(cut.kind, 'cut', `${status} 必须画成中性卡`);
+    assert.deepStrictEqual(acts(cut), [], `${status} 不该给重试出口`);
+});
+
+// ── 汇总 ────────────────────────────────────────────────────────────
+const states = [
+    ready({}),
+    ready({ stale_lineage: true }),
+    frameSlotState(null, { seq: 9 }),
+    slotPendingState('image', 10, '等待中'),
+    videoSlotState({ slot: 12, url: '/o/vid_012.mp4', source: 'manual_upload' }, { seq: 12 }),
+];
+assert.deepStrictEqual(summarizeSlotStates(states),
+    { total: 5, ready: 3, pending: 1, missing: 1, flagged: 1 });
+
+console.log('slot model tests passed');
+
+// Only the current useful action is promoted; every other action remains available.
+const primary = state => state.actions.filter(a => a.primary).map(a => a.act);
+assert.deepStrictEqual(primary(ready({})), ['preview-slot']);
+assert.deepStrictEqual(primary(ready({ manual_issue: '错位' })), ['fix-frame']);
+assert.deepStrictEqual(primary(ready({ candidates: [{ index: 1 }, { index: 2 }] })), ['view-candidates']);
+assert.deepStrictEqual(primary(frameSlotState(null, { seq: 2 })), ['retry-frame']);
+assert.deepStrictEqual(primary(videoSlotState({ slot: 2, status: 'failed' }, { seq: 2 })), ['retry-video']);
+assert.deepStrictEqual(primary(videoSlotState({ slot: 2, url: '/v.mp4' }, { seq: 2 })), ['preview-slot']);

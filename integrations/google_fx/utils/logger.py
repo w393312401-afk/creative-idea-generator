@@ -12,12 +12,15 @@
 """
 
 import os
+import sys
 import time
 import threading
 import contextvars
 import logging
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
+
+from . import lease_registry
 
 # 轮转参数（可通过环境变量覆盖）
 _LOG_MAX_BYTES = int(os.environ.get("ADSPWR_LOG_MAX_BYTES", str(10 * 1024 * 1024)))  # 默认 10MB
@@ -51,6 +54,11 @@ def current_task_label():
     return _task_label_var.get()
 
 
+def _skip_file_under_pytest():
+    """pytest 下默认不落盘；显式设置 ADSPWR_LOG_DIR 的测试仍可写到自己的目录。"""
+    return 'pytest' in sys.modules and not os.environ.get("ADSPWR_LOG_DIR", "").strip()
+
+
 def _get_file_logger():
     """惰性、幂等地构建写文件用的 logger（reload/并发下不会重复挂 handler）。"""
     global _file_logger
@@ -62,7 +70,12 @@ def _get_file_logger():
         logger = logging.getLogger("adspwr_file")
         logger.setLevel(logging.INFO)
         logger.propagate = False
-        if not logger.handlers:  # 幂等：避免重复注册导致重复写入
+        if not logger.handlers and _skip_file_under_pytest():
+            # 测试进程不碰生产日志（与 server_common._UNDER_PYTEST 同一约定）：
+            # 测试替身的 "boom"、假 Page 的 AttributeError 曾写进 logs/server.log，
+            # 控制台 FX 日志面板按警告/错误筛选时会把它们当真实故障展示。
+            logger.addHandler(logging.NullHandler())
+        elif not logger.handlers:  # 幂等：避免重复注册导致重复写入
             handler = RotatingFileHandler(
                 get_log_file_path(),
                 maxBytes=_LOG_MAX_BYTES,
@@ -93,6 +106,8 @@ def get_log_file_path() -> str:
 
 def log(msg, prefix="System"):
     """ 🌟 精致化日志输出 """
+    # 每条日志都是该任务租约的一次心跳（作战板据此标"疑似卡死"）；未安装登记簿时为空操作。
+    lease_registry.touch()
     task_label = _task_label_var.get()
     if task_label:
         msg = f"[{task_label}] {msg}"

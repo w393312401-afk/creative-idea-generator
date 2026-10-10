@@ -1,0 +1,88 @@
+/* ==========================================================================
+   由 index.html 的内联 style="" 迁移出来的类（重复出现 / 带硬编码颜色的那批）。
+   最后一个加载的 app 样式表；组件类需要压住 .action-btn 等基础类时，用「双类」
+   选择器，不要再回到 !important。
+   仍留在 HTML 里的内联样式只有两种：① 由脚本切换 display 的 display:none；
+   ② 一次性的弹窗/预览布局（迁移收益低，改动风险大）。
+   ========================================================================== */
+
+/* — 间距 / 排布小工具 — */
+.u-hstack-8 { display: flex; align-items: center; gap: 8px; }
+.u-mt-12 { margin-top: 12px; }
+.u-mt-20 { margin-top: 20px; }
+.u-mr-auto { margin-right: auto; }
+.u-no-underline { text-decoration: none; }
+.u-va-middle { vertical-align: middle; }
+
+/* — 语义色按钮：原先写死 #f59e0b / #06b6d4，换成类，暗色主题也能统一调整 — */
+.mini-btn.tone-warn {
+    color: var(--accent-orange, #f59e0b);
+    border-color: rgba(245, 158, 11, 0.4);
+}
+.mini-btn.tone-info {
+    color: var(--neon-cyan, #06b6d4);
+    border-color: rgba(6, 182, 212, 0.4);
+}
+
+/* — 生成区的取消按钮 — */
+.action-btn.btn-cancel-generate {
+    margin-top: 24px;
+    padding: 10px 24px;
+    font-size: var(--fs-md);
+}
+.action-btn.btn-cancel-inline {
+    margin-left: 12px;
+    margin-top: 0;
+    padding: 4px 10px;
+    font-size: var(--fs-xs);
+}
+
+/* — 进度条所在行（display 仍由脚本切换，留在内联 style 里） — */
+.frames-progress.frames-progress-row {
+    align-items: center;
+    gap: 12px;
+    justify-content: center;
+    flex-wrap: wrap;
+}
+
+/* — 成片参数行：标签 + 紧凑下拉 — */
+.inline-field-label {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    color: var(--text-secondary);
+    font-size: var(--fs-sm);
+    white-space: nowrap;
+}
+select.compact-select {
+    padding: 6px 10px;
+    color: var(--text-primary);
+    background: var(--surface, #111827);
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-sm);
+}
+
+/* — 成片卡片里的「下载 / 在文件夹中显示」小按钮 — */
+.action-btn.btn-merged-action {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    text-decoration: none;
+    padding: 6px 12px;
+    font-size: var(--fs-sm);
+    color: var(--text-primary);
+    background: rgba(var(--ink-rgb), 0.08);
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-xs);
+    cursor: pointer;
+}
+.action-btn.btn-merged-action.u-ml-8 { margin-left: 8px; }
+
+/* — 页头右侧挂一个操作按钮（图像工坊渲染室「在画廊查看」） — */
+.panel-header.panel-header-split {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 12px;
+}
+.panel-header.panel-header-split .mini-btn { flex-shrink: 0; white-space: nowrap; }

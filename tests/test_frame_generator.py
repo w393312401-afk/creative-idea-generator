@@ -1,4 +1,5 @@
 import io
+import json
 import os
 import shutil
 import tempfile
@@ -9,6 +10,11 @@ from unittest.mock import patch
 
 from frame_generator import (
     plan_fx_chunks,
+    fx_bridge_target_sequences,
+    fx_threshold_target_sequences,
+    fx_camera_cut_target_sequences,
+    split_fx_chunks_at_heads,
+    fx_prompt_with_bridge_control,
     plan_frame_chunk_accounts,
     _fx_extract_uuid,
     _fx_find_ref_for,
@@ -16,6 +22,7 @@ from frame_generator import (
     generate_frame_sequence,
     _execute_request_with_retry,
     _generate_image_edit,
+    _image_edit_api_size,
     _image_size_to_api_size,
     CHAT_TRANSPORT,
     reset_edits_pool_state,
@@ -36,6 +43,12 @@ def _write_test_image(path, size):
     os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
     Image.new('RGB', size, (90, 110, 130)).save(
         path, format='WEBP' if path.lower().endswith('.webp') else 'PNG')
+
+
+def _make_test_cover(root, name='test_cover.webp'):
+    path = os.path.join(root, 'covers', name)
+    _write_test_image(path, (72, 128))
+    return path
 
 
 def _test_image_data_url(size):
@@ -65,6 +78,59 @@ class TestPlanFxChunks(unittest.TestCase):
         self.assertEqual(plan_fx_chunks([5, 3, 4]), [[3, 4, 5]])
         self.assertEqual(plan_fx_chunks([]), [])
 
+    def test_bridge_target_starts_a_fresh_batch(self):
+        prompts = {i: {'prompt': f'image {i}', 'meta': ''} for i in range(1, 8)}
+        videos = {4: {'body': 'cross the threshold', 'meta': '[BRIDGE]'}}
+        heads = fx_bridge_target_sequences(prompts, videos)
+        self.assertEqual(heads, {5})
+        self.assertEqual(
+            split_fx_chunks_at_heads(plan_fx_chunks(prompts), heads),
+            [[1, 2, 3, 4], [5], [6, 7]],
+        )
+
+    def test_fx_bridge_control_is_inlined_and_idempotent(self):
+        prompts = {5: {'prompt': 'Camera settles inside.', 'meta': ''}}
+        videos = {4: {'body': 'cross', 'meta': '[BRIDGE]'}}
+        rendered = fx_prompt_with_bridge_control(5, prompts[5], prompts, videos)
+        self.assertIn('CROSSING REVEAL', rendered)
+        prompts[5]['prompt'] = rendered
+        self.assertEqual(
+            fx_prompt_with_bridge_control(5, prompts[5], prompts, videos), rendered)
+
+    def test_fx_bridge_turn_uses_the_same_crossing_reveal_control(self):
+        """TBCP v7：过门前一帧的门是关死的，参考图里没有可推进、也没有可旋转的室内，
+        直推与转向在图像侧因此完全同构——两者共用弱参考揭示指令，不再分流。"""
+        prompts = {5: {'prompt': 'Camera settles inside.', 'meta': ''}}
+        videos = {4: {'body': 'cross and pan', 'meta': '[BRIDGE TURN]'}}
+        rendered = fx_prompt_with_bridge_control(5, prompts[5], prompts, videos)
+        self.assertIn('CROSSING REVEAL', rendered)
+        self.assertIn('do not reproduce its composition', rendered)
+
+    def test_fx_generic_camera_cut_uses_same_world_control(self):
+        prompts = {2: {'prompt': 'CAM-E southeast exterior service view.',
+                       'meta': 'CAMERA CUT'}}
+        rendered = fx_prompt_with_bridge_control(2, prompts[2], prompts, {})
+        self.assertIn('DECLARED CAMERA CUT', rendered)
+        self.assertIn('same physical site', rendered)
+        self.assertNotIn('CROSSING REVEAL', rendered)
+        prompts[2]['prompt'] = rendered
+        self.assertEqual(fx_prompt_with_bridge_control(2, prompts[2], prompts, {}),
+                         rendered)
+
+    def test_fx_camera_cut_splits_batch_but_never_enters_threshold_grounding(self):
+        prompts = {i: {'prompt': f'CAM-A frame {i}', 'meta': ''}
+                   for i in range(1, 5)}
+        prompts[2]['meta'] = 'CAMERA CUT'
+        videos = {2: {'meta': 'BRIDGE'}}
+        threshold_heads = fx_threshold_target_sequences(prompts, videos)
+        camera_heads = fx_camera_cut_target_sequences(prompts)
+        self.assertEqual(threshold_heads, {3})
+        self.assertEqual(camera_heads, {2})
+        self.assertEqual(
+            split_fx_chunks_at_heads(plan_fx_chunks(prompts),
+                                     threshold_heads | camera_heads),
+            [[1], [2], [3, 4]])
+
 
 class TestPlanFrameChunkAccounts(unittest.TestCase):
     """只换号、不换 IP：每批绑一个号池账号，IP 全程不动（换 IP 已全局关停）。"""
@@ -76,21 +142,21 @@ class TestPlanFrameChunkAccounts(unittest.TestCase):
             plans = plan_frame_chunk_accounts(chunks, ring, 5)
             self.assertEqual(plans, [{'user_id': None}] * 2)
 
-    def test_switches_account_per_batch(self):
+    def test_batches_keep_current_account_until_exhausted(self):
         chunks = [[1, 2, 3, 4, 5], [6, 7, 8, 9, 10], [11, 12]]
         plans = plan_frame_chunk_accounts(chunks, ['a', 'b', 'c'], 5)
-        self.assertEqual([p['user_id'] for p in plans], ['a', 'b', 'c'])
+        self.assertEqual([p['user_id'] for p in plans], [None, None, None])
 
-    def test_ring_wraps_around(self):
+    def test_batches_do_not_wrap_back_to_an_exhausted_account(self):
         chunks = [[1, 2, 3, 4, 5]] * 4
         plans = plan_frame_chunk_accounts(chunks, ['a', 'b'], 5)
-        self.assertEqual([p['user_id'] for p in plans], ['a', 'b', 'a', 'b'])
+        self.assertEqual([p['user_id'] for p in plans], [None] * 4)
 
     def test_interval_larger_than_batch_keeps_account_across_batches(self):
-        """节拍 10 帧 + 每批 5 帧 = 两批共用一个号。"""
+        """旧节拍不再强制切换账号。"""
         chunks = [[1, 2, 3, 4, 5]] * 4
         plans = plan_frame_chunk_accounts(chunks, ['a', 'b'], 10)
-        self.assertEqual([p['user_id'] for p in plans], ['a', 'a', 'b', 'b'])
+        self.assertEqual([p['user_id'] for p in plans], [None] * 4)
 
     def test_never_emits_rotate_ip(self):
         """换 IP 已关停：计划里不该再出现任何换 IP 指示。"""
@@ -99,11 +165,11 @@ class TestPlanFrameChunkAccounts(unittest.TestCase):
             for plan in plan_frame_chunk_accounts(chunks, ring, 5):
                 self.assertNotIn('rotate_ip', plan)
 
-    def test_short_chunks_from_cut_heads_still_accumulate_to_interval(self):
-        """硬切把批次切碎（1 帧、2 帧）时，按累计帧数而不是按批数换号。"""
+    def test_short_chunks_from_cut_heads_keep_current_account(self):
+        """场景硬切会拆分批次，但不会提前换浏览器。"""
         chunks = [[1], [2, 3], [4, 5, 6], [7, 8]]
         plans = plan_frame_chunk_accounts(chunks, ['a', 'b'], 5)
-        self.assertEqual([p['user_id'] for p in plans], ['a', 'a', 'a', 'b'])
+        self.assertEqual([p['user_id'] for p in plans], [None] * 4)
 
     def test_no_chunks(self):
         self.assertEqual(plan_frame_chunk_accounts([], ['a', 'b'], 5), [])
@@ -197,15 +263,16 @@ class TestFrameProgressEvents(unittest.TestCase):
         self.tmp = tempfile.mkdtemp()
         self.old_output_root = server_common.OUTPUT_ROOT
         server_common.OUTPUT_ROOT = self.tmp
+        self.cover = _make_test_cover(self.tmp)
 
     def tearDown(self):
         server_common.OUTPUT_ROOT = self.old_output_root
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def test_frame_start_events_are_emitted_with_no_per_frame_qa(self):
-        """逐帧 VLM 质检门已停用：渲染只发 frame_start/frame，不再发 frame_qa/frame_retry，
-        每帧落 manifest 的 quality_gate 都是 'pending_manual_review'（一致性审查移到
-        整套序列渲染完成后统一进行，见 pipeline_orchestrator._sequence_consistency_review）。"""
+        """渲染期不做任何视觉判定：只发 frame_start/frame，不发 frame_qa/frame_retry，
+        每帧落 manifest 的 quality_gate 都是 'pending_manual_review'。一致性审查只能由
+        用户手动触发（见 pipeline_orchestrator._sequence_consistency_review）。"""
         prompt_block = """图片 1:
 first frame prompt
 
@@ -232,9 +299,10 @@ visible construction change
 
         with patch('frame_generator._generate_text_image', side_effect=fake_text_image), \
              patch('frame_generator._generate_image_edit', side_effect=fake_image_edit), \
-             patch('prompt_pipeline.run_vlm_qa_check', side_effect=AssertionError('per-frame QA gate should no longer be called')):
+             patch('prompt_pipeline._multimodal_chat',
+                   side_effect=AssertionError('rendering must never call a visual judge')):
             manifest = generate_frame_sequence(
-                {},
+                {'coverReferencePath': self.cover},
                 'progress_contract',
                 prompt_block,
                 on_progress=lambda stage, details: events.append((stage, details)),
@@ -249,6 +317,34 @@ visible construction change
         self.assertEqual(starts[1]['sequence'], 2)
         for frame in manifest['frames']:
             self.assertEqual(frame['quality_gate'], 'pending_manual_review')
+
+    def test_subset_prompt_keeps_its_real_slot_and_uses_durable_parent(self):
+        """A prompt block containing only IMAGE 3 must render slot 3, never slot 1."""
+        frames_dir = os.path.join(server_common._get_project_dir('subset_slot_3'), 'frames')
+        os.makedirs(frames_dir, exist_ok=True)
+        parent = os.path.join(frames_dir, 'img_002.webp')
+        _write_test_image(parent, (72, 128))
+        calls = []
+
+        def fake_image_edit(config, prompt, reference_path, target_path, *args, **kwargs):
+            calls.append((prompt, reference_path, target_path))
+            _write_test_image(target_path, (72, 128))
+            return False
+
+        with patch('frame_generator._generate_image_edit', side_effect=fake_image_edit):
+            manifest = generate_frame_sequence(
+                {'coverReferencePath': self.cover},
+                'subset_slot_3',
+                '图片 3:\nthird-slot prompt\n',
+                on_progress=lambda *args: None,
+                target_sequences=[3],
+            )
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0], 'third-slot prompt')
+        self.assertEqual(calls[0][1], parent)
+        self.assertTrue(calls[0][2].endswith('img_003.webp'))
+        self.assertEqual([(f['sequence'], f['slot']) for f in manifest['frames']], [(3, 3)])
 
 
 class TestQuotaFallback(unittest.TestCase):
@@ -269,6 +365,7 @@ second frame prompt
         self.tmp = tempfile.mkdtemp()
         self.old_output_root = server_common.OUTPUT_ROOT
         server_common.OUTPUT_ROOT = self.tmp
+        self.cover = _make_test_cover(self.tmp)
 
     def tearDown(self):
         server_common.OUTPUT_ROOT = self.old_output_root
@@ -298,11 +395,12 @@ second frame prompt
 
         def fake_image_edit(config, prompt, reference_path, target_path, *a, **kw):
             edit_calls.append(config.get('imageModel'))
-            if config.get('imageModel') == 'primary-model':
+            if len(edit_calls) > 1:
                 raise QuotaExhaustedError('primary exhausted')
             self._write(target_path, f'edit:{prompt}')
 
-        config = {'imageModel': 'primary-model', 'imageEditFallbackModel': 'fallback-model'}
+        config = {'imageModel': 'primary-model', 'imageEditFallbackModel': 'fallback-model',
+                  'coverReferencePath': self.cover}
 
         events = []
         with patch('frame_generator._generate_text_image', side_effect=fake_text_image), \
@@ -312,7 +410,7 @@ second frame prompt
                                          on_progress=lambda stage, details: events.append((stage, details)))
 
         # 只打了主模型一枪，没有第二个模型的重试
-        self.assertEqual(edit_calls, ['primary-model'])
+        self.assertEqual(edit_calls, ['primary-model', 'primary-model'])
         self.assertEqual([s for s, _d in events if s == 'model_fallback'], [])
         # 第 1 帧已落盘：补额度后重试靠断点续传直接复用，不白烧
         manifest = self._read_manifest('quota_fallback')
@@ -320,7 +418,7 @@ second frame prompt
 
     def test_no_silent_text_image_fallback_when_edit_quota_exhausted(self):
         """图生图配额耗尽时绝不静默丢参考图改文生图重画——那会产出真正断链的
-        帧（构图跳变根源）。只有第 1 帧（本就没有参考帧）允许文生图。"""
+        帧（构图跳变根源）。第一帧也必须使用封面图生图。"""
         text_calls = []
 
         def fake_text_image(config, prompt, target_path, *a, **kw):
@@ -330,7 +428,7 @@ second frame prompt
         def fake_image_edit(config, prompt, reference_path, target_path, *a, **kw):
             raise QuotaExhaustedError('exhausted')
 
-        config = {'imageModel': 'primary-model'}
+        config = {'imageModel': 'primary-model', 'coverReferencePath': self.cover}
 
         with patch('frame_generator._generate_text_image', side_effect=fake_text_image), \
              patch('frame_generator._generate_image_edit', side_effect=fake_image_edit):
@@ -338,9 +436,9 @@ second frame prompt
                 generate_frame_sequence(config, 'quota_fallback_full', self._PROMPT_BLOCK,
                                          on_progress=lambda stage, details: None)
 
-        self.assertEqual(text_calls, ['primary-model'])
+        self.assertEqual(text_calls, [])
         manifest = self._read_manifest('quota_fallback_full')
-        self.assertTrue(any(f['sequence'] == 1 for f in manifest['frames']))
+        self.assertFalse(manifest and manifest.get('frames'))
 
 
 class TestChatTransportFallback(unittest.TestCase):
@@ -356,6 +454,7 @@ class TestChatTransportFallback(unittest.TestCase):
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
+        self.cover = _make_test_cover(self.tmp)
         self.ref_path = os.path.join(self.tmp, 'img_001.webp')
         self.target_path = os.path.join(self.tmp, 'img_002.webp')
         _write_test_image(self.ref_path, (720, 1280))
@@ -429,6 +528,43 @@ class TestChatTransportFallback(unittest.TestCase):
                 _generate_image_edit(config, 'p', self.ref_path, self.target_path)
 
         self.assertEqual(self.chat_payloads, [])
+
+    def test_windows_edits_uses_verified_pixel_size_and_quality_fields(self):
+        """Windows 8046 edits 走已实测成功的 size + image_size，不再发旧 aspect_ratio。"""
+        requests = []
+
+        def fake_execute(req, *args, **kwargs):
+            requests.append(req)
+            data_url = _test_image_data_url((768, 1376))
+            b64 = data_url.split(',', 1)[1]
+            return json.dumps({'data': [{'b64_json': b64}]}).encode('utf-8')
+
+        config = {
+            'imageModel': 'nano-banana-2',
+            'imageAspectRatio': '9:16',
+            'imageQuality': '2K',
+            'imageEditTransport': 'edits',
+            'apiKey': 'k',
+        }
+        with patch('frame_generator._execute_request_with_retry', side_effect=fake_execute):
+            transport = _generate_image_edit(config, 'p', self.ref_path, self.target_path)
+
+        self.assertIsNone(transport)
+        self.assertEqual(len(requests), 1)
+        body = requests[0].data.decode('latin-1')
+        self.assertIn('name="model"\r\n\r\ngemini-3.1-flash-image\r\n', body)
+        self.assertIn('name="size"\r\n\r\n720x1280\r\n', body)
+        self.assertIn('name="image_size"\r\n\r\n2K\r\n', body)
+        self.assertIn('name="response_format"\r\n\r\nb64_json\r\n', body)
+        self.assertIn('name="image"; filename="reference.png"', body)
+        self.assertNotIn('name="aspect_ratio"', body)
+
+    def test_windows_edits_size_mapping(self):
+        self.assertEqual(_image_edit_api_size('1:1'), '1024x1024')
+        self.assertEqual(_image_edit_api_size('9:16'), '720x1280')
+        self.assertEqual(_image_edit_api_size('16:9'), '1280x720')
+        self.assertEqual(_image_edit_api_size('4:3'), '1216x896')
+        self.assertEqual(_image_edit_api_size('720x1280'), '720x1280')
 
     def test_transport_chat_never_sends_the_doomed_edits_request(self):
         """网关补丁缺失的机器上直接指定 chat 通道：那一枪必挂（~1s + 一整张参考图
@@ -628,14 +764,14 @@ class TestChatTransportFallback(unittest.TestCase):
         try:
             with patch('frame_generator._generate_text_image', side_effect=fake_text_image), \
                  patch('frame_generator._generate_image_edit', side_effect=fake_image_edit):
-                generate_frame_sequence({}, 'chat_transport_resume', prompt_block,
+                generate_frame_sequence({'coverReferencePath': self.cover}, 'chat_transport_resume', prompt_block,
                                         on_progress=lambda s, d: None)
             # 第二轮：两帧都已在盘上，一枪不打，纯复用 manifest
             with patch('frame_generator._generate_text_image',
                        side_effect=AssertionError('续传不该重渲已有帧')), \
                  patch('frame_generator._generate_image_edit',
                        side_effect=AssertionError('续传不该重渲已有帧')):
-                manifest = generate_frame_sequence({}, 'chat_transport_resume', prompt_block,
+                manifest = generate_frame_sequence({'coverReferencePath': self.cover}, 'chat_transport_resume', prompt_block,
                                                    on_progress=lambda s, d: None)
         finally:
             server_common.OUTPUT_ROOT = old_root
@@ -643,7 +779,7 @@ class TestChatTransportFallback(unittest.TestCase):
         frames = {f['sequence']: f for f in manifest['frames']}
         self.assertEqual(frames[2]['transport'], CHAT_TRANSPORT)
         self.assertEqual(frames[2]['actual_pixels'], '768x1376')
-        self.assertNotIn('transport', frames[1])
+        self.assertEqual(frames[1]['transport'], CHAT_TRANSPORT)
 
     def test_degraded_frames_are_recorded_in_manifest_and_announced_live(self):
         """降档帧绝不伪装成正常帧：manifest 记 transport/degraded_reason/真实像素，
@@ -664,22 +800,22 @@ class TestChatTransportFallback(unittest.TestCase):
             with patch('frame_generator._generate_text_image', side_effect=fake_text_image), \
                  patch('frame_generator._generate_image_edit', side_effect=fake_image_edit):
                 manifest = generate_frame_sequence(
-                    {'imageQuality': '2K'}, 'chat_transport_trace',
+                    {'imageQuality': '2K', 'coverReferencePath': self.cover}, 'chat_transport_trace',
                     "图片 1:\nfirst frame prompt\n\n图片 2:\nsecond frame prompt\n",
                     on_progress=lambda stage, details: events.append((stage, details)))
         finally:
             server_common.OUTPUT_ROOT = old_root
 
         frames = {f['sequence']: f for f in manifest['frames']}
-        self.assertNotIn('transport', frames[1])       # 首帧走的是正常 t2i 通道
+        self.assertEqual(frames[1]['transport'], CHAT_TRANSPORT)
         self.assertEqual(frames[2]['transport'], CHAT_TRANSPORT)
         self.assertIn('分辨率降档', frames[2]['degraded_reason'])
         self.assertEqual(frames[2]['actual_pixels'], '768x1376')
         self.assertEqual(frames[2]['image_size'], '2K')  # 请求的档位如实保留
 
         announced = [d for s, d in events if s == 'transport_fallback']
-        self.assertEqual([d['sequence'] for d in announced], [2])
-        self.assertIn('IMG 002', announced[0]['message'])
+        self.assertEqual([d['sequence'] for d in announced], [1, 2])
+        self.assertIn('IMG 001', announced[0]['message'])
         self.assertTrue(announced[0]['degraded'])
         # manifest 落盘的内容与返回值一致（前端读的是盘上那份）
         with open(os.path.join(manifest['project_dir'], 'manifest.json'), encoding='utf-8') as f:
@@ -705,7 +841,7 @@ class TestChatTransportFallback(unittest.TestCase):
             with patch('frame_generator._generate_text_image', side_effect=fake_text_image), \
                  patch('frame_generator._generate_image_edit', side_effect=fake_image_edit):
                 manifest = generate_frame_sequence(
-                    {'imageQuality': '1K'}, 'chat_transport_1k',
+                    {'imageQuality': '1K', 'coverReferencePath': self.cover}, 'chat_transport_1k',
                     "图片 1:\nfirst frame prompt\n\n图片 2:\nsecond frame prompt\n",
                     on_progress=lambda stage, details: events.append((stage, details)))
         finally:
@@ -933,6 +1069,79 @@ class TestPromptBlockBracketSurvival(unittest.TestCase):
         self.assertEqual(sorted(images.keys()), list(range(1, total_beats + 2)))
         self.assertEqual(sorted(videos.keys()), list(range(1, total_beats + 1)))
 
+    def test_a_whole_output_document_parsed_as_a_block_drops_head_and_tail(self):
+        """存量/误传的数据里，整份带标记文档被当成 prompt_block 直接送来解析。
+
+        slot 正则的尾段是开放式的（…|\\Z），所以 ===AUDIT=== 那一节会被吃进**最后
+        一段视频**的正文，跟着这一拍原样送进 i2v（2026-08-15：复刻线的提示词末尾
+        长出「skill 直出模式：…」）。写入侧已经改成只存 ===PROMPTS=== 正文，解析器
+        这道兜底管的是已经存脏了的数据。"""
+        block, total_beats = self._build_block()
+        content = (
+            "===TITLE===\n测试标题\n===THEME===\n测试主题\n===PROMPTS===\n"
+            f"{block}\n===AUDIT===\nskill 直出模式：文本阶段无审查、无重写。\n"
+        )
+        images, videos = _parse_prompt_slots(content)
+        self.assertEqual(sorted(images.keys()), list(range(1, total_beats + 2)))
+        self.assertEqual(sorted(videos.keys()), list(range(1, total_beats + 1)))
+        self.assertNotIn('直出模式', videos[total_beats]['body'])
+        self.assertNotIn('测试标题', images[1]['body'])
+
+    def test_a_line_that_merely_looks_like_a_marker_stays_in_the_body(self):
+        """只认 TITLE/THEME/PROMPTS/AUDIT/TRACES 这几个名字：提示词正文里真写着
+        一行 `=== ... ===` 时不能被当成分节切掉。"""
+        body = 'A carved sign over the door reads\n=== WELCOME HOME ===\nin burnt letters.'
+        images, _videos = _parse_prompt_slots(f'图片提示词\n图片 1:\n{body}\n')
+        self.assertEqual(images[1]['body'], body)
+
+    def test_parse_prompt_slots_survives_summary_and_meta(self):
+        """测试提示词编号后面加简介（例如：视频 10（最终完工氛围展示）:）以及
+        带有 [PACE 1.38] / [BRIDGE] / [CUT] / [HERO] 的各种组合解析与保持。"""
+        sample_block = """图片提示词
+图片 1（初始泥地·未动工）:
+A wide shot of muddy soil.
+
+图片 2（开荒挖坑）:
+A wide shot of excavated pit.
+
+图片 5（室内一层·切开地洞活板门）[BRIDGE]:
+A shot of the wooden hatch door.
+
+视频提示词
+视频 1（开荒挖坑）[PACE 1.31]:
+Worker digging in the mud.
+
+视频 5（一层车间布置与开地洞）[PACE 1.38]:
+Worker mounting tools and opening trapdoor.
+
+视频 10（最终完工氛围展示）:
+Cinematic showcase of finished bedroom.
+"""
+        images, videos = _parse_prompt_slots(sample_block)
+        self.assertEqual(images[1]['summary'], '初始泥地·未动工')
+        self.assertEqual(images[1]['meta'], '')
+        self.assertEqual(images[1]['body'], 'A wide shot of muddy soil.')
+
+        self.assertEqual(images[5]['summary'], '室内一层·切开地洞活板门')
+        self.assertEqual(images[5]['meta'], 'BRIDGE')
+
+        self.assertEqual(videos[1]['summary'], '开荒挖坑')
+        self.assertEqual(videos[1]['meta'], 'PACE 1.31')
+
+        self.assertEqual(videos[5]['summary'], '一层车间布置与开地洞')
+        self.assertEqual(videos[5]['meta'], 'PACE 1.38')
+
+        self.assertEqual(videos[10]['summary'], '最终完工氛围展示')
+        self.assertEqual(videos[10]['meta'], '')
+
+        # 验证 _format_prompt_block 重新输出一致性
+        formatted = _format_prompt_block(images, videos)
+        self.assertIn("图片 1（初始泥地·未动工）:", formatted)
+        self.assertIn("图片 5（室内一层·切开地洞活板门） [BRIDGE]:", formatted)
+        self.assertIn("视频 1（开荒挖坑） [PACE 1.31]:", formatted)
+        self.assertIn("视频 5（一层车间布置与开地洞） [PACE 1.38]:", formatted)
+        self.assertIn("视频 10（最终完工氛围展示）:", formatted)
+
 
 class TestGptImagePixelSize(unittest.TestCase):
     """gpt-image-2 routes to the real OpenAI-shaped codex gateway (65038), which only
@@ -967,12 +1176,7 @@ class TestGptImagePixelSize(unittest.TestCase):
 
 
 class TestAnchorInertiaQuotaFallback(unittest.TestCase):
-    """P1 惯性兜底的 t2i 重渲与主渲染路径共用同一套配额处置：配额耗尽原样上抛。
-
-    2026-07-17 拱渡槽单曾因这里把配额错误咽成"t2i 兜底失败"、保留 i2i 复读帧
-    继续往下渲，造成下游空间断裂。自动切兜底模型已整体取消，现在的正确行为是
-    就地停在配额耗尽这个真因上——反正下一帧也会撞同一堵墙。
-    非配额原因的 t2i 失败仍然只留痕、保留 i2i 原帧（不因一帧优化失败炸掉整单）。"""
+    """P1 惯性加强重试始终保持 i2i，且与主路径共用配额处置。"""
 
     _PROMPT_BLOCK = """图片 1:
 exterior prompt
@@ -988,6 +1192,7 @@ bridge video
         self.tmp = tempfile.mkdtemp()
         self.old_output_root = server_common.OUTPUT_ROOT
         server_common.OUTPUT_ROOT = self.tmp
+        self.cover = _make_test_cover(self.tmp)
 
     def tearDown(self):
         server_common.OUTPUT_ROOT = self.old_output_root
@@ -999,57 +1204,42 @@ bridge video
         with open(target_path, 'wb') as f:
             f.write(content.encode('utf-8'))
 
-    def _run(self, config, text_image_side_effect):
+    def _run(self, config, retry_error=None):
         events = []
+        edit_calls = []
 
         def fake_image_edit(cfg, prompt, reference_path, target_path, *a, **kw):
+            edit_calls.append(reference_path)
+            if len(edit_calls) == 3 and retry_error:
+                raise retry_error
             self._write(target_path, 'edit:stuck-duplicate')
 
-        with patch('frame_generator._generate_text_image', side_effect=text_image_side_effect), \
+        config = dict(config, coverReferencePath=self.cover)
+        with patch('frame_generator._generate_text_image') as text_image, \
              patch('frame_generator._generate_image_edit', side_effect=fake_image_edit), \
              patch('frame_generator.detect_anchor_inertia', return_value=(True, 1.5)), \
-             patch('prompt_pipeline.check_door_clearance_frame', return_value=(True, 'PASS')):
+             patch('prompt_pipeline.ground_threshold_reveal_prompt', return_value=None):
             manifest = generate_frame_sequence(
                 config, 'inertia_quota_fallback', self._PROMPT_BLOCK,
                 on_progress=lambda stage, details: events.append((stage, details)))
-        return manifest, events
+        text_image.assert_not_called()
+        return manifest, events, edit_calls
 
-    def test_inertia_t2i_quota_exhaustion_aborts_the_run(self):
+    def test_inertia_i2i_quota_exhaustion_aborts_the_run(self):
         """惯性重渲撞上配额耗尽：原样上抛，不切模型、不留复读帧继续往下渲。"""
-        text_calls = []
-
-        def fake_text_image(cfg, prompt, target_path, *a, **kw):
-            text_calls.append(cfg.get('imageModel'))
-            # 首帧 t2i 用主模型正常成功；惯性重渲时主模型配额已尽
-            if len(text_calls) > 1:
-                raise QuotaExhaustedError('primary exhausted')
-            self._write(target_path, f'text:{cfg.get("imageModel")}')
-
-        # 配了兜底键也一样（该键已不再透传，留在这里是防回归）
         config = {'imageModel': 'primary-model', 'imageEditFallbackModel': 'fallback-model'}
         with self.assertRaises(QuotaExhaustedError):
-            self._run(config, fake_text_image)
+            self._run(config, QuotaExhaustedError('primary exhausted'))
 
-        # 只打了主模型：首帧 t2i + 惯性重渲，没有第三次换模型的尝试
-        self.assertEqual(text_calls, ['primary-model', 'primary-model'])
-
-    def test_inertia_t2i_non_quota_failure_keeps_frame_with_reason(self):
-        """非配额原因的 t2i 重渲失败：保留 i2i 原帧并留痕，不炸掉整单。"""
-        text_calls = []
-
-        def fake_text_image(cfg, prompt, target_path, *a, **kw):
-            text_calls.append(cfg.get('imageModel'))
-            if len(text_calls) > 1:
-                raise RuntimeError('t2i upstream boom')
-            self._write(target_path, 'text:first-frame')
-
+    def test_inertia_i2i_non_quota_failure_keeps_frame_with_reason(self):
+        """非配额原因的 i2i 加强重试失败：保留原帧并留痕，不炸掉整单。"""
         config = {'imageModel': 'primary-model'}
-        manifest, _ = self._run(config, fake_text_image)
+        manifest, _, edit_calls = self._run(config, RuntimeError('i2i upstream boom'))
 
-        self.assertEqual(text_calls, ['primary-model', 'primary-model'])
+        self.assertEqual(len(edit_calls), 3)
         frame2 = next(f for f in manifest['frames'] if f['sequence'] == 2)
         self.assertIn('anchor_inertia', frame2['vlm_qa_reason'])
-        self.assertIn('t2i 兜底失败', frame2['vlm_qa_reason'])
+        self.assertIn('i2i 加强重试失败', frame2['vlm_qa_reason'])
         with open(po_frame_path('inertia_quota_fallback', 2), 'rb') as f:
             self.assertEqual(f.read(), b'edit:stuck-duplicate')
 
@@ -1096,174 +1286,273 @@ class TestDecodeImageAspectCrop(unittest.TestCase):
             self.assertEqual(im.size, (128, 128))
 
 
-class TestDoorClearancePushTargeting(unittest.TestCase):
-    """P0 门框清除兜底重试必须把 VLM 判定的具体残留位置喂回控制指令，而不是重复
-    上一轮已经推不动的泛化 IMG2IMG_BRIDGE_CONTROL_PROMPT 措辞——不然模型对同一句
-    "再往前推"给出同样保守的结果（2026-07-16 岩湖贝壳单 img_005 连续两推、
-    每次原因都不同，画面仍残留门框，是这条真实复现）。"""
-
-    _PROMPT_BLOCK = """图片 1:
-exterior prompt
-
-图片 2:
-exterior prompt 2
-
-图片 3:
-interior prompt
-
-视频 1:
-ordinary video 1
-
-视频 2 [BRIDGE]:
-bridge video 2
-"""
+class TestBeatFrameMappingGate(unittest.TestCase):
+    """Beat↔图像渲染后 1:1 硬闸：全量渲染收尾时，落盘帧号集合必须与
+    prompt_block 声明的 IMAGE N 集合完全相等。"""
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
         self.old_output_root = server_common.OUTPUT_ROOT
         server_common.OUTPUT_ROOT = self.tmp
+        self.cover = _make_test_cover(self.tmp)
 
     def tearDown(self):
         server_common.OUTPUT_ROOT = self.old_output_root
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def test_retry_control_prompt_carries_the_reported_failure_location(self):
-        edit_calls = []
-        text_calls = []
+    def test_stale_manifest_frame_beyond_current_beat_count_is_rejected(self):
+        """项目改稿导致 beat 数量收窄后，旧 manifest 遗留的多余帧不能被静默沿用。"""
+        project_dir = server_common._get_project_dir('mapping_gate_extra')
+        os.makedirs(project_dir, exist_ok=True)
+        manifest_path = os.path.join(project_dir, 'manifest.json')
+        with open(manifest_path, 'w', encoding='utf-8') as f:
+            json.dump({
+                'title': 'mapping_gate_extra',
+                'frames': [
+                    {'sequence': 1, 'slot': 1, 'file': 'a', 'url': '/a',
+                     'quality_gate': 'pending_manual_review'},
+                    {'sequence': 2, 'slot': 2, 'file': 'b', 'url': '/b',
+                     'quality_gate': 'pending_manual_review'},
+                ],
+            }, f)
 
-        def fake_text_image(config, prompt, target_path, *a, **kw):
-            text_calls.append({'prompt': prompt})
-            os.makedirs(os.path.dirname(target_path), exist_ok=True)
-            with open(target_path, 'wb') as f:
-                f.write(b'text')
+        def fake_image_edit(config, prompt, reference_path, target_path, *args, **kwargs):
+            _write_test_image(target_path, (72, 128))
+            return False
 
-        def fake_image_edit(config, prompt, reference_path, target_path, control_prompt=None, *a, **kw):
-            edit_calls.append({'reference': reference_path, 'control_prompt': control_prompt})
-            os.makedirs(os.path.dirname(target_path), exist_ok=True)
-            with open(target_path, 'wb') as f:
-                f.write(b'edit')
+        with patch('frame_generator._generate_image_edit', side_effect=fake_image_edit):
+            with self.assertRaises(RuntimeError) as ctx:
+                generate_frame_sequence(
+                    {'coverReferencePath': self.cover},
+                    'mapping_gate_extra',
+                    '图片 1:\nonly beat left\n',
+                    on_progress=lambda *a: None,
+                )
+        self.assertIn('映射失守', str(ctx.exception))
 
-        dc_results = iter([
-            (False, 'FAIL: 画面左侧可见生锈门框边缘'),
-            (False, 'FAIL: 画面右下角残留门槛踏板'),
-            (False, 'FAIL: 门洞轮廓仍框住整个画面'),
-        ])
+    def test_matched_beat_and_frame_counts_render_cleanly(self):
+        def fake_image_edit(config, prompt, reference_path, target_path, *args, **kwargs):
+            _write_test_image(target_path, (72, 128))
+            return False
 
-        def fake_door_clearance(config, image_path):
-            return next(dc_results)
-
-        with patch('frame_generator._generate_text_image', side_effect=fake_text_image), \
-             patch('frame_generator._generate_image_edit', side_effect=fake_image_edit), \
-             patch('prompt_pipeline.check_door_clearance_frame', side_effect=fake_door_clearance):
-            manifest = generate_frame_sequence({}, 'door_push_targeting', self._PROMPT_BLOCK,
-                                                on_progress=lambda *a: None)
-
-        push_calls = [c for c in edit_calls if 'doorpush' in (c['reference'] or '')]
-        # Only the first extra push still edits from the (stuck) reference frame — it must
-        # be told exactly what the audit just found wrong on THIS frame, not a copy of the
-        # previous round's instruction, and must not yet claim to be the last attempt.
-        self.assertEqual(len(push_calls), 1)
-        self.assertIn('画面左侧可见生锈门框边缘', push_calls[0]['control_prompt'])
-        self.assertNotIn('last correction attempt', push_calls[0]['control_prompt'])
-
-        # i2i editing twice from the same stuck reference can't break a locked composition
-        # (2026-07-22 confirmed live 2/2): the final budgeted push abandons the reference
-        # entirely and re-renders frame 3 via t2i instead of pushing it a second time.
-        frame3_text_calls = [c for c in text_calls if c['prompt'] == 'interior prompt']
-        self.assertEqual(len(frame3_text_calls), 1)
-
-        frame3 = next(f for f in manifest['frames'] if f['sequence'] == 3)
-        self.assertIn('门洞轮廓仍框住整个画面', frame3['vlm_qa_reason'])
-        self.assertIsNone(frame3['reference'])
-
-
-
-class TestFirstInteriorRevealRawState(unittest.TestCase):
-    """过门帧原始度兜底（2026-07-26 用户实测："过门帧有人工痕迹、不够原始"）：门框
-    出画了不代表这一帧对了——i2i 进到室内后普遍渲成被布景过的样子。渲后对真实像素
-    判定，未通过则以该帧自身为参考做一次定向状态修正（镜头不动、只改内容），修完
-    仍不过只留痕，绝不拦渲染。"""
-
-    _PROMPT_BLOCK = """图片 1:
-exterior prompt
-
-图片 2:
-exterior prompt 2
-
-图片 3:
-interior prompt
-
-视频 1:
-ordinary video 1
-
-视频 2 [BRIDGE]:
-bridge video 2
-"""
-
-    def setUp(self):
-        self.tmp = tempfile.mkdtemp()
-        self.old_output_root = server_common.OUTPUT_ROOT
-        server_common.OUTPUT_ROOT = self.tmp
-
-    def tearDown(self):
-        server_common.OUTPUT_ROOT = self.old_output_root
-        shutil.rmtree(self.tmp, ignore_errors=True)
-
-    def _run(self, title, raw_state_results):
-        edit_calls = []
-        events = []
-        results = iter(raw_state_results)
-
-        def fake_text_image(config, prompt, target_path, *a, **kw):
-            os.makedirs(os.path.dirname(target_path), exist_ok=True)
-            with open(target_path, 'wb') as f:
-                f.write(b'text')
-
-        def fake_image_edit(config, prompt, reference_path, target_path, control_prompt=None, *a, **kw):
-            edit_calls.append({'reference': reference_path, 'control_prompt': control_prompt})
-            os.makedirs(os.path.dirname(target_path), exist_ok=True)
-            with open(target_path, 'wb') as f:
-                f.write(b'edit')
-
-        with patch('frame_generator._generate_text_image', side_effect=fake_text_image), \
-             patch('frame_generator._generate_image_edit', side_effect=fake_image_edit), \
-             patch('prompt_pipeline.check_door_clearance_frame', return_value=(True, 'PASS')), \
-             patch('prompt_pipeline.check_first_interior_reveal_raw_state',
-                   side_effect=lambda *a, **kw: next(results)):
+        with patch('frame_generator._generate_image_edit', side_effect=fake_image_edit):
             manifest = generate_frame_sequence(
-                {}, title, self._PROMPT_BLOCK,
-                on_progress=lambda stage, details: events.append((stage, details)))
-        return manifest, edit_calls, events
+                {'coverReferencePath': self.cover},
+                'mapping_gate_clean',
+                '图片 1:\nfirst\n\n图片 2:\nsecond\n',
+                on_progress=lambda *a: None,
+            )
+        self.assertEqual([f['sequence'] for f in manifest['frames']], [1, 2])
 
-    def test_touched_looking_frame_is_re_edited_with_the_reported_reason(self):
-        manifest, edit_calls, events = self._run(
-            'raw_state_fix',
-            [(False, 'FAIL: 地面被扫干净，角落码着整齐的木料'), (True, 'PASS')])
 
-        fix_calls = [c for c in edit_calls if 'rawstate' in (c['reference'] or '')]
-        self.assertEqual(len(fix_calls), 1)
-        # 泛化指令对已经渲成这样的模型没有纠正力：必须点名 VLM 报回来的具体问题
-        self.assertIn('地面被扫干净，角落码着整齐的木料', fix_calls[0]['control_prompt'])
-        self.assertIn('RAW STATE CORRECTION', fix_calls[0]['control_prompt'])
-        # 修完通过就不再留痕
-        frame3 = next(f for f in manifest['frames'] if f['sequence'] == 3)
-        self.assertIsNone(frame3['vlm_qa_reason'])
-        self.assertTrue(any(stage == 'raw_state' for stage, _ in events))
+class TestRegionLockControlPrompt(unittest.TestCase):
+    """常规拍的 changed_grid_cells 应当被写进控制指令，收紧锁定范围。"""
 
-    def test_still_touched_after_the_budgeted_fix_keeps_the_frame_and_records_it(self):
-        manifest, edit_calls, _ = self._run(
-            'raw_state_giveup',
-            [(False, 'FAIL: 墙面看着像刚粉刷过'), (False, 'FAIL: 墙面仍然太干净')])
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.old_output_root = server_common.OUTPUT_ROOT
+        server_common.OUTPUT_ROOT = self.tmp
+        self.cover = _make_test_cover(self.tmp)
 
-        self.assertEqual(len([c for c in edit_calls if 'rawstate' in (c['reference'] or '')]), 1)
-        frame3 = next(f for f in manifest['frames'] if f['sequence'] == 3)
-        self.assertIn('墙面仍然太干净', frame3['vlm_qa_reason'])
-        # 渲染不被拦下：这一帧照常落盘进 manifest
-        self.assertTrue(os.path.exists(po_frame_path('raw_state_giveup', 3)))
+    def tearDown(self):
+        server_common.OUTPUT_ROOT = self.old_output_root
+        shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def test_passing_frame_is_left_alone(self):
-        _, edit_calls, _ = self._run('raw_state_pass', [(True, 'PASS')])
-        self.assertEqual([c for c in edit_calls if 'rawstate' in (c['reference'] or '')], [])
+    def test_declared_changed_grid_cells_are_written_into_the_control_prompt(self):
+        project_dir = server_common._get_project_dir('region_lock_gate')
+        os.makedirs(project_dir, exist_ok=True)
+        manifest_path = os.path.join(project_dir, 'manifest.json')
+        with open(manifest_path, 'w', encoding='utf-8') as f:
+            json.dump({
+                'title': 'region_lock_gate',
+                'frames': [],
+                'spatial_beats': [{'index': 1, 'changed_grid_cells': ['B2', 'C2']}],
+            }, f)
+
+        calls = []
+
+        def fake_image_edit(config, prompt, reference_path, target_path, *args, **kwargs):
+            calls.append(kwargs.get('control_prompt', ''))
+            _write_test_image(target_path, (72, 128))
+            return False
+
+        with patch('frame_generator._generate_image_edit', side_effect=fake_image_edit), \
+             patch('frame_generator._continuity_result', return_value=({}, 'fam-1')):
+            generate_frame_sequence(
+                {'coverReferencePath': self.cover},
+                'region_lock_gate',
+                '图片 1:\nfirst frame prompt\n\n图片 2:\nsecond frame prompt\n',
+                on_progress=lambda *a: None,
+            )
+
+        # calls[0] is IMAGE 1 (cover-anchored, control_prompt is '' by design);
+        # calls[1] is IMAGE 2, which must carry the declared grid-cell lock.
+        self.assertEqual(len(calls), 2)
+        self.assertIn('B2, C2', calls[1])
+        self.assertIn('REGION LOCK', calls[1])
+
+    def test_beat_without_declared_grid_cells_keeps_the_generic_control_prompt(self):
+        calls = []
+
+        def fake_image_edit(config, prompt, reference_path, target_path, *args, **kwargs):
+            calls.append(kwargs.get('control_prompt', ''))
+            _write_test_image(target_path, (72, 128))
+            return False
+
+        with patch('frame_generator._generate_image_edit', side_effect=fake_image_edit):
+            generate_frame_sequence(
+                {'coverReferencePath': self.cover},
+                'region_lock_gate_generic',
+                '图片 1:\nfirst frame prompt\n\n图片 2:\nsecond frame prompt\n',
+                on_progress=lambda *a: None,
+            )
+
+        self.assertEqual(len(calls), 2)
+        self.assertNotIn('REGION LOCK', calls[1])
+
+    def test_target_image_camera_cut_changes_only_declared_frame_control(self):
+        block = ('图片 1:\nCAM-A exterior.\n\n'
+                 '图片 2 [CAMERA CUT]:\nCAM-E southeast service view.\n\n'
+                 '图片 3:\nCAM-E service cabinet complete.\n\n'
+                 '视频 1:\nThe camera cuts to the southeast.\n\n'
+                 '视频 2:\nThe worker finishes the cabinet.\n')
+        images, _ = _parse_prompt_slots(block)
+        self.assertEqual(images[2]['meta'], 'CAMERA CUT')
+        calls = []
+
+        def fake_image_edit(config, prompt, reference_path, target_path, *args, **kwargs):
+            calls.append((prompt, kwargs.get('control_prompt', '')))
+            _write_test_image(target_path, (72, 128))
+            return False
+
+        with patch('frame_generator._generate_image_edit', side_effect=fake_image_edit), \
+             patch('frame_generator._continuity_result', return_value=({}, 'fam-1')):
+            generate_frame_sequence(
+                {'coverReferencePath': self.cover}, 'camera_cut_gate', block,
+                on_progress=lambda *a: None)
+
+        self.assertEqual(len(calls), 3)
+        self.assertIn('DECLARED CAMERA CUT', calls[1][1])
+        self.assertNotIn('camera ABSOLUTELY locked', calls[1][1])
+        self.assertNotIn('CROSSING REVEAL', calls[1][1])
+        self.assertIn('camera ABSOLUTELY locked', calls[2][1])
+
+
+class TestCollageQAWiring(unittest.TestCase):
+    """FFmpeg 拼图 + 连续性 QA 报告在全量渲染收尾时写回 manifest。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.old_output_root = server_common.OUTPUT_ROOT
+        server_common.OUTPUT_ROOT = self.tmp
+        self.cover = _make_test_cover(self.tmp)
+
+    def tearDown(self):
+        server_common.OUTPUT_ROOT = self.old_output_root
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_full_render_populates_collage_and_qa_report_urls(self):
+        def fake_image_edit(config, prompt, reference_path, target_path, *args, **kwargs):
+            _write_test_image(target_path, (72, 128))
+            return False
+
+        def fake_collage(frame_paths, output_path, columns=5):
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_bytes(b'fake-jpg')
+            return output_path
+
+        with patch('frame_generator._generate_image_edit', side_effect=fake_image_edit), \
+             patch('tools.collage.build_keyframe_collage', side_effect=fake_collage):
+            manifest = generate_frame_sequence(
+                {'coverReferencePath': self.cover},
+                'collage_qa_wiring',
+                '图片 1:\nfirst\n\n图片 2:\nsecond\n',
+                on_progress=lambda *a: None,
+            )
+
+        self.assertIn('collage_url', manifest)
+        self.assertTrue(manifest['collage_url'].endswith('_collage.jpg'))
+        self.assertIn('continuity_qa_report_url', manifest)
+        project_dir = server_common._get_project_dir('collage_qa_wiring')
+        report_path = os.path.join(project_dir, 'continuity_qa_report.json')
+        self.assertTrue(os.path.exists(report_path))
+        with open(report_path, encoding='utf-8') as f:
+            report = json.load(f)
+        self.assertEqual(report['total_frames'], 2)
+
+    def test_collage_failure_is_best_effort_and_does_not_break_the_render(self):
+        def fake_image_edit(config, prompt, reference_path, target_path, *args, **kwargs):
+            _write_test_image(target_path, (72, 128))
+            return False
+
+        with patch('frame_generator._generate_image_edit', side_effect=fake_image_edit), \
+             patch('tools.collage.build_keyframe_collage',
+                   side_effect=RuntimeError('ffmpeg missing')):
+            manifest = generate_frame_sequence(
+                {'coverReferencePath': self.cover},
+                'collage_qa_best_effort',
+                '图片 1:\nfirst\n',
+                on_progress=lambda *a: None,
+            )
+
+        self.assertNotIn('collage_url', manifest)
+        self.assertEqual(len(manifest['frames']), 1)
+
+
+class TestManifestSyncAndFrameResilience(unittest.TestCase):
+    """测试 manifest 中存在旧格式 dict 或非 dict 项时的健壮性。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.old_output_root = server_common.OUTPUT_ROOT
+        server_common.OUTPUT_ROOT = self.tmp
+        self.cover = _make_test_cover(self.tmp)
+
+    def tearDown(self):
+        server_common.OUTPUT_ROOT = self.old_output_root
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_sync_project_manifest_handles_dict_videos_and_frames(self):
+        import server
+        project_dir = os.path.join(self.tmp, 'legacy_dict_project')
+        os.makedirs(project_dir, exist_ok=True)
+        manifest_path = os.path.join(project_dir, 'manifest.json')
+        with open(manifest_path, 'w', encoding='utf-8') as f:
+            json.dump({
+                'title': 'legacy_dict_project',
+                'images': {'1': {'summary': 'frame 1'}},
+                'videos': {'1': {'summary': 'video 1'}},
+            }, f)
+
+        # Should not throw 'str' object has no attribute 'get'
+        server.sync_project_manifest_with_disk(project_dir)
+        with open(manifest_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        self.assertIsInstance(data.get('frames'), list)
+        self.assertIsInstance(data.get('videos'), list)
+
+    def test_frame_generation_handles_manifest_with_only_slot_key(self):
+        project_dir = os.path.join(self.tmp, 'slot_only_project')
+        os.makedirs(project_dir, exist_ok=True)
+        manifest_path = os.path.join(project_dir, 'manifest.json')
+        with open(manifest_path, 'w', encoding='utf-8') as f:
+            json.dump({
+                'title': 'slot_only_project',
+                'frames': [{'slot': 1, 'file': 'img_001.webp'}],
+            }, f)
+
+        def fake_image_edit(config, prompt, reference_path, target_path, *args, **kwargs):
+            _write_test_image(target_path, (72, 128))
+            return False
+
+        with patch('frame_generator._generate_image_edit', side_effect=fake_image_edit):
+            manifest = generate_frame_sequence(
+                {'coverReferencePath': self.cover},
+                'slot_only_project',
+                '图片 1:\nfirst\n',
+                on_progress=lambda *a: None,
+            )
+        self.assertEqual(len(manifest['frames']), 1)
 
 
 if __name__ == '__main__':

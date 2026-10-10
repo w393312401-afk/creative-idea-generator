@@ -1,0 +1,1177 @@
+/* ==========================================================================
+   项目工作台（任务列表 + 点子库合并后的主页面）— 全部选择器锚在 #panel-projects 下。
+
+   与 gallery.css / ledger.css 同一套约定：作用域限定在自己的面板 id 里，通用类名
+   不跨面板泄漏。视觉语言刻意照抄创意台账的工具栏/芯片（同样的圆角、同样的
+   rgba(176,123,82,…) 主色），但因为那套规则是 #panel-ledger 前缀限定的，这里必须
+   重新声明一遍同样的值——跨面板"借用"样式在这个项目里行不通（见 panels-tabs.css
+   里 #trend-refs-manage-modal 那段同样教训的注释）。
+
+   布局：宽屏左列表 + 右详情双栏（详情常驻，取代原先覆盖工作区的 380px 抽屉）；
+   窄屏详情降级为覆盖在列表上的浮层。
+   见 docs/project_workbench_refactor_plan.md
+   ========================================================================== */
+
+#panel-projects .projects-shell {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    /* 不加 backdrop-filter：本元素铺满整个 .glass-panel，而背景色与父面板同为
+       var(--bg-panel) —— 模糊一层和自己同色的平面，输出必然还是那个颜色，
+       却要为整幅视口再跑一遍 20px 高斯模糊（而父面板原本还有一层，叠成两层）。
+       理由与实测数据见 css/tokens.css 的 .glass-panel。 */
+    background: var(--bg-panel);
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-2xl);
+    overflow: hidden;
+}
+
+#panel-projects .panel-header {
+    padding: 1.5rem 1.5rem 0.75rem 1.5rem;
+    flex-shrink: 0;
+}
+
+#panel-projects .panel-header h2 {
+    font-size: 1.25rem;
+    font-weight: 600;
+    letter-spacing: -0.3px;
+    margin-bottom: 0.25rem;
+    color: var(--text-main);
+}
+
+#panel-projects .panel-header p {
+    font-size: 0.8rem;
+    color: var(--text-muted);
+}
+
+/* ── 项目分区与工具栏 ──────────────────────────────────────────────────── */
+
+#panel-projects .projects-section-tabs {
+    display: flex;
+    gap: 6px;
+    padding: 0 1.5rem 10px;
+    flex-shrink: 0;
+}
+
+#panel-projects .projects-section-btn {
+    border: 1px solid transparent;
+    border-radius: var(--radius-md);
+    background: transparent;
+    color: var(--text-muted);
+    padding: 8px 18px;
+    font-size: var(--fs-md);
+    font-weight: 600;
+    cursor: pointer;
+    transition: var(--transition-fast);
+}
+
+#panel-projects .projects-section-btn:hover {
+    color: var(--text-main);
+    background: rgba(var(--ink-rgb), 0.04);
+}
+
+#panel-projects .projects-section-btn.active {
+    color: var(--neon-cyan);
+    background: rgba(176, 123, 82, 0.1);
+    border-color: rgba(176, 123, 82, 0.35);
+}
+
+#panel-projects .projects-section-btn:focus-visible {
+    outline: 2px solid var(--neon-cyan);
+    outline-offset: 2px;
+}
+
+#panel-projects .projects-filters[hidden] {
+    display: none;
+}
+
+#panel-projects .projects-toolbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 10px;
+    padding: 10px 1.5rem;
+    border-bottom: 1px solid var(--border-color);
+    background: rgba(var(--ink-rgb), 0.03);
+    flex-shrink: 0;
+}
+
+#panel-projects .projects-filters {
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+}
+
+#panel-projects .projects-filter-chip {
+    background: transparent;
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-2xl);
+    color: var(--text-secondary);
+    font-size: var(--fs-sm);
+    font-weight: 600;
+    padding: 5px 14px;
+    cursor: pointer;
+    transition: var(--transition-fast);
+}
+
+#panel-projects .projects-filter-chip:hover {
+    color: var(--neon-cyan);
+    border-color: rgba(176, 123, 82, 0.35);
+}
+
+#panel-projects .projects-filter-chip.active {
+    background: rgba(176, 123, 82, 0.1);
+    border-color: rgba(176, 123, 82, 0.4);
+    color: var(--neon-cyan);
+}
+
+#panel-projects .projects-filter-chip.warn.active {
+    background: rgba(220, 120, 60, 0.12);
+    border-color: rgba(220, 120, 60, 0.45);
+    color: #c2621f;
+}
+
+#panel-projects .projects-search-sort {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex: 1;
+    min-width: 200px;
+    max-width: 380px;
+}
+
+#panel-projects .projects-search-input,
+#panel-projects .projects-sort-select {
+    background: rgba(var(--ink-rgb), 0.04);
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-md);
+    color: var(--text-main);
+    font-size: var(--fs-sm);
+    padding: 6px 12px;
+    outline: none;
+    transition: var(--transition-fast);
+}
+
+#panel-projects .projects-search-input {
+    flex: 1;
+    min-width: 120px;
+}
+
+#panel-projects .projects-search-input:focus,
+#panel-projects .projects-sort-select:focus {
+    border-color: rgba(176, 123, 82, 0.45);
+    box-shadow: 0 0 0 2px rgba(176, 123, 82, 0.12);
+}
+
+#panel-projects .projects-search-input::placeholder { color: var(--text-muted); }
+
+#panel-projects .projects-sort-select {
+    color: var(--text-secondary);
+    font-weight: 600;
+    cursor: pointer;
+}
+
+/* ── 显示方式切换（列表 / 网格 / 紧凑）───────────────────────────── */
+#panel-projects .projects-view-switch {
+    display: flex;
+    gap: 2px;
+    padding: 2px;
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-md);
+    background: rgba(var(--ink-rgb), 0.04);
+    flex-shrink: 0;
+}
+
+#panel-projects .projects-view-btn {
+    background: transparent;
+    border: none;
+    border-radius: var(--radius-sm);
+    color: var(--text-muted);
+    font-size: var(--fs-md);
+    line-height: 1;
+    padding: 5px 9px;
+    cursor: pointer;
+    transition: var(--transition-fast);
+}
+
+#panel-projects .projects-view-btn:hover { color: var(--neon-cyan); }
+
+#panel-projects .projects-view-btn.active {
+    background: rgba(176, 123, 82, 0.14);
+    color: var(--neon-cyan);
+}
+
+#panel-projects .projects-toolbar-right {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    margin-left: auto;
+}
+
+#panel-projects .projects-tool-btn.primary {
+    background: var(--neon-cyan);
+    border-color: var(--neon-cyan);
+    color: var(--bg-panel-solid);
+    padding: 8px 14px;
+}
+
+#panel-projects .workspace-more { position: relative; }
+#panel-projects .workspace-more > summary { list-style: none; }
+#panel-projects .workspace-more > summary::-webkit-details-marker { display: none; }
+#panel-projects .workspace-more-menu {
+    position: absolute;
+    right: 0;
+    top: calc(100% + 6px);
+    min-width: 190px;
+    padding: 6px;
+    background: var(--bg-panel-solid);
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-md);
+    box-shadow: 0 8px 28px rgba(0, 0, 0, 0.16);
+    z-index: 80;
+}
+#panel-projects .workspace-more-menu .projects-tool-btn {
+    display: block;
+    width: 100%;
+    border: 0;
+    background: transparent;
+    text-align: left;
+    padding: 9px 10px;
+}
+#panel-projects .workspace-more-menu .projects-tool-btn:hover { background: var(--bg-card-hover); }
+#panel-projects .workspace-menu-divider { border-top: 1px solid var(--border-color); margin: 5px; }
+
+#panel-projects .projects-history,
+#panel-projects .projects-technical {
+    margin-top: 16px;
+    padding-top: 12px;
+    border-top: 1px solid var(--border-color);
+}
+#panel-projects .projects-history > summary,
+#panel-projects .projects-technical > summary,
+#panel-projects .projects-more-actions > summary {
+    color: var(--text-secondary);
+    cursor: pointer;
+    font-size: var(--fs-sm);
+    padding: 6px 0;
+}
+#panel-projects .project-current-status {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px 12px;
+    margin: 12px 0 4px;
+    color: var(--text-main);
+}
+#panel-projects .project-current-status > span:not(.project-spinner) { font-size: var(--fs-sm); color: var(--text-secondary); }
+#panel-projects .project-main .project-current-status { margin: 4px 0 0; }
+#panel-projects .project-next-hint { font-size: var(--fs-sm); color: var(--text-secondary); line-height: 1.6; margin-bottom: 12px; }
+#panel-projects .projects-more-actions .projects-detail-actions { margin-top: 8px; }
+
+/* ── 多选批量条 ────────────────────────────────────────────────────── */
+#panel-projects .projects-bulkbar {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 10px;
+    padding: 8px 1.5rem;
+    border-bottom: 1px solid rgba(176, 123, 82, 0.35);
+    background: rgba(176, 123, 82, 0.09);
+    flex-shrink: 0;
+}
+
+/* hidden 属性的 display:none 敌不过上面的 display:flex，得显式压回去 */
+#panel-projects .projects-bulkbar[hidden] { display: none; }
+
+#panel-projects .projects-bulk-count {
+    font-size: var(--fs-sm);
+    font-weight: 700;
+    color: var(--text-main);
+    white-space: nowrap;
+}
+
+#panel-projects .projects-bulk-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    flex: 1;
+}
+
+#panel-projects .projects-stats {
+    font-size: var(--fs-xs);
+    color: var(--text-muted);
+    white-space: nowrap;
+}
+
+#panel-projects .projects-tool-btn,
+#panel-projects .projects-btn {
+    background: rgba(var(--ink-rgb), 0.04);
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-md);
+    color: var(--text-secondary);
+    font-size: var(--fs-sm);
+    font-weight: 600;
+    padding: 6px 12px;
+    cursor: pointer;
+    transition: var(--transition-fast);
+    white-space: nowrap;
+}
+
+#panel-projects .projects-tool-btn:hover,
+#panel-projects .projects-btn:hover {
+    color: var(--neon-cyan);
+    border-color: rgba(176, 123, 82, 0.4);
+}
+
+#panel-projects .projects-btn.primary {
+    background: rgba(176, 123, 82, 0.12);
+    border-color: rgba(176, 123, 82, 0.4);
+    color: var(--neon-cyan);
+}
+
+#panel-projects .projects-btn.danger:hover {
+    color: #d9534f;
+    border-color: rgba(217, 83, 79, 0.45);
+}
+
+/* ── 双栏主体 ──────────────────────────────────────────────────────────── */
+
+#panel-projects .projects-body {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    align-items: stretch;
+}
+
+#panel-projects .projects-list {
+    flex: 1;
+    min-width: 0;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    padding: 12px 1.5rem 24px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+#panel-projects .projects-status {
+    padding: 32px 8px;
+    text-align: center;
+    font-size: var(--fs-md);
+    color: var(--text-muted);
+}
+
+#panel-projects .projects-status.error { color: #d9534f; }
+
+/* ── 项目行 ────────────────────────────────────────────────────────────── */
+
+#panel-projects .project-row {
+    display: flex;
+    align-items: flex-start;
+    gap: 12px;
+    padding: 10px 12px;
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-lg);
+    background: rgba(var(--ink-rgb), 0.02);
+    cursor: pointer;
+    transition: transform 0.18s cubic-bezier(0.16, 1, 0.3, 1),
+                box-shadow 0.18s ease,
+                border-color 0.18s ease,
+                background 0.18s ease;
+}
+
+#panel-projects .project-row:hover {
+    border-color: rgba(176, 123, 82, 0.35);
+    background: rgba(var(--ink-rgb), 0.04);
+}
+
+#panel-projects .project-row.selected {
+    border-color: rgba(176, 123, 82, 0.65);
+    background: rgba(176, 123, 82, 0.08);
+    box-shadow: 0 0 0 1px rgba(176, 123, 82, 0.35), 0 4px 12px rgba(176, 123, 82, 0.12);
+}
+
+/* 勾选（多选）与选中（详情焦点）是两回事：前者虚线描边，后者实线底色，
+   同一行可以同时处于两种状态 */
+#panel-projects .project-row.multi-selected {
+    border-color: rgba(176, 123, 82, 0.5);
+    border-style: dashed;
+    background: rgba(176, 123, 82, 0.05);
+}
+
+/* 勾选框占位但默认透明：常显会让 hover 之外的每一行都挂个空框，
+   而 opacity 而非 display 保证显隐不引起整列重排 */
+#panel-projects .project-check {
+    flex: 0 0 auto;
+    align-self: center;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 18px;
+    height: 18px;
+    cursor: pointer;
+    opacity: 0;
+    transition: var(--transition-fast);
+}
+
+#panel-projects .project-row:hover .project-check,
+#panel-projects .project-row.multi-selected .project-check,
+#panel-projects .projects-list.has-selection .project-check {
+    opacity: 1;
+}
+
+#panel-projects .project-check input {
+    accent-color: var(--neon-cyan);
+    cursor: pointer;
+    margin: 0;
+}
+
+#panel-projects .project-row[data-state="running"] {
+    border-color: rgba(176, 123, 82, 0.35);
+}
+
+#panel-projects .project-thumb {
+    width: 80px;
+    height: 56px;
+    flex-shrink: 0;
+    border-radius: var(--radius-md);
+    overflow: hidden;
+    background: rgba(var(--ink-rgb), 0.06);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    position: relative;
+}
+
+#panel-projects .project-thumb img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    display: block;
+    transition: transform 0.25s ease;
+}
+
+#panel-projects .project-thumb-icon { font-size: 24px; opacity: 0.55; }
+
+/* 封面浮层：右上角状态徽章与底部快捷操作 */
+#panel-projects .project-thumb-overlay {
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+    padding: 6px;
+    z-index: 2;
+}
+
+#panel-projects .project-thumb-badges {
+    display: flex;
+    gap: 4px;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    width: 100%;
+    pointer-events: auto;
+}
+
+#panel-projects .project-card-actions {
+    display: flex;
+    gap: 4px;
+    justify-content: flex-end;
+    width: 100%;
+    pointer-events: auto;
+    opacity: 0;
+    transform: translateY(4px);
+    transition: opacity 0.18s ease, transform 0.18s ease;
+}
+
+#panel-projects .project-row:hover .project-card-actions {
+    opacity: 1;
+    transform: translateY(0);
+}
+
+#panel-projects .project-card-btn {
+    background: rgba(18, 18, 22, 0.8);
+    border: 1px solid rgba(255, 255, 255, 0.2);
+    color: #f1f5f9;
+    border-radius: var(--radius-sm);
+    font-size: var(--fs-2xs);
+    font-weight: 600;
+    padding: 3px 7px;
+    cursor: pointer;
+    backdrop-filter: blur(8px);
+    transition: var(--transition-fast);
+    line-height: 1.2;
+    white-space: nowrap;
+}
+
+#panel-projects .project-card-btn:hover {
+    background: rgba(176, 123, 82, 0.9);
+    border-color: rgba(176, 123, 82, 1);
+    color: #fff;
+}
+
+#panel-projects .project-card-btn.primary {
+    background: rgba(176, 123, 82, 0.8);
+    border-color: rgba(176, 123, 82, 0.95);
+    color: #fff;
+}
+
+#panel-projects .project-main {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+}
+
+#panel-projects .project-title-line {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-wrap: wrap;
+}
+
+#panel-projects .project-title {
+    font-size: var(--fs-md);
+    font-weight: 600;
+    color: var(--text-main);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 100%;
+}
+
+#panel-projects .project-badges-inline {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+}
+
+#panel-projects .project-meta {
+    font-size: var(--fs-xs);
+    color: var(--text-muted);
+    line-height: 1.3;
+}
+
+#panel-projects .project-error {
+    font-size: var(--fs-xs);
+    color: #d9534f;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+/* 状态徽章 */
+#panel-projects .project-badge {
+    font-size: var(--fs-2xs);
+    font-weight: 700;
+    padding: 2px 7px;
+    border-radius: var(--radius-sm);
+    white-space: nowrap;
+    border: 1px solid transparent;
+    line-height: 1.2;
+}
+
+#panel-projects .project-badge.state-running {
+    background: rgba(176, 123, 82, 0.16);
+    color: #8A5A32;
+    border-color: rgba(176, 123, 82, 0.35);
+}
+
+#panel-projects .project-badge.fx-queue.waiting {
+    background: transparent;
+    color: var(--warning);
+    border: 1px dashed var(--warning);
+}
+
+#panel-projects .project-badge.fx-queue.active {
+    background: transparent;
+    color: var(--text-secondary);
+    border-color: var(--border-color);
+}
+
+#panel-projects .project-badge.state-completed {
+    background: rgba(90, 150, 110, 0.14);
+    color: #3f7a52;
+    border-color: rgba(90, 150, 110, 0.32);
+}
+
+#panel-projects .project-badge.state-saved {
+    background: rgba(120, 130, 200, 0.14);
+    color: #5560a8;
+    border-color: rgba(120, 130, 200, 0.32);
+}
+
+#panel-projects .project-badge.state-failed,
+#panel-projects .project-badge.warn {
+    background: rgba(217, 83, 79, 0.14);
+    color: #c0453f;
+    border-color: rgba(217, 83, 79, 0.35);
+}
+
+#panel-projects .project-badge.state-cancelled,
+#panel-projects .project-badge.state-unknown,
+#panel-projects .project-badge.job {
+    background: rgba(var(--ink-rgb), 0.06);
+    color: var(--text-muted);
+    border-color: var(--border-color);
+}
+
+#panel-projects .project-badge.saved {
+    background: rgba(var(--ink-rgb), 0.05);
+    color: var(--text-secondary);
+    border-color: var(--border-color);
+}
+
+/* 运行中进度 */
+#panel-projects .project-progress {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: var(--fs-xs);
+    color: var(--text-secondary);
+}
+
+#panel-projects .project-spinner {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    border: 2px solid rgba(176, 123, 82, 0.25);
+    border-top-color: rgba(176, 123, 82, 0.9);
+    animation: projects-spin 0.9s linear infinite;
+    flex-shrink: 0;
+}
+
+@keyframes projects-spin { to { transform: rotate(360deg); } }
+
+@media (prefers-reduced-motion: reduce) {
+    #panel-projects .project-spinner { animation: none; }
+}
+
+/* 媒体子作业聚合徽章 */
+#panel-projects .project-jobs {
+    display: flex;
+    gap: 5px;
+    flex-wrap: wrap;
+    align-items: center;
+}
+
+#panel-projects .project-job {
+    font-size: var(--fs-2xs);
+    font-weight: 600;
+    padding: 2px 7px;
+    border-radius: var(--radius-sm);
+    background: rgba(var(--ink-rgb), 0.04);
+    color: var(--text-muted);
+    border: 1px solid var(--border-color);
+    white-space: nowrap;
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+    line-height: 1.25;
+}
+
+#panel-projects .project-job.completed {
+    color: #3f7a52;
+    background: rgba(90, 150, 110, 0.12);
+    border-color: rgba(90, 150, 110, 0.28);
+}
+#panel-projects .project-job.failed {
+    color: #c0453f;
+    background: rgba(217, 83, 79, 0.12);
+    border-color: rgba(217, 83, 79, 0.28);
+}
+#panel-projects .project-job.running {
+    color: #8A5A32;
+    background: rgba(176, 123, 82, 0.14);
+    border-color: rgba(176, 123, 82, 0.35);
+}
+#panel-projects .project-job.cancelled {
+    color: var(--text-muted);
+    background: rgba(var(--ink-rgb), 0.04);
+    border-color: var(--border-color);
+}
+
+/* ── 显示方式：网格 ────────────────────────────────────────────────────
+   标准 16:9 画幅卡片、浮动角标、整齐等高、悬停动效与快捷操作。 */
+#panel-projects .projects-list.view-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+    align-content: start;
+    gap: 14px;
+}
+
+/* 加载/空状态在网格里会缩成一个单元格，让它横跨整行 */
+#panel-projects .projects-list.view-grid .projects-status { grid-column: 1 / -1; }
+
+#panel-projects .projects-list.view-grid .project-row {
+    position: relative;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 10px;
+    padding: 10px;
+    height: 100%;
+    box-sizing: border-box;
+}
+
+#panel-projects .projects-list.view-grid .project-row:hover .project-thumb img {
+    transform: scale(1.03);
+}
+
+#panel-projects .projects-list.view-grid .project-thumb {
+    width: 100%;
+    height: auto;
+    aspect-ratio: 16 / 9;
+    border-radius: var(--radius-md);
+}
+
+#panel-projects .projects-list.view-grid .project-thumb-icon { font-size: 32px; }
+
+#panel-projects .projects-list.view-grid .project-check {
+    position: absolute;
+    left: 8px;
+    top: 8px;
+    z-index: 3;
+    width: 22px;
+    height: 22px;
+    border-radius: var(--radius-sm);
+    background: rgba(0, 0, 0, 0.5);
+    backdrop-filter: blur(4px);
+}
+
+/* 网格模式下：状态徽章浮在封面右上角，标题行内徽章隐藏 */
+#panel-projects .projects-list.view-grid .project-badges-inline {
+    display: none;
+}
+
+#panel-projects .projects-list.view-grid .project-thumb-badges .project-badge {
+    backdrop-filter: blur(8px);
+    background: rgba(15, 15, 20, 0.72);
+    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.35);
+}
+
+#panel-projects .projects-list.view-grid .project-thumb-badges .project-badge.state-running {
+    background: rgba(176, 123, 82, 0.45);
+    color: #f5cf9e;
+    border-color: rgba(176, 123, 82, 0.6);
+}
+
+#panel-projects .projects-list.view-grid .project-thumb-badges .project-badge.state-completed {
+    background: rgba(30, 80, 50, 0.65);
+    color: #8ee0a8;
+    border-color: rgba(90, 150, 110, 0.6);
+}
+
+#panel-projects .projects-list.view-grid .project-thumb-badges .project-badge.state-saved {
+    background: rgba(45, 55, 110, 0.65);
+    color: #a8b4f5;
+    border-color: rgba(120, 130, 200, 0.6);
+}
+
+#panel-projects .projects-list.view-grid .project-thumb-badges .project-badge.state-failed,
+#panel-projects .projects-list.view-grid .project-thumb-badges .project-badge.warn {
+    background: rgba(120, 30, 30, 0.7);
+    color: #fca5a5;
+    border-color: rgba(217, 83, 79, 0.6);
+}
+
+#panel-projects .projects-list.view-grid .project-main {
+    justify-content: space-between;
+    flex: 1;
+    gap: 6px;
+}
+
+#panel-projects .projects-list.view-grid .project-title {
+    white-space: normal;
+    overflow-wrap: anywhere;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+    line-height: 1.4;
+    min-height: 2.8em;
+}
+
+#panel-projects .projects-list.view-grid .project-jobs {
+    min-height: 22px;
+    margin-top: auto;
+}
+
+/* 非网格模式下（列表模式）：封面浮层隐藏，行内徽章显示 */
+#panel-projects .projects-list:not(.view-grid) .project-thumb-overlay {
+    display: none;
+}
+
+/* ── 显示方式：紧凑 ────────────────────────────────────────────────────
+   一行一屏里塞进最多项目：缩略图降到 32px、正文压成单行。子作业徽章与错误详情
+   在这一档隐藏——状态徽章（含"子作业失败"）仍在，要看具体哪条失败就点开详情栏。 */
+#panel-projects .projects-list.view-compact { gap: 2px; }
+
+#panel-projects .projects-list.view-compact .project-row {
+    align-items: center;
+    gap: 8px;
+    padding: 5px 10px;
+    border-radius: var(--radius-md);
+}
+
+#panel-projects .projects-list.view-compact .project-thumb {
+    width: 32px;
+    height: 32px;
+    border-radius: var(--radius-sm);
+}
+
+#panel-projects .projects-list.view-compact .project-thumb-icon { font-size: var(--fs-base); }
+
+#panel-projects .projects-list.view-compact .project-main {
+    flex-direction: row;
+    align-items: center;
+    gap: 10px;
+}
+
+#panel-projects .projects-list.view-compact .project-title-line {
+    flex: 1;
+    min-width: 0;
+    flex-wrap: nowrap;
+    overflow: hidden;
+}
+
+#panel-projects .projects-list.view-compact .project-meta,
+#panel-projects .projects-list.view-compact .project-progress {
+    flex: 0 0 auto;
+    white-space: nowrap;
+}
+
+#panel-projects .projects-list.view-compact .project-jobs,
+#panel-projects .projects-list.view-compact .project-error {
+    display: none;
+}
+
+/* ── 详情栏 ────────────────────────────────────────────────────────────── */
+
+#panel-projects .projects-detail {
+    /* 随面板宽度伸缩（1352px 宽 ≈ 380px，窄一点收到 300px），不再固定 340px */
+    width: clamp(300px, 28%, 380px);
+    flex-shrink: 0;
+    border-left: 1px solid var(--border-color);
+    background: rgba(var(--ink-rgb), 0.02);
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    padding: 16px 18px 28px;
+}
+
+#panel-projects .projects-detail-empty {
+    font-size: var(--fs-sm);
+    color: var(--text-muted);
+    text-align: center;
+    padding-top: 40px;
+}
+
+#panel-projects .projects-detail-head {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 8px;
+}
+
+#panel-projects .projects-detail-head h3 {
+    font-size: var(--fs-base);
+    font-weight: 600;
+    color: var(--text-main);
+    line-height: 1.4;
+}
+
+#panel-projects .projects-detail-close {
+    background: transparent;
+    border: none;
+    color: var(--text-muted);
+    font-size: var(--fs-2xl);
+    line-height: 1;
+    cursor: pointer;
+    flex-shrink: 0;
+}
+
+#panel-projects .projects-detail-close:hover { color: var(--text-main); }
+
+#panel-projects .projects-detail-theme {
+    margin-top: 6px;
+    font-size: var(--fs-xs);
+    color: var(--text-muted);
+    line-height: 1.5;
+}
+
+/* 孤立作业的处境说明——它没有母项目可打开，得先讲清楚"为什么这行长得不一样" */
+#panel-projects .projects-detail-hint {
+    margin-top: 10px;
+    padding: 8px 10px;
+    border: 1px solid var(--border-color);
+    border-left: 2px solid rgba(176, 123, 82, 0.5);
+    border-radius: var(--radius-sm);
+    background: rgba(var(--ink-rgb), 0.04);
+    font-size: var(--fs-xs);
+    line-height: 1.6;
+    color: var(--text-muted);
+}
+
+#panel-projects .projects-detail-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin: 14px 0;
+}
+
+/* 「换模型再跑」：下拉 + 按钮成对，占满一行 */
+#panel-projects .projects-rerun {
+    display: flex;
+    gap: 6px;
+    width: 100%;
+}
+
+#panel-projects .projects-rerun select {
+    flex: 1;
+    min-width: 0;
+}
+
+#panel-projects .projects-tool-btn.danger:hover {
+    color: #d9534f;
+    border-color: rgba(217, 83, 79, 0.45);
+}
+
+#panel-projects .projects-facts {
+    display: grid;
+    grid-template-columns: auto 1fr;
+    gap: 5px 12px;
+    font-size: var(--fs-xs);
+    align-items: baseline;
+}
+
+#panel-projects .projects-facts dt {
+    color: var(--text-muted);
+    white-space: nowrap;
+}
+
+#panel-projects .projects-facts dd {
+    color: var(--text-secondary);
+    word-break: break-all;
+}
+
+#panel-projects .projects-detail-section { margin-top: 18px; }
+
+#panel-projects .projects-detail-section h4 {
+    font-size: var(--fs-xs);
+    font-weight: 700;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin-bottom: 8px;
+}
+
+#panel-projects .projects-job-list {
+    list-style: none;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+#panel-projects .projects-job-list li {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    font-size: var(--fs-xs);
+    padding: 6px 8px;
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-md);
+    color: var(--text-secondary);
+}
+
+#panel-projects .projects-job-list li.failed { border-color: rgba(217, 83, 79, 0.3); }
+
+#panel-projects .projects-job-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+}
+
+#panel-projects .projects-job-actions {
+    display: inline-flex;
+    gap: 4px;
+    flex: 0 0 auto;
+}
+
+#panel-projects .projects-job-btn {
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-sm);
+    background: transparent;
+    color: var(--text-secondary);
+    padding: 2px 7px;
+    font: inherit;
+    font-size: var(--fs-2xs);
+    cursor: pointer;
+}
+
+#panel-projects .projects-job-btn:hover {
+    background: var(--bg-card-hover);
+    color: var(--text-primary);
+}
+
+#panel-projects .projects-job-btn.danger {
+    color: #c0453f;
+    border-color: rgba(217, 83, 79, 0.3);
+}
+
+#panel-projects .projects-job-id {
+    font-family: var(--font-mono, monospace);
+    font-size: var(--fs-2xs);
+    color: var(--text-muted);
+    word-break: break-all;
+}
+
+#panel-projects .projects-job-error {
+    font-size: var(--fs-2xs);
+    color: #c0453f;
+}
+
+/* ── 跨面板跳转时的定位高亮（画廊分组 / 台账行）─────────────────────── */
+.flash-highlight {
+    animation: projects-flash 1.6s ease-out;
+}
+
+@keyframes projects-flash {
+    0%, 40% { background-color: rgba(176, 123, 82, 0.22); }
+    100% { background-color: transparent; }
+}
+
+/* ── 窄屏：详情降级为覆盖在列表上的浮层 ───────────────────────────── */
+@media (max-width: 1024px) {
+    #panel-projects .projects-body { position: relative; }
+
+    #panel-projects .projects-detail {
+        position: absolute;
+        inset: 0;
+        width: auto;
+        border-left: none;
+        background: var(--bg-panel-solid);
+        z-index: 5;
+        display: none;
+    }
+
+    #panel-projects .projects-detail.open { display: block; }
+
+    #panel-projects .projects-toolbar { padding: 10px 16px; }
+    #panel-projects .projects-bulkbar { padding: 8px 16px; }
+    #panel-projects .projects-list { padding: 12px 16px 24px; }
+    #panel-projects .projects-search-sort { max-width: none; }
+}
+
+/* 触屏没有 hover：勾选框常显，否则多选完全没法进入 */
+@media (hover: none) {
+    #panel-projects .project-check { opacity: 1; }
+}
+
+/* 拖放导入 JSON 的靶区（原先是「点子库」抽屉，抽屉删除后搬到工作台列表） */
+#panel-projects .projects-list.dragover {
+    outline: 2px dashed rgba(176, 123, 82, 0.55);
+    outline-offset: -6px;
+    background: rgba(176, 123, 82, 0.06);
+}
+
+/* 归档只展示最终交付文件，预览确认对话框位于 body 下。 */
+#panel-projects .project-badge.state-archived {
+    color: #60826a;
+    background: rgba(96, 130, 106, 0.12);
+}
+
+#panel-projects .project-badge.state-archive_pending {
+    color: #ad7b36;
+    background: rgba(173, 123, 54, 0.12);
+}
+
+#panel-projects .projects-btn:disabled {
+    opacity: 0.5;
+    cursor: wait;
+}
+
+#panel-projects .projects-archive-files h4 {
+    margin: 18px 0 8px;
+    font-size: var(--fs-md);
+}
+
+#panel-projects .projects-archive-files ul {
+    list-style: none;
+    margin: 12px 0;
+    padding: 0;
+}
+
+#panel-projects .projects-archive-files li {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 10px 0;
+    border-bottom: 1px solid var(--border-color);
+}
+
+#panel-projects .projects-archive-files li > span {
+    flex: 1;
+    min-width: 0;
+    font-size: var(--fs-sm);
+}
+
+#panel-projects .projects-archive-files small {
+    display: block;
+    margin-top: 3px;
+    color: var(--text-muted);
+    overflow-wrap: anywhere;
+}
+
+#panel-projects .projects-archive-files a {
+    text-decoration: none;
+    flex: 0 0 auto;
+}
+
+#panel-projects .projects-archive-video {
+    margin: 12px 0;
+}
+
+#panel-projects .projects-archive-video video {
+    display: block;
+    width: 100%;
+    max-height: 320px;
+    background: #161616;
+    border-radius: var(--radius-md);
+}
+
+#panel-projects .projects-archive-video figcaption {
+    margin-top: 5px;
+    color: var(--text-muted);
+    font-size: var(--fs-xs);
+    overflow-wrap: anywhere;
+}
+
+.projects-archive-preview {
+    display: block;
+    max-height: 220px;
+    margin: 12px 0;
+    overflow-y: auto;
+}
+
+.projects-archive-preview-project {
+    display: block;
+    margin-bottom: 10px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid var(--border-color);
+    overflow-wrap: anywhere;
+}
+
+.projects-archive-preview-project > span {
+    display: block;
+    margin-top: 3px;
+    font-size: var(--fs-sm);
+}
+
+.projects-archive-warning {
+    color: #c0453f;
+}

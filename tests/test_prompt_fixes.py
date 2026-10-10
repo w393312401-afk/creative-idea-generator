@@ -77,10 +77,11 @@ class TestPromptFixes(unittest.TestCase):
         self.assertIn("equipment", cleaned.lower())
         self.assertIn("installation", cleaned.lower())
 
-        # Test negative sentence with worker remains untouched
-        prompt_negative = "No workers are present in this view."
+        # Test negative sentence with worker is stripped of worker tokens to prevent diffusion hallucinations
+        prompt_negative = "The room is clean with no workers present."
         cleaned_negative = fix_image_clean_frame_proactive(prompt_negative)
-        self.assertEqual(cleaned_negative, prompt_negative)
+        self.assertNotIn("worker", cleaned_negative.lower())
+        self.assertIn("clean", cleaned_negative.lower())
 
         # Test sweep replacement
         prompt_sweep = "The person is sweeping the floor."
@@ -138,7 +139,7 @@ class TestPromptFixes(unittest.TestCase):
         self.assertIn("IMAGE 3", fixed_partial)
 
     def test_aux_model_defaults_to_low_cost_for_reasoning_agent(self):
-        self.assertEqual(_aux_model({'model': 'gemini-3-flash-agent'}), 'gemini-3.5-flash-low')
+        self.assertEqual(_aux_model({'model': 'gemini-3-flash-agent'}), 'gemini-3.8-flash-high')
         self.assertEqual(_aux_model({'model': 'gemini-3-flash-agent', 'cheapModel': 'cheap-json-model'}), 'cheap-json-model')
         self.assertEqual(_aux_model({'model': 'gpt-5.5'}), 'gpt-5.5')
 
@@ -167,7 +168,7 @@ class TestPromptFixes(unittest.TestCase):
         self.assertIn(3, failures)
         self.assertIn("Monotonic state regression", failures[2][0])
         self.assertIn("Static frame violation", failures[3][0])
-        self.assertEqual(mocked_chat.call_args.kwargs['model'], 'gemini-3.5-flash-low')
+        self.assertEqual(mocked_chat.call_args.kwargs['model'], 'gemini-3.8-flash-high')
 
     def test_fix_primary_landmarks_no_replacement(self):
         from prompt_pipeline import fix_primary_landmarks
@@ -187,8 +188,12 @@ class TestPromptFixes(unittest.TestCase):
         self.assertIn("height of the frame", fixed)
         self.assertIn("inspects the support beam", fixed)
         
-        # Missing/imprecise landmarks are appended at the end
-        self.assertIn("Locked anchors: sliding door frame sill at Grid B2, metal support beam at Grid A1", fixed)
+        # Missing/imprecise landmarks are appended at the end — as prose, never as grid labels
+        # (2026-08-05: grid cells in the prompt body were rendered into frames as literal letters)
+        self.assertIn("Locked anchors: sliding door frame sill at the centre of the frame; "
+                      "metal support beam in the upper left of the frame.", fixed)
+        self.assertNotIn("Grid B2", fixed)
+        self.assertNotIn("Grid A1", fixed)
 
     def test_threshold_bridge_stage_validation(self):
         # TBCP v4: the entire crossing is ONE beat (bridge_stage=1), and it must not land
@@ -320,17 +325,17 @@ Video prompt 8 here.
         snapshot that must NOT be resumed as-is (else every retry is a zero-work instant re-fail)."""
         from prompt_pipeline import _checkpoint_is_failed_terminal
 
-        # 7 beats -> gate limit = max(2, 7//3) = 2. fallback_count 3 > 2 -> failed terminal.
+        # Production gate limit is zero: any saved placeholder marks a diagnostic/failed terminal.
         self.assertTrue(_checkpoint_is_failed_terminal(
             {"fallback_count": 3, "pass_beats_done": [2, 3, 5]}, 7))
-        # At/under the limit -> a legitimately resumable interruption.
-        self.assertFalse(_checkpoint_is_failed_terminal({"fallback_count": 2}, 7))
+        self.assertTrue(_checkpoint_is_failed_terminal({"fallback_count": 2}, 7))
+        # A clean checkpoint remains resumable.
         self.assertFalse(_checkpoint_is_failed_terminal({"fallback_count": 0}, 7))
         # Robust to missing field / non-dict.
         self.assertFalse(_checkpoint_is_failed_terminal({}, 7))
         self.assertFalse(_checkpoint_is_failed_terminal(None, 7))
-        # Larger sequence raises the limit: 30 beats -> limit 10, so 3 fallbacks is fine.
-        self.assertFalse(_checkpoint_is_failed_terminal({"fallback_count": 3}, 30))
+        # Sequence length does not relax the production zero-placeholder gate.
+        self.assertTrue(_checkpoint_is_failed_terminal({"fallback_count": 3}, 30))
 
     def test_local_trim_to_budget_fits_and_keeps_ends(self):
         """Local trim (used when the 8046 aux model is unreachable for compression) must bring an
@@ -402,6 +407,33 @@ class TestPacketShapeNormalization(unittest.TestCase):
         errors = check_stylistic_repetition(curr, prev, packet, is_video=True)
         self.assertIsInstance(errors, list)
 
+    def test_omni_cut_table_does_not_shatter_into_repeated_sentence_fragments(self):
+        """切点表是逐拍逐字相同的契约结构件，不能被当成"抄了上一拍"。
+
+        2026-08-06：句级去重按裸 [.!?] 断句，小数点把切点表切成 "5, a full shot from 1"
+        这类残片；残片当然逐拍相同，于是几乎每一拍都报一条"相似度 1.00"，把真正的
+        语义复读淹掉（实测一单 8/11 拍都是它）。is_mostly_boilerplate 里针对切点表的
+        白名单本来就是按整句写的，断句修对了才真的生效。
+        """
+        cut_table = (
+            'Cut this eight-second clip on these marks and hold no other cuts — an establishing '
+            'long shot from 0.0 to 1.5, a full shot from 1.5 to 2.9, a medium shot from 2.9 to '
+            '4.9, a close-up from 4.9 to 6.4, and a wide outro shot from 6.4 to 8.0 seconds.'
+        )
+        curr = cut_table + ' The worker lays grey stone tiles across the floor in pressing cycles.'
+        prev = cut_table + ' The worker hoists timber studs into place and drives nails home.'
+        errors = check_stylistic_repetition(curr, prev, {}, is_video=True)
+        self.assertEqual([e for e in errors if 'sentence is too similar' in e], [])
+
+    def test_genuinely_duplicated_sentences_are_still_caught(self):
+        # 句子里不能带 is_mostly_boilerplate 的环境/材料白名单词（tile、dust、seam…），
+        # 否则它会被正当地当成"逐拍应当保持一致"的内容而豁免掉。
+        repeated = 'The lone builder lifts each heavy granite slab onto the raised platform.'
+        curr = repeated + ' A hush settles over the alcove.'
+        prev = repeated + ' Rain taps against the shutters.'
+        errors = check_stylistic_repetition(curr, prev, {}, is_video=True)
+        self.assertTrue([e for e in errors if 'sentence is too similar' in e])
+
     def test_normalize_beat_ladder(self):
         ladder = [
             {"index": "1", "operation": "clearing", "description": {"text": "remove debris"}, "bridge_stage": None},
@@ -447,6 +479,24 @@ class TestPacketShapeNormalization(unittest.TestCase):
         ])
         self.assertEqual(ladder[0]["operation"], "clearing")
         self.assertEqual(ladder[0]["description"], "haul the debris out")
+
+    def test_normalize_beat_ladder_object_lifecycle_keys(self):
+        # 与 anchor_keywords 那组"缺失就补 []"的口径刻意相反：introduced_objects /
+        # removed_objects 缺失时**必须保持缺失**，milestone_ladder_violations 要靠这个
+        # 区分"没声明"（硬伤）和"声明了空数组"（合法）。只在键本来就存在时做形状归一化。
+        ladder = normalize_beat_ladder([
+            {"index": 1, "operation": "clearing", "description": "d1"},
+            {"index": 2, "operation": "framing", "description": "d2",
+             "introduced_objects": "single string form", "removed_objects": None},
+            {"index": 3, "operation": "drywall", "description": "d3",
+             "introduced_objects": ["cast-iron stove", "  ", 42]},
+        ])
+        self.assertNotIn("introduced_objects", ladder[0])
+        self.assertNotIn("removed_objects", ladder[0])
+        self.assertEqual(ladder[1]["introduced_objects"], ["single string form"])
+        self.assertEqual(ladder[1]["removed_objects"], [])
+        self.assertEqual(ladder[2]["introduced_objects"], ["cast-iron stove", "42"])
+        self.assertNotIn("removed_objects", ladder[2])
 
     def test_normalize_beat_ladder_anchor_keywords(self):
         # SIGNATURE ANCHOR RULE (2026-07-20): the reward beat's anchor_keywords must
@@ -525,10 +575,16 @@ class TestShotFamilySpatialLocks(unittest.TestCase):
         )
         fixed = fix_primary_landmarks(prompt, self.PACKET, family='exterior')
         self.assertEqual(fixed.lower().count('locked anchors:'), 1)
-        self.assertIn('decaying trunk base opening at Grid C2 holding 35 percent of frame height', fixed)
-        self.assertIn('curved interior cavity wall at Grid B2 holding 65 percent of frame height', fixed)
-        self.assertIn('misty forest canopy at Grid A2 holding 45 percent of frame height', fixed)
+        self.assertIn('decaying trunk base opening across the lower centre of the frame, '
+                      'rising to about a third of the frame height', fixed)
+        self.assertIn('curved interior cavity wall at the centre of the frame, '
+                      'rising to about two thirds of the frame height', fixed)
+        self.assertIn('misty forest canopy across the upper centre of the frame, '
+                      'rising to about two fifths of the frame height', fixed)
         self.assertNotIn('55 percent', fixed)
+        # 规范锚点句本身绝不能带回记号（正文别处的旧记号由 scrub_spatial_notation 兜）
+        stanza = fixed[fixed.lower().index('locked anchors:'):]
+        self.assertNotRegex(stanza, r'Grid [A-C][1-3]|\d+ percent')
 
     def test_fix_primary_landmarks_interior_uses_interior_set(self):
         from prompt_pipeline import fix_primary_landmarks
@@ -539,8 +595,10 @@ class TestShotFamilySpatialLocks(unittest.TestCase):
         )
         fixed = fix_primary_landmarks(prompt, self.PACKET, family='interior')
         self.assertNotIn('misty forest canopy', fixed)
-        self.assertIn('heartwood ridge at Grid B2 holding 60 percent of frame height', fixed)
-        self.assertIn('mossy root shelf at Grid C2 holding 30 percent of frame height', fixed)
+        self.assertIn('heartwood ridge at the centre of the frame, '
+                      'rising to about three fifths of the frame height', fixed)
+        self.assertIn('mossy root shelf across the lower centre of the frame, '
+                      'rising to about a third of the frame height', fixed)
 
     def test_fix_primary_landmarks_interior_without_registered_set_strips_exterior_stanza(self):
         from prompt_pipeline import fix_primary_landmarks
@@ -581,7 +639,8 @@ class TestShotFamilySpatialLocks(unittest.TestCase):
                    "roughly 40 percent of frame height; the worker hammers beams into place.")
         errs = check_worker_scale_lock(drifted, packet)
         self.assertEqual(len(errs), 1)
-        self.assertIn('18 percent', errs[0])
+        # 判据按"桶"而不是按数字：40%（约五分之二）与 18%（约六分之一）分属不同档位
+        self.assertIn('about a sixth of the frame height', errs[0])
         good = ("At t=0s, one lone worker enters the frame from the Grid C1 edge, standing "
                "roughly 18 percent of frame height; the worker hammers beams into place.")
         self.assertEqual(check_worker_scale_lock(good, packet), [])
@@ -653,6 +712,31 @@ class TestShotFamilySpatialLocks(unittest.TestCase):
         exterior = "The decaying trunk stands in mist."
         fixed_ext = fix_horizon_line(exterior, family='exterior')
         self.assertIn('horizon line', fixed_ext.lower())
+
+    def test_found_carrier_scale_lock_holds_subject_scale_and_cavity_enclosure(self):
+        """2026-08-05 实机：找到型载体此前没有任何主体尺度锁，IMAGE 1 把前景框景当成了主体，
+        真正的载体缩成中景一粒，而那个"腔体"是穿透的——透过它能看见背景水面和树。"""
+        from prompt_pipeline import fix_found_carrier_scale_lock
+        packet = dict(self.PACKET, origin_contract={'mode': 'existing_restoration'})
+        prompt = "Static wide tripod shot facing the hollow oak trunk. Locked anchors: trunk base at Grid C2."
+
+        fixed = fix_found_carrier_scale_lock(prompt, packet, family='exterior')
+        self.assertIn('longest visible dimension spanning roughly two-thirds', fixed)
+        self.assertIn('dead-end enclosed volume', fixed)
+        self.assertIn('Locked anchors: trunk base at Grid C2.', fixed)
+        # 幂等：反复修复不得累积互相矛盾的尺度句
+        self.assertEqual(fixed, fix_found_carrier_scale_lock(fixed, packet, family='exterior'))
+
+        # 室内族、交付型载体两条都不该被这把锁碰到
+        self.assertEqual(fix_found_carrier_scale_lock(prompt, packet, family='interior'), prompt)
+        delivered = dict(packet, origin_contract={'mode': 'carrier_delivery_build'})
+        self.assertEqual(fix_found_carrier_scale_lock(prompt, delivered, family='exterior'), prompt)
+
+        # 没有登记室内的项目（纯外部修复）只锁尺度，不谈盲端腔体
+        no_interior = {k: v for k, v in packet.items() if k != 'interior_camera_dna'}
+        exterior_only = fix_found_carrier_scale_lock(prompt, no_interior, family='exterior')
+        self.assertIn('longest visible dimension spanning roughly two-thirds', exterior_only)
+        self.assertNotIn('dead-end enclosed volume', exterior_only)
 
     def test_normalize_packet_coerces_interior_fields(self):
         packet = {

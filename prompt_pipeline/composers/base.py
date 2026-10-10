@@ -1,0 +1,1252 @@
+"""base profile（gemini-veo-restoration-composer）的 Phase 2 composer。
+
+这里是 prompt_pipeline.compose_remaining_beats 的原实现，逐字平移过来的——行为必须
+与拆分前完全一致，任何"顺手优化"都属于越界。
+
+平移时只做了一处机械改写：所有对 prompt_pipeline 模块级函数的调用改成 `pp.xxx` 的
+属性访问（而不是 `from .. import xxx`）。这不是风格偏好——全套测试都用
+`patch.object(pp, 'validate_beat_prompts', ...)` 这类打桩方式，import 绑定会把桩打空。
+
+可被 profile 子类覆写的钩子集中在类的前半部分，且**只覆盖 VIDEO 一侧**：
+  · batch_system_prompt / single_beat_system_prompt —— VIDEO 撰写指令（IMAGE 段的
+    指令也在同一份 system prompt 里，子类的做法是追加覆写段而不是重写整份）
+  · apply_proactive_fixes —— 确定性修复（IMAGE 侧一律委托 base）
+  · validate_beat_prompts / split_structural_video_errors / rework_structural_video_beat
+    —— 审计与定向回炉：子类把自己的违规项标成结构性硬伤，就自动接进既有的
+    「校验 → 回炉一轮 → record_beat_audit 留痕」通路，主流程一行都不用改
+  · finalize_fallback_video —— 占位符兜底稿的收尾
+"""
+
+import json
+import re
+import sys
+
+import prompt_pipeline as pp
+from server_common import OMNI_VIDEO_DURATIONS
+
+
+# 2026-08-30「僵直时间」排查：Omni 面板时长此前是整批盲选一个默认值（通常是服务端
+# 持久化下来的 10 秒），与本批拍子实际的内容量无关——拍重普遍偏低的一批仍要求生成
+# 10 秒，模型填不满只能在片尾定住不动。这里按整条 beat_ladder 的拍重中位数，反推一个
+# 更贴合内容量的 Omni 档位；只在调用方（resolve_video_duration）没有更高优先级的显式
+# 配置时才会被用上，不会覆盖用户主动选择的时长。
+def _infer_batch_duration_hint(beat_ladder):
+    """按 beat_ladder 的拍重中位数推算一个 Omni 档位（4/6/8/10s 之一）。
+
+    用中位数而不是均值：个别揭示/过门拍的高拍重不该把整批的档位选择拉偏。运镜拍
+    （threshold/reward/bridge/hard_cut，beat_delta_weight 返回 None）不计入统计——它们
+    的时长是叙事设计的一部分，见 beat_clip_speed 的同款排除。beat_ladder 缺失/为空
+    （Phase 1、单镜 base/Veo 链路）或全是运镜拍时返回 None，调用方回落到既有默认值。
+    """
+    weights = [w for w in pp.ladder_delta_weights(beat_ladder) if w]
+    if not weights:
+        return None
+    weights.sort()
+    n = len(weights)
+    mid = n // 2
+    median_weight = weights[mid] if n % 2 else (weights[mid - 1] + weights[mid]) / 2.0
+    implied_seconds = pp.beat_clip_seconds(median_weight)
+    return min(OMNI_VIDEO_DURATIONS, key=lambda d: abs(d - implied_seconds))
+
+
+class BaseComposer:
+    """Phase 2 的默认实现。子类只覆写 VIDEO 相关钩子，主流程不复制。"""
+
+    profile = 'base'
+
+    def __init__(self):
+        # 本次运行的上下文，由 begin_run 填。system prompt 的风格分支要读 brief
+        # （例如"用户明确要院线感"），而钩子签名里没有它。
+        self.config = None
+        self.state = None
+        # Omni 面板时长的内容量提示，同样由 begin_run 填。见 _infer_batch_duration_hint。
+        self._duration_hint = None
+
+    # ── 可覆写钩子（默认全部原样委托给 prompt_pipeline 的模块级实现）──────────
+
+    def begin_run(self, config, state):
+        """每次 Phase 2 开跑时调用一次，让子类拿到本单的 config/state。base 只记下来。
+
+        顺带按 state['beat_ladder']（有就有，Phase 1 阶段这个键还不存在）推算一个
+        Omni 时长提示，供 OmniComposer.clip_duration() 使用——base/Veo 线不读这个
+        属性，计算了也不影响它。"""
+        self.config = config
+        self.state = state
+        self._duration_hint = _infer_batch_duration_hint((state or {}).get('beat_ladder'))
+
+    def banned_elements_block(self):
+        """反推复刻线的负面清单段落。非复刻单返回空串。
+
+        `banned_elements` 是 Pass B 从帧事实里反推出来的「这类改造通常会有、但原片里
+        一帧都没出现」的东西。2026-08-10 之前它只在成品提示词上做事后 substring 扫描：
+        写手从未见过这份清单，扫出命中也只是记一笔就照常交付——一道声称存在的门禁，
+        实际是张事后报告单。现在它进 system prompt，命中率的问题在写之前就解决掉，
+        `banned_element_hits` 退回它本来该是的角色：交付前的兜底复核。
+        """
+        brief = (self.state or {}).get('parsed_brief') or {}
+        banned = [str(x).strip() for x in (brief.get('banned_elements') or []) if str(x).strip()]
+        if not banned:
+            return ""
+        return (
+            "\n==================== BANNED ELEMENTS (HARD, THIS JOB ONLY) ====================\n"
+            "This job reproduces the beat ladder of a real reference film. The following things "
+            "are exactly the ones a renovation of this type would plausibly involve but that "
+            "appear in NO frame of that film. They are absent on purpose — writing them in would "
+            "invent work the reference never showed:\n"
+            + "\n".join(f"- {x}" for x in banned)
+            + "\nNever name any of these in a VIDEO or IMAGE prompt, in any wording, including as "
+              "something absent, removed, or not present. If a beat seems to need one, the beat "
+              "is describing work the reference film did not contain — write only what the beat's "
+              "own declared fields state.\n")
+
+    def scene_constants_block(self):
+        """反推复刻线的场景恒常特征段落。非复刻单返回空串。
+
+        与 `banned_elements_block` 严格对称：那一段说「原片里永远没有的东西」，这一段说
+        「原片里一直都在的东西」——墙上的绿霉污渍、屋檐的青苔、常驻画面的那盏工作灯。
+
+        它们为什么需要单独一段：整条反推链路是围绕**变化**建的，节拍只承载每一拍的
+        delta，而恒常的东西不产生 delta。实测（2026-08-13）一条片子里 57% 的帧都记到了
+        墙上的污渍，而它在整条节拍阶梯里一个字都没有。不把它们送进来，写手写出的就是
+        同一道工序的通用想象——干净的混凝土、没有落叶青苔——工序全对，就是不像那条片子。
+        """
+        brief = (self.state or {}).get('parsed_brief') or {}
+        from prompt_pipeline.reference_context import scene_constants_lines
+        lines = scene_constants_lines(brief.get('scene_constants'),
+                                              brief.get('scene_signature'))
+        if not lines:
+            return ""
+        # 「一直在动」那一栏要单独再叮一句：上面那段说的是「一直在」，而运动项的失效方式
+        # 不是被写漏，是被写成静物（"a stream runs past the stump" 读起来完全合规，画面里
+        # 那条溪却是一张静止的贴图）。每一条 VIDEO 都必须让它继续动。
+        sc_dict = brief.get('scene_constants') if isinstance(brief.get('scene_constants'), dict) else {}
+        motion = [str(x).strip()
+                  for x in (sc_dict.get('motion') or [])
+                  if str(x).strip()]
+        motion_rule = (
+            "\nThe items listed as never stopping are the film's ambient life: they keep moving "
+            "in EVERY video clip, on their own, with nobody touching them, and the IMAGE anchors "
+            "catch them mid-motion rather than frozen. A clip in which only the worker's hands "
+            "move and the water, smoke, flame and foliage hold still reads as a photograph with "
+            "one animated cut-out on it.\n" if motion else "")
+        # 人物那一栏同样要单独叮一句，而且理由和运动项是同一类：光把它列进「一直都在」
+        # 是不够的。每一帧都是独立生成的，图像模型对上一帧没有记忆——外形只要不在这一条
+        # 提示词的正文里被复述一遍，它就会被重新掷一次骰子：同一条片子里换人种、换肤色、
+        # 换发型、把休闲工装换成反光背心加安全帽。所以这里要求的不是「知道有这个人」，
+        # 而是**每一条 IMAGE 与 VIDEO 都逐条复述这份外形**。
+        cast = [str(x).strip()
+                for x in (sc_dict.get('cast') or [])
+                if str(x).strip()]
+        cast_rule = (
+            "\nThe living cast listed above is FIXED IDENTITY, and it is the single easiest thing "
+            "in this job to lose: every frame is generated independently, so anyone whose "
+            "appearance is not spelled out in THIS prompt is re-invented from scratch in it. "
+            "Restate each person's/animal's appearance IN FULL in EVERY IMAGE and EVERY VIDEO "
+            "prompt where they are in frame — apparent ethnicity and skin tone, build, hair, "
+            "facial hair, headwear, upper garment and its colour, lower garment and its colour, "
+            "footwear — word for word the same attributes every time, in the same order. Never "
+            "vary them for visual interest, never let a beat's trade swap the outfit (no hardhat "
+            "or hi-vis vest appears unless the list itself says so), never let a later beat "
+            "change ethnicity, skin tone, hair, or clothing colour, and never add a second person "
+            "who is not on this list. What changes from beat to beat is only the POSE and the "
+            "action, never the person.\n"
+            # 活物一律真人（prompt_pipeline.human_cast）：外形锁得再死，只要正文管他们叫
+            # figurine/doll，生图模型就照着渲蜡像。恒常项那一栏已经在落地时归一过措辞，
+            # 这里把同一条要求明说给写手，两头一致。
+            + "Everyone on this list is a REAL HUMAN BEING: real skin, real hair, real fabric "
+              "clothing, natural human posture and weight. Never write them as figurines, dolls, "
+              "mannequins, wax figures, or resin/plastic models, and never describe their skin, "
+              "hair or clothing as resin, plastic, porcelain, vinyl or wax. If the scene is a "
+              "miniature set, they are small people, not toys — their size is governed by the "
+              "scale lock alone.\n" if cast else "")
+        # 环境底噪与 motion 是同一件事的两半：那条管「画面里一直在动的」，这条管
+        # 「声轨上一直在响的」。它的失效方式是**每条 VIDEO 各编一句**——这一拍林间风、
+        # 下一拍城市车流，整片的声场一拍一个样。每拍自己的 sfx 是「这一下活儿的声音」，
+        # 这一栏是「没人干活时这地方的声音」，两者叠在一起才是原片的声音。
+        ambient_sound = [str(x).strip()
+                         for x in (sc_dict.get('ambient_sound') or [])
+                         if str(x).strip()]
+        sound_rule = (
+            "\nThe items listed as audible under every shot are this film's ambient bed. EVERY "
+            "video clip's ambient line must be that bed and nothing else — it does not change "
+            "from beat to beat, it is not invented per clip, and it sits UNDER that beat's own "
+            "declared sfx rather than replacing them. A film whose acoustic space changes shot to "
+            "shot reads as a pile of stock clips rather than one continuous place. Never add "
+            "music, score, or a mood bed on top of it.\n" if ambient_sound else "")
+        # 影调是「像不像那条片子」的第一眼因素，而它此前在这条链路上一个字都没有：每一帧
+        # 的色温、对比、饱和都由图像模型自己决定，于是十几张图拼起来像十几条片子。
+        grade = [str(x).strip()
+                 for x in (sc_dict.get('grade') or [])
+                 if str(x).strip()]
+        grade_rule = (
+            "\nThe photographic grade listed above applies to EVERY IMAGE and EVERY VIDEO in this "
+            "job, identically. Carry its colour temperature bias, contrast, black level and "
+            "saturation into each prompt in those same plain photographic terms. Never upgrade it "
+            "with mood or quality vocabulary (cinematic, dramatic, moody, epic, award-winning) — "
+            "those are not gradings, and each one pulls the render toward a different film than "
+            "the one being reproduced.\n" if grade else "")
+        return (
+            "\n==================== SCENE CONSTANTS (THIS JOB ONLY) ====================\n"
+            "These are present in the reference film from the first frame to the last. They are "
+            "not work anyone performs — they are what the place is made of and what it looks "
+            "like. Carry them through EVERY prompt as standing description of the environment:\n"
+            + "\n".join(f"- {x}" for x in lines)
+            + "\nNever describe a surface these cover as clean, new, or unmarked unless a beat "
+              "explicitly says that beat's work made it so. They are the reason the reference "
+              "film looks like itself.\n"
+            + motion_rule + cast_rule + sound_rule + grade_rule)
+
+    def batch_system_prompt(self, config, packet, scup_ref, tbcp_ref):
+        """批量直出调用的共享 system prompt（每拍都相同的那部分）。"""
+        return (pp._batch_shared_system_prompt(packet, scup_ref, tbcp_ref)
+                + self.banned_elements_block() + self.scene_constants_block())
+
+    def single_beat_system_prompt(self, config, i, contract, packet, compiled_images,
+                                  compiled_videos, scup_ref, tbcp_ref_i):
+        """单拍兜底生成的 system prompt。"""
+        beat = contract['beat']
+
+        # 人物占比按**这一拍自己的机位**算，不再写死。写死的那个 '~35%' 曾被逐字抄进
+        # 一整套 19 段视频，横跨 20mm 俯拍全景和 22mm 侧身平视——两者相差近一倍。
+        # 机位读不出焦段时退回原来的例子（见 anchor_geometry.cast_scale_hint）。
+        from ..anchor_geometry import cast_scale_hint
+        _camera_text = (contract.get('camera_dna') or (packet or {}).get('camera_dna')
+                        or (packet or {}).get('camera') or '')
+        _cast_scale_example = cast_scale_hint(_camera_text) or (
+            'one lone male worker, 1.78m tall, occupying ~35% of frame height, '
+            'realistically proportioned to the 2.2m ceiling')
+
+        prior_prompts_block = ""
+        if i > 1:
+            prior_prompts_block = f"""
+==================== PREVIOUS BEAT GENERATED PROMPTS (DO NOT DUPLICATE PHRASING) ====================
+To prevent formulaic repetition, the vocabulary, sentence structures, and opening patterns of VIDEO {i} and IMAGE {i+1} must NOT duplicate or mirror those in the previous beat prompts:
+Previous VIDEO {i-1}:
+{compiled_videos[i-1]}
+
+Previous IMAGE {i}:
+{compiled_images[i]}
+"""
+
+        return f"""You are a professional prompt composer operating under the `gemini-veo-restoration-composer` skill.
+Your job is to generate exactly two prompts for Beat {i}:
+1. VIDEO {i}: The construction timelapse video.
+2. IMAGE {i+1}: The clean environment state snapshot after the video.
+
+==================== LIGHTING PHASE CONTRACT FOR THIS BEAT ====================
+- IMAGE {i} (State before this beat) uses lighting phase: {contract['img_i_lighting']}
+- IMAGE {i+1} (The state you are generating now) MUST use lighting phase: {contract['img_ip1_lighting']}
+- VIDEO {i} (The transition video prompt) MUST describe the transition matching this lighting phase progression: from '{contract['img_i_lighting']}' to '{contract['img_ip1_lighting']}'.
+
+==================== SHOT FAMILY CONTRACT FOR THIS BEAT ====================
+{contract['family_contract']}
+
+==================== SKILL CONTRACTS ====================
+{scup_ref}
+{tbcp_ref_i}
+{contract['templates_cropped']}
+
+==================== DRIFT LOCK PACKET ====================
+{json.dumps(packet, indent=2, ensure_ascii=False)}
+
+==================== PRIOR PROMPTS (for continuity) ====================
+IMAGE 1 (Trauma State):
+{compiled_images[1]}
+
+IMAGE {i} (State before this beat):
+{compiled_images[i]}
+{prior_prompts_block}
+
+Instructions:
+- VIDEO {i} must start with: "Use the provided first frame and last frame as exact composition anchors. Use IMAGE {i} as the actual first-frame image and IMAGE {i+1} as the actual last-frame image; every visible action must interpolate between those two frame images without inventing a third layout."
+- VIDEO {i} must use progressive (-ing) verbs for ongoing actions, name worker silhouettes (HAL) and tools (MTAL) if workers are present, encapsulate bulk materials in rigid containers (VMFP/RCE), and include pacing control "continuous construction time-lapse, not real-time footage" (unless threshold or reward).
+- EVEN RATE (unless threshold or reward): the clip must also state that the transformation advances continuously and at an even rate across the entire clip duration — at every moment something is visibly progressing, no interval of the clip is static or paused, and no part of the change is deferred and then delivered as a single sudden step. Distribute the beat's work evenly over the whole clip; never describe the scene as holding, settling, or waiting mid-clip, and never save a visible portion of the milestone for the final moment.
+- VIDEO {i} CONCRETENESS (no abstractions): describe the SAME single lone worker every beat, reusing the exact costume from the packet worker_choreography (e.g. "one lone worker in a solid pale shirt, dark pants, and dark cap"); name the ONE specific manual tool used; describe the worker repeatedly performing the work cycle in -ing verbs (e.g. scooping, lifting, pressing, fastening), each pass carrying natural variation in weight, angle, and pace — never an identical robotic loop. NEVER write vague filler like "transformation progresses" or "the scene transforms" — show observable physical actions only.
+- FULL-FIELD DELTA CONSERVATION & MULTI-ZONE ACTION COVERAGE (P0): In VIDEO {i}, all physical differences between IMAGE {i} and IMAGE {i+1} across 4 spatial zones (Top/Roof/Ceiling, Middle/Walls/Openings, Bottom/Floor/Approach, Peripherals/Spoil/Materials) MUST have 100% assigned worker actions, explicit geometric tools, and corresponding audio SFX. If IMAGE {i+1} shows structural demolition (e.g. rotted roof boards/membrane stripped away) or debris cleared alongside ground work, VIDEO {i} MUST explicitly describe the worker dismantling and tossing/stacking those roof elements into designated spoil piles as well as the ground clearing. Zero phantom changes: never leave any changing zone unacted. Material balance: demolition debris must visibly stack/bundle, and installed materials must deplete.
+- VIDEO {i} must end with a PERSISTENT-TRACES clause naming the marks this beat leaves behind (e.g. scrape grooves, end-grain circles, screw heads, nail rows, sawdust trails, trimmed edges, compression tracks), followed by a natural-language description of both the near-field diegetic sound effects (2-4 specific sounds of tools, materials, or footsteps) and the steady room/environment ambient noise. Use varied phrasing for these audio descriptions rather than a single formulaic structure.
+- IMAGE {i+1} must be a clean frame with ZERO workers/machinery. Do NOT use the words 'worker', 'builder', 'carpenter', 'laborer', 'person', 'man', 'woman', or 'people' under any circumstances, even to state that they are absent or not present. Describe only static objects, surfaces, and traces. {contract['anchor_rule']} Then describe this beat's state delta following its own STAGE SCOPE TIER (see the STAGE SCOPE FOR THIS BEAT instruction below). Also include a FEW (2-3, not exhaustive) PERSISTENT physical traces that prove the work happened (scrape marks, fastener heads, sawdust, membrane wrinkles, displaced soil, etc.).
+- {pp._milestone_beat_directive(beat, img_before=f"IMAGE {i}", img_after=f"IMAGE {i+1}") or (pp.outline_delivery_directive(beat) + 'This is a threshold/bridge/reward beat — follow its dedicated camera/reward rules instead of the ordinary milestone package contract.')}
+  Prior MAJOR installed/finished features (panels, walls, floors, fixtures, primary landmarks) stay present and unchanged (monotonic state) — but you do NOT need to re-list every minor trace from every earlier beat; it is fine and expected for small cosmetic details to fade from the description as new ones accumulate.
+- REWARD BEAT TWO-PHASE STRUCTURE (only applies if this beat's operation is "reward" — the final beat): this clip is now the sequence's ONLY closing shot, so it must carry both jobs. Its first two thirds deliver the declared reward as ACTUAL PHYSICAL MOTION — the mechanism moving through its travel, the lights coming up, the occupant walking in and using the space — never a static hold on a finished room. Its final third settles into a held, slightly tightened framing on the signature anchor with no further action, and that settle IS the closing appreciation; no separate showcase clip follows it. Keep the whole space finished, styled, and free of workers, tools, materials, and construction activity throughout.
+- For threshold bridge beats (if beat is a threshold bridge), follow the TBCP rules: the ENTIRE exterior-to-interior crossing is ONE single beat (bridge_stage 1) — there is no separate hold/sill/vestibule/turn beat. Its VIDEO is the ONLY visible clip for the crossing, bound normally from the previous beat's IMAGE to this beat's own IMAGE, and must depict the full exterior-to-settle arc (plus, in the PAN variant, ending in a stationary pan locking onto the interior's long axis) in one continuous shot, with the door-frame wipe, exposure/white-balance roll, and anchor scale-up all completing within it. EVERY crossing — bridge or DECLARED CUT-IN alike — starts from a CLOSED entry: the previous beat's IMAGE keeps its door/hatch shut (or, on a carrier with no leaf yet, its raw opening unlit and opaque) and shows nothing of the interior, and the crossing clip itself pushes that entry open on camera before advancing through it. There is no interior peek and no anchor scale-up before the clip. A DECLARED CUT-IN beat works the same way on the video side — its VIDEO is a real generated crossing clip, written as an ordinary video prompt bound from the previous beat's IMAGE to this beat's own IMAGE — while its IMAGE re-establishes the interior from scratch per its anchor rule. The crossing clip enters an untouched ruin and stays that way for its whole length — nothing is cleaned, cleared, tidied, repaired, or installed while the camera moves, and no tool, ladder, scaffolding, tarp, work light, or stacked material appears in it; write it as one unbroken take at a steady speed (no cut, fade, dissolve, speed ramp, or freeze), and never call it a construction time-lapse.
+- THRESHOLD MONOTONIC INHERITANCE (P0): When crossing from exterior to interior (IMAGE T+1), the interior first reveal MUST 100% physically inherit all envelope/structural work completed in prior exterior beats:
+  1. Roof/Ceiling: If exterior beats built or weatherproofed the roof, the ceiling underside in IMAGE T+1 MUST show the newly installed roof timbers/sheathing/membrane. NEVER describe ceiling cracks, missing roof sections, or water leaks.
+  2. Ground/Floor: If an earlier exterior beat already cleared the earthen floor, the floor in IMAGE T+1 is already clean bare earth. DO NOT describe fallen timber or leaf piles again.
+  3. Untouched Scope: ONLY untreated interior wall surfaces, lack of interior framing/insulation, and lack of internal utilities remain in their raw state.
+- NLVTR visual-only rule: No '%' symbols, no numeric ranges, no acronyms (HAL, SCUP, NGCS, VMFP, RCE, GCTR, RPL, OSPL, RHMA, PBISP, HCL, NLVTR, MTAL, TSPA) in the prompts.
+- REALISM rule (mandatory): strictly documentary photorealism. Every material, fixture, tool, and technique must be real-world and present-day (wood, stone, brass, wool, glass, leather, standard trade tools). NO sci-fi, futuristic, cyberpunk, holographic, glowing-tech-panel, LED-neon, or spacecraft-style elements anywhere in the scene.
+- SINGLE CONTINUOUS PHOTOGRAPH rule (mandatory): each IMAGE is one real photograph of one moment — never a grid of multiple panels, a collage, a storyboard, a comparison/before-after split, or a multi-view composite. The "Grid A1-C3" notation used elsewhere in this contract is an internal composition-registration convention for you the writer — never describe or render literal grid lines, panel borders, or divided frames in the image itself.
+- FULL-ENCLOSURE COVERAGE: When the beat involves framing, insulating, paneling, or painting walls, the IMAGE prompt MUST explicitly include the ceiling/roof/top surface as well. For example, if walls in Grid B1, B3, C1, C3 are paneled, the ceiling curve in Grid A1, A2, A3 must ALSO be described as paneled. Never treat wall coverage as complete without ceiling coverage in any enclosed space (cabin, room, fuselage, container, vault, etc.).
+{pp.ENVELOPE_CROSS_VIEW_RULE}
+- CAMERA VIEWPOINT CONTINUITY: If the previous IMAGE was shot from an interior viewpoint (camera inside the space, entry behind camera), the next IMAGE MUST maintain the same interior viewpoint UNLESS an explicit camera-pullback VIDEO is inserted between them. You CANNOT jump from interior to exterior viewpoint without a transition. If the beat requires switching back to an exterior view, generate the VIDEO as a reverse dolly pulling back through the doorway, and describe the exposure transition accordingly.
+- EXTERIOR WORK VISIBILITY: If the beat involves work on the EXTERIOR surface of the structure (e.g., exterior insulation, exterior membrane), and the camera is positioned INSIDE looking out, the VIDEO must show the worker operating at the boundary edges visible from inside (e.g., working at seam lines visible in Grid B1/B3 from the interior). Do not describe exterior work that would be invisible from the current camera position.
+- ZONE-APPROPRIATE PROTECTIVE LAYERS: only describe waterproofing membrane, tar/bitumen coating, or vapor barrier material on a surface with real moisture/weather exposure (below-grade wall/floor, roof, exterior envelope, bathroom/kitchen/pool). Never describe these on an ordinary dry interior wall, floor, or ceiling — use plain primer/paint finish there instead.
+- CONSTRUCTION ORDER CONSTRAINTS: Floor finish (hardwood, tile) MUST be installed BEFORE heavy anchored objects (fireplace, stove) are placed on it. If this beat installs a fireplace or heavy object, the IMAGE must show it sitting on the FINISHED floor, not on bare metal/subfloor. If the floor is not yet finished, the fireplace cannot be installed in this beat.
+- HUMAN-SPATIAL METRIC CONSERVATION & ERGONOMIC SCALE (P0):
+  1. Strict Metric Dimensions: Every space MUST declare explicit 3D metric dimensions (e.g. excavation pit: 3.2m diameter, 1.8m deep; interior room: 3.0m diameter, strict 2.2m ceiling clearance). Never use vague relative terms like 'spacious' or 'waist-deep'.
+  2. Ergonomic Prop Scale: In compact structures (diameter <= 3.5m), FORBID oversized residential furniture (e.g. two-tier bunk beds, large sectional sofas) that causes AI to hallucinate cavernous halls. Use compact ergonomic furniture (low-profile single platform daybed with under-bed storage, recessed berth, compact 80cm workbench).
+  3. Camera Normalization: Default to 24mm wide-angle lens feel at 1.3m chest height, horizon/vanishing axis at 45%-50% frame height.
+  4. Video Worker Scale Figure: VIDEO {i} must declare the worker's metric scale, computed for THIS beat's lens and camera height — never copied from another beat (e.g. '{_cast_scale_example}'). A longer lens or a closer camera means a LARGER share of frame height; restating one beat's percentage on a differently-framed beat is a contradiction the renderer cannot resolve.
+{pp.WORK_FIRST_VIDEO_RULES}
+- LIVING CAST & DYNAMIC WORKER CHOREOGRAPHY (P0):
+  1. Zero Frozen Figures: Never describe workers, figurines, characters, or animals as static, holding still, unmoving, or holding their previous posture (FORBIDDEN: 'remain standing', 'stay put', 'static in place', 'unchanged', 'standing still', 'holding position', 'where they were', 'same posture').
+  2. Action-Reaction Causal Chain: Every beat's VIDEO must describe active, continuous physical kinetic labor and bodily posture transitions from the starting image's pose to the resulting image's settled pose (e.g. Inception Reflex -> Active Tool/Hand Movement -> Settled Landing Posture).
+  3. Identity Locked vs Pose Decoupled: Restate their fixed identity, costume, and scale verbatim, but ensure their pose, action, and physical placement dynamically evolve across every single beat.
+  4. Natural Human Body Mechanics (applies to the working figure too, not only bystanders): the Action-Reaction Causal Chain above is a body's real physical mechanics, not a smooth constant-speed glide between the starting pose and the landing pose — weight shifts onto the working leg or arm before each effort, the torso leans and counter-rotates with the load, each repeated pass lands at a slightly different angle and pace than the last, and there is a brief natural settle between reaching for a tool and gripping it. Describe THIS, not a mechanically identical repeating loop.
+- Output the prompts in the following format:
+===VIDEO===
+<video prompt body>
+===IMAGE===
+<image prompt body>
+===TRACES===
+[
+  {{
+"name": "precise name of new permanent feature/material/trace (e.g. steel screw heads, green insulation foam)",
+"material_color": "color/texture (e.g. metallic silver)",
+"initial_state": "state when introduced (e.g. freshly installed)",
+"grid": "approximate grid coordinate if mentioned (e.g. Grid B2, default to Grid B2)",
+"z_depth_scale": "depth scale if mentioned (e.g. 50%, default to 50%)"
+  }}
+]
+{self.banned_elements_block()}{self.scene_constants_block()}"""
+
+    def apply_proactive_fixes(self, i, video_prompt, image_prompt, packet, mode, is_last,
+                              is_threshold_or_reveal, beat=None, config=None, family=None,
+                              beat_ladder=None):
+        """确定性修复（VIDEO + IMAGE）。
+
+        beat_ladder 供只有"看得见在先各拍"才判得了的收口用（末帧继承句、末帧镜面地是否
+        有工序背书）。缺省 None 时那两条一律保持改动前的行为，不删不改。"""
+        if pp.reviews_disabled(config if config is not None else self.config):
+            return video_prompt, image_prompt
+        return pp.apply_proactive_fixes(
+            i, video_prompt, image_prompt, packet, mode, is_last, is_threshold_or_reveal,
+            beat=beat, config=config, family=family, beat_ladder=beat_ladder)
+
+    def validate_beat_prompts(self, i, video_prompt, image_prompt, packet, mode, is_last,
+                              is_threshold_or_reveal, prev_video=None, prev_image=None,
+                              beat=None, family=None, is_pre_bridge=False,
+                              is_post_reveal_cleanup=False, video_word_limit=None):
+        """单拍校验。video_word_limit 缺省 = base 的一镜到底档硬顶（见 pp 侧说明）。"""
+        if pp.reviews_disabled(self.config):
+            return []
+        return pp.validate_beat_prompts(
+            i, video_prompt, image_prompt, packet, mode, is_last, is_threshold_or_reveal,
+            prev_video, prev_image, beat=beat, family=family, is_pre_bridge=is_pre_bridge,
+            is_post_reveal_cleanup=is_post_reveal_cleanup, video_word_limit=video_word_limit)
+
+    def split_structural_video_errors(self, errs):
+        """把校验结果分成（结构性硬伤, 其余瑕疵）——前者触发定向回炉。"""
+        if pp.reviews_disabled(self.config):
+            return [], []
+        return pp.split_structural_video_errors(errs)
+
+    def rework_structural_video_beat(self, config, i, video_prompt, structural_errs, packet, beat=None):
+        """结构性硬伤的定向回炉（只重写 VIDEO）。"""
+        if pp.reviews_disabled(config):
+            return video_prompt, None
+        return pp.rework_structural_video_beat(config, i, video_prompt, structural_errs, packet, beat=beat)
+
+    def finalize_fallback_video(self, video_prompt, contract):
+        """占位符兜底稿的收尾（base 不做任何额外处理）。"""
+        return video_prompt
+
+    def normalize_reworked_video(self, video_prompt, beat=None):
+        """把**非 profile 感知**的回炉稿（如里程碑成对回炉）归一回本 profile 的镜头契约。
+        base 是一镜到底，无需归一。"""
+        return video_prompt
+
+    def video_profile_violations(self, video_prompt, beat=None):
+        """本 profile 独有的 VIDEO 硬伤（base 没有）。用于判断一轮回炉是否**引入**了
+        新的 profile 违规，而不是照单全收地把稿子判死。"""
+        return []
+
+    @staticmethod
+    def patch_milestone_video_prompt(video_prompt, beat):
+        """确定性补齐 VIDEO 里程碑骨架中缺失的起首动作、进度线与物料流向。
+        避免因细微关键词遗漏触发沉重的多轮网络回炉或退回单拍重试。"""
+        if pp.reviews_disabled(None):
+            return video_prompt
+        if not isinstance(beat, dict) or beat.get('operation') in ('threshold', 'reward') \
+                or beat.get('bridge_stage') or beat.get('hard_cut'):
+            return video_prompt
+        v = video_prompt or ''
+        additions = []
+        before = beat.get('before_state')
+        if before and not pp._field_has_keyword_overlap(v, before):
+            additions.append(f'In the opening frame, the visible state is {before}.')
+        prim = beat.get('primary_progress')
+        if prim and not pp._field_has_keyword_overlap(v, prim, minimum=2):
+            additions.append(f'The primary progression shows {prim}.')
+        sec = beat.get('secondary_progress')
+        if sec and not pp._field_has_keyword_overlap(v, sec, minimum=2):
+            additions.append(f'Simultaneously, secondary progress shows stock materials: {sec}.')
+        after = beat.get('after_state')
+        if after and not pp._field_has_keyword_overlap(v, after, minimum=2):
+            additions.append(f'By the final moment, {after}.')
+        low = v.lower()
+        if not re.search(r'\b(first|very first|at t=0|initial)\b', low):
+            additions.append('At the opening instant, the first effective tool contact begins.')
+        if not re.search(r'\b(repeated|repeatedly|cycles|cycle by cycle|one by one|course by course|row by row)\b', low):
+            additions.append('Repeated work cycles continue cycle by cycle.')
+        if not re.search(r'\b(stock|bundle|stack|crate|bucket|barrow|carrier|container|pile|rack|bag|tray|source|carried in|delivered)\b', low):
+            additions.append('Materials are drawn from a stock container and carried along a movement path.')
+        if additions:
+            v = v.rstrip()
+            if v and not v.endswith(('.', '!', '?')):
+                v += '.'
+            v = f"{v} {' '.join(additions)}".strip()
+        return v
+
+    @staticmethod
+    def patch_milestone_image_prompt(image_prompt, beat):
+        """确定性补齐 IMAGE 里程碑骨架中缺失的产品锚点、收工状态、全域覆盖及持久痕迹。"""
+        if pp.reviews_disabled(None):
+            return image_prompt
+        if not isinstance(beat, dict) or beat.get('operation') in ('threshold', 'reward') \
+                or beat.get('bridge_stage') or beat.get('hard_cut'):
+            return image_prompt
+        im = image_prompt or ''
+        additions = []
+        mname = beat.get('milestone_name')
+        if mname and not pp._field_has_keyword_overlap(im, mname):
+            additions.append(f'The finished scene centers on the {mname}.')
+        after = beat.get('after_state')
+        if after and not pp._field_has_keyword_overlap(im, after, minimum=2):
+            additions.append(f'The completed visible state reveals {after}.')
+        extent = beat.get('completion_extent')
+        if extent and not pp._field_has_keyword_overlap(im, extent):
+            additions.append(f'Across the full area: {extent}.')
+        declared = [t for t in (beat.get('persistent_traces') or []) if str(t).strip()]
+        missing = [t for t in declared if not pp._field_has_keyword_overlap(im, t)]
+        req = min(2, len(declared))
+        if len(declared) - len(missing) < req and missing:
+            additions.append(f'Persistent contact traces remain visibly embedded: {", ".join(missing[:req])}.')
+        if additions:
+            im = im.rstrip()
+            if im and not im.endswith(('.', '!', '?')):
+                im += '.'
+            im = f"{im} {' '.join(additions)}".strip()
+        return im
+
+    def repair_beat_prompts(self, config, i, v_p, i_p, contract, packet, beat_ladder,
+                            parsed_traces, prev_image, structural, style_errs, reworked,
+                            log_prefix):
+        """一拍的「里程碑成对回炉 + IMAGE 侧合并回炉」。批量通路与单拍兜底通路共用。
+
+        2026-08-22 之前这里是一条 8 段的**串行链**（相似度 → 里程碑 → TRACES → 卡片工序
+        → STAGE SCOPE → 招牌反差点 → sterile 占位 → 首现衰败 → 包络体倒退），每段各打一次
+        模型：一拍命中三条就是三次调用，实测 145 拍里 26 拍 ≥2 条。而且链是有序的，后一段
+        重写可以把前一段的修复悄悄改回去——reverify_beat_repairs 只能事后把残留报出来。
+
+        现在只剩两步：里程碑仍然单独成对回炉（它要同时改 VIDEO，且是下游硬门，60 次里
+        37 次真的带着 VIDEO 错），其余 8 条 IMAGE 侧缺陷合并成 **一次** pp.repair_image_defects
+        调用，采纳条件是「至少修好一条、且一条新的都没引入」——在任何一道 check 上都不比
+        串行链更宽松。
+
+        Returns (v_p, i_p, structural, style_errs, reworked, image_reworked,
+                 outline_missing_before)。
+        """
+        if pp.reviews_disabled(config):
+            return (v_p, i_p, [], [], None, None, [])
+        beat = contract['beat']
+        image_reworked = None
+
+        # 先做确定性里程碑就地对齐：补齐次要材料线、起首动作或痕迹点缀，避免非必要网络回炉
+        v_p = self.patch_milestone_video_prompt(v_p, beat)
+        i_p = self.patch_milestone_image_prompt(i_p, beat)
+
+        milestone_video_errs = pp.check_milestone_video_prompt(v_p, beat)
+        milestone_image_errs = pp.check_milestone_image_prompt(i_p, beat)
+        if milestone_video_errs or milestone_image_errs:
+            if sys.stdout:
+                print(f"[DIRECT] {log_prefix} 显著里程碑骨架缺失，成对回炉一轮: "
+                      f"VIDEO={milestone_video_errs}; IMAGE={milestone_image_errs}")
+            v_p, i_p, milestone_reworked = pp.rework_milestone_prompt_pair(
+                config, i, v_p, i_p, beat, milestone_video_errs, milestone_image_errs,
+                normalize_video=lambda t: self.normalize_reworked_video(t, beat=beat),
+                profile_video_check=lambda t: self.video_profile_violations(t, beat=beat))
+            structural = structural + milestone_video_errs
+            style_errs = style_errs + milestone_image_errs
+            reworked = milestone_reworked if reworked is None else (reworked or milestone_reworked)
+            image_reworked = milestone_reworked
+
+        # 卡片工序（节拍简介）在成片里的收口：回炉**之前**的缺失编号要先留一份，否则
+        # 下面记总账时区分不出"一次过"和"回炉后通过"（见 pp.record_outline_delivery）。
+        outline_missing_before = pp.outline_missing_indices(i_p, beat)
+
+        defect_kwargs = dict(
+            beat=beat, packet=packet, prev_image=prev_image, parsed_traces=parsed_traces,
+            stage_scope=contract['stage_scope'],
+            beat_ladder=beat_ladder, family=contract['family'])
+        defects = pp.collect_image_defects(i, i_p, **defect_kwargs)
+        if defects:
+            if sys.stdout:
+                print(f"[DIRECT] {log_prefix} IMAGE 侧命中 {len(defects)} 类缺陷"
+                      f"（{'、'.join(sorted(defects))}），合并回炉一次: "
+                      + "; ".join(m for k in sorted(defects) for m in defects[k]))
+            i_p, merged_reworked, residual_defects = pp.repair_image_defects(
+                config, i, i_p, defects, **defect_kwargs)
+            if sys.stdout:
+                if merged_reworked:
+                    print(f"[DIRECT] {log_prefix} IMAGE 合并回炉成功，已采用重写稿"
+                          + (f"（仍残留：{'、'.join(sorted(residual_defects))}）"
+                             if residual_defects else "（全部修复）"))
+                else:
+                    print(f"[DIRECT] {log_prefix} IMAGE 合并回炉未通过，保留原稿（仅留痕）")
+            # 留痕口径不变：命中过的缺陷原文照旧进 style_errs（相似度那几条本就已经在
+            # validate_beat_prompts 的结果里，这里去重避免同一条记两遍）。
+            style_errs = list(dict.fromkeys(
+                style_errs + [m for k in pp._IMAGE_DEFECT_ORDER if k in defects
+                              for m in defects[k]]))
+            image_reworked = (merged_reworked if image_reworked is None
+                              else (image_reworked or merged_reworked))
+
+        return (v_p, i_p, structural, style_errs, reworked, image_reworked,
+                outline_missing_before)
+
+    # ── Phase 2 主流程 ──────────────────────────────────────────────────────
+
+    def compose_remaining_beats(self, config, state, on_progress=None):
+        """Phase 2 of the composer: beats 2..N+1 text generation and assembly. Consumes
+        `state` from compose_anchor_and_packet(); if the caller refined state['packet']
+        against an accepted rendered IMAGE 1, beats 2+ are written against that confirmed
+        packet instead of the pre-visualized one.
+
+        审查规则退役后，完整 VIDEO/IMAGE 响应直接采纳，不调用任何内容质量检查、
+        自动修正文或回炉钩子。传输重试、响应缺段和槽位编号校验照常运行。
+
+        断点续传:每完成一拍(beat)就把进度存盘(见 _save_checkpoint),按
+        state['brief_fingerprint'] 存取——同一份 dimensions 中断/失败后重试时，已经成功生成
+        的拍会被跳过，只重新生成尚未成功的那些拍，不必推倒重来整单重跑。落到占位符兜底的拍
+        不算成功，仍会在续传时重新尝试真实生成。"""
+        self.begin_run(config, state)
+        skip_reviews = pp.reviews_disabled(config)
+        theme = state['theme']
+        total_beats = state['total_beats']
+        parsed_brief = state['parsed_brief']
+        title = state['title']
+        beat_ladder = state['beat_ladder']
+        packet = state['packet']
+        compiled_images = state.get('compiled_images')
+        if not isinstance(compiled_images, dict):
+            compiled_images = {}
+            state['compiled_images'] = compiled_images
+        compiled_videos = state.get('compiled_videos')
+        if not isinstance(compiled_videos, dict):
+            compiled_videos = {}
+            state['compiled_videos'] = compiled_videos
+        if state.get('image_1_prompt'):
+            compiled_images[1] = state['image_1_prompt']
+        brief_fingerprint = state['brief_fingerprint']
+
+        mode = parsed_brief.get('mode', 'Standard')
+        _profile = self.profile
+        scup_ref = pp.load_reference_file('spatial-consistency-upgrade-protocol.md', _profile)
+        templates_raw = pp.load_reference_file('prompt-templates.md', _profile)
+
+        _checkpoint = pp.load_compose_checkpoint(brief_fingerprint) or {}
+        pass_beats_done = set(int(x) for x in (_checkpoint.get('pass_beats_done') or []))
+        fallback_count = int(_checkpoint.get('fallback_count') or 0)
+        slot_states = dict(_checkpoint.get('slot_states') or {})
+        for i in range(1, total_beats + 1):
+            slot_states[str(i)] = 'validated' if i in pass_beats_done else 'pending'
+        diagnostic_mode = bool(config.get('diagnostic_mode') or config.get('diagnosticMode'))
+        # strictPromptPipelineV2 已退役；缺段/网络失败仍不能伪造生产正文。
+        allow_placeholders = diagnostic_mode and bool(config.get('allowPlaceholderPrompts', False))
+        if isinstance(config, dict):
+            config['_compose_slot_states'] = slot_states
+
+        # 自愈:若存档里的 fallback_count 已超过质量门禁上限,这份 checkpoint 是一次「合成失败」的终态
+        # (而非可续的中断)——继续按它续传只会把那几拍当"已完成"跳过、fallback_count 一进门禁就再挂,
+        # 使每次重试都变成"零工作量瞬间再失败"(用户侧就是"出错任务重试不了")。此时丢弃拍级续传状态,
+        # 从头全量重生成所有拍(Phase 1 的 packet/beat_ladder/IMAGE 1 仍从 state 复用)。
+        if not skip_reviews and pp._checkpoint_is_failed_terminal(_checkpoint, total_beats):
+            if sys.stdout:
+                print(f"[RESUME] Checkpoint fallback_count={fallback_count} 已超门禁上限 {max(2, total_beats // 3)}，"
+                      f"判定为失败终态存档而非可续中断；丢弃拍级续传状态，全量重生成所有拍。")
+            pass_beats_done = set()
+            fallback_count = 0
+
+        def _save_checkpoint():
+            pp.save_compose_checkpoint(brief_fingerprint, {
+                'theme': theme,
+                'total_beats': total_beats,
+                'parsed_brief': parsed_brief,
+                'title': title,
+                'beat_ladder': beat_ladder,
+                'packet': packet,
+                'image_1_prompt': compiled_images.get(1, ''),
+                'compiled_images': pp._checkpoint_encode_slots(compiled_images),
+                'compiled_videos': pp._checkpoint_encode_slots(compiled_videos),
+                'pass_beats_done': sorted(pass_beats_done),
+                'fallback_count': fallback_count,
+                'slot_states': dict(slot_states),
+            })
+
+        # 落盘一次起点(Phase 1 的产出，或已被上游 gate/refine 过的版本):即便第一拍就崩，
+        # 这些也不会跟着丢。
+        _save_checkpoint()
+
+        beats_to_generate = [b for b in range(1, total_beats + 1) if b not in pass_beats_done]
+        if pass_beats_done and sys.stdout:
+            print(f"[RESUME] Skipping beats already completed before the last interruption/failure: {sorted(pass_beats_done)}")
+
+        def _generate_single_beat_with_retries(i, contract):
+            """skill 直出模式的单拍兜底：仅当批量直出没给出这一拍的 VIDEO/IMAGE 段时才走到
+            这里。单独生成一次即采纳（确定性修复照常、结构校验只记录），重试只针对
+            传输/代理故障或响应缺段，不再做「校验不过→带反馈重写」的自愈循环。
+            Returns (vid_prompt, img_prompt, new_ledger_items, beat_succeeded)."""
+            nonlocal fallback_count
+            beat = contract['beat']
+            is_last = contract['is_last']
+            is_threshold_or_reveal = contract['is_threshold_or_reveal']
+            is_pre_bridge = contract['is_pre_bridge']
+            family = contract['family']
+            # 第二空间的帧要用换过锚点视图的包（见 packet_for_space）；其余拍拿到的就是原包。
+            beat_packet = contract.get('packet') or packet
+            tbcp_ref_i = tbcp_ref if (contract['is_bridge'] or contract['is_cut']) else ''
+
+            beat_system = self.single_beat_system_prompt(
+                config, i, contract, packet, compiled_images, compiled_videos,
+                scup_ref, tbcp_ref_i)
+            beat_user = f"Generate prompts for Beat {i}: {beat.get('operation', '')} - {beat.get('description', '')}."
+
+            vid_prompt = ""
+            img_prompt = ""
+            new_ledger_items = None
+            # 硬门没过、但已经是**真实稿**的最好一版（里程碑措辞差几条，不含终帧倒退）。
+            # 全部重试用完后拿它兜底，见下面 best_effort 的采纳分支。
+            best_effort = None
+            last_failure_reason = ''
+
+            for attempt in range(max(0, int(config.get('composeBatchRetryCount', 1))) + 1):
+                pp._raise_if_cancelled(on_progress)
+                request_started = pp.time.time()
+                try:
+                    timeout_sec = int(config.get('composeRequestTimeoutSeconds', 45))
+                    resp = pp._chat(config, beat_system, beat_user, temperature=0.8, timeout=timeout_sec)
+                    config.setdefault('_compose_request_timings', []).append({
+                        'kind': 'single', 'beat': i, 'attempt': attempt + 1,
+                        'started_at': request_started, 'ended_at': pp.time.time(),
+                        'failure_reason': None,
+                    })
+                    secs = pp._extract_marked(resp, ['===VIDEO===', '===IMAGE===', '===TRACES==='])
+                    v_p = secs.get('===VIDEO===', '').strip()
+                    i_p = secs.get('===IMAGE===', '').strip()
+                    if not (v_p and i_p):
+                        missing = [name for name, value in (('VIDEO', v_p), ('IMAGE', i_p)) if not value]
+                        last_failure_reason = 'LLM response missing required sections: ' + ', '.join(missing)
+                        config['_compose_request_timings'][-1]['failure_reason'] = last_failure_reason
+                        if sys.stdout:
+                            print(f"[DEBUG] Beat {i} attempt {attempt+1}: response missing VIDEO/IMAGE sections, retrying.")
+                        continue
+
+                    # 退役审查时绕过所有父类/子类质量修正文钩子，直接保留模型稿。
+                    if not skip_reviews:
+                        v_p, i_p = self.apply_proactive_fixes(
+                            i, v_p, i_p, beat_packet, mode, is_last, is_threshold_or_reveal,
+                            beat=beat, config=config, family=family, beat_ladder=beat_ladder)
+                    # 2026-07-30：声明式切入拍的 VIDEO 不再被占位声明覆盖——它和单一过门拍
+                    # 一样是真实可见的跨越片段，正文一律走 LLM 稿 + 确定性修复 + 校验 + 回炉
+                    # 的普通通路（占位覆盖正是「过门镜头不生成」的根因）。
+
+                    # skill 直出模式：风格瑕疵只记录不拦截——确定性修复已经兜住会直接
+                    # 破坏渲染的硬伤，剩余瑕疵交给帧渲染后的真实画面审查
+                    # (prompt_pipeline.check_full_sequence_consistency)。
+                    # 例外：结构性硬伤（VIDEO 无动作正文/桥接无运镜/幽灵施工）意味着
+                    # i2v 将无画面可拍（静止/冻结闪切/自造空间），对该拍定向回炉一轮。
+                    prev_v = compiled_videos.get(i - 1) if i > 1 else None
+                    prev_i = compiled_images.get(i) if i > 1 else None
+                    errs = [] if skip_reviews else self.validate_beat_prompts(
+                        i, v_p, i_p, beat_packet, mode, is_last, is_threshold_or_reveal,
+                        prev_v, prev_i, beat=beat, family=family, is_pre_bridge=is_pre_bridge,
+                        is_post_reveal_cleanup=contract['is_post_reveal_cleanup'])
+                    structural, style_errs = ([], []) if skip_reviews else self.split_structural_video_errors(errs)
+                    reworked = None
+                    if structural:
+                        if sys.stdout:
+                            print(f"[DIRECT] Beat {i} 结构性硬伤，定向回炉一轮: {structural}")
+                        v_p, reworked = self.rework_structural_video_beat(config, i, v_p, structural, packet, beat=beat)
+                        if sys.stdout:
+                            print(f"[DIRECT] Beat {i} 回炉{'成功，已采用重写稿' if reworked else '未通过，保留原稿（仅留痕）'}")
+                    # TRACES 解析提前到检查链最前面：check_image_realizes_traces 需要用这拍
+                    # 自己声明的 new_ledger_items 反查 IMAGE 正文，必须在那道检查跑之前拿到。
+                    parsed_traces = None
+                    traces_str = secs.get('===TRACES===', '').strip()
+                    if traces_str:
+                        try:
+                            traces_clean = pp._strip_code_fences(traces_str).strip()
+                            parsed = json.loads(traces_clean)
+                            if isinstance(parsed, list):
+                                parsed_traces = [
+                                    {
+                                        "name": str(item.get("name")),
+                                        "material_color": str(item.get("material_color", "unknown")),
+                                        "initial_state": str(item.get("initial_state", "installed")),
+                                        "grid": str(item.get("grid", "Grid B2")),
+                                        "z_depth_scale": str(item.get("z_depth_scale", "50%"))
+                                    }
+                                    for item in parsed if isinstance(item, dict) and "name" in item
+                                ]
+                        except Exception as e:
+                            if sys.stdout:
+                                print(f"[DEBUG] Failed to parse prompt-embedded TRACES JSON: {e}")
+                    if skip_reviews:
+                        # 保留真实生成内容与自带台账；关闭审查时不回炉、不做质量硬拦，
+                        # 也不把未审过的稿子写成「审查通过」。缺段仍由上面的提取检查处理。
+                        vid_prompt, img_prompt = v_p, i_p
+                        new_ledger_items = parsed_traces
+                        break
+                    (v_p, i_p, structural, style_errs, reworked, image_reworked,
+                     outline_missing_before) = self.repair_beat_prompts(
+                        config, i, v_p, i_p, contract, packet, beat_ladder, parsed_traces,
+                        prev_i, structural, style_errs, reworked, f'Beat {i}')
+                    # 回读校验：修没修以最终文本为准，不以每道回炉自报的布尔为准
+                    residual = pp.reverify_beat_repairs(
+                        i, v_p, i_p, beat, parsed_traces=parsed_traces,
+                        stage_scope=contract['stage_scope'],
+                                    beat_ladder=beat_ladder, family=family)
+                    remaining_milestone_errors = (
+                        pp.check_milestone_video_prompt(v_p, beat) + pp.check_milestone_image_prompt(i_p, beat))
+                    # 终帧倒退是整条序列最贵的失败，和里程碑硬门同级：重试整拍而不是留痕
+                    payoff_blocking = pp.payoff_blocking_residual(residual, is_last)
+                    # 硬门只有两类：里程碑骨架残缺 + 终帧倒退。其余回读残留一律留痕放行
+                    # （下面的 record_beat_audit 会记成 rework_failed/needs_attention）。
+                    # 2026-08-08：这里曾把整份 residual 也算进硬门，等于「回炉没修干净就
+                    # 整拍重来」——每拍白烧一次整拍 LLM 调用，10 拍的单子撞死 720s 硬时限
+                    # （COMPOSE_TIMEOUT），日志里还会打出「重试整拍: []」这种空原因。
+                    hard_gate_errors = list(dict.fromkeys(
+                        remaining_milestone_errors + payoff_blocking))
+                    if hard_gate_errors:
+                        last_failure_reason = '; '.join(hard_gate_errors)
+                        if sys.stdout:
+                            print(f"[DIRECT] Beat {i} 硬门仍未通过，重试整拍: {hard_gate_errors}")
+                        # 终帧倒退不留后路（整条序列最贵的失败）；纯里程碑措辞差的这版
+                        # 是可用的真实稿，先留一份最好的，重试全用完后兜底采纳。
+                        if not payoff_blocking and (
+                                best_effort is None
+                                or len(hard_gate_errors) < len(best_effort['hard_gate'])):
+                            best_effort = {
+                                'video': v_p, 'image': i_p, 'traces': parsed_traces,
+                                'structural': structural, 'style_errs': style_errs,
+                                'reworked': reworked, 'image_reworked': image_reworked,
+                                'residual': residual, 'hard_gate': hard_gate_errors,
+                                'outline_missing_before': outline_missing_before,
+                            }
+                        continue
+                    if style_errs and sys.stdout:
+                        print(f"[DIRECT] Beat {i} 校验有瑕疵（直出模式仅记录，不重写）: {style_errs}")
+                    if residual and sys.stdout:
+                        print(f"[DIRECT] Beat {i} 回读校验仍有残留（回炉未真正生效）: {residual}")
+                    pp.record_beat_audit(config, i, structural, style_errs, reworked, image_reworked,
+                                         milestone_name=beat.get('milestone_name'),
+                                         residual=residual)
+                    # 同一批结论按**卡片工序**再记一份（_beat_audit 是按拍组织的，
+                    # 回答不了"卡片上第 3 条最后成没成"）——见 pp.record_outline_delivery
+                    pp.record_outline_delivery(config, i, i_p, beat,
+                                               missing_before=outline_missing_before)
+
+                    vid_prompt = v_p
+                    img_prompt = i_p
+                    new_ledger_items = parsed_traces
+                    break
+                except pp.GenerationCancelled:
+                    raise
+                except (NameError, AttributeError, TypeError, ImportError, KeyError, IndexError) as e:
+                    raise RuntimeError(
+                        f"Beat {i} hit a code-level error ({type(e).__name__}: {e}); aborting to avoid "
+                        f"shipping placeholder output. Fix the bug rather than retrying."
+                    ) from e
+                except Exception as e:
+                    last_failure_reason = str(e) or type(e).__name__
+                    config.setdefault('_compose_request_timings', []).append({
+                        'kind': 'single', 'beat': i, 'attempt': attempt + 1,
+                        'started_at': request_started, 'ended_at': pp.time.time(),
+                        'failure_reason': str(e),
+                    })
+                    if sys.stdout:
+                        print(f"[DEBUG] Beat {i} attempt {attempt+1} error: {e}")
+
+            if not (vid_prompt and img_prompt) and best_effort:
+                # 重试全部用完，但手里有一份完整的真实稿——只是里程碑骨架措辞还差几条。
+                # 旧行为是直接 ComposeFailure，把整单（这里是 19 拍）在第 7 拍上判死；
+                # 而这份稿子不是占位符，"production 禁止占位符" 这条并不适用于它。
+                # 采纳 + 记 needs_attention 留痕，交给渲染后的真实画面审查兜底。
+                if sys.stdout:
+                    print(f"[DIRECT] Beat {i} 重试用尽，采用硬门未过的最好真实稿（留痕）: "
+                          f"{best_effort['hard_gate']}")
+                pp.record_beat_audit(config, i, best_effort['structural'],
+                                     best_effort['style_errs'], best_effort['reworked'],
+                                     best_effort['image_reworked'],
+                                     milestone_name=beat.get('milestone_name'),
+                                     residual=list(dict.fromkeys(
+                                         list(best_effort['residual'] or [])
+                                         + list(best_effort['hard_gate']))))
+                pp.record_outline_delivery(config, i, best_effort['image'], beat,
+                                           missing_before=best_effort['outline_missing_before'])
+                vid_prompt = best_effort['video']
+                img_prompt = best_effort['image']
+                new_ledger_items = best_effort['traces']
+
+            beat_succeeded = bool(vid_prompt and img_prompt)
+            if not beat_succeeded:
+                slot_states[str(i)] = 'failed'
+                _save_checkpoint()
+                if not allow_placeholders:
+                    raise pp.ComposeFailure(
+                        f"Beat {i} failed prompt generation; validated checkpoint retained. "
+                        f"Cause: {last_failure_reason or 'No complete IMAGE/VIDEO prompt pair was produced'}. "
+                        "Retry to resume from the retained checkpoint. "
+                        "Production mode forbids placeholder IMAGE/VIDEO prompts.",
+                        'BEAT_GENERATION_FAILED')
+                fallback_count += 1
+                desc = beat.get('description', 'performing restoration work').strip().rstrip('.')
+
+                if contract['is_cut']:
+                    # 声明式切入拍的兜底稿：与 bridge 兜底同款的真实跨越镜头，只多一步
+                    # 「封闭的门在片段里被推开」——绝不再回落成占位声明。
+                    vid_prompt = (
+                        f"Use the provided first frame and last frame as exact composition anchors. Use IMAGE {i} as the actual first-frame image and IMAGE {i+1} as the actual last-frame image; every visible action must interpolate between those two frame images without inventing a third layout. "
+                        f"The closed entry seen in the first frame is pushed open on camera, revealing the dark interior beyond, and the camera pushes forward in one continuous coaxial move straight through the opening, the door frame sliding fully out of frame, settling fully inside by the last frame with the threshold completely behind the camera. Exposure and white balance roll from exterior daylight to the interior's dimmer tone across the clip. "
+                        f"The interior it enters is an untouched ruin at every moment of the clip — debris lying where it fell, dirt drifts, stained and corroded surfaces — and nothing is cleaned, cleared, or repaired during the crossing; the frame stays sterile of workers and no tools, ladders, or staged materials appear at any point. One unbroken take at a steady speed: no cut, no fade, no dissolve, no speed ramp."
+                    )
+                elif contract['is_bridge']:
+                    _turn_dir = str(beat.get('turn_direction') or '').strip().lower()
+                    _turn_txt = (
+                        f", then turns with one smooth pan to the {_turn_dir} to align with the interior's long axis"
+                        if _turn_dir in ('left', 'right') else ""
+                    )
+                    vid_prompt = (
+                    f"Use the provided first frame and last frame as exact composition anchors. Use IMAGE {i} as the actual first-frame image and IMAGE {i+1} as the actual last-frame image; every visible action must interpolate between those two frame images without inventing a third layout. "
+                    f"The camera pushes forward in one continuous coaxial move through the open threshold, the door frame sliding fully out of frame{_turn_txt}, and settles fully inside by the last frame. "
+                    f"The interior it enters is an untouched ruin at every moment of the clip — debris lying where it fell, dirt drifts, stained and corroded surfaces — and nothing is cleaned, cleared, or repaired during the crossing; no tools, ladders, or staged materials appear at any point. One unbroken take at a steady speed: no cut, no fade, no dissolve, no speed ramp."
+                )
+                elif not is_threshold_or_reveal:
+                    _package = ', '.join(beat.get('package_operations') or [beat.get('operation', 'construction')])
+                    _traces = ', '.join(beat.get('persistent_traces') or ['contact marks', 'material dust'])
+                    vid_prompt = (
+                        f"Use the provided first frame and last frame as exact composition anchors. Use IMAGE {i} as the actual first-frame image and IMAGE {i+1} as the actual last-frame image; every visible action must interpolate between those two frame images without inventing a third layout. "
+                        f"This is a continuous construction time-lapse, not real-time footage, creating the {beat.get('milestone_name')} milestone through the cohesive {_package} package. In the opening frame the visible state is {beat.get('before_state')}; the frame is empty of people, and immediately after that opening instant the same lone worker enters from off-frame at the adjacent work face with one short reach or step, makes the first effective tool contact without pausing, and repeatedly performs the work cycle along a visible movement path. The primary progression shows {beat.get('primary_progress')}; simultaneously the secondary progression shows {beat.get('secondary_progress')}. By the final moment {beat.get('after_state')} across {beat.get('completion_extent')}, while {_traces} remain; the worker withdraws fully out of frame with the last working motion so the final frame is empty of people again, with no separate departure or empty hold. Installed materials and any stock retained by the last-frame anchor stay in place."
+                    )
+                else:
+                    vid_prompt = (
+                    f"Use the provided first frame and last frame as exact composition anchors. Use IMAGE {i} as the actual first-frame image and IMAGE {i+1} as the actual last-frame image; every visible action must interpolate between those two frame images without inventing a third layout. "
+                    f"The video captures the physical process of: {desc}. A worker is visible performing the manual installation and assembly steps, slowly building and placing elements. The background and camera position remain locked."
+                )
+                if not is_threshold_or_reveal:
+                    vid_prompt += " continuous construction time-lapse, not real-time footage."
+                if not skip_reviews:
+                    vid_prompt = self.finalize_fallback_video(vid_prompt, contract)
+
+                _attitude = ("horizon line remains level" if family == 'exterior'
+                             else "camera pitch locked level; the central vanishing axis stays centered")
+                if not is_threshold_or_reveal:
+                    _traces = ', '.join(beat.get('persistent_traces') or ['contact marks', 'material dust'])
+                    img_prompt = (
+                        f"A static ultra-wide 14mm tripod shot at 1.6m height; {_attitude}. The scene is the "
+                        f"{beat.get('milestone_name')} anchor, with {beat.get('after_state')} across "
+                        f"{beat.get('completion_extent')}. {_traces} remain visibly embedded in the completed "
+                        f"work. {beat.get('preserve_state')}. The frame contains only static surfaces, materials, "
+                        f"and causal traces."
+                    )
+                else:
+                    img_prompt = (
+                        f"A static ultra-wide 14mm tripod shot at 1.6m height: clean completed state after the step of {desc} of {theme}; "
+                        f"{_attitude}; no workers are present in this clean frame. The newly completed features are visible and integrated into the scene."
+                    )
+                if is_last:
+                    img_prompt += " Polished floor displays blurred diffused reflections."
+
+            return vid_prompt, img_prompt, new_ledger_items, beat_succeeded
+
+        # Batched passes: precompute every pending beat's deterministic contract, then
+        # generate the beats in ROLLING WINDOWS of composeBatchSize — each window is ONE
+        # _chat call whose shared reference docs/rules/packet are sent once instead of
+        # once-per-beat (see _batch_shared_system_prompt). This is the dominant cost saver
+        # versus the old one-call-per-beat loop; only whichever beats a window doesn't
+        # produce validly for fall back to the (unchanged) single-beat retry loop above,
+        # which is the uncommon case.
+        #
+        # 2026-08-22：此前只有**第一个**窗口真的批量发出去,窗口之外的拍全部逐拍单发
+        # （batch_total 早就按 ceil(n/batch_size) 报了 7 个窗口,实际只跑第 1 个）。
+        # 一单 21 拍 = 1 次批量 + 18 次单发,实测单发拍 ~93s/拍、批量拍 ~9s/拍生成,
+        # 整个 Phase 2 拖到半小时。改成逐窗滚动后调用次数从 19 降到 7,且每个窗口的
+        # 起点锚点图取自**已提交**的上一拍产物,跨窗口连续性与逐拍通路完全一致。
+        contracts = {i: pp._beat_contract(i, total_beats, beat_ladder, mode, packet, templates_raw,
+                                          parsed_brief=parsed_brief) for i in beats_to_generate}
+        batch_secs = {}
+        # TBCP 契约按**整单**是否有过门/切入拍决定加载,不再只看第一个窗口:过门拍落在
+        # 第 5/6/12 拍是常态(实测三单分别在 3、5、6、12、13 拍),旧写法下它一旦不在头
+        # 三拍里,tbcp_ref 恒为空串——那一拍无论走批量还是单发,拿到的 system prompt 里
+        # 都没有过门协议正文。这是顺带修掉的一个静默质量洞,不是提速改动。
+        tbcp_ref = (pp.load_reference_file('threshold-bridge-consistency-protocol.md', _profile)
+                    if any(contracts[i]['is_bridge'] or contracts[i]['is_cut']
+                           for i in beats_to_generate) else '')
+        # 默认 5（2026-08-22 从 3 上调）：滚动窗口落地后，窗口大小直接决定整单的模型
+        # 调用次数（21 拍 → 3 时 7 次、5 时 5 次）。上限受两头夹：一窗的输出要装得进
+        # max_tokens（每拍 VIDEO+IMAGE+TRACES 约 900 token，5 拍 ≈ 4.5k，离 32k 很远），
+        # 以及一窗要跑得完 composeRequestTimeoutSeconds（实测 3 拍窗 26.5s，5 拍窗约
+        # 45s，默认 120s 有 2.5 倍余量）。再往上不建议：一窗请求失败会把**整窗**的拍
+        # 全部退回逐拍通路，窗口越大这个爆炸半径越大。
+        batch_size = max(1, int(config.get('composeBatchSize', 5)))
+        batch_windows = [beats_to_generate[k:k + batch_size]
+                         for k in range(0, len(beats_to_generate), batch_size)]
+        # 窗口首拍 → (窗口, 第几个窗口)。逐拍循环走到窗口首拍时才发这一窗的批量请求,
+        # 于是窗口 k+1 的起点锚点图必然是窗口 k 最后一拍**已落盘**的 IMAGE。
+        window_starts = {w[0]: (w, n + 1) for n, w in enumerate(batch_windows) if w}
+
+        def _run_batch_window(batch_beats, batch_index):
+            """发一窗批量请求,返回按 ===BEAT N ...=== 标记切好的段落字典。
+            任何传输层失败都返回空字典 —— 这一窗的拍照旧退回逐拍通路。"""
+            batch_system = self.batch_system_prompt(config, packet, scup_ref, tbcp_ref)
+            first_anchor_image = compiled_images.get(batch_beats[0], '')
+            batch_user = pp._build_batch_user_message(
+                batch_beats, contracts, first_anchor_image)
+            markers = []
+            for i in batch_beats:
+                markers += [f'===BEAT {i} VIDEO===', f'===BEAT {i} IMAGE===', f'===BEAT {i} TRACES===']
+
+            if on_progress:
+                on_progress('batch_generating', {
+                    'batch_index': batch_index, 'batch_total': len(batch_windows),
+                    'beat_start': batch_beats[0], 'beat_end': batch_beats[-1],
+                    'attempt': 1, 'attempt_total': 2,
+                    'elapsed_seconds': 0,
+                    'deadline_remaining_seconds': int(config.get('composeRequestTimeoutSeconds', 45)),
+                })
+            if sys.stdout:
+                print(f"[DEBUG] Step 5: Batch-composing window {batch_index}/{len(batch_windows)} "
+                      f"— beat(s) {batch_beats} of {total_beats} in one call...")
+            pp._raise_if_cancelled(on_progress)
+            def _request_batch():
+                retry_count = max(0, int(config.get('composeBatchRetryCount', 1)))
+                timeout_seconds = int(config.get('composeRequestTimeoutSeconds', 45))
+                last_error = None
+                for attempt in range(retry_count + 1):
+                    started = pp.time.time()
+                    try:
+                        pp._raise_if_cancelled(on_progress)
+                        response = pp._chat(
+                            config, batch_system, batch_user, temperature=0.8,
+                            timeout=timeout_seconds)
+                        config.setdefault('_compose_request_timings', []).append({
+                            'kind': 'batch', 'beats': list(batch_beats), 'attempt': attempt + 1,
+                            'started_at': started, 'ended_at': pp.time.time(),
+                            'failure_reason': None,
+                        })
+                        if on_progress:
+                            on_progress('batch_generated', {
+                                'batch_index': batch_index,
+                                'batch_total': len(batch_windows),
+                                'beat_start': batch_beats[0], 'beat_end': batch_beats[-1],
+                                'attempt': attempt + 1, 'attempt_total': retry_count + 1,
+                                'elapsed_seconds': round(pp.time.time() - started, 2),
+                                'deadline_remaining_seconds': max(
+                                    0, round(timeout_seconds - (pp.time.time() - started), 2)),
+                            })
+                        return response
+                    except pp.GenerationCancelled:
+                        raise
+                    except (NameError, AttributeError, TypeError, ImportError, KeyError, IndexError):
+                        raise
+                    except Exception as exc:
+                        last_error = exc
+                        config.setdefault('_compose_request_timings', []).append({
+                            'kind': 'batch', 'beats': list(batch_beats), 'attempt': attempt + 1,
+                            'started_at': started, 'ended_at': pp.time.time(),
+                            'failure_reason': str(exc),
+                        })
+                        if on_progress:
+                            on_progress('batch_retry' if attempt < retry_count else 'batch_failed', {
+                                'batch_index': batch_index,
+                                'batch_total': len(batch_windows),
+                                'beat_start': batch_beats[0], 'beat_end': batch_beats[-1],
+                                'attempt': attempt + 1, 'attempt_total': retry_count + 1,
+                                'elapsed_seconds': round(pp.time.time() - started, 2),
+                                'deadline_remaining_seconds': 0,
+                                'failure_reason': str(exc),
+                            })
+                raise last_error
+            # Same fail-fast-on-code-bugs philosophy as the single-beat retry loop: a
+            # NameError/AttributeError/etc from this call (including inside _chat itself)
+            # means real code is broken, not that the LLM/proxy hiccuped — abort rather than
+            # mask it behind "fall back to individual retries for everyone", which would
+            # just re-trigger the same bug per beat. Everything else (timeouts, connection
+            # errors, malformed API responses) IS treated as a transient/flaky-proxy issue
+            # and falls back to per-beat retry below, exactly what that path exists for.
+            try:
+                resp = _request_batch()
+                return pp._extract_marked(resp, markers)
+            except pp.GenerationCancelled:
+                raise
+            except (NameError, AttributeError, TypeError, ImportError, KeyError, IndexError) as e:
+                raise RuntimeError(
+                    f"Batched beat generation hit a code-level error ({type(e).__name__}: {e}); aborting to "
+                    f"avoid shipping placeholder output. Fix the bug rather than retrying."
+                ) from e
+            except Exception as e:
+                if sys.stdout:
+                    print(f"[DEBUG] Batch window {batch_index}/{len(batch_windows)} call failed ({e}); "
+                          f"falling back to individual retries for beat(s) {batch_beats}.")
+                return {}
+
+        # One beat at a time: try to resolve it from the batch response first, otherwise
+        # fall back to an individual retry — and commit (compiled_images/videos, beat_ready,
+        # object ledger, checkpoint) immediately either way. Committing per-beat as each one
+        # resolves (rather than only after the whole batch has been parsed) means a
+        # code-level bug hit while processing a LATER beat in the same batch still leaves
+        # every EARLIER beat's already-valid result safely checkpointed, matching the
+        # granularity the resume mechanism has always guaranteed.
+        for i in beats_to_generate:
+            # 走到一个窗口的首拍才发这一窗的批量请求（见 window_starts 的说明）。
+            if i in window_starts:
+                _window, _window_index = window_starts[i]
+                batch_secs = _run_batch_window(_window, _window_index)
+
+            if on_progress:
+                on_progress('batch', {'current': i, 'total': total_beats})
+
+            contract = contracts[i]
+            vid_prompt = img_prompt = ''
+            new_ledger_items = None
+            beat_succeeded = False
+
+            v_p = batch_secs.get(f'===BEAT {i} VIDEO===', '').strip()
+            i_p = batch_secs.get(f'===BEAT {i} IMAGE===', '').strip()
+            if v_p and i_p:
+                try:
+                    # 第二空间的帧用换过锚点视图的包（见 packet_for_space）
+                    _pkt = contract.get('packet') or packet
+                    if not skip_reviews:
+                        v_p, i_p = self.apply_proactive_fixes(
+                            i, v_p, i_p, _pkt, mode, contract['is_last'], contract['is_threshold_or_reveal'],
+                            beat=contract['beat'], config=config, family=contract['family'],
+                            beat_ladder=beat_ladder)
+                    # 2026-07-30：声明式切入拍的 VIDEO 不再被占位声明覆盖（同单拍通路的注释）。
+                    prev_v = compiled_videos.get(i - 1) if i > 1 else None
+                    prev_i = compiled_images.get(i) if i > 1 else None
+                    errs = [] if skip_reviews else self.validate_beat_prompts(
+                        i, v_p, i_p, _pkt, mode, contract['is_last'], contract['is_threshold_or_reveal'],
+                        prev_v, prev_i, beat=contract['beat'], family=contract['family'],
+                        is_pre_bridge=contract['is_pre_bridge'],
+                        is_post_reveal_cleanup=contract['is_post_reveal_cleanup'])
+                except (NameError, AttributeError, TypeError, ImportError, KeyError, IndexError) as e:
+                    raise RuntimeError(
+                        f"Beat {i} hit a code-level error ({type(e).__name__}: {e}) while processing the "
+                        f"batched generation result; aborting to avoid shipping placeholder output. Fix "
+                        f"the bug rather than retrying."
+                    ) from e
+                # TRACES 解析提前到检查链最前面：check_image_realizes_traces 需要用这拍自己
+                # 声明的 new_ledger_items 反查 IMAGE 正文，必须在那道检查跑之前就拿到。
+                parsed_traces = None
+                traces_str = batch_secs.get(f'===BEAT {i} TRACES===', '').strip()
+                if traces_str:
+                    try:
+                        traces_clean = pp._strip_code_fences(traces_str).strip()
+                        parsed = json.loads(traces_clean)
+                        if isinstance(parsed, list):
+                            parsed_traces = [
+                                {
+                                    "name": str(item.get("name")),
+                                    "material_color": str(item.get("material_color", "unknown")),
+                                    "initial_state": str(item.get("initial_state", "installed")),
+                                    "grid": str(item.get("grid", "Grid B2")),
+                                    "z_depth_scale": str(item.get("z_depth_scale", "50%")),
+                                }
+                                for item in parsed if isinstance(item, dict) and "name" in item
+                            ]
+                    except Exception as e:
+                        if sys.stdout:
+                            print(f"[DEBUG] Failed to parse prompt-embedded TRACES JSON for beat {i}: {e}")
+                if skip_reviews:
+                    vid_prompt, img_prompt, beat_succeeded = v_p, i_p, True
+                    new_ledger_items = parsed_traces
+                else:
+                    # skill 直出模式：批量直出的结果只要有 VIDEO/IMAGE 两段就直接采纳——风格
+                    # 瑕疵只记录不打回（确定性修复已兜住渲染硬伤，剩余瑕疵交给帧渲染后对真实
+                    # 画面的审查）。例外：结构性硬伤（VIDEO 无动作正文/桥接无运镜/幽灵施工）
+                    # 会让 i2v 无画面可拍，对命中的拍定向回炉一轮（只重写 VIDEO，失败保留原稿）。
+                    structural, style_errs = self.split_structural_video_errors(errs)
+                    reworked = None
+                    if structural:
+                        if sys.stdout:
+                            print(f"[DIRECT] Batch beat {i} 结构性硬伤，定向回炉一轮: {structural}")
+                        v_p, reworked = self.rework_structural_video_beat(config, i, v_p, structural, packet, beat=contract['beat'])
+                        if sys.stdout:
+                            print(f"[DIRECT] Batch beat {i} 回炉{'成功，已采用重写稿' if reworked else '未通过，保留原稿（仅留痕）'}")
+                    (v_p, i_p, structural, style_errs, reworked, image_reworked,
+                     outline_missing_before) = self.repair_beat_prompts(
+                        config, i, v_p, i_p, contract, packet, beat_ladder, parsed_traces,
+                        prev_i, structural, style_errs, reworked, f'Batch beat {i}')
+                    # 回读校验：修没修以最终文本为准（见 pp.reverify_beat_repairs）
+                    residual = pp.reverify_beat_repairs(
+                        i, v_p, i_p, contract['beat'], parsed_traces=parsed_traces,
+                        stage_scope=contract['stage_scope'],
+                                beat_ladder=beat_ladder, family=contract['family'])
+                    remaining_milestone_errors = (
+                        pp.check_milestone_video_prompt(v_p, contract['beat'])
+                        + pp.check_milestone_image_prompt(i_p, contract['beat']))
+                    if remaining_milestone_errors:
+                        v_p = self.patch_milestone_video_prompt(v_p, contract['beat'])
+                        i_p = self.patch_milestone_image_prompt(i_p, contract['beat'])
+                        remaining_milestone_errors = (
+                            pp.check_milestone_video_prompt(v_p, contract['beat'])
+                            + pp.check_milestone_image_prompt(i_p, contract['beat']))
+                    payoff_blocking = pp.payoff_blocking_residual(residual, contract['is_last'])
+                    if style_errs and sys.stdout:
+                        print(f"[DIRECT] Batch beat {i} 校验有瑕疵（直出模式仅记录，不重写）: {style_errs}")
+                    # 同上：批量稿已有完整内容，硬门仅阻断终帧严重倒退（payoff_blocking）及彻底无法修复的里程碑硬伤
+                    hard_gate_errors = list(dict.fromkeys(
+                        remaining_milestone_errors + payoff_blocking))
+                    if not hard_gate_errors:
+                        if residual and sys.stdout:
+                            print(f"[DIRECT] Batch beat {i} 回读校验仍有残留（回炉未真正生效）: {residual}")
+                        pp.record_beat_audit(config, i, structural, style_errs, reworked, image_reworked,
+                                             milestone_name=contract['beat'].get('milestone_name'),
+                                             residual=residual)
+                        pp.record_outline_delivery(config, i, i_p, contract['beat'],
+                                                   missing_before=outline_missing_before)
+                        vid_prompt, img_prompt, beat_succeeded = v_p, i_p, True
+                        new_ledger_items = parsed_traces
+                    elif sys.stdout:
+                        print(f"[DIRECT] Batch beat {i} 硬门未通过，转入单拍重试: {hard_gate_errors}")
+
+            if not beat_succeeded:
+                if sys.stdout:
+                    print(f"[DEBUG] Step 5: Individually composing Beat {i} of {total_beats} (batch response missing this beat's sections)...")
+                vid_prompt, img_prompt, new_ledger_items, beat_succeeded = _generate_single_beat_with_retries(i, contract)
+
+            compiled_images[i + 1] = img_prompt
+            compiled_videos[i] = vid_prompt
+
+            if on_progress:
+                _, _, partial_block = pp._build_partial_prompt_block(
+                    compiled_images, compiled_videos, beat_ladder,
+                    parsed_brief.get('pacing_skeleton'),
+                    parsed_brief=parsed_brief)
+                on_progress('beat_ready', {
+                    'index': i,
+                    'total': total_beats,
+                    'prompt_block': partial_block,
+                    'is_revision': False,
+                })
+
+            # Dynamically update the object ledger with new persistent traces/features.
+            # skill 直出模式：只消费生成响应里自带的 ===TRACES=== 段；缺失时不再额外调
+            # extract_persistent_traces_to_ledger 的 LLM 兜底（台账更新是 best-effort）。
+            if vid_prompt and img_prompt:
+                if new_ledger_items:
+                    if 'object_ledger' not in packet or not isinstance(packet['object_ledger'], list):
+                        packet['object_ledger'] = []
+                    existing_names = {x['name'].lower() for x in packet['object_ledger'] if isinstance(x, dict) and 'name' in x}
+                    added_count = 0
+                    for item in new_ledger_items:
+                        if item['name'].lower() not in existing_names:
+                            packet['object_ledger'].append(item)
+                            existing_names.add(item['name'].lower())
+                            added_count += 1
+                    if sys.stdout:
+                        print(f"[DEBUG] Dynamic Ledger: Added {added_count} new items (deduplicated). Total objects: {len(packet['object_ledger'])}")
+
+            # 断点续传:只把真正成功生成(非占位符兜底)的拍标记为已完成——兜底拍在续传时
+            # 仍需重新真实生成，否则一次 LLM 抖动就会把某一拍永久锁死成占位符文本。
+            if beat_succeeded:
+                slot_states[str(i)] = 'validated'
+                pass_beats_done.add(i)
+            else:
+                slot_states[str(i)] = 'degraded'
+            _save_checkpoint()
+
+        # Quality gate
+        fallback_limit = 0 if not diagnostic_mode else total_beats
+        if not skip_reviews and fallback_count > fallback_limit:
+            raise pp.ComposeFailure(
+                f"{fallback_count} of {total_beats} beats fell back to placeholder prompts "
+                f"(limit {fallback_limit}); diagnostic output cannot be shipped.",
+                'PLACEHOLDER_PROMPTS_PRESENT',
+            )
+        if isinstance(config, dict):
+            config['_compose_degraded'] = bool(fallback_count)
+            config['_compose_placeholder_count'] = fallback_count
+            config['_compose_diagnostic'] = diagnostic_mode
+
+        # 收尾步骤：追加一条"英雄展示视频"提示词（视频 total_beats+1 [HERO]），
+        # 唯一来源锚点是帧序列最后一张整体完工图。锦上添花，不设硬门禁——失败/跳过
+        # 都不影响整单合成结果，只是没有这一条额外视频。
+        # 2026-07-31 起 _HERO_SHOWCASE_ENABLED 默认为 False（收尾不再放两条完工镜头，
+        # 见 docs/plans/pacing_rhythm_balance_plan.md §7），整段连同进度提示一起跳过。
+        hero_video_text = ''
+        if pp._HERO_SHOWCASE_ENABLED:
+            if on_progress:
+                on_progress('outline', '正在生成英雄展示视频提示词（完工全景 · 手持推镜/摇镜）...')
+            try:
+                pp._raise_if_cancelled(on_progress)
+                hero_video_text = pp._compose_hero_showcase_video(config, state, on_progress=on_progress)
+            except pp.GenerationCancelled:
+                raise
+            except Exception as e:
+                if sys.stdout:
+                    print(f"[HERO] 英雄展示视频提示词生成异常，跳过该附加步骤: {e}")
+                hero_video_text = ''
+        if hero_video_text:
+            compiled_videos[total_beats + 1] = hero_video_text
+
+        # Convert compiled_images and compiled_videos to dicts with meta before formatting.
+        # Shared with the per-beat progressive-reveal on_progress('beat_ready', ...) events
+        # via _build_partial_prompt_block, so live per-beat snapshots and the final assembly
+        # never diverge in BRIDGE-tagging.
+        formatted_images, formatted_videos, reassembled_prompts_block = pp._build_partial_prompt_block(
+            compiled_images, compiled_videos, beat_ladder, parsed_brief.get('pacing_skeleton'), parsed_brief
+        )
+        if (total_beats + 1) in formatted_videos:
+            # _build_partial_prompt_block only tags BRIDGE/CUT beats from beat_ladder — the
+            # hero slot sits one past the last real beat, so it always falls through that
+            # loop untagged. Stamp it here instead of teaching the shared helper about a
+            # slot that only exists in this one caller.
+            formatted_videos[total_beats + 1]['meta'] = 'HERO'
+            reassembled_prompts_block = pp._format_prompt_block(formatted_images, formatted_videos)
+
+        # 卡片工序交付总账：规划期的认领结果（_outline_contract）与合成期的逐条交付
+        # 结果（_outline_prompt_audit）在这里按**工序**汇成一张表，run 结束由 server.py
+        # 汇入 result。纯留痕重排索引，不参与任何判定（见 pp.build_outline_delivery_ledger）。
+        pp.stash_outline_delivery_ledger(config, beat_ladder,
+                                         skeleton=parsed_brief.get('pacing_skeleton'))
+
+        skipped = config.get('_skipped_checks', 0) if isinstance(config, dict) and not skip_reviews else 0
+        skipped_str = f"\n\n[WARNING] 本次跳过了 {skipped} 项校验。" if skipped > 0 else ""
+
+        # Safety net: earlier free-form LLM generation steps can silently truncate or drop
+        # slots. compiled_images/compiled_videos are the verified-complete source of truth
+        # (every beat unconditionally writes both an image and video entry), so re-check the
+        # final block against them and rebuild from source if anything went missing rather
+        # than shipping a partial prompt set.
+        check_images, check_videos = pp._parse_prompt_slots(reassembled_prompts_block)
+        missing_images, missing_videos = pp._missing_prompt_slots(
+            check_images, check_videos, (1, total_beats + 1), (1, total_beats)
+        )
+        if missing_images or missing_videos:
+            if sys.stdout:
+                print(f"[WARNING] Final prompt block was missing slots (images={missing_images}, videos={missing_videos}); "
+                      f"rebuilding from the verified-complete compiled beat data.")
+            reassembled_prompts_block = pp._format_prompt_block(formatted_images, formatted_videos)
+
+        audit_text = (
+            '全部审查规则已永久退役；正文保持模型原稿，未进行质量审查或自动改写。'
+            if skip_reviews else
+            'skill 直出模式：文本阶段无审查、无重写，批量直出+确定性修复一次成型；一致性审查在帧渲染完成后对着真实画面进行。'
+        )
+        final_output = f"""===TITLE===
+{title}
+===THEME===
+{parsed_brief.get('theme', theme)}
+===PROMPTS===
+{reassembled_prompts_block}
+===AUDIT===
+{audit_text}{skipped_str}"""
+
+        # 整单成功交付，断点续传存档功成身退——否则下次同一份 dimensions 的全新一键合成
+        # 会被误当成续传，平白复用一份已经用过的旧输出。
+        pp.clear_compose_checkpoint(brief_fingerprint)
+
+        return final_output

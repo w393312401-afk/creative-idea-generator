@@ -20,6 +20,10 @@ import pytest
 from PIL import Image
 
 import server
+from frame_generator import _fx_find_ref_for
+
+
+_FX_UUID = '11111111-2222-3333-4444-555555555555'
 
 
 @pytest.fixture(autouse=True)
@@ -43,10 +47,18 @@ def project(tmp_path):
     project_dir = str(tmp_path / 'proj')
     frames_dir = os.path.join(project_dir, 'frames')
     os.makedirs(frames_dir, exist_ok=True)
+    fx_src_dir = os.path.join(frames_dir, 'fx_src')
+    os.makedirs(fx_src_dir, exist_ok=True)
 
     for seq, color in ((1, (255, 0, 0)), (2, (0, 255, 0)), (3, (0, 0, 255))):
         Image.new('RGB', (90, 160), color=color).save(
             os.path.join(frames_dir, f'img_{seq:03d}.webp'), format='WEBP')
+    Image.new('RGB', (90, 160), color=(0, 180, 0)).save(
+        os.path.join(fx_src_dir, f'img_002_{_FX_UUID}.jpg'), format='JPEG')
+    Image.new('RGB', (90, 160), color=(0, 160, 0)).save(
+        os.path.join(fx_src_dir, 'chain_ref_002.jpg'), format='JPEG')
+    Image.new('RGB', (90, 160), color=(0, 0, 180)).save(
+        os.path.join(fx_src_dir, f'img_003_{_FX_UUID}.jpg'), format='JPEG')
 
     manifest = {
         'title': 'upload_frame_test',
@@ -57,7 +69,9 @@ def project(tmp_path):
              'vlm_qa_reason': 'looks fine', 'parent_hash': 'abc123'},
             {'slot': 2, 'sequence': 2, 'file': 'frames/img_002.webp', 'url': '/frames/img_002.webp',
              'prompt': 'second frame prompt', 'model': 'gemini', 'quality_gate': 'sequence_review_flagged',
-             'vlm_qa_reason': '跳变', 'manual_issue': '塔吊消失了', 'parent_hash': 'def456'},
+             'vlm_qa_reason': '跳变', 'manual_issue': '塔吊消失了', 'parent_hash': 'def456',
+             'backend': 'google_fx', 'fx_uuid': _FX_UUID,
+             'fx_src': f'frames/fx_src/img_002_{_FX_UUID}.jpg'},
             {'slot': 3, 'sequence': 3, 'file': 'frames/img_003.webp', 'url': '/frames/img_003.webp',
              'prompt': 'third frame prompt', 'model': 'gemini', 'quality_gate': 'auto_approved',
              'parent_hash': 'ghi789'},
@@ -71,7 +85,7 @@ def project(tmp_path):
     with open(os.path.join(project_dir, 'manifest.json'), 'w', encoding='utf-8') as f:
         json.dump(manifest, f)
 
-    return {'dir': project_dir, 'frames_dir': frames_dir}
+    return {'dir': project_dir, 'frames_dir': frames_dir, 'fx_src_dir': fx_src_dir}
 
 
 def _png_bytes(size=(120, 200), color=(200, 120, 40)):
@@ -152,6 +166,28 @@ class TestUploadFrameSuccess:
         assert frame['source'] == 'manual_upload'
         assert frame['parent_hash'] == '', "手动上传的帧不派生自任何上一帧，i2i 血统在此断开"
         assert frame['file'].endswith('frames/img_002.webp')
+
+    def test_old_fx_uuid_and_reference_cache_are_cleared(self, project, monkeypatch):
+        monkeypatch.setattr(server, '_get_project_dir', lambda title: project['dir'])
+        assert _fx_find_ref_for(project['frames_dir'], 3), 'fixture must begin with the old frame-2 UUID'
+
+        h, sent = _upload_handler(
+            {'title': 'upload_frame_test', 'sequence': '2', 'prompt_block': _PROMPT_BLOCK},
+            _png_bytes(color=(240, 80, 20)),
+        )
+        server.SparkRequestHandler.do_POST(h)
+        assert sent[0][1] == 200, sent[0][0]
+
+        names = os.listdir(project['fx_src_dir'])
+        assert not any(name.startswith('img_002_') for name in names)
+        assert 'chain_ref_002.jpg' not in names
+        assert any(name.startswith('img_003_') for name in names), 'other frame UUIDs must remain intact'
+        assert _fx_find_ref_for(project['frames_dir'], 3) is None
+
+        frame = next(f for f in _manifest(project)['frames'] if f['sequence'] == 2)
+        assert 'fx_uuid' not in frame
+        assert 'fx_src' not in frame
+        assert 'backend' not in frame
 
     def test_downstream_frames_marked_stale_lineage(self, project, monkeypatch):
         monkeypatch.setattr(server, '_get_project_dir', lambda title: project['dir'])

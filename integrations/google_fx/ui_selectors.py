@@ -12,7 +12,7 @@
 """
 
 # 📌 选择器版本号 — 每次 UI 变更时更新此值，方便追踪
-SELECTOR_VERSION = "2026-04-16"  # 基于 2026-04-16 实测 DOM 更新
+SELECTOR_VERSION = "2026-09-05"  # 基于 2026-09-05 实测 DOM 更新（Flow 迁 flow.google.com + Angular Material）
 
 # ==============================================================================
 # 🎯 UI 选择器字典
@@ -25,9 +25,11 @@ UI_SELECTORS = {
     "google_fx": {
         # --- 导航 ---
         "new_project_btn": [
-            # 语言无关主选择器：Google Symbols 的业务图标名稳定，覆盖中/英/印尼语。
-            "button:has(i.google-symbols:text-is('add_2'))",
-            "button:has(i:text-is('add_2'))",
+            "button.new-project-button",
+            "button:has(.new-project-button)",
+            # 先用明确文案定位。项目内的“创建媒体”按钮也使用 add_2，裸图标
+            # 选择器会误点它，并把一次无效 click 误报成“新建项目成功”。
+            "button:has(mat-icon:text-is('add_2')):has-text('New project')",
             "button:has(i.google-symbols:text-is('add_2')):has-text('New project')",
             "button:has(i:text-is('add_2')):has-text('New project')",
             "button:has-text('New project')",
@@ -37,6 +39,9 @@ UI_SELECTORS = {
             "button:has-text('新建项目')",
             "button[aria-label*='新建项目']",
             "button:has-text('Project baru')",
+            # 未知语言兜底：排除项目内带 popup 的“创建/添加媒体”按钮。
+            "button:not([aria-haspopup]):has(i.google-symbols:text-is('add_2'))",
+            "button:not([aria-haspopup]):has(i:text-is('add_2'))",
         ],
 
         # --- 输入 ---
@@ -45,73 +50,30 @@ UI_SELECTORS = {
             "[contenteditable='true']",
         ],
 
-        # --- 历史参考图清理 ---
-        "close_history_btn": [
-            "button:has(i:has-text('close'))",
-            "button[data-state='closed'] i",
-            "button[aria-label*='Close']",
-        ],
-
         # --- 图片上传 (通用入口) ---
-        # ✅ 2026-04-05 基于实测 DOM 验证
-        # 路径: 底部输入框左侧 [+] → Media Picker 面板 → Upload image
+        # + 按钮 (底部输入框左侧，触发 Media Picker)。这份列表就是
+        # google_fx_helpers._find_add2_btn 实际在用的那份，两边共用同一个源，
+        # 所以选择器探针探的和生产代码点的是同一批选择器。
         "add_media_btn": [
-            # + 按钮 (底部输入框左侧，触发 Media Picker)
-            "button[aria-haspopup='dialog']",
-        ],
-        "media_picker_ready": [
-            # Media Picker 面板已打开的等待条件
-            "input[placeholder='Search for Assets']",
-        ],
-        "upload_image_trigger": [
-            # Upload image 可点击区域 (有 onclick，含 upload icon)
-            # 实测: <div class='sc-70a6bd2c-10 fxheTi'><i>upload</i><div>Upload image</div></div>
-            "div.sc-70a6bd2c-10.fxheTi",
-            # 后备: 包含 upload icon 的 div
-            "div:has(> i.google-symbols)",
-        ],
-        "file_input": [
-            # ✅ 实测: input[type='file'][accept='image/*'] 已挂载 DOM，可直接 set_input_files
-            "input[type='file'][accept='image/*']",
-            "input[type='file']",
-        ],
-        "agree_btn": ["button:has-text('I agree')", "button:has-text('我同意')"],
-        "crop_and_save_btn": [
-            "button:has-text('Crop and Save')",
-            "button:has-text('Save')",
-            "button[aria-label*='Crop']",
-            "button:has-text('裁剪并保存')",
-            "button:has-text('保存')",
-            "button[aria-label*='裁剪']",
-        ],
-        "crop_ratio_combobox": ["button[role='combobox']"],
-        "portrait_opt": [
-            "div[role='option']:has-text('Portrait')",
-            "li:has-text('Portrait')",
-            "div:has-text('9:16')",
-            "div[role='option']:has-text('纵向')",
-            "li:has-text('纵向')",
-        ],
-        "first_frame_indicator": ["span:has-text('First Frame')", "span:has-text('第一帧')", "span:has-text('首帧')"],
-        "upload_indicator": [
-            "span:has-text('This is your ingredient, it can used to effect the outcome')",
-            "span:has-text('This is your ingredient')",
-            "span:has-text('First Frame')",
-            "button:has(i:has-text('close'))",
-            "span:has-text('这是您的原料')",
-            "span:has-text('首帧')",
+            # 画布上传优先使用顶部入口；提示词框 + 打开的是另一种素材选择器。
+            "button[aria-label='Add media menu']",
+            "button[mattooltip='Add media']",
+            "button[aria-label*='Add media' i]",
+            "button[aria-label*='添加媒体']",
+            # 某些布局隐藏顶部入口，保留素材选择器作为兼容路径。
+            "button[aria-label='Add ingredients to the prompt box']",
+            "button.add-menu-trigger[aria-haspopup]",
+            "button[aria-haspopup='dialog']:has(span:text('Create'))",
+            "button[aria-haspopup='dialog']:has(i.google-symbols:text('add_2'))",
+            "button[aria-haspopup='dialog']:has(i:text('add_2'))",
+            "button[aria-haspopup='menu']:has(span:text('Create'))",
+            "button[aria-haspopup='menu']:has(span:text('添加媒体'))",
+            "button[aria-haspopup='menu']:has(mat-icon:text-is('add'))",
+            "button[aria-haspopup='menu']:has(i:text-is('add'))",
         ],
 
-        # --- 配置面板: 模式/比例/数量/模型 Tab 按钮 ---
+        # --- 配置面板: 比例/数量/模型 Tab 按钮 ---
         # ✅ 2026-04-05 基于实测: 所有 tab 按钮含稳定 class flow_tab_slider_trigger
-        "mode_tab_image": [
-            # Image 模式 Tab
-            "button.flow_tab_slider_trigger[aria-controls$='-content-IMAGE']",
-        ],
-        "mode_tab_video": [
-            # Video 模式 Tab
-            "button.flow_tab_slider_trigger[aria-controls$='-content-VIDEO']",
-        ],
         "ratio_tab": {
             # 比例选择 Tab (aria-controls 末尾为比例 key)
             "9:16":  "button.flow_tab_slider_trigger[aria-controls$='-content-PORTRAIT']",
@@ -127,77 +89,23 @@ UI_SELECTORS = {
             "x3": "button.flow_tab_slider_trigger[aria-controls$='-content-3']",
             "x4": "button.flow_tab_slider_trigger[aria-controls$='-content-4']",
         },
-        "model_dropdown_trigger": [
-            # 配置面板内打开模型列表的触发器
-            "button[aria-haspopup='menu']:has(i.google-symbols:text-is('arrow_drop_down'))",
-            ".DropdownMenuContent button[aria-haspopup='menu']",
-        ],
         "config_panel_root": [
             ".DropdownMenuContent[role='menu'][data-state='open']",
             "[role='menu'].DropdownMenuContent[data-state='open']",
             "[role='menu'][data-state='open']",
-        ],
-        "model_menu_root": [
-            "[role='menu'][data-state='open'][aria-labelledby]",
-            "[data-radix-menu-content][data-state='open'][aria-labelledby]",
-        ],
-        "model_menu_item": [
-            # 模型菜单各选项: 包含模型名的 button
-            # 用法: '[role="menuitem"] button:has-text("Nano Banana 2")'
-            '[role="menuitem"] button',
-        ],
-
-        # --- 上传对话框 (旧路径兼容) ---
-        "upload_dialog_btn": [
-            "div:has-text('Upload'):has(i:has-text('upload'))",
-            "div:has-text('上传'):has(i:has-text('upload'))",
-        ],
-
-        # --- 错误检测 ---
-        "something_went_wrong": [
-            # \u5b9e\u6d4b\u6709\u6548 (2026-03-25): \u9519\u8bef\u5361\u7247 DOM \u7ed3\u6784
-            "div[class*='sc-25d34a31-1']:has-text('Failed')",
-            "div[class*='sc-25d34a31-2']:has-text('something went wrong')",
-            "div[class*='sc-2a857f86-1']:has-text('Failed')",
-            # \u6587\u5b57\u517c\u5bb9\u517c\u5bb9
-            "text='Something went wrong'",
-            "text='Something went wrong.'",
-            "text='Oops, something went wrong!'",
-            # \u5c55\u5f00\u6210\u542b\u6709\u6587\u5b57\u7684\u5143\u7d20
-            ":has-text('Oops, something went wrong!')",
-        ],
-        "send_feedback": ["text='Send app feedback'"],
-
-        # --- 下载 ---
-        "download_btn": [
-            "button:has-text('Download')",
-            "button[aria-label*='Download']",
-            "button:has-text('下载')",
-            "button[aria-label*='下载']",
-        ],
-        "done_btn": [
-            "button:has-text('Done')",
-            "button[aria-label*='Done']",
-            "button:has-text('完成')",
-            "button[aria-label*='完成']",
+            ".cdk-overlay-pane:has(.settings-content)",
+            ".cdk-overlay-pane:has(mat-button-toggle-group)",
+            ".cdk-overlay-pane:has-text('360p')",
+            ".cdk-overlay-pane:has-text('720p')",
+            ".cdk-overlay-pane",
+            ".settings-content",
         ],
 
         # --- 配置按钮 (底部工具栏) ---
         # Video 模式: Veo 3.1 - Fast / Veo 3.1 - Quality
         # Image 模式: Nano Banana Pro / Nano Banana 2 / Nano Banana 2 Lite
+        # ⚠️ 非选择器：这是文本关键词表，不能当 CSS 选择器用（选择器探针会跳过）。
         "config_btn_keywords": ["Banana", "Nano", "Imagen", "Video", "Veo", "Pro"],
-        "config_btn_count_keywords": ["x1", "x2", "x3", "x4"],
-
-        # --- 发送 ---
-        "send_btn_icon_texts": ["arrow_forward", "send", "arrow_upward"],
-        "send_btn_aria_labels": ["Send", "send", "Submit", "submit", "Create"],
-        "create_btn": ["button:has-text('Create')", "button:has-text('创建')", "button:has-text('生成')"],
-
-        # --- 上传对话框 ---
-        "upload_dialog_btn": [
-            "div:has-text('Upload'):has(i:has-text('upload'))",
-            "div:has-text('上传'):has(i:has-text('upload'))",
-        ],
 
         # --- 积分余额 ---
         # 首次/未完成初始化的账号会停在产品介绍落地页；必须先点击 CTA 才会
@@ -234,34 +142,216 @@ UI_SELECTORS = {
             "button:has-text('继续')",
             "button:has-text('Lanjutkan')",
         ],
+        "flow_project_error_btn": [
+            "button:has-text('Back to projects')",
+            "button:has-text('Back to project')",
+            "button:has-text('返回项目')",
+            "button:has-text('Kembali ke project')",
+            "button:has-text('Kembali ke proyek')",
+            "a:has-text('Back to projects')",
+            "a:has-text('返回项目')",
+            "button:has(i:text('arrow_back'))",
+            "button:has(i.google-symbols:text('arrow_back'))",
+        ],
         "account_menu_trigger": [
             "button:has(img[alt='User profile image'])",
+            ".header-user-button",
+            "[role='button'].header-user-button",
+            "[role='button'][aria-label*='Account details' i]",
+            "[role='button'][aria-label*='账号详情']",
+            "[aria-label*='Account details' i]",
+            "[aria-label*='账号详情']",
+            "[role='button']:has(flow-user-tier-chip)",
             "button:has(img[alt='用户头像'])",
             "button:has(img[alt*='头像'])",
-            "button:has(img[src*='googleusercontent.com'])",
+            "button:has(img.user-avatar)",
+            "button:has(img[class*='avatar'])",
             "button[aria-label*='Google Account']",
+            "button[aria-label*='Google 账号']",
             "button[aria-label*='Account']",
+            "button[aria-label*='账号']",
             "button[aria-label*='account' i]",
             "button[aria-label*='profile' i]",
-            "button[aria-haspopup='menu']:has(img)",
             "[role='button']:has(img[alt*='profile' i])",
-            "header button:has(img)",
-            "button:has(img)",
         ],
         # 必须先确认账号菜单/弹层真实打开，再在这个局部范围内读积分。不能用
         # 全页 text=/N credits/，否则会把套餐宣传的 monthly credits 当成余额。
         "account_menu_surface": [
             "div[role='dialog']",
+            ".panel",
+            ".panel.panel-mobile",
+            ".panel[role='dialog']",
+            "[aria-label*='账号设置']",
+            "[aria-label*='Account settings' i]",
+            ".credits-info-wrapper",
             "div[role='menu']",
             "[data-radix-popper-content-wrapper]",
             ".cdk-overlay-pane",
         ],
+        # --- 画布结果卡片 ---
+        # 2026-09-05 血泪：这一族此前**根本不在 UI_SELECTORS 里**，选择器只以
+        # 硬编码 JS 字符串的形式散落在 helpers 里。于是 Flow 把卡片从
+        # div[data-tile-id] 换成 <flow-grid-tile-container> 那天，选择器探针
+        # 结构上就看不见这处故障——而它恰恰是"点了 Generate 却永远等不到新卡片、
+        # 反复重传参考图烧积分"的唯一根因。
+        #
+        # 顺序即优先级：第 0 层是当前线上 DOM，探针把命中第 0 层报成 primary、
+        # 命中靠后层报成 fallback。helpers 的 FLOW_TILE_SELECTOR / _FLOW_TILE_JS
+        # 直接读这张表，运行期真实命中层级记进 selector_stats('canvas_tile')，
+        # 所以"探针说的"和"生产代码用的"永远是同一份东西。
+        "canvas_tile": [
+            "flow-grid-tile-container",   # 2026-09-05 起的 Angular Material 版
+            "div[data-tile-id]",          # 旧版 Radix/React（保留：回滚/灰度时还会遇到）
+            "flow-tile-container",
+            "flow-image-tile",
+        ],
+
         "credit_display": [
+            ".credits-count",
+            "a.credits-link",
             "a[href*='flow_ai_credits_page']",
             "a[href*='credits']",
+            "[aria-label*='点数']",
+            "[aria-label*='Credits' i]",
+            ".credits-info",
         ],
     },
 
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # 🔐 Google 账号登录页 (accounts.google.com) — 供 utils/auto_login.py 使用
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # 掉登录后自动重新登进去要走「选号 → 邮箱 → 密码 → 两步验证」几步表单。
+    # Google 这几页的 class 名是构建期混淆产物（每次发版都变），所以这里一律
+    # 只用**语义属性**定位：input 的 type/name/autocomplete、以及 Google 十几年
+    # 没换过的 id（#identifierId / #totpPin）。文案兜底放最后，且中英都列。
+    #
+    # 新增于 2026-07-30。不涉及本文件顶部 LOCKED 声明的三项
+    # (config_btn_keywords / ORIENT_ICON_MAP / RATIO_MAP)。
+    "google_login": {
+        # labs.google 自己的 Auth.js 登录中转页。账号会话失效或当前 Google
+        # 身份无权进入 Flow 时，页面不会直接跳 accounts.google.com，而是先显示
+        # 「Try signing in with a different account. / Sign in with Google」。
+        # form action 比页面 class 和错误文案稳定，文案选择器只作兜底。
+        "provider_signin": [
+            "form[action*='/fx/api/auth/signin/google'] button[type='submit']",
+            "form[action*='/api/auth/signin/google'] button[type='submit']",
+            "button:has-text('Sign in with Google')",
+        ],
+        # 邮箱输入页 (signin/identifier)
+        "email_input": [
+            "input#identifierId",
+            "input[name='identifier']",
+            "input[type='email']",
+        ],
+        # 密码页 (signin/challenge/pwd)。autocomplete 属性比 name 稳。
+        "password_input": [
+            "input[type='password'][name='Passwd']",
+            "input[name='Passwd']",
+            "input[type='password'][autocomplete='current-password']",
+            "input[type='password']:not([aria-hidden='true'])",
+        ],
+        # 两步验证的动态码输入框 (challenge/totp)。Google 的备用码输入框
+        # (challenge/backup-code) 用的是 name='backupCodePin'，故意不列——
+        # 备用码是一次性的，自动填等于烧掉用户的应急手段。
+        "totp_input": [
+            "input#totpPin",
+            "input[name='totpPin']",
+            "input[type='tel'][autocomplete='one-time-code']",
+            "input[autocomplete='one-time-code']",
+        ],
+        # 「下一步 / Next」。Google 把它渲染成 div[role=button] 已经很多年，
+        # 但 #identifierNext / #passwordNext 这两个容器 id 一直在。
+        "next_btn": [
+            "#identifierNext button",
+            "#passwordNext button",
+            "#totpNext button",
+            "#identifierNext",
+            "#passwordNext",
+            "#totpNext",
+            "button:has-text('Next')",
+            "button:has-text('下一步')",
+            "button:has-text('Berikutnya')",
+            "div[role='button']:has-text('Next')",
+            "div[role='button']:has-text('下一步')",
+        ],
+        # 账号选择页 (signin/accountchooser) 上的「使用其他账号」。
+        # 目标邮箱本身在列表里时优先直接点它（auto_login 动态构造选择器），
+        # 只有找不到才退到这个入口重新走邮箱流程。
+        "use_another_account": [
+            # 这一项的 DOM 形状 Google 换过好几轮（li → div[role=link] → 带
+            # jsname 的按钮），文案还有简/繁/印尼三套且「账号/帐户/帳戶」三种写法
+            # 都在线上出现过。少一个变体的代价是整条自动登录死在 chooser_stuck，
+            # 所以这里宁可列全。
+            "li:has-text('Use another account')",
+            "li:has-text('使用其他账号')",
+            "li:has-text('使用其他帐户')",
+            "li:has-text('使用其他帳戶')",
+            "li:has-text('使用其他帳號')",
+            "div[role='link']:has-text('Use another account')",
+            "div[role='link']:has-text('使用其他账号')",
+            "div[role='link']:has-text('使用其他帐户')",
+            "div[role='link']:has-text('使用其他帳戶')",
+            "div[role='button']:has-text('Use another account')",
+            "button:has-text('Use another account')",
+            "a[href*='AddSession']",
+            "*:has-text('Gunakan akun lain')",
+        ],
+        # 账号选择页上的一行账号。data-identifier / data-email 存的是账号原文，
+        # 比行内可见文本可靠：列表里显示的邮箱可能被截断（"jia…@gmail.com"），
+        # 靠 :has-text 匹配就会漏掉本来在页面上的目标账号。
+        "account_row_attrs": ["data-identifier", "data-email"],
+        # 新版登录方式选择页（"Welcome / Choose how you want to sign in:"，
+        # 出现在**密码之前**）上的「Enter your password」。这一页也有一项叫
+        # 「Try another way」，但它是登录方式入口、不是两步验证的换方式入口；
+        # 必须先认出这一项走密码路，否则会被当成 2FA challenge picker 卡死。
+        # data-challengetype='1' 是 Google 给密码这一项的稳定语义属性。
+        "password_option": [
+            "[data-challengetype='1']",
+            "li:has-text('Enter your password')",
+            "div[role='link']:has-text('Enter your password')",
+            "div[role='button']:has-text('Enter your password')",
+            "button:has-text('Enter your password')",
+            "li:has-text('输入您的密码')",
+            "li:has-text('输入密码')",
+            "div[role='link']:has-text('输入您的密码')",
+            "div[role='button']:has-text('输入您的密码')",
+            "button:has-text('输入您的密码')",
+            "li:has-text('輸入您的密碼')",
+            "div[role='link']:has-text('輸入您的密碼')",
+            "*:has-text('Masukkan sandi Anda')",
+        ],
+        # 「换一种验证方式」页上通往身份验证器 App 的那一项。Google 默认可能
+        # 先推手机点确认（Tap Yes），那种自动化处理不了，必须切到 TOTP。
+        "try_another_way": [
+            "button:has-text('Try another way')",
+            "button:has-text('尝试其他方式')",
+            "div[role='button']:has-text('Try another way')",
+            "div[role='button']:has-text('尝试其他方式')",
+            "*[jsname]:has-text('More ways to verify')",
+        ],
+        "authenticator_option": [
+            # challenge picker 的稳定语义属性；6 是 Google 的 TOTP challenge type。
+            "[data-challengetype='6']",
+            "li:has-text('Google Authenticator')",
+            "li:has-text('authenticator app')",
+            "li:has-text('身份验证器')",
+            "li:has-text('验证码应用')",
+            "div[role='link']:has-text('Google Authenticator')",
+            "div[role='button']:has-text('Google Authenticator')",
+            "div[role='button']:has-text('authenticator app')",
+            "div[role='link']:has-text('身份验证器')",
+            "div[role='button']:has-text('身份验证器')",
+        ],
+        # 登录页上表示「这一步出错了」的提示区。用来把「密码错」跟「网络慢
+        # 还没跳转」区分开——分不清就会在密码错的情况下不停重试，把号锁掉。
+        "error_text": [
+            "div[aria-live='assertive']",
+            "div[jsname='B34EJ'] span",
+            "div.o6cuMc",
+            "span.OyEIQ",
+        ],
+    },
 
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

@@ -15,7 +15,7 @@ const fs = require('fs');
 const path = require('path');
 const vm = require('vm');
 
-const ctx = { console };
+const ctx = { console, URLSearchParams };
 vm.createContext(ctx);
 vm.runInContext(
     fs.readFileSync(path.join(__dirname, '..', 'js', 'media_renderer.js'), 'utf8'), ctx);
@@ -71,3 +71,10 @@ safeSetImageSrc(img, 'javascript:alert(1)');
 assert.strictEqual(img.src, undefined);
 
 console.log('media cache-bust tests passed');
+
+// 已带版本的缩略图 URL 再用于灯箱，不能重复追加 v 或把版本放进 hash。
+assert.strictEqual(cacheBustedUrl(busted), busted);
+const hashed = cacheBustedUrl('/outputs/p/frames/img_003.webp?v=old&x=1#preview');
+assert.strictEqual((hashed.match(/[?&]v=/g) || []).length, 1);
+assert.ok(hashed.endsWith('#preview'));
+assert.ok(!hashed.includes('v=old'));

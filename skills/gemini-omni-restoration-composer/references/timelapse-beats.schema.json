@@ -1,0 +1,324 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "timelapse-beats.schema.json",
+  "title": "timelapse_beats.json",
+  "description": "反推模式（Tier 4）Stage 1 的唯一交付契约。对话里的视频分析与手工反推以本文件为准。不要在别处再写一份字段说明——SKILL.md 只描述纪律，字段以此为准。",
+  "type": "object",
+  "required": ["video_duration_sec", "beats", "banned_elements"],
+  "additionalProperties": true,
+  "properties": {
+    "video_duration_sec": {
+      "type": "number",
+      "exclusiveMinimum": 0
+    },
+    "source_video": {
+      "type": "string",
+      "description": "源视频绝对路径。二创产出的变体 beats 保留它，用于回溯参考帧。"
+    },
+    "variant_of": {
+      "type": ["string", "null"],
+      "description": "非空表示这是二创变体，值为原始 beats 的 pipeline_id。1:1 复刻恒为 null。"
+    },
+    "mutation_axes": {
+      "type": "array",
+      "description": "二创专用：本变体实际改动的轴。1:1 复刻为空数组。",
+      "items": {
+        "type": "string",
+        "enum": ["carrier", "environment", "material", "pacing", "reward"]
+      },
+      "maxItems": 2
+    },
+    "banned_elements": {
+      "type": "array",
+      "description": "此类改造「合理会有」但任一被审查帧里都没出现的对象/工具/材料/工种/工序。P0 门禁据此判定：出现在任何 IMAGE/VIDEO 提示词里即交付前必须重写。",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "scene_signature": {
+      "type": "string",
+      "description": "一句话说清这是个什么地方：结构、材质、风化、周围环境、常驻光线——第一帧成立、最后一帧仍然成立的那部分。由 Pass B 产出；二创按新载体重写，绝不继承。与 banned_elements 对称：一个说原片里永远没有的，一个说原片里一直都在的。"
+    },
+    "ambient_motion": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Pass B 产出口：整片一直在动的环境物（见 scene_constants.motion 的说明）。attach_scene_constants 会把它并进 scene_constants.motion，之后以那一份为准——两处并存只是因为机械统计与模型产出走的是两条路，最终只有一个真相源。"
+    },
+    "ambient_sound": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Pass B 产出口：整片声轨上一直在响、且没有人在制造的声音（风穿树冠、溪流、远处车流、海浪、雨打屋顶、空混凝土房间的混响、虫鸣）。它是 ambient_motion 的听觉对偶——每一拍的 sfx 是「这一下活儿的声音」，这一栏是「没人干活时这地方的声音」。attach_scene_constants 会把它并进 scene_constants.ambient_sound；不给它落脚点，每条 VIDEO 结尾那句 Ambient noise 都是现编的，整片声场一拍一个样。"
+    },
+    "color_grade": {
+      "type": "string",
+      "description": "Pass B 产出口：整片的影调，一句话，只写摄影口径——色温偏向、对比、饱和、黑位、胶片/数码质感。绝不写情绪与品类词（cinematic / dramatic / moody / epic），那些不是影调，下游只会各自渲染自己对那个词的想象。attach_scene_constants 会把它并进 scene_constants.grade（装成单元素列表，因为这个容器全链路按列表读）。"
+    },
+    "cast_identity": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Pass B 产出口：整片反复出现的活物（每个工人/助手/人偶/动物）各一条的固定外形——人种与肤色、身形与年龄段、发型胡须、帽子、上衣与颜色、裤子与颜色、鞋。只写外形，不写动作（动作是每一拍自己的 cast_action）。attach_scene_constants 会把它并进 scene_constants.cast，之后以那一份为准；与 ambient_motion 同一条「两处并存、最终只有一个真相源」的理由。"
+    },
+    "scene_constants": {
+      "type": "object",
+      "description": "场景恒常特征，由 prompt_pipeline.reverse.analyze_scene_constants 从帧事实本地统计（出现在超过三成半帧里的可见物），不花模型调用。存在的理由：整条反推链路围绕**变化**而建，节拍只承载每拍 delta，恒常的东西不产生 delta，于是被整条压掉——实测一条片子 57% 的帧都记到了墙上的污渍，而它在节拍阶梯里一个字都没有。人工卡点上可编辑；删空后不会被重新统计回来（判键在不在，不判值真不真）。",
+      "properties": {
+        "environment": { "type": "array", "items": { "type": "string" }, "description": "常驻大环境与地貌水体、气候光照等宏观环境特征。" },
+        "materials": { "type": "array", "items": { "type": "string" } },
+        "traces": { "type": "array", "items": { "type": "string" } },
+        "fixtures_in_shot": { "type": "array", "items": { "type": "string" } },
+        "cast": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "全片常驻的活物（人/人偶/动物）各一条的固定外形：人种与肤色、身形与年龄段、发型胡须、帽子、上衣与颜色、裤子与颜色、鞋。来源二选一——Pass B 的顶层 cast_identity 优先（它看的是整段帧序列，写得出「全片同一个人」这层意思），没有就退回帧事实 cast_appearance 的本地统计。它的失效方式比其余各栏更刺眼：每一帧都是独立生成的，图像模型对上一帧没有记忆，外形不在这一条提示词里复述一遍就会被重新掷一次骰子——同一条片子里换人种、换肤色、换发型，休闲工装变成反光背心加安全帽。合成侧据此要求每一条 IMAGE/VIDEO 逐条复述这份外形，只换姿势不换人。"
+        },
+        "grade": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "全片影调（来自顶层 color_grade，通常只有一条）。「像不像那条片子」的第一眼因素，而它此前在这条链路上一个字都没有：每一帧的色温、对比、饱和都由图像模型自己定，十几张图拼起来像十几条片子。"
+        },
+        "ambient_sound": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "整片一直在响的环境底噪（来自顶层 ambient_sound）。与 motion 严格对称：那一栏是「一直在动」，这一栏是「一直在响」，两栏都统计不出来（帧事实是一张张无声的静止画面），只能由 Pass B 读或人在卡点上补。"
+        },
+        "motion": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "整片自始至终都在动、但没有主体性的东西：溪水、烟、火苗、风吹树冠、飘雪、雨、晾着的布、飘尘、闪烁的灯丝。它与另外几栏的区别不是「在不在」而是「动不动」——它们不是谁做出来的工作，也不产生每一拍的变化，所以在节拍阶梯里没有任何落脚点，而漏掉它交付出来的背景就是一张静止照片。**机械统计出不了这一栏**（帧事实是一张张静止画面的清单，看不出水在流），只能由 Pass B 从帧序列里读出来或由人在卡点上补。"
+        }
+      }
+    },
+    "time_windows": {
+      "type": "array",
+      "description": "定长时间窗（默认 5 秒一格），由 prompt_pipeline.reverse.analyze_time_windows 从帧事实本地统计。与节拍互为对照：节拍由模型按语义切、宽窄不一，定长窗只讲「这五秒画面里多了什么少了什么」。某一格有明显增减而覆盖它的那一拍只字未提，多半是漏掉了一道工序。",
+      "items": {
+        "type": "object",
+        "properties": {
+          "start": { "type": "number" },
+          "end": { "type": "number" },
+          "frame_count": { "type": "integer" },
+          "workers_present_ratio": { "type": "number" },
+          "baseline": { "type": "array", "items": { "type": "string" }, "description": "第一窗专用：起始画面里就有的东西。第一窗没有「此前」，把它们算成新出现只会让时间线第一行全是噪音。" },
+          "appeared": { "type": "array", "items": { "type": "string" } },
+          "vanished": { "type": "array", "items": { "type": "string" }, "description": "比 appeared 噪声大：同一样东西换个说法就会被算成消失。最后一窗恒为空——片子结束不等于东西消失。" },
+          "brief": { "type": "array", "items": { "type": "string" }, "description": "只在这一窗露过面的东西。它同时满足新出现与消失，两栏都报会自相矛盾，因此单列——往往是一闪而过的工序或临时道具。" },
+          "extent_start": { "type": "string" },
+          "extent_end": { "type": "string" }
+        }
+      }
+    },
+    "beats": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/definitions/beat" }
+    }
+  },
+  "definitions": {
+    "beat": {
+      "type": "object",
+      "required": [
+        "id", "start", "end",
+        "visual_subject", "visible_details", "visible_action", "visible_result",
+        "state_before", "state_after", "persistent_traces", "package_operations",
+        "workers_present", "source_event_ids", "evidence_frames"
+      ],
+      "additionalProperties": true,
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^B[0-9]{2,}$",
+          "description": "B01、B02……按时间顺序，不跳号。"
+        },
+        "start": { "type": "number", "minimum": 0 },
+        "end": { "type": "number", "minimum": 0 },
+        "macro_environment": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "description": "这一拍所处的大环境与地貌水体、气候光照、空间包络与周边宏观环境识别特征。只写「这地方本来长什么样」：地貌、地质、气候光照、空间三维包络。**本拍施工产物一律不写这里**（挖出来的坑、砌起来的墙都属于 state_before/state_after）——首拍那 1~3 条是整条片子唯一一次大环境配额，分一条给已经写过的施工结果就少一条真环境。规则：仅在第一拍（锚点首帧）与过门拍/换空间首拍（新空间承接帧）填写，中间普通工序拍保持留空以减少对大模型提示词的上下文干扰。"
+        },
+        "visual_subject": { "type": "string", "minLength": 1 },
+        "visible_details": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "minItems": 1,
+          "description": "只写帧里真实可见的。推断、常识补全、行业惯例一律不算。每条＝材料 + 颜色/质感/状态 + 它在画面里的位置（\"yellow fibreglass batts in the left wall bays\"，不是 \"insulation\"）。3~6 条，建议顶到 5~6：这是原片长相在提示词里唯一的落脚点（beats_to_dimensions 的 mat 通道）。不要拿一条去复述 macro_environment 或 persistent_traces 已经写过的东西——配额只有这几条，重复一条就少一条真信息。"
+        },
+        "visible_action": { "type": "string", "minLength": 1 },
+        "visible_result": { "type": "string", "minLength": 1 },
+        "state_before": {
+          "type": "string",
+          "minLength": 1,
+          "description": "具体的空间完成度，例如「墙面左三分之二已上底漆，右三分之一仍是裸抹灰」。不接受「部分完成」这类含糊表述。要写「量」不是写「样」：范围/比例/齐平关系/高度差都算，一个量词都没有的状态句等于没说完成度。与 visible_result 分工——visible_result 写这一下看见了什么，state_after 写完成到哪儿。"
+        },
+        "state_after": { "type": "string", "minLength": 1 },
+        "persistent_traces": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "minItems": 2,
+          "description": "本拍**新**留下、必须被后续状态继承的痕迹，每条须同时点名痕迹本身与它落在哪个面上。原本就在的环境物（落叶、青苔、旧污渍）不是痕迹——它们属于 macro_environment 或 scene_constants；混进来会稀释这一栏，因为 beats_to_dimensions 会把整栏拼成一个 trace 串下发。下界 2 不是本文件的发明——合成器的 frame-state 硬闸就是这么判的（prompt_pipeline/frame_state.py），少于两条会在合成前被打回。"
+        },
+        "material_specs": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "maxItems": 3,
+          "description": "本拍所用/所露材料的**工程规格**：标称厚度、等级、断面尺寸、表面纹理、光泽度（\"9mm OSB sheathing, raw matte face\"、\"2x4 SPF studs (38x89mm)\"）。Pass A 每一帧都在按这个口径记（_PASS_A_SYSTEM 的 material_specs），2026-08-24 之前 beats 这一层没有字段承接，逐帧量出来的规格全部止步于 frame_facts.json——交付出来的是「一块板」的通用想象，不是这条片子里那块板。与 visible_details 分工：那一栏写「什么料、什么颜色、在画面哪儿」，这一栏写「多厚、什么等级、什么面」。最多 3 条；没量到就留空，绝不猜一个标称值。"
+        },
+        "tool_specifics": {
+          "type": "string",
+          "description": "`tool` 那件工具的**具体型号/驱动方式/在用的刀头或批头**（\"18V cordless brushless impact driver with magnetic bit\"、\"pneumatic framing nailer\"、\"stainless steel notched trowel\"）。`tool` 回答「是什么工具」，这一栏回答「是哪一种、怎么驱动的」。Pass A 的 tool_specifics 一直在逐帧记，此前没有字段承接。留空只是没量到，不是「没有工具」。"
+        },
+        "fastening_and_bonding": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "maxItems": 3,
+          "description": "本拍可见的**紧固与粘接方式**：机械紧固件或化学粘接（\"countersunk black drywall screws\"、\"expanding PU foam sealant along the gap\"、\"construction adhesive bead\"、\"staples\"）。它决定这一拍的接缝长什么样，也决定 sfx 里那一下是拧、是钉还是挤——Pass A 逐帧记着它，此前没有字段承接。最多 3 条。"
+        },
+        "micro_traces": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "maxItems": 3,
+          "description": "本拍留下的**微观**痕迹：细木屑、铅笔弹线、石膏粉、过喷飞溅、边角料（\"fine sawdust along the pencil cut-line\"、\"chalk snap line on the subfloor\"）。与 persistent_traces 分工：那一栏是「必须被后续帧继承」的宏观痕迹（下界 2 条，整栏会被拼成一个 trace 串下发），这一栏是让这一拍看起来像真在施工的细节，不要求继承。Pass A 逐帧记着它，此前没有字段承接。最多 3 条。"
+        },
+        "package_operations": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 3,
+          "items": { "type": "string", "minLength": 1 },
+          "description": "共同产出同一个终端成果的 2~3 道紧密耦合工序（例如 [\"cut\", \"fit\", \"fasten\"] 共同产出一面封好的吊顶）。一个拍只申报一道工序 = 拍粒度过细，合成器会判死。上下界的权威来源是 prompt_pipeline/frame_state.validate_frame_state_contract 的 min/max_package_operations 默认值。"
+        },
+        "workers_present": {
+          "type": "boolean",
+          "description": "本拍证据帧里是否有工人/机械。false 的帧才是 IMAGE 锚点候选。"
+        },
+        "source_event_ids": {
+          "type": "array",
+          "items": { "type": "string", "pattern": "^E[0-9]{2,}$" },
+          "description": "本拍认领的 video_overview.json change_events 条目。每个事件必须且只能被一拍认领。"
+        },
+        "evidence_frames": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 },
+          "description": "review_XXX.png / scene_XXX_*.png 文件名，时间戳须落在 [start, end] 内。凡断言了动作或结果的拍，此项必填。二创变体例外：那一份改名为 reference_frames，validate_beats 据 variant_of / mutation_axes 豁免本字段。"
+        },
+        "stage": {
+          "type": "string",
+          "enum": ["demolition", "structural", "rough_in", "enclosure", "surface", "floor", "fixtures", "furnishing", "reveal"],
+          "description": "施工阶段。采用本字段 enum 中的九档阶段。要点：墙体龙骨与保温属 enclosure，不属 structural，更不属 fixtures；fixtures 专指通电/通水设备，本拍没有这类设备就一定不是 fixtures；rough_in 只指日后会被盖住的线管水管本身。校验器据此判施工依赖顺序，标错会报出一条与真实病灶无关的硬伤。"
+        },
+        "space": {
+          "type": "string",
+          "minLength": 1,
+          "description": "这一拍的机位所在的物理空间，短标签，同一空间的每一拍逐字复用（如 \"wooded slope outside\" / \"entrance tunnel\" / \"sleeping alcove\"）。只有机位真的穿过开口进入另一个封闭空间才换新标签；同一空间内的重新取景、换角度、推拉摇一律沿用原标签。这条序列是原片「进了几次门、在第几拍进」的唯一记录：合成期按它逐处标记过门拍（prompt_pipeline.__init__.apply_observed_space_sequence），把两个空间写成同一个标签，复刻出来就少一次进门。缺失/写空的拍继承上一拍（reverse.normalize_beat_spaces），因此 2026-08-14 之前的存量文档整片只有一个空间，行为不变。"
+        },
+        "coverage_frames": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["frame", "timestamp"],
+            "properties": {
+              "frame": { "type": "string", "minLength": 1 },
+              "timestamp": { "type": "number", "minimum": 0 }
+            }
+          },
+          "description": "派生字段，由 prompt_pipeline.reverse.attach_coverage_frames 从已抽好的 review_sampling 帧里按时间均分算出，铺满 [start, end]（每拍 6~10 张）。只为人工核对而存在——evidence_frames 最多三张，长拍中段会看不见。不参与任何判据，模型不产出它，时间窗一改就整份重算。"
+        },
+        "observed_cuts": {
+          "type": "array",
+          "items": { "type": "number", "minimum": 0 },
+          "description": "派生字段，由 prompt_pipeline.reverse.attach_shot_cuts 从 video_overview.json 的 cut_points 里按本拍时间窗切出（绝对秒，不含贴着拍窗边界那一刀）。原片在这一拍内部剪过的位置，是「这一拍在原片里是几个镜头」的事实来源。模型不产出它，时间窗一改就整份重算。"
+        },
+        "observed_shot_seconds": {
+          "type": ["number", "null"],
+          "description": "派生字段：本拍时长 ÷ observed_shot_count，即原片这一拍平均每个镜头多长。**镜头数不能跨拍长直接比较**——原片一拍平均三秒半，交付一拍是固定片长（八秒），「原片这拍是一镜」与「我们切了两刀」说的不是同一个节奏。判断交付有没有改掉原片的剪辑节奏，比的是这个数与 clip_seconds ÷ 交付镜头数。"
+        },
+        "cast_action": {
+          "type": "string",
+          "description": "画面里**每一个有主体性的活物**在这一拍除了干活以外的身体语言，严格按「触发源 -> 即时应激动作 -> 过程视线/位移追踪 -> 收尾定格」因果链记录：姿态、朝向、视线、位移、手势、神情。活物 = 真人工人 / 微缩树脂人偶 / 动物（工地上的狗、屋顶的猫、沙盘里的树脂小鸡都算）。有几个就写几个。与 visible_action 分工不同——那一栏写的是工序（\"trowels the surface\"），这一栏写的是人本身对工序与环境变动的即时生理反应（\"As the hand enters from the canopy -> figurines tilt heads up in awe -> as the shack is gripped -> swiftly stand up -> turn to face the cleared footprint\"）。严禁写 remain / stay / static / unchanged 等静态位置词：延时片里人是唯一的活物，冻住它等于把片子变成静物展示。"
+        },
+        "insert_subject": {
+          "type": "string",
+          "description": "原片这一拍切进特写时，那个插入镜拍的是什么（\"the tweezer tip pressing a roof tile\"、\"mortar squeezing out from under the block\"）。只在 observed_shot_count ≥ 2、也就是原片这一拍真的切过刀时才填；一镜到底的拍留空。多镜头链路的插入镜内容默认由「工具接触点 / 持久痕迹」两条通用职责兜底，这一栏是唯一能让插入镜拍的是**原片那个东西**的入口。"
+        },
+        "observed_shot_count": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "派生字段：observed_cuts 的条数加一，即原片这一拍由几个镜头组成。1 = 原片这一拍是一镜。多镜头语法（omni / miniature）按它挑三镜梯还是四镜梯；**字段缺席表示未知**（老 job、二创变体、抽帧异常），与 1 不是一回事，不要用 or 1 兜底。"
+        },
+        "reference_frames": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "description": "二创专用：原片对应帧，仅作运镜与构图参考，不再是事实断言。变异时由 evidence_frames 改名而来。"
+        },
+        "operation": {
+          "type": ["string", "null"],
+          "description": "本拍的主导物理工序（单一）。用于施工依赖顺序校验。写成干净的里程碑级工序词（1~3 词，如 \"seat bus\" / \"board ceiling\"），不要写成带宾语的整句——合成器按它做相位判定，长短语会把判定和中文翻译一起搞糊。"
+        },
+        "tool": {
+          "type": "string",
+          "description": "动作峰值上那件几何工具（吊车/摇臂锯/橡胶锤/抹刀…）。_PASS_B_SYSTEM 的「动作-工具-音效三联绑定」早就要求点名它，但 2026-08-22 之前没有字段承接，它只能混在 visible_action 那句英文里，合成器读不出来。留空只是没写，不是「没有工具」。"
+        },
+        "sfx": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "maxItems": 4,
+          "description": "本拍能听见的物理声，一条一个声源（\"hydraulic crane whine\"、\"soil clods sliding down the trench wall\"）。抽帧那边早就把音频瞬态算出来喂进了 Pass B 摘要（audio_sfx=[spike@…s, +…dB]），2026-08-22 之前没有字段承接，检测出来的那一下就地蒸发，而交付口径写着「ASMR 原声混音 60% 物理细节 / 0% BGM」。绝不写配乐、情绪音、旁白。"
+        },
+        "shot_scale": {
+          "type": "string",
+          "enum": ["extreme_wide", "wide", "medium", "close", "extreme_close"],
+          "description": "本拍景别。复刻线在此之前逐拍没有任何机位字段（原创线有 camera_family），十几拍的镜头语言全由合成器自己挑，等于原片的镜头一格都没锁。"
+        },
+        "camera_move": {
+          "type": "string",
+          "enum": ["static", "push_in", "pull_out", "pan", "tilt", "orbit", "follow", "handheld", "crane"],
+          "description": "本拍运镜。闭集枚举，不收自由文本——自由文本会被规划器当成创作提示重新发挥。过门拍通常是 push_in / follow。"
+        },
+        "camera_angle": {
+          "type": "string",
+          "enum": ["bird_eye", "high_angle", "eye_level", "low_angle", "worm_eye", "dutch_angle"],
+          "description": "本拍机位的**垂直**角度：鸟瞰 / 高角度俯拍 / 平视 / 低角度仰拍 / 虫视 / 倾斜角。按画面自身的几何读（透视线往哪收、看得见物体的顶面还是底面、地平线落在画面第几分）——不是按工序猜。与 camera_bearing 是两根互相独立的轴，两栏都要标：同一道工序，贴地仰拍和站着俯看是两条完全不同的片子。倾斜角严格说是第三根轴（滚转），但它一旦出现就是这一拍最抢眼的角度事实，占掉这一格；只用于画面整体歪着（地平线本身是斜的），不要拿它表示「机位偏到一侧」。",
+          "x-binding": "beats_to_dimensions → _outline_normalized_entries → build_outline_plan_block 的 ANGLE 规则；并由 observed_camera_angle_packet_rule 写进族级 camera_dna（IMAGE 的开场句是族级的，逐拍再写一句角度只会和它打架）。"
+        },
+        "camera_bearing": {
+          "type": "string",
+          "enum": ["front", "three_quarter", "side", "rear_three_quarter", "back"],
+          "description": "本拍机位的**水平**方位：镜头对着主体的哪一面——正面 / 前侧四分之三（正面与一个侧面同时可见）/ 侧面 / 后侧四分之三 / 背面。闭集枚举，不收自由文本。"
+        },
+        "lens_feel": {
+          "type": "string",
+          "enum": ["ultra_wide", "wide", "normal", "tele", "macro"],
+          "description": "本拍的焦段感。与 shot_scale 是两件事：广角站远和长焦站近都能拍到「整面墙」，画面却完全不像。按透视本身读——边缘畸变与近处物体夸张（超广）、背景被压扁贴到主体上（长焦）、接近肉眼（标准）。camera_dna 里那句「ultra-wide 16mm lens feel」在这一栏出现之前是模型自己编的。"
+        },
+        "subject_placement": {
+          "type": "string",
+          "description": "主体在这一拍画面里的位置与占比，一句话：左/中/右（按三分）、上/下、占画面高度几分之几，以及地平线落在第几分。分数写英文单词，绝不写数字与百分号（会被图像模型当文字画进画面）。**这是整条链路上唯一一次量原片的构图**：primary_landmarks 的 grid 与 z_depth_scale 此前全由 packet 那次调用按主题编，再对齐我们自己渲出来的图，跟原片没有任何关系。",
+          "x-binding": "beats_to_dimensions（键收短成 placement）→ _outline_normalized_entries → build_outline_plan_block 的 PLACEMENT 规则；并由 observed_camera_angle_packet_rule 约束 packet 里的 z_depth_scale 与地平线钉位。"
+        },
+        "time_treatment": {
+          "type": "string",
+          "enum": ["timelapse", "real_time", "slow_motion"],
+          "description": "这一拍的时间处理。按本拍窗口内人与物料的移动速度读，不是按全片的 speed_multiplier。这类片子的最后一拍成品巡览几乎都是实时的，而它周围每一拍都是延时——此前所有拍一律被写成 \"continuous construction time-lapse\"，于是一段从容的成品巡览被交付成一条发疯的快放。"
+        },
+        "worker_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 12,
+          "description": "本拍画面里的人数。workers_present 只是个布尔，且它压根没进 beats_to_dimensions（纯核对用），十几拍下来人数会自己漂。0 表示清场帧，与 workers_present=false 同义。"
+        },
+        "light_state": {
+          "type": "string",
+          "description": "本拍的光照与时段（\"overcast midday, no cast shadows\"、\"low golden side light from frame left\"）。延时片跨天跨时段，不逐拍声明就每拍随机跳光。"
+        },
+        "material_flow": {
+          "type": "string",
+          "description": "本拍的物料收支：挖出来的土去哪了、耗掉的料从哪来（\"excavated soil piled on the trench's north lip\"）。_PASS_B_SYSTEM 的 Material & Spoil Balance 规则一直要求交代它，但没有字段承接，只能挤进 visible_result 或干脆丢掉。"
+        },
+        "confidence": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "description": "Pass A 帧事实置信度在本拍上的聚合。低于 0.5 的拍在 review_beats 里高亮待人工核对。"
+        }
+      }
+    }
+  }
+}

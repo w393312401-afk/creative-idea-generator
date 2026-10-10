@@ -15,7 +15,7 @@ from prompt_pipeline import (
     check_camera_contradictions,
     check_colon_label_style,
     check_image_static_state,
-    check_pbisp_peek,
+    check_closed_entry_before_crossing,
     check_shot_family_leakage,
     fix_primary_landmarks,
     fix_sound_design,
@@ -148,35 +148,68 @@ class TestNegativeExampleIsCaught(unittest.TestCase):
         self.assertEqual(check_image_static_state(
             "Two brass sconces are mounted on the walls, fully installed and glowing."), [])
 
-    def test_pbisp_peek_flagged(self):
-        packet_with_interior = dict(PACKET, interior_primary_landmarks=[
-            {'name': 'heartwood ridge', 'grid': 'Grid B2', 'z_depth_scale': '60%'},
-        ])
-        # 实际产出的桥前帧（图4）没有透过开口预览室内锚点
-        errs = check_pbisp_peek(IMAGES[4]['body'], packet_with_interior)
-        self.assertTrue(any('heartwood ridge' in e for e in errs))
-        self.assertEqual(check_pbisp_peek(
-            "Through the open trunk base, the heartwood ridge is already visible and sharp.",
-            packet_with_interior), [])
+    def test_open_peeking_pre_crossing_image_flagged(self):
+        """TBCP v7：过门前一帧必须闭门。旧规则要的恰好相反（透过开口预览室内锚点），
+        实测下来那块低分辨率的猜测室内正是 i2v 过门后换世界的来源。"""
+        # 旧 PBISP 范文原句：既没有闭门声明，又明说了 peek。
+        peeking = ("Through the open doorway in Grid B2 the camera sneak-peeks the heartwood "
+                   "ridge, already sharp at about one-fifth of frame height.")
+        errs = check_closed_entry_before_crossing(peeking, PACKET)
+        self.assertTrue(any('previews the interior' in e for e in errs))
+        self.assertTrue(any('must state that the entry is CLOSED' in e for e in errs))
+        # 门被写成开着的（即使没用 peek 措辞）同样命中——缺闭门声明这条是兜底。
+        open_door = ("The plank entry door stands open in Grid B2 while the worker finishes the "
+                     "step below it.")
+        self.assertTrue(any('must state that the entry is CLOSED' in e
+                            for e in check_closed_entry_before_crossing(open_door, PACKET)))
 
-    def test_pbisp_peek_video_side_flagged_as_structural(self):
-        # 2026-07-22 森林瞭望塔实测单：图片3有门内预告室内锚点，视频2全篇没提，
-        # 造成视频末尾跟静态末帧对不上（"结尾跳变"）。label='VIDEO' 让同一条
-        # 检查也能查视频文本，且命中的错误文案要落进结构性硬伤标记表以触发回炉。
-        from prompt_pipeline import check_pbisp_peek, _STRUCTURAL_VIDEO_ERROR_MARKERS
-        packet_with_interior = dict(PACKET, interior_primary_landmarks=[
-            {'name': 'heartwood ridge', 'grid': 'Grid B2', 'z_depth_scale': '60%'},
-        ])
-        video_missing_peek = (
+    def test_closed_entry_pre_crossing_image_passes(self):
+        sealed = ("The weathered plank door in Grid B2 is shut tight in its frame, its boards "
+                  "swollen and streaked with rust; nothing of the hollow inside reads through it.")
+        self.assertEqual(check_closed_entry_before_crossing(sealed, PACKET), [])
+
+    def test_leafless_carrier_satisfies_the_rule_with_darkness(self):
+        """没有门扇的毛坯洞口没法"关上"——等价合规形态是洞里一片不透光的黑。"""
+        dark = ("The raw entrance opening in the trunk base reads as flat unlit darkness, "
+                "showing nothing of what lies inside.")
+        self.assertEqual(check_closed_entry_before_crossing(dark, PACKET), [])
+
+    def test_negated_open_wording_is_not_a_violation(self):
+        """契约本身鼓励写澄清句；"门从不打开"不能被当成"门开着"。"""
+        negated = ("The plank door stays closed for the whole beat — it never swings open, and "
+                   "no part of the interior is visible.")
+        self.assertEqual(check_closed_entry_before_crossing(negated, PACKET), [])
+
+    def test_pre_crossing_video_that_opens_the_door_is_structural(self):
+        """过门前一拍的 VIDEO 末帧就是那张闭门帧：这一拍把门打开 = 和自己的末帧矛盾，
+        与旧 PBISP continuity 同一类交接断裂，必须进结构性硬伤表触发定向回炉。"""
+        from prompt_pipeline import _STRUCTURAL_VIDEO_ERROR_MARKERS
+        video_opens_it = (
             "Use the provided first frame and last frame as exact composition anchors. "
-            "The worker repairs the stairs and railings throughout the clip."
+            "The worker repairs the stairs, then the trunk door swings open to reveal the "
+            "heartwood ridge inside."
         )
-        errs = check_pbisp_peek(video_missing_peek, packet_with_interior, label='VIDEO')
-        self.assertTrue(any('heartwood ridge' in e for e in errs))
+        errs = check_closed_entry_before_crossing(video_opens_it, PACKET, label='VIDEO')
+        self.assertTrue(errs)
         self.assertTrue(any(any(m in e for m in _STRUCTURAL_VIDEO_ERROR_MARKERS) for e in errs))
-        self.assertEqual(check_pbisp_peek(
-            "Through the open trunk base, the heartwood ridge stays visible and sharp across the clip.",
-            packet_with_interior, label='VIDEO'), [])
+        sealed_video = (
+            "Use the provided first frame and last frame as exact composition anchors. "
+            "The worker repairs the stairs and railings throughout the clip; the plank door "
+            "stays shut behind them and nothing inside is revealed."
+        )
+        self.assertEqual(check_closed_entry_before_crossing(sealed_video, PACKET, label='VIDEO'), [])
+
+    def test_pre_crossing_video_need_not_mention_the_door_at_all(self):
+        """正面的闭门声明只对 IMAGE 强制：这一拍的 VIDEO 常在做门以外的室外工序，
+        不提那扇门本来就合规（末帧照样是闭门帧）。对它也强制，等于每单白烧一轮回炉。"""
+        off_door_video = (
+            "Use the provided first frame and last frame as exact composition anchors. "
+            "The worker rakes the gravel apron flat across the whole clip."
+        )
+        self.assertEqual(
+            check_closed_entry_before_crossing(off_door_video, PACKET, label='VIDEO'), [])
+        # 同一段正文放在 IMAGE 侧仍然要被打回——静态帧必须正面说明门是关着的
+        self.assertTrue(check_closed_entry_before_crossing(off_door_video, PACKET))
 
     def test_video_process_content_contract(self):
         # 2026-07-12 17:18 实测单：IMAGE 对是全画幅大变化，VIDEO 却空心
@@ -235,7 +268,8 @@ class TestNegativeExampleIsCaught(unittest.TestCase):
         fixed = fix_primary_landmarks(prompt, packet, family='interior')
         low = fixed.lower()
         self.assertEqual(low.count('locked anchors:') + low.count('locked landmarks:'), 1)
-        self.assertIn('holding 50 percent of frame height', fixed)
+        self.assertIn('rising to about half the frame height', fixed)
+        self.assertNotRegex(fixed, r'Grid [A-C][1-3]')
         # "Locked anchors are ..."（图1形状）同样被视作 stanza 收编
         ext = ("Static shot facing the oak trunk. Locked anchors are helical screw piles at the "
                "base of the trunk at Grid C2, gaping natural opening of the hollow trunk at Grid B2, "
@@ -252,18 +286,29 @@ class TestNegativeExampleIsCaught(unittest.TestCase):
         }
         ext_fixed = fix_primary_landmarks(ext, ext_packet, family='exterior')
         self.assertEqual(ext_fixed.lower().count('locked anchors'), 1)
-        self.assertIn('holding 15 percent of frame height', ext_fixed)
+        self.assertIn('rising to about a sixth of the frame height', ext_fixed)
+        self.assertNotRegex(ext_fixed, r'Grid [A-C][1-3]')
 
     def test_state_delta_label_flagged(self):
         errs = check_colon_label_style("State delta: brass branch LED sconces are mounted in Grid B1.")
         self.assertTrue(errs)
 
     def test_out_and_in_no_double_entry_and_clean_grammar(self):
-        from prompt_pipeline import fix_out_and_in
-        # 实测单视频3形状：body 已有 enters/exits，旧检测词组太窄又贴了第二份进出模板
+        from prompt_pipeline import fix_out_and_in, check_out_and_in
+        # 净帧策略：写手自己写的进出画一律留着，不再补第二句（幂等）。
         body = ("A worker in a yellow vest enters, builds a timber frame, and exits. "
                 "Nails and conduits remain.")
-        self.assertEqual(fix_out_and_in(body, False, beat=None, packet=None), body)
+        migrated = fix_out_and_in(body, False, beat=None, packet=None)
+        self.assertEqual(migrated, body, '已经写全进出画的正文不该被再追加一句')
+        # 旧策略那句「0 秒已在工位」跟空的首帧锚点冲突，要被洗掉并换成入画/出画。
+        legacy = ("At t=0s, one lone worker is already positioned at the active work face. "
+                  "The worker hammers beams into place.")
+        rewritten = fix_out_and_in(legacy, False, beat=None, packet=None)
+        self.assertNotIn('already positioned at the active work face', rewritten)
+        self.assertIn('enters from off-frame', rewritten)
+        self.assertIn('withdraws fully out of frame', rewritten)
+        self.assertEqual(check_out_and_in(rewritten), [])
+        self.assertEqual(fix_out_and_in(rewritten, False, beat=None, packet=None), rewritten)
         # 被动语态的拍描述不能拼进 'cycles of'（实测单曾产出破碎语法+双逗号）
         beat = {'operation': 'framing', 'description':
                 'An independent internal timber framing structure and floor platform are erected inside the cavity.'}
@@ -277,6 +322,24 @@ class TestNegativeExampleIsCaught(unittest.TestCase):
         # 服装截断落在词边界，不再出现 "solid dark enters"
         self.assertNotIn('solid dark enters', out)
 
+    def test_worker_boundary_choreography_is_required(self):
+        """这条判据 2026-08-31 整个翻了向：首尾锚点帧都是空的，进出画是唯一正确的写法。"""
+        from prompt_pipeline import check_out_and_in
+        boundary = ('The opening frame is empty of people; one lone worker enters the frame, '
+                    'makes the first effective tool contact immediately, hammers the wall, and '
+                    'exits before the final frame.')
+        self.assertEqual(check_out_and_in(boundary), [])
+        # 旧策略那句现在要被判：它跟空的首帧锚点冲突。
+        legacy = ('At t=0s, one lone worker is already positioned at the active work face and '
+                  'makes the first effective tool contact immediately, continuing through the final frame.')
+        errs = check_out_and_in(legacy)
+        self.assertTrue(any('enter from off-frame' in e for e in errs), errs)
+        self.assertTrue(any('step fully out of frame' in e for e in errs), errs)
+        # 材料进出画从来不是人物进出画，不能拿它顶替。
+        material_only = ('At t=0s, one lone worker is already positioned at the active work face. '
+                         'Rubble exits through a rigid chute into a skip outside.')
+        self.assertTrue(check_out_and_in(material_only))
+
     def test_out_and_in_injects_locked_worker_scale(self):
         from prompt_pipeline import fix_out_and_in
         beat = {'operation': 'framing', 'description': 'timber frame erected inside the cavity.'}
@@ -284,7 +347,9 @@ class TestNegativeExampleIsCaught(unittest.TestCase):
                   'worker_scale_percent': '18%'}
         out = fix_out_and_in('A lone worker hammers beams into place inside the cavity.',
                              False, beat=beat, packet=packet)
-        self.assertIn('standing roughly 18 percent of frame height', out)
+        # 2026-08-05：注入的比例改成分数散文（数字会被渲成画面上的文字）
+        self.assertIn('standing about a sixth of the frame height', out)
+        self.assertNotIn('18 percent', out)
         self.assertNotIn(',,', out)
         # No worker_scale_percent locked on the packet -> clause degrades gracefully, no
         # stray punctuation left behind where the clause would have been.
@@ -298,7 +363,8 @@ class TestNegativeExampleIsCaught(unittest.TestCase):
         from prompt_pipeline import fix_out_and_in
         packet = {'worker_scale_percent': '22%'}
         out = fix_out_and_in('Two workers assemble the frame together.', False, beat=None, packet=packet)
-        self.assertIn('each standing roughly 22 percent of frame height', out)
+        self.assertIn('each standing about a quarter of the frame height', out)
+        self.assertNotIn('22 percent', out)
         self.assertNotIn(',,', out)
 
     def test_sound_design_hum_hear_detected(self):
@@ -360,7 +426,8 @@ class TestNegativeExampleIsRepaired(unittest.TestCase):
         fixed = fix_primary_landmarks(IMAGES[4]['body'], PACKET, family='exterior')
         self.assertEqual(fixed.lower().count('locked anchors:'), 1)
         self.assertNotIn('55 percent', fixed)
-        self.assertIn('decaying trunk base opening at Grid C2 holding 35 percent of frame height', fixed)
+        self.assertIn('decaying trunk base opening across the lower centre of the frame, '
+                      'rising to about a third of the frame height', fixed)
 
     def test_bridge_image5_regains_camera(self):
         _, (v, img) = self._fixed_beat(4)

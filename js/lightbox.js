@@ -31,9 +31,17 @@ function initLightbox() {
     });
 }
 
-function openLightbox(items, index) {
-    lightboxItems = items;
-    lightboxActiveIndex = index;
+function openLightbox(items, index = 0) {
+    if (typeof items === 'string') {
+        lightboxItems = [{ type: 'image', url: items, caption: '' }];
+        lightboxActiveIndex = 0;
+    } else if (items && !Array.isArray(items)) {
+        lightboxItems = [items];
+        lightboxActiveIndex = 0;
+    } else {
+        lightboxItems = items || [];
+        lightboxActiveIndex = (typeof index === 'number' && index >= 0) ? index : 0;
+    }
 
     const modal = document.getElementById('lightbox-modal');
     if (!modal) return;
@@ -48,11 +56,13 @@ function closeLightbox() {
     const modal = document.getElementById('lightbox-modal');
     if (!modal) return;
     modal.style.display = 'none';
+    document.getElementById('lightbox-img')?.removeAttribute('src');
 
     const video = document.getElementById('lightbox-video');
     if (video) {
         video.pause();
-        video.src = '';
+        video.removeAttribute('src');
+        video.load();
     }
 
     document.removeEventListener('keydown', handleLightboxKeydown);
@@ -76,13 +86,15 @@ function updateLightboxContent() {
 
     if (item.type === 'video') {
         img.style.display = 'none';
+        img.removeAttribute('src');
         video.src = item.url;
         video.style.display = 'block';
         video.play().catch(err => console.log("Auto-play prevented", err));
     } else {
         video.style.display = 'none';
         video.pause();
-        video.src = '';
+        video.removeAttribute('src');
+        video.load();
         // 直接赋 src 会命中浏览器对这个 URL 的既有缓存，重试/修复原地覆盖同名
         // 帧文件后点开还是老图。safeSetImageSrc（media_renderer.js）按 URL 维护
         // 缓存版本号，重渲发生时该 URL 已被 bump 过，这里用 bust=false 直接

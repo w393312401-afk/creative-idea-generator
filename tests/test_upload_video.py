@@ -1,11 +1,10 @@
 """视频槽位手动上传接口 (/api/upload_video) 的行为契约。
 
 覆盖点：
-- 正常上传：首尾帧与该槽位期望的锚点图匹配时直接落盘、更新 manifest.videos，
+- 正常上传：直接落盘、更新 manifest.videos，
   并清掉过期的 merged_video（内容已变，旧合并成片不再准确）；已存在的旧文件
   会被新上传的内容覆盖。
-- 首尾帧不匹配的上传默认被 409 拒绝（anchor_mismatch，不写入磁盘/manifest）；
-  force=true 才允许强制覆盖——这是用户要求的"重试/上传的首尾帧必须对应上"契约。
+- 手动上传即使首尾帧不匹配也直接放行写入，不弹窗拦截或返回 409。
 - 上传内容统一经 ffmpeg 转码成 h264/yuv420p mp4，不依赖原始容器/编码。
 """
 import io
@@ -196,10 +195,10 @@ class TestUploadVideoAnchorMatch:
 
 
 class TestUploadVideoAnchorMismatch:
-    def test_mismatched_anchors_rejected_without_force(self, project, tmp_path, monkeypatch):
+    def test_mismatched_anchors_succeed_directly(self, project, tmp_path, monkeypatch):
         monkeypatch.setattr(server, '_get_project_dir', lambda title: project['dir'])
 
-        # 槽位 1 期望红→绿；这里传一段蓝→黄的视频，首尾都对不上。
+        # 槽位 1 期望红→绿；这里传一段蓝→黄的视频，首尾都对不上，也应直接成功写入并返回 200。
         clip = _make_two_tone_video(str(tmp_path / 'mismatch.mp4'), '0x0000ff', '0xffff00')
         h, sent = _upload_handler(
             {'title': 'upload_video_test', 'slot': '1', 'prompt_block': _PROMPT_BLOCK},
@@ -209,33 +208,18 @@ class TestUploadVideoAnchorMismatch:
 
         assert len(sent) == 1
         body, status = sent[0]
-        assert status == 409
-        assert body['status'] == 'anchor_mismatch'
-        assert 'anchor_check' in body
+        assert status == 200, body
+        assert body['status'] == 'ok'
+        assert body['video']['slot'] == 1
+        assert 'anchor_check' in body['video']
 
         dest = os.path.join(project['videos_dir'], 'vid_001.mp4')
-        assert not os.path.exists(dest)
+        assert os.path.exists(dest)
 
         with open(os.path.join(project['dir'], 'manifest.json'), encoding='utf-8') as f:
             mdata = json.load(f)
-        assert mdata['videos'] == []
-
-    def test_force_flag_overrides_anchor_mismatch(self, project, tmp_path, monkeypatch):
-        monkeypatch.setattr(server, '_get_project_dir', lambda title: project['dir'])
-
-        clip = _make_two_tone_video(str(tmp_path / 'mismatch2.mp4'), '0x0000ff', '0xffff00')
-        h, sent = _upload_handler(
-            {'title': 'upload_video_test', 'slot': '1', 'prompt_block': _PROMPT_BLOCK, 'force': 'true'},
-            _read_bytes(clip),
-        )
-        server.SparkRequestHandler.do_POST(h)
-
-        assert len(sent) == 1
-        body, status = sent[0]
-        assert status == 200, body
-        assert body['video']['slot'] == 1
-        dest = os.path.join(project['videos_dir'], 'vid_001.mp4')
-        assert os.path.exists(dest)
+        assert len(mdata['videos']) == 1
+        assert mdata['videos'][0]['slot'] == 1
 
 
 class TestUploadVideoValidation:
@@ -314,3 +298,50 @@ class TestUploadVideoHeroMetaPropagation:
             "merge_project_videos 靠 meta 里的 HERO 标记识别英雄片段；"
             "没有旧 manifest 记录时必须落回 prompt_block 解析结果，否则会被合成阶段静默忽略"
         )
+
+
+class TestManualUploadMergeRecognition:
+    """测试手动上传的视频（尤其是 slot >= len(frames) 的末尾槽位，如 12 帧项目上传了 VID 12）
+    在合成视频 (merge_project_videos) 时能被正确识别并完整并入成片。"""
+
+    def test_manual_upload_at_last_slot_is_merged(self, project, tmp_path, monkeypatch):
+        from video_generator import merge_project_videos
+
+        monkeypatch.setattr(server, '_get_project_dir', lambda title: project['dir'])
+
+        # 构造 12 个 frames 和前 11 段视频
+        frames = []
+        for i in range(1, 13):
+            f_path = os.path.join(project['frames_dir'], f'frame_{i:03d}.png')
+            _make_frame(f_path, (i * 15 % 255, 100, 100))
+            frames.append({'slot': i, 'file': f'frames/frame_{i:03d}.png', 'status': 'success'})
+
+        videos = []
+        for i in range(1, 12):
+            v_path = os.path.join(project['videos_dir'], f'vid_{i:03d}.mp4')
+            _make_two_tone_video(v_path, '0xff0000', '0x00ff00')
+            videos.append({'slot': i, 'file': f'videos/vid_{i:03d}.mp4', 'status': 'success'})
+
+        with open(os.path.join(project['dir'], 'manifest.json'), 'w', encoding='utf-8') as f:
+            json.dump({'title': 'upload_video_test', 'frames': frames, 'videos': videos}, f)
+
+        # 手动上传第 12 段视频 (slot=12, 即 VID 012)
+        clip12 = _make_two_tone_video(str(tmp_path / 'clip12.mp4'), '0x0000ff', '0xffff00')
+        h, sent = _upload_handler(
+            {'title': 'upload_video_test', 'slot': '12'},
+            _read_bytes(clip12),
+        )
+        server.SparkRequestHandler.do_POST(h)
+        assert sent[0][1] == 200
+
+        # 执行合并视频
+        result = merge_project_videos(project['dir'], speed=2.0)
+        assert result is not None
+        assert result['status'] == 'success'
+
+        # 检查 concat 列表，确保 vid_012.mp4 被包含进来了
+        with open(os.path.join(project['dir'], 'manifest.json'), encoding='utf-8') as f:
+            mdata = json.load(f)
+        assert len(mdata['videos']) == 12
+        assert any(v['slot'] == 12 and v['source'] == 'manual_upload' for v in mdata['videos'])
+

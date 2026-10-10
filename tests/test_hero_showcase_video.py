@@ -1,4 +1,4 @@
-"""英雄展示视频（默认收尾步骤，2026-07-22，2026-07-23 改为只上传首帧）：帧序列生成
+"""英雄展示视频（收尾步骤，2026-07-22，2026-07-23 改为只上传首帧）：帧序列生成
 完毕后，额外用最后一张整体完工图作为唯一来源锚点（只作首帧，不设结束锚点），生成
 一条手持展示视频提示词（视频 total_beats+1 [HERO]），并接入实际的视频生成/合成
 管线。三层覆盖：
@@ -9,6 +9,13 @@
    "下一张"结束帧（end_frame 为 None），且不应触发"首尾近乎相同"的误报警告。
 3. video_generator.merge_project_videos —— HERO 片段是可选附加片段，不参与主体序列
    的完整性门禁；成功时追加在成片末尾，失败/缺失时静默跳过、不阻塞主体合并。
+
+2026-07-31：`_HERO_SHOWCASE_ENABLED` 默认改为 False（收尾不再连放两条完工镜头，
+见 docs/plans/pacing_rhythm_balance_plan.md §7）。第 1 层的用例因此显式把开关打开再跑——
+它们锁的是「开关打开时这条管线仍然完好」，这正是选择关开关而不是删代码的前提；
+关闭态本身由 TestHeroShowcaseDisabledByDefault 单独锁。第 2、3 层是纯下游逻辑，
+不读这个开关（存量项目的 manifest 里还有 HERO 槽位，且手动上传路径仍需可用），
+所以保持原样运行。
 """
 import json
 import os
@@ -16,6 +23,7 @@ import re
 import shutil
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from PIL import Image
@@ -23,12 +31,22 @@ from PIL import Image
 import prompt_pipeline as pp
 from video_generator import plan_video_slots, merge_project_videos, PartialMergeBlocked
 
+# 导入期快照：下面的用例会 patch 这个常量，快照让「仓库默认值」这条锁不受 patch 影响。
+_HERO_ENABLED_DEFAULT = pp._HERO_SHOWCASE_ENABLED
+
 
 # ─────────────────────────────────────────────────────────────────────────
 # 1. prompt_pipeline: 提示词生成本身
 # ─────────────────────────────────────────────────────────────────────────
 
-class TestComposeHeroShowcaseVideo(unittest.TestCase):
+class _HeroComposeFixture:
+    """开关两态共用的夹具（不是 TestCase，所以不会把用例也继承过去）。
+
+    子类用 HERO_ENABLED 声明自己要跑在哪一态上。
+    """
+
+    HERO_ENABLED = True
+
     def setUp(self):
         self._tmp_dir = tempfile.mkdtemp()
         self._path_patch = patch.object(pp, 'COMPOSE_CHECKPOINT_PATH', os.path.join(self._tmp_dir, 'compose_checkpoints.json'))
@@ -36,6 +54,7 @@ class TestComposeHeroShowcaseVideo(unittest.TestCase):
         self.fingerprint = 'fp-hero-showcase-test'
 
         patches = [
+            patch.object(pp, '_HERO_SHOWCASE_ENABLED', self.HERO_ENABLED),
             patch.object(pp, 'load_reference_file', return_value=''),
             patch.object(pp, 'get_cropped_templates', return_value=''),
             patch.object(pp, 'apply_proactive_fixes', side_effect=lambda i, v, im, *a, **k: (v, im)),
@@ -94,6 +113,13 @@ class TestComposeHeroShowcaseVideo(unittest.TestCase):
             )
         return fake_chat
 
+
+class TestComposeHeroShowcaseVideo(_HeroComposeFixture, unittest.TestCase):
+    """开关打开时的行为。锁的是「HERO 管线本身没被拆掉」——这正是 2026-07-31
+    选择关开关而不是删代码的前提（存量项目的 manifest 里还有 HERO 槽位）。"""
+
+    HERO_ENABLED = True
+
     def test_hero_video_appended_after_normal_beats_succeed(self):
         state = self._make_state(total_beats=3)
         calls = []
@@ -134,6 +160,40 @@ class TestComposeHeroShowcaseVideo(unittest.TestCase):
         self.assertNotIn('[HERO]', output)
         self.assertIn('视频 3:', output)  # 主体序列照常交付
         self.assertIsNone(pp.load_compose_checkpoint(self.fingerprint))
+
+
+class TestHeroShowcaseDisabledByDefault(_HeroComposeFixture, unittest.TestCase):
+    """关闭态（2026-07-31 起的默认）：收尾不再追加第二条完工镜头。
+
+    整个 HERO 步骤——包括那次 LLM 调用——都必须消失，主体序列则完全不受影响。
+    """
+
+    HERO_ENABLED = False
+
+    def test_default_is_disabled(self):
+        # 读的是导入期快照，不是 setUp 里 patch 过的值——这条锁的是仓库里的默认值本身。
+        self.assertFalse(
+            _HERO_ENABLED_DEFAULT,
+            "英雄展示视频应默认关闭（docs/plans/pacing_rhythm_balance_plan.md §7）")
+
+    def test_no_hero_slot_and_no_llm_call_when_disabled(self):
+        state = self._make_state(total_beats=3)
+        calls = []
+        with patch.object(pp, '_chat', side_effect=self._fake_chat(calls)):
+            output = pp.compose_remaining_beats({}, state)
+
+        self.assertNotIn('hero', calls, "关闭时不应再为 HERO 发起 LLM 调用")
+        self.assertNotIn('[HERO]', output)
+        self.assertNotIn('视频 4', output, "视频槽位应止于 reward 拍（视频 3）")
+        # 主体序列与最终揭示图照常交付
+        self.assertIn('视频 3:', output)
+        self.assertIn('图片 4:', output)
+
+    def test_compose_hero_returns_empty_without_touching_state(self):
+        state = self._make_state(total_beats=3)
+        state['compiled_images'][4] = 'IMAGE 4 finished reveal'
+        with patch.object(pp, '_chat', side_effect=AssertionError('不应被调用')):
+            self.assertEqual(pp._compose_hero_showcase_video({}, state), '')
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -207,6 +267,14 @@ class TestPlanVideoSlotsHero(_TmpDirCase):
 # ─────────────────────────────────────────────────────────────────────────
 
 class TestMergeHeroClip(_TmpDirCase):
+    def setUp(self):
+        super().setUp()
+        # This fixture checks HERO selection and ordering, not internal retiming.
+        retime = patch('video_generator.retime_clips_for_merge',
+                       side_effect=lambda files, tmp, metas=None: (list(files), []))
+        retime.start()
+        self.addCleanup(retime.stop)
+
     def _write_manifest(self, frames_n, videos_entries, title='Hero Merge Test'):
         frames = []
         for i in range(1, frames_n + 1):
@@ -218,24 +286,27 @@ class TestMergeHeroClip(_TmpDirCase):
         with open(os.path.join(self.tmp, 'manifest.json'), 'w', encoding='utf-8') as f:
             json.dump(manifest, f)
 
-    def _fake_run_factory(self, captured):
+    def _fake_run_factory(self, captured, output_duration):
         def fake_run(cmd, cwd=None, **kwargs):
             captured.setdefault('calls', []).append(cmd)
             if cmd[0] == 'ffprobe':
-                class Probe:
-                    returncode = 0
-                    stderr = ''
-                    stdout = '5.0'
-                return Probe()
-            # ffmpeg concat merge: capture the concat list content before it's deleted
-            i_idx = cmd.index('-i')
-            concat_list_path = cmd[i_idx + 1]
-            with open(concat_list_path, 'r', encoding='utf-8') as f:
-                captured['concat_list'] = f.read()
+                if '-select_streams' in cmd and cmd[cmd.index('-select_streams') + 1].startswith('a'):
+                    stdout = json.dumps({'streams': []}) if 'json' in cmd else ''
+                else:
+                    duration = output_duration if cmd[-1] == captured.get('output_path') else 8.0
+                    stdout = json.dumps({
+                        'streams': [{'codec_type': 'video', 'width': 1080, 'height': 1920,
+                                     'r_frame_rate': '30/1', 'avg_frame_rate': '30/1',
+                                     'duration': str(duration)}],
+                        'format': {'duration': str(duration)},
+                    })
+                return SimpleNamespace(returncode=0, stderr='', stdout=stdout)
+            captured['inputs'] = [cmd[i + 1] for i, value in enumerate(cmd) if value == '-i']
             out_path = cmd[-1]
             os.makedirs(os.path.dirname(out_path) or '.', exist_ok=True)
             with open(out_path, 'wb') as f:
                 f.write(b'fake-merged-mp4')
+            captured['output_path'] = out_path
 
             class Ok:
                 returncode = 0
@@ -254,16 +325,15 @@ class TestMergeHeroClip(_TmpDirCase):
              'meta': 'HERO', 'is_hero': True},
         ])
         captured = {}
-        with patch('video_generator.subprocess.run', side_effect=self._fake_run_factory(captured)):
+        with patch('video_generator.subprocess.run',
+                   side_effect=self._fake_run_factory(captured, output_duration=6.0)):
             result = merge_project_videos(self.tmp)
 
         self.assertIsNotNone(result)
         self.assertEqual(result['status'], 'success')
-        concat_lines = [l for l in captured['concat_list'].splitlines() if l.strip()]
-        self.assertEqual(len(concat_lines), 3)
-        self.assertIn(os.path.basename(vid_hero), concat_lines[-1],
-                      "英雄片段必须排在拼接列表的最后一位")
-        self.assertNotIn(os.path.basename(vid1), concat_lines[-1])
+        self.assertEqual(captured['inputs'], [vid1, vid2, vid_hero],
+                         "英雄片段必须排在拼接列表的最后一位")
+        self.assertEqual(result['duration_seconds'], 6.0)
 
     def test_failed_hero_clip_is_skipped_without_blocking_main_merge(self):
         self._touch(os.path.join(self.videos_dir, 'vid_001.mp4'))
@@ -275,13 +345,15 @@ class TestMergeHeroClip(_TmpDirCase):
              'meta': 'HERO', 'is_hero': True},
         ])
         captured = {}
-        with patch('video_generator.subprocess.run', side_effect=self._fake_run_factory(captured)):
+        with patch('video_generator.subprocess.run',
+                   side_effect=self._fake_run_factory(captured, output_duration=4.0)):
             result = merge_project_videos(self.tmp)  # must not raise PartialMergeBlocked
 
         self.assertIsNotNone(result)
         self.assertEqual(result['status'], 'success')
-        concat_lines = [l for l in captured['concat_list'].splitlines() if l.strip()]
-        self.assertEqual(len(concat_lines), 2, "失败的英雄片段不应计入拼接列表")
+        self.assertEqual(captured['inputs'], [os.path.join(self.videos_dir, f'vid_{slot:03d}.mp4')
+                                              for slot in (1, 2)],
+                         "失败的英雄片段不应计入拼接列表")
 
     def test_missing_hero_entry_behaves_exactly_like_before_the_feature(self):
         self._touch(os.path.join(self.videos_dir, 'vid_001.mp4'))
@@ -291,13 +363,14 @@ class TestMergeHeroClip(_TmpDirCase):
             {'slot': 2, 'status': 'success', 'file': 'videos/vid_002.mp4', 'start_anchor_slot': 2},
         ])
         captured = {}
-        with patch('video_generator.subprocess.run', side_effect=self._fake_run_factory(captured)):
+        with patch('video_generator.subprocess.run',
+                   side_effect=self._fake_run_factory(captured, output_duration=4.0)):
             result = merge_project_videos(self.tmp)
 
         self.assertIsNotNone(result)
         self.assertEqual(result['status'], 'success')
-        concat_lines = [l for l in captured['concat_list'].splitlines() if l.strip()]
-        self.assertEqual(len(concat_lines), 2)
+        self.assertEqual(captured['inputs'], [os.path.join(self.videos_dir, f'vid_{slot:03d}.mp4')
+                                              for slot in (1, 2)])
 
 
 if __name__ == '__main__':

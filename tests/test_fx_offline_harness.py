@@ -69,6 +69,52 @@ def test_selector_probe_marks_conditional_families_as_not_broken():
     assert all(row['family'] != 'prompt_input' for row in conditional)
 
 
+def test_selector_probe_does_not_fail_idle_page_for_dialog_only_controls():
+    """配置面板/落地页等只在别的页面状态存在的族，缺失不应让 L1 静止页自检失败。"""
+    probe = probe_selectors(FakePage())
+    contextual = {
+        row['family']: row['state'] for row in probe['families']
+        if row['family'] in {'config_panel_root', 'flow_entry_btn', 'credit_display'}
+    }
+    assert contextual == {
+        'config_panel_root': 'conditional',
+        'flow_entry_btn': 'conditional',
+        'credit_display': 'conditional',
+    }
+    assert probe['summary']['missing'] == 0
+
+
+def test_add_media_family_does_not_fall_back_to_config_button():
+    """页面没有上传入口时，add_media_btn 必须报 missing，不能误中底部配置按钮
+    （同为 aria-haspopup='dialog'）——误中会让上传流程去点模型/比例面板。"""
+    probe = probe_selectors(FakePage(flow_page_html(add_media_button=False)))
+    add_media = next(row for row in probe['families'] if row['family'] == 'add_media_btn')
+    assert add_media['state'] == 'missing'
+
+
+def test_probed_families_are_all_consumed_by_production_code():
+    """探针只该探生产代码真读的族。
+
+    历史上 UI_SELECTORS 攒了一堆没有任何消费者的族（旧上传路径、旧错误横幅、
+    甚至几张被当成选择器探测的文本关键词表），探针把它们一并报成"失效"，把
+    面板变成了噪音。这条用例把"字典里的族"和"代码里读的族"钉在一起，防止再漂。
+    """
+    import re
+    from pathlib import Path
+    from integrations.google_fx.ui_selectors import UI_SELECTORS
+    from integrations.google_fx.services.google_fx_diagnostics import _NON_SELECTOR_FAMILIES
+
+    root = Path(__file__).resolve().parent.parent / 'integrations' / 'google_fx'
+    sources = [p for p in root.rglob('*.py')
+               if p.name not in {'ui_selectors.py', 'google_fx_diagnostics.py'}]
+    blob = '\n'.join(p.read_text(encoding='utf-8', errors='ignore') for p in sources)
+
+    probed = [f for f, v in UI_SELECTORS['google_fx'].items()
+              if isinstance(v, (list, tuple)) and f not in _NON_SELECTOR_FAMILIES]
+    orphans = [f for f in probed if not re.search(r'\b%s\b' % re.escape(f), blob)]
+    assert not orphans, f'这些族没有任何生产消费者，应该删掉或接上：{orphans}'
+
+
 # ── D2：失败取证 ─────────────────────────────────────────────────────────────
 
 def test_capture_writes_screenshot_dom_and_meta(tmp_path, monkeypatch):
@@ -116,6 +162,20 @@ def test_capture_prunes_old_buckets(tmp_path, monkeypatch):
     assert len(os.listdir(tmp_path / 'fx_debug')) <= 2
 
 
+def test_clear_captures_removes_all_directories(tmp_path, monkeypatch):
+    debug_dir = tmp_path / 'fx_debug'
+    monkeypatch.setattr(forensics, 'DEBUG_ROOT', debug_dir)
+    forensics.capture(FakePage(), 'cap1', '', bucket='task_1')
+    forensics.capture(FakePage(), 'cap2', '', bucket='task_2')
+    assert len(forensics.list_captures()) == 2
+    assert len(os.listdir(debug_dir)) == 2
+
+    cleared = forensics.clear_captures()
+    assert cleared == 2
+    assert len(forensics.list_captures()) == 0
+    assert len(os.listdir(debug_dir)) == 0
+
+
 # ── D6：dry-run 不提交 ───────────────────────────────────────────────────────
 
 def test_dry_run_short_circuits_the_single_submit_choke_point(monkeypatch):
@@ -156,7 +216,7 @@ def test_account_pool_retries_rate_limited_pages(monkeypatch):
     assert len(rows) == 3, '限频是瞬时状态，退避重试后应拿到完整结果'
 
 
-def test_get_ads_ws_url_fails_fast_on_dead_debug_port(monkeypatch):
+def test_get_ads_ws_url_fails_fast_on_dead_debug_port(monkeypatch, ads_inventory_reader):
     """AdsPower 说"启动成功"但调试端口没起来：必须报错，不能返回一个连不上的 ws。"""
     from integrations.google_fx.utils import browser
     monkeypatch.setattr(browser.time, 'sleep', lambda _s: None)

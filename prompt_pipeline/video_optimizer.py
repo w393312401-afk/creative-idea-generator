@@ -1,0 +1,626 @@
+"""Video Prompt Visual Delta Optimization Gate (视频生成前画面差量提示词优化门).
+
+根据真实渲染落盘的帧序列画面（IMAGE i 与 IMAGE i+1），通过多模态 VLM 进行全域四区差量扫描
+（顶域、中域、底域、物料与废料流向），结合动作-工具-音效三位一体与公制尺度守恒，优化并重写视频提示词
+（VIDEO i），彻底消除 I2V 生成过程中的画面跳变、突变、凭空变化与空心定格。
+"""
+import hashlib
+import json
+import os
+import re
+import sys
+from datetime import datetime
+
+import server_common
+
+
+def _find_frame_file(project_dir, sequence):
+    """查找指定序号的帧图片文件路径（优先 .webp，其次 .png / .jpg / .jpeg）。"""
+    frames_dir = os.path.join(project_dir, 'frames')
+    if not os.path.isdir(frames_dir):
+        return None
+    for ext in ('.webp', '.png', '.jpg', '.jpeg'):
+        p = os.path.join(frames_dir, f'img_{sequence:03d}{ext}')
+        if os.path.exists(p):
+            return p
+    return None
+
+
+def _get_file_fingerprint(file_path):
+    """计算单个帧文件的快速内容指纹（MD5 + 文件大小）。"""
+    if not file_path or not os.path.isfile(file_path):
+        return None
+    try:
+        stat = os.stat(file_path)
+        h = hashlib.md5()
+        with open(file_path, 'rb') as f:
+            while chunk := f.read(65536):
+                h.update(chunk)
+        return f"{stat.st_size}:{h.hexdigest()}"
+    except Exception:
+        try:
+            stat = os.stat(file_path)
+            return f"{stat.st_size}:{stat.st_mtime_ns}"
+        except Exception:
+            return None
+
+
+def _get_slot_delta_fingerprint(start_path, end_path, video_meta=None, spatial_contract=None,
+                                frame_anchors=None):
+    """计算槽位差量优化的环境指纹。当起止帧内容或元数据变化时，指纹改变。"""
+    fp_start = _get_file_fingerprint(start_path)
+    fp_end = _get_file_fingerprint(end_path)
+    if not fp_start or not fp_end:
+        return None
+    meta_str = str(video_meta or '').upper().strip()
+    contract_str = ""
+    if isinstance(spatial_contract, dict) and spatial_contract:
+        dim = spatial_contract.get('carrier_envelope', {})
+        if dim:
+            contract_str = json.dumps(dim, sort_keys=True)
+    fingerprint = f"s:{fp_start}|e:{fp_end}|m:{meta_str}|c:{contract_str}"
+    if frame_anchors is not None:
+        # Different numbered anchors can have identical image bytes. The cached
+        # prompt still names those anchors, so automatic pairing must compare IDs.
+        fingerprint += f"|a:{frame_anchors[0]}>{frame_anchors[1]}"
+    return fingerprint
+
+
+def _normalize_optimized_frame_anchors(prompt, start_seq, end_seq):
+    """Keep auto-resolved anchors explicit after the VLM rewrites a video's body."""
+    ref = r'(?:IMAGE|IMG|FRAME|图片|图像|画面)\s*\d+'
+    role = r'as\s+(?:the\s+)?(?:actual\s+)?(?:first|last|starting|ending)[- ]frame(?:\s+image)?'
+    body = str(prompt or '').strip()
+    statements = (
+        r'Use\s+the\s+provided\s+first\s+frame\s+and\s+last\s+frame\s+as\s+exact\s+composition\s+anchors[.]?',
+        r'Use\s+the\s+provided\s+image\s+as\s+the\s+exact\s+starting\s+composition\s+and\s+environment\s+anchor[.]?',
+        rf'(?:Use\s+(?:the\s+provided\s+)?)?{ref}\s+{role}(?:\s+and\s+{ref}\s+{role})?[.]?',
+        rf'(?:使用|以)?\s*{ref}\s*(?:作为|为)?\s*(?:起始|首|第一|结束|尾|最后)[- ]?帧',
+        rf'{ref}\s*(?:->|→|—>|-->|至|到)\s*{ref}',
+        # A stray single-frame declaration would win over the new pair in the
+        # anchor parser. Remove its role phrase without deleting nearby actions.
+        r'sole\s+starting[- ]frame(?:\s+anchor)?',
+    )
+    for statement in statements:
+        body = re.sub(statement, '', body, flags=re.IGNORECASE)
+    body = re.sub(r'[ \t]{2,}', ' ', body).lstrip(' .;,。；，').rstrip()
+    opening = (
+        "Use the provided first frame and last frame as exact composition anchors. "
+        f"Use IMAGE {start_seq} as the actual first-frame image and IMAGE {end_seq} "
+        "as the actual last-frame image."
+    )
+    return f"{opening} {body}".strip()
+
+
+def _persist_optimization_results(project_dir, title, prompt_block, optimizations,
+                                  original_prompt_block=None, target_slots=None):
+    """原子持久化优化结果至 manifest.json 和 .stepped_pipeline.json。"""
+    try:
+        from prompt_pipeline import prompt_slots_list, _parse_prompt_slots, _format_prompt_block
+        with server_common.manifest_lock(project_dir):
+            cur_manifest = server_common.read_manifest(project_dir) or {'title': title, 'frames': []}
+            if original_prompt_block is not None and cur_manifest.get('prompt_block'):
+                # Images keep rendering while the video VLM is busy. Commit only
+                # the selected video edits whose source prompt is still current.
+                images, current_videos = _parse_prompt_slots(cur_manifest['prompt_block'])
+                _, previous_videos = _parse_prompt_slots(original_prompt_block)
+                _, optimized_videos = _parse_prompt_slots(prompt_block)
+                records = dict(cur_manifest.get('video_prompt_optimizations') or {})
+                for slot in (target_slots or []):
+                    if slot not in optimized_videos or current_videos.get(slot) not in (
+                            previous_videos.get(slot), optimized_videos.get(slot)):
+                        continue
+                    current_videos[slot] = optimized_videos[slot]
+                    record = optimizations.get(str(slot)) or optimizations.get(slot)
+                    if record is not None:
+                        records[str(slot)] = record
+                prompt_block = _format_prompt_block(images, current_videos)
+                optimizations = records
+            cur_manifest['prompt_block'] = prompt_block
+            cur_manifest['prompt_slots'] = prompt_slots_list(prompt_block)
+            cur_manifest['video_prompt_optimizations'] = optimizations
+            server_common.write_manifest(project_dir, cur_manifest)
+    except Exception as e:
+        if sys.stdout:
+            print(f"[VIDEO OPTIMIZER] Warning: failed to persist updated prompt_block to manifest: {e}")
+
+    try:
+        stepped_state_path = os.path.join(project_dir, '.stepped_pipeline.json')
+        if os.path.exists(stepped_state_path):
+            with open(stepped_state_path, 'r', encoding='utf-8') as f:
+                st_state = json.load(f)
+            if isinstance(st_state, dict):
+                st_state['prompt_block'] = prompt_block
+                st_state['video_prompt_optimizations'] = optimizations
+                st_state['updated_at'] = datetime.now().isoformat()
+                with open(stepped_state_path, 'w', encoding='utf-8') as f:
+                    json.dump(st_state, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        if sys.stdout:
+            print(f"[VIDEO OPTIMIZER] Warning: failed to sync stepped state: {e}")
+    return prompt_block
+
+
+def resolve_optimizer_profile(config, manifest_data=None):
+    """这一趟视频提示词优化该按哪个题材 profile 跑。
+
+    2026-08-30 修：此前这里读的是 `manifest['profile'] or config['profile']`——**两个键
+    全仓库没有任何写入方**（前端与 server_config.json 用的都是 `skillProfile`，解析口径
+    唯一长在 server_common.active_skill_profile）。于是它恒为 'base'：用户在配置中心
+    「提示词链路」里选 Omni / Miniature，这道门一次都没读到过。典型的「配了但从未生效」，
+    与 qaGateLevel / imageEditTransport / skillProfile 栽过的是同一个坑。
+
+    manifest 上那份仍然优先：它是"这一单已经钉死用哪条链路"的位置。现在没有写入方，
+    读到就当显式指定。
+    """
+    recorded = str(((manifest_data or {}).get('profile') or '')).strip().lower()
+    if recorded:
+        return recorded
+    return server_common.active_skill_profile(config)
+
+
+def _is_miniature_job(profile, video_prompt):
+    """这一段该不该按微缩沙盘（巨手 + 微距）的规则优化。
+
+    两个来源都保留，是有意的，不是"兜底"：
+      · profile == 'miniature' —— 用户显式钉死链路，不需要正文佐证；
+      · 正文自己就是微缩片 —— 合成侧判微缩走的是**题材证据**
+        （reverse.detect_miniature_scale），不是 profile：一单微缩片配着 Omni Flash
+        完全合法，此时 profile 会解析成 'omni'。这时若只认 profile，就会拿真实尺度的
+        规则去优化一段巨手微距片，往里塞一个「1.78m 高的工人」。
+    profile 显式说了不是微缩，也不能一票否决正文——两者只是同一件事的两个观测口。
+    """
+    if str(profile or '').strip().lower() == 'miniature':
+        return True
+    low = str(video_prompt or '').lower()
+    return 'miniature' in low or 'macro diorama' in low
+
+def optimize_single_video_prompt(config, start_frame_path, end_frame_path, original_video_prompt,
+                                 slot_index=None, start_seq=None, end_seq=None,
+                                 video_meta='', spatial_contract=None, profile=None):
+    """针对单段视频提示词（VIDEO i），基于真实的起始帧与结束帧图像进行多模态视觉差量分析与优化。
+
+    - start_frame_path: 起始锚点帧图像路径 (IMAGE i)
+    - end_frame_path: 结束锚点帧图像路径 (IMAGE i+1)
+    - original_video_prompt: 原始视频提示词正文
+    - slot_index: 视频槽位号 (i)
+    - start_seq / end_seq: 起始帧号与结束帧号（默认 start_seq=slot_index, end_seq=slot_index+1）
+    - video_meta: 槽位元数据标签 (如 [BRIDGE], [CUT], [HERO] 等)
+    - spatial_contract: 空间契约/Drift Lock 数据（可选）
+    - profile: 题材 Profile（'miniature', 'omni', 'base' 等）
+
+    返回优化后的视频提示词字符串。若 VLM 调用失败或发生异常，安全降级返回原始提示词。
+    """
+    if not original_video_prompt or not original_video_prompt.strip():
+        return original_video_prompt
+
+    if not start_frame_path or not os.path.exists(start_frame_path):
+        return original_video_prompt
+
+    # 若为单帧槽位（如无结束帧的独立片段），且无 end_frame_path，则无法做两帧差量对比，直接返回
+    if not end_frame_path or not os.path.exists(end_frame_path):
+        return original_video_prompt
+
+    s_idx = start_seq if start_seq is not None else (slot_index if slot_index is not None else 1)
+    e_idx = end_seq if end_seq is not None else (s_idx + 1)
+    meta_str = str(video_meta or '').upper()
+    is_crossing = 'BRIDGE' in meta_str or 'CUT' in meta_str
+    
+    is_miniature = _is_miniature_job(profile, original_video_prompt)
+
+    contract_info = ""
+    if isinstance(spatial_contract, dict) and spatial_contract:
+        dim = spatial_contract.get('carrier_envelope', {})
+        if dim:
+            contract_info = f"\nSpatial Envelope Reference: {json.dumps(dim, ensure_ascii=False)}"
+
+    crossing_rules = (
+        "\nCRITICAL TWO-SHOT TRANSITION RULE FOR CROSSING SLOTS:\n"
+        "- This slot is marked as a TRANSITION / BRIDGE slot.\n"
+        "- If Shot A (Exterior Opening): The camera performs a forward push toward the entrance. "
+        "Show explicit mechanical unlocking (turning hatch wheel, sliding bolt, unlatching). "
+        "Strictly ZERO workers, ZERO tools, and ZERO construction work inside the frame.\n"
+        "- If Shot B (Interior Entry): Camera is locked inside facing main depth axis; actor enters "
+        "with tools to stage and deliver the first physical work."
+        if is_crossing else ""
+    )
+
+    if is_miniature:
+        actor_and_scale_rule = (
+            "3. ACTOR & SCALE (MINIATURE DIORAMA & GIANT HANDS):\n"
+            "   - Construction is executed 100% by OVERSIZED REAL HUMAN HANDS (Giant Hands / Macro Fingers) entering "
+            "from frame margins wielding micro-tools (precision tweezers, miniature trowels, craft knives, glue applicators).\n"
+            "   - Strictly NEVER describe a full-scale human worker, neon safety vests, hard hats, or people inside the miniature structure.\n"
+            "   - Camera perspective: Locked macro diorama framing (50-85mm macro lens feel, shallow depth of field, creamy background bokeh) on tripod.\n"
+        )
+        syntax_rule = (
+            "6. MANDATORY SYNTAX & CLAUSES:\n"
+            f"   - Opening sentence MUST be: \"Use the provided image as the exact starting composition and environment anchor. "
+            f"Use IMAGE {s_idx} as the actual first-frame image; begin from this initial state and naturally progress the work through "
+            "the multi-shot sequence without inventing extraneous layouts.\"\n"
+            "   - Pacing clause MUST be: \"edited miniature craft time-lapse assembled from multiple macro camera setups, not real-time footage, "
+            "with oversized human hands entering and withdrawing between passes.\"\n"
+        )
+        living_cast_rule = (
+            "5. LIVING CAST ACTION-REACTION INTERLOCK (MINIATURE FIGURINES):\n"
+            "   - When miniature figurines (e.g. resident couple) are present, NEVER omit them or freeze them into static dolls.\n"
+            "   - Interweave their bodily responses directly with the giant hands/tools: immediate reflex/head-tilt when hands enter, "
+            "active gaze/body tracking during tool operations, and nodding/stepping forward to admire upon hand withdrawal.\n"
+            "   - Strictly FORBID static/idle phrasing ('unmoving', 'remain standing', 'stay in place', 'unchanged', 'static pose', 'watching quietly').\n"
+        )
+    else:
+        actor_and_scale_rule = (
+            "3. HUMAN SCALE & WORKER CONTINUOUS POSE TRANSITION:\n"
+            "   - Describe the worker with exact scale: 'a lone male worker (1.78m tall, occupying ~35% of vertical "
+            "frame height, realistically proportioned to the ceiling clearance) in a solid work jacket, dark trousers, "
+            "boots, face never visible'.\n"
+            "   - If a worker or character is visible in Image 1 and/or Image 2, the video prompt MUST explicitly describe their continuous "
+            "kinetic labor and posture progression from Image 1's starting pose to Image 2's landing pose across the entire clip. "
+            "Strictly FORBID static poses or leaving the character unmoving (e.g. 'remain standing', 'stay put', 'static in place', 'standing still', 'holding position', 'where they were').\n"
+            "   - NATURAL BODY MECHANICS (mandatory): that progression must read as real human mechanics, never a smooth constant-speed glide between the two poses — weight shifts onto the working leg or arm before each effort, the torso leans and counter-rotates with the load, and there is a brief natural settle between reaching for a tool and gripping it. A worker whose only description is the start pose and the end pose renders as a robotic linear blend; describe the weight and timing of the motion connecting them, not just the two poses.\n"
+            "   - Camera perspective: Faithful to the camera angle, lens feel, and framing established in Image 1 and Image 2 (locked to the active camera setup without inventing new camera moves or altering the viewpoint angle).\n"
+        )
+        syntax_rule = (
+            "6. MANDATORY SYNTAX & CLAUSES:\n"
+            f"   - Opening sentence MUST be: \"Use the provided first frame and last frame as exact composition anchors. "
+            f"Use IMAGE {s_idx} as the actual first-frame image and IMAGE {e_idx} as the actual last-frame image; every "
+            "visible action must move naturally from the first frame's pose to the last frame's exact pose and layout — "
+            "with real human weight, momentum, and non-uniform timing, never a smooth constant-speed blend between two "
+            "fixed poses — without inventing a third layout.\"\n"
+            "   - Pacing clause MUST be: \"Continuous construction time-lapse, not real-time footage.\"\n"
+        )
+        living_cast_rule = (
+            "5. LIVING CAST ACTION-REACTION INTERLOCK (WHEN FIGURES/ANIMALS ARE PRESENT):\n"
+            "   - When miniature figurines, resident characters, or animals are visible, NEVER omit them or freeze them into static dolls.\n"
+            "   - Interweave their bodily responses directly with the worker/craftsman actions: immediate reflex/head-tilt when hands or tools enter, active gaze/body tracking during tool operations, and settled posture facing the completed work upon completion.\n"
+            "   - Strictly FORBID static/idle phrasing ('unmoving', 'remain standing', 'stay in place', 'unchanged', 'static pose', 'watching quietly').\n"
+        )
+
+    system_prompt = (
+        "You are an expert visual supervisor and video prompt optimization engine for continuous "
+        "time-lapse construction and renovation videos (bridging two keyframes for "
+        "Google Veo / Omni video generation).\n\n"
+        "You are provided with two ACTUAL rendered images in chronological order:\n"
+        f"1. Image 1: The START anchor frame (IMAGE {s_idx})\n"
+        f"2. Image 2: The END anchor frame (IMAGE {e_idx})\n\n"
+        "Your task is to visually compare Image 1 and Image 2, identify all physical deltas between them, "
+        "and REWRITE / OPTIMIZE the provided VIDEO prompt so that it 100% accurately and physically "
+        "connects these two exact images through real human weight, momentum, and non-uniform motion — "
+        "never a smooth constant-speed blend between two fixed poses, which reads as a robotic glide, not "
+        "a moving body — while completely preventing visual jumps, pops, teleportation, or ungrounded "
+        "discrepancies.\n\n"
+        "RULES & PROTOCOLS (MUST COMPLY STRICTLY):\n"
+        "1. FULL-FIELD 4-ZONE DELTA SCANNING:\n"
+        "   - Top / Overhead: Roof, rafters, skylights, ceiling panels, light fixtures, insulation.\n"
+        "   - Middle / Facade & Walls: Wall finishes, masonry, cracks, partitions, window openings, conduit.\n"
+        "   - Bottom / Floor: Bare ground, crushed gravel, waterproof membrane, floor joists, floorboards, rugs.\n"
+        "   - Peripherals & Spoil: Waste stacks/crates accumulating, raw timber/materials visibly diminishing.\n"
+        "2. ZERO PHANTOM CHANGES & ACTION-TOOL-SFX TRIAD:\n"
+        "   - Every visible change between Image 1 and Image 2 MUST be physically delivered by craftsman/worker action.\n"
+        "   - Assign concrete action verbs, specific geometric hand/power tools (e.g. cordless drill, aluminum rake, "
+        "utility knife, rubber mallet), and visible trace buildup (dust lines, screw heads, shavings).\n"
+        "   - No ghost work: structures must NEVER appear or melt away without an active worker/craftsman.\n"
+        + actor_and_scale_rule
+        + "4. ASMR SOUND EFFECTS (60% VOLUME, 0% BGM):\n"
+        "   - Include specific physical ASMR sound effects: gritty scraping, sawing buzzing, cordless drill chatter, "
+        "hammer taps, rubber membrane crackle, footsteps on gravel/wood. Strictly NO background music (BGM).\n"
+        + living_cast_rule
+        + syntax_rule
+        + crossing_rules
+        + contract_info
+        + "\n\nOUTPUT FORMAT:\n"
+        "Return STRICT JSON only with NO markdown fences, matching exactly this structure:\n"
+        '{"optimized_prompt": "...", "visual_delta_summary": "..."}'
+    )
+
+    user_text = (
+        f"START Frame (IMAGE {s_idx}): Attached as first image.\n"
+        f"END Frame (IMAGE {e_idx}): Attached as second image.\n\n"
+        f"Current VIDEO {slot_index or s_idx} prompt draft:\n"
+        f"{original_video_prompt.strip()}\n\n"
+        "Visually inspect both images and rewrite the VIDEO prompt to match their exact real physical delta."
+    )
+
+    from prompt_pipeline import (_multimodal_chat, clean_prompt_text, fix_camera_contradictions,
+                                 _strip_code_fences, _reraise_if_cancelled, fix_natural_body_mechanics)
+
+    try:
+        response = _multimodal_chat(
+            config,
+            system_prompt,
+            user_text,
+            [start_frame_path, end_frame_path],
+            max_tokens=2048,
+            timeout=90
+        )
+        response_clean = _strip_code_fences(response).strip()
+        data = json.loads(response_clean)
+        optimized = str(data.get('optimized_prompt') or '').strip()
+        if not optimized:
+            return original_video_prompt
+
+        # 确定性后处理与清理
+        optimized = clean_prompt_text(optimized)
+        optimized = fix_camera_contradictions(optimized, is_moving=is_crossing)
+
+        # 确保标准开篇句完整
+        if is_miniature:
+            expected_anchor = (
+                f"Use the provided image as the exact starting composition and environment anchor. "
+                f"Use IMAGE {s_idx} as the actual first-frame image; begin from this initial state "
+                "and naturally progress the work through the multi-shot sequence without inventing extraneous layouts."
+            )
+            if not optimized.lower().startswith("use the provided image as the exact starting composition"):
+                optimized = f"{expected_anchor} {optimized}"
+        else:
+            expected_anchor = (
+                f"Use the provided first frame and last frame as exact composition anchors. "
+                f"Use IMAGE {s_idx} as the actual first-frame image and IMAGE {e_idx} as the actual last-frame image; "
+                f"every visible action must move naturally from the first frame's pose to the last frame's exact pose "
+                f"and layout — with real human weight, momentum, and non-uniform timing, never a smooth "
+                f"constant-speed blend between two fixed poses — without inventing a third layout."
+            )
+            if not optimized.lower().startswith("use the provided first frame and last frame as exact composition anchors"):
+                optimized = f"{expected_anchor} {optimized}"
+
+        optimized = fix_natural_body_mechanics(optimized)
+        return optimized
+    except Exception as e:
+        _reraise_if_cancelled(e)
+        if sys.stdout:
+            print(f"[VIDEO OPTIMIZER] Slot {slot_index or s_idx} optimization warning (kept original prompt): {e}")
+        return original_video_prompt
+
+
+def optimize_video_prompts_for_sequence(config, title, prompt_block, on_progress=None, target_slots=None, force=False):
+    """视频生成前优化门：扫描全套已渲染帧图像，对比每拍真实差量并优化整套提示词块中的视频提示词。
+
+    - config: 全局配置字典
+    - title: 项目标题 / project_key
+    - prompt_block: 当前的完整提示词文本（包含图片与视频提示词）
+    - on_progress: 进度回调 (stage, details)
+    - target_slots: 限制优化的视频槽位列表（None 表示全量）
+    - force: 是否强制重新执行 VLM 优化（False 时优先复用已持久化的槽位差量优化记录）
+
+    返回优化后的新 prompt_block 字符串，并自动原子持久化至 manifest.json。
+    """
+    project_dir = server_common._get_project_dir(title)
+    if not prompt_block or not str(prompt_block).strip():
+        if os.path.isdir(project_dir):
+            mdata = server_common.read_manifest(project_dir) or {}
+            prompt_block = mdata.get('prompt_block', '')
+        if not prompt_block or not str(prompt_block).strip():
+            return prompt_block
+
+    # 配置项检查：若显式禁用优化门，则直接放行
+    if not server_common.gate_setting('optimizeVideoPromptsBeforeGen', config):
+        return prompt_block
+
+    from prompt_pipeline import (
+        _parse_prompt_slots, _format_prompt_block, prompt_slots_list,
+        _map_parallel, _reraise_if_cancelled
+    )
+
+    images, videos = _parse_prompt_slots(prompt_block)
+    if not videos:
+        return prompt_block
+
+    if not os.path.isdir(project_dir):
+        return prompt_block
+
+    # 读取空间契约与 manifest 中已持久化的差量优化记录
+    manifest_data = server_common.read_manifest(project_dir) or {}
+    persisted_prompt_at_start = manifest_data.get('prompt_block') or prompt_block
+    pairing_config = config
+    if 'videoFramePairing' not in config and manifest_data.get('video_frame_pairing'):
+        pairing_config = dict(config, videoFramePairing=manifest_data['video_frame_pairing'])
+    auto_pairing = str(pairing_config.get('videoFramePairing', '')).strip().lower() == 'auto'
+    if auto_pairing:
+        from video_generator import resolve_video_frame_anchors
+    spatial_contract = manifest_data.get('spatial_contract')
+    profile = resolve_optimizer_profile(config, manifest_data)
+    existing_optimizations = manifest_data.get('video_prompt_optimizations') or {}
+    if not isinstance(existing_optimizations, dict):
+        existing_optimizations = {}
+
+    # 确定待优化的槽位集合与指纹匹配情况
+    wanted_slots = set(target_slots) if target_slots else set(videos.keys())
+    slots_to_vlm = []
+    slot_fingerprints = {}
+    slot_frames = {}
+    cached_results = {}
+
+    for slot_idx in sorted(videos.keys()):
+        if slot_idx not in wanted_slots:
+            continue
+        video_item = videos[slot_idx]
+        anchors = (resolve_video_frame_anchors(slot_idx, video_item, pairing_config)
+                   if auto_pairing else {
+                       'start_anchor_slot': slot_idx,
+                       'end_anchor_slot': slot_idx + 1,
+                   })
+        start_seq = anchors['start_anchor_slot']
+        end_seq = anchors['end_anchor_slot']
+        # A single-frame clip has no visual delta to optimize. Keep its declared
+        # start frame and avoid turning it into a two-frame interpolation prompt.
+        if end_seq is None:
+            continue
+        start_path = _find_frame_file(project_dir, start_seq)
+        end_path = _find_frame_file(project_dir, end_seq)
+        
+        # 必须起始帧与结束帧均已渲染落盘
+        if not start_path or not end_path:
+            continue
+
+        meta = video_item.get('meta', '') if isinstance(video_item, dict) else ''
+        fp = _get_slot_delta_fingerprint(
+            start_path, end_path, meta, spatial_contract,
+            frame_anchors=(start_seq, end_seq) if auto_pairing else None,
+        )
+        if not fp:
+            continue
+        slot_fingerprints[slot_idx] = fp
+        slot_frames[slot_idx] = dict(anchors, start_frame_path=start_path, end_frame_path=end_path)
+
+        # 检查持久化记录是否存在且环境指纹完全匹配
+        opt_rec = existing_optimizations.get(str(slot_idx)) or existing_optimizations.get(slot_idx)
+        if (not force) and isinstance(opt_rec, dict) and opt_rec.get('fingerprint') == fp and opt_rec.get('optimized_prompt'):
+            cached_body = opt_rec['optimized_prompt']
+            cached_results[slot_idx] = (
+                _normalize_optimized_frame_anchors(cached_body, start_seq, end_seq)
+                if auto_pairing else cached_body
+            )
+        else:
+            slots_to_vlm.append(slot_idx)
+
+    # 回填已命中的持久化优化结果
+    updated_videos = dict(videos)
+    changed_count = 0
+    for slot_idx, cached_body in cached_results.items():
+        if not cached_body or not cached_body.strip():
+            continue
+        orig_item = updated_videos.get(slot_idx)
+        orig_body = orig_item['body'] if isinstance(orig_item, dict) else str(orig_item)
+        if orig_body.strip() != cached_body.strip():
+            if isinstance(orig_item, dict):
+                orig_item['body'] = cached_body
+            else:
+                updated_videos[slot_idx] = cached_body
+            changed_count += 1
+
+    # 若所有槽位均已命中持久化缓存，无需任何 VLM 调用
+    if not slots_to_vlm:
+        if changed_count > 0:
+            new_prompt_block = _format_prompt_block(images, updated_videos)
+            new_prompt_block = _persist_optimization_results(project_dir, title, new_prompt_block,
+                existing_optimizations, original_prompt_block=persisted_prompt_at_start,
+                target_slots=list(cached_results))
+            if on_progress:
+                on_progress('prompt_block_updated', {
+                    'prompt_block': new_prompt_block,
+                    'prompt_slots': prompt_slots_list(new_prompt_block),
+                    'optimized_slots_count': len(cached_results),
+                    'changed_count': changed_count,
+                    'cached_count': len(cached_results),
+                    'newly_optimized_count': 0,
+                    'message': f'视频提示词优化门：已复用 {len(cached_results)} 段已持久化的画面差量优化提示词',
+                })
+            return new_prompt_block
+        else:
+            return prompt_block
+
+    total_count = len(slots_to_vlm)
+    if on_progress:
+        msg = (f'正在执行视频提示词视觉优化门（依据真实画面差量防跳变，待优化 {total_count} 段，已复用缓存 {len(cached_results)} 段）...'
+               if cached_results else f'正在执行视频提示词视觉优化门（依据真实画面差量防跳变，共 {total_count} 段）...')
+        on_progress('video_optimization_start', {
+            'total': total_count,
+            'slots': slots_to_vlm,
+            'cached_count': len(cached_results),
+            'message': msg,
+        })
+
+    items = []
+    for slot_idx in slots_to_vlm:
+        video_item = videos[slot_idx]
+        body = video_item['body'] if isinstance(video_item, dict) else str(video_item)
+        meta = video_item.get('meta', '') if isinstance(video_item, dict) else ''
+        frames = slot_frames[slot_idx]
+        items.append((slot_idx, {
+            'config': config,
+            'start_frame_path': frames['start_frame_path'],
+            'end_frame_path': frames['end_frame_path'],
+            'original_video_prompt': body,
+            'slot_index': slot_idx,
+            'start_seq': frames['start_anchor_slot'],
+            'end_seq': frames['end_anchor_slot'],
+            'video_meta': meta,
+            'spatial_contract': spatial_contract,
+            'profile': profile,
+        }))
+
+    completed_count = 0
+
+    def _worker(arg):
+        result = optimize_single_video_prompt(**arg)
+        if auto_pairing and result and str(result).strip():
+            return _normalize_optimized_frame_anchors(result, arg['start_seq'], arg['end_seq'])
+        return result
+
+    def _optimization_record(slot_idx, result):
+        frames = slot_frames[slot_idx]
+        record = {
+            'slot': slot_idx,
+            'fingerprint': slot_fingerprints.get(slot_idx),
+            'optimized_prompt': result,
+            'optimized_at': datetime.now().isoformat(),
+            'start_frame': os.path.basename(frames['start_frame_path']),
+            'end_frame': os.path.basename(frames['end_frame_path']),
+        }
+        if auto_pairing:
+            record.update({
+                'start_anchor_slot': frames['start_anchor_slot'],
+                'end_anchor_slot': frames['end_anchor_slot'],
+                'frame_pairing_source': frames.get('source'),
+            })
+        return record
+
+    def _on_slot_done(slot_idx, result):
+        nonlocal completed_count
+        completed_count += 1
+        if result and str(result).strip():
+            existing_optimizations[str(slot_idx)] = _optimization_record(slot_idx, result)
+        if on_progress:
+            on_progress('video_optimization_slot', {
+                'slot': slot_idx,
+                'current': completed_count,
+                'total': total_count,
+                'prompt': result,
+                'message': f'视频 {slot_idx} 提示词已依据真实画面差量完成优化 ({completed_count}/{total_count})',
+            })
+
+    # 并发执行各槽位差量优化
+    max_workers = min(4, len(items)) if len(items) > 1 else 1
+    try:
+        optimized_results = _map_parallel(_worker, items, max_workers=max_workers, on_done=_on_slot_done)
+    except Exception as e:
+        _reraise_if_cancelled(e)
+        if sys.stdout:
+            print(f"[VIDEO OPTIMIZER] Batch optimization error: {e}")
+        optimized_results = {}
+
+    # 将优化结果回填进 videos 结构并持久化记录
+    for slot_idx, new_body in optimized_results.items():
+        if not new_body or not new_body.strip():
+            continue
+        original_item = updated_videos.get(slot_idx)
+        orig_body = original_item['body'] if isinstance(original_item, dict) else str(original_item)
+        if orig_body.strip() != new_body.strip():
+            if isinstance(original_item, dict):
+                original_item['body'] = new_body
+            else:
+                updated_videos[slot_idx] = new_body
+            changed_count += 1
+
+        existing_optimizations[str(slot_idx)] = _optimization_record(slot_idx, new_body)
+
+    # 组装新 prompt_block
+    new_prompt_block = _format_prompt_block(images, updated_videos)
+
+    # 原子写回 manifest.json 与 stepped_state
+    new_prompt_block = _persist_optimization_results(project_dir, title, new_prompt_block,
+        existing_optimizations, original_prompt_block=persisted_prompt_at_start,
+        target_slots=sorted(set(cached_results) | set(optimized_results)))
+
+    if on_progress:
+        on_progress('prompt_block_updated', {
+            'prompt_block': new_prompt_block,
+            'prompt_slots': prompt_slots_list(new_prompt_block),
+            'optimized_slots_count': len(optimized_results) + len(cached_results),
+            'changed_count': changed_count,
+            'newly_optimized_count': len(optimized_results),
+            'cached_count': len(cached_results),
+            'message': f'视频提示词优化门完成：已依据真实画面差量优化 {len(optimized_results)} 段，复用缓存 {len(cached_results)} 段',
+        })
+
+    return new_prompt_block

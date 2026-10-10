@@ -1,0 +1,15 @@
+{
+  "note": "Includes HTML and local linked scripts/styles; gzip level 6. External fonts and dynamic media excluded. 5% byte headroom; review budgets before increasing.",
+  "pages": {
+    "index.html": {
+      "raw_bytes": 2406400,
+      "gzip_bytes": 654336,
+      "scripts": 30
+    },
+    "console.html": {
+      "raw_bytes": 295936,
+      "gzip_bytes": 81920,
+      "scripts": 5
+    }
+  }
+}

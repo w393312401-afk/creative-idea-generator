@@ -1,0 +1,22 @@
+# Tier-4 video reverse-engineering path — video_to_prompt_pipeline.py only.
+# The composition chain (scripts/*.py) needs NONE of this; see requirements-compose.txt.
+
+# Required. Frame decoding, difference maps, and per-crop statistics all go through PIL.
+pillow>=9.0.0
+
+# Optional fallback ONLY. The pipeline extracts frames with FFmpeg first and imports cv2
+# lazily (inside the function, guarded by try/except) if FFmpeg is unavailable — see the
+# "[-] cv2 not available either" branch. Skip this install if FFmpeg is on PATH.
+opencv-python-headless>=4.8.0
+
+# ---------------------------------------------------------------------------------------
+# NOT dependencies of anything in this package — removed from the old combined list:
+#   numpy                  no module here imports it (PIL pulls its own needs)
+#   requests               every script and the pipeline use urllib from the stdlib
+#   python-dotenv          no .env loading anywhere in this package
+#   google-generativeai    multimodal calls go through the server's OpenAI-compatible
+#   openai                 endpoint via urllib; neither SDK is imported here
+# If you reintroduce one, import it somewhere first.
+#
+# EXTERNAL, not pip-installable: FFmpeg must be on PATH. It does the frame extraction and
+# builds the 5-column keyframe collage the T0 gate requires.

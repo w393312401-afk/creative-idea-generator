@@ -1,5 +1,6 @@
 import os
 import sys
+import re
 import json
 import shutil
 import socket
@@ -9,31 +10,48 @@ import urllib.parse
 import base64
 import time
 import threading
+import queue
+import contextvars
 import mimetypes
 import contextlib
 from datetime import datetime
 from http.server import SimpleHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
+from web_runtime.static_files import StaticFilesMixin
+from web_runtime.compression import compress_response
 
 # Register MIME types to ensure correct browser content-type headers
 mimetypes.add_type('image/webp', '.webp')
 mimetypes.add_type('video/mp4', '.mp4')
 
 # Import everything from sub-modules to preserve namespace compatibility
+import server_common
 from server_common import *
 from frame_generator import *
 from video_generator import *
+from video_generation_recovery import (
+    DEFAULT_RETRY_DELAYS as VIDEO_RETRY_DELAYS, VideoRecoveryExhaustedError,
+    delivered_slots, execute_video_generation_with_recovery, exhausted_message, max_slot_attempts)
 from prompt_pipeline import *
 
 # Explicitly import private functions that are not imported by wildcard '*'
 from server_common import (
     _get_project_dir, _safe_project_name, _LOG_PATH, _account_switch_interval,
     _IP_ROTATE_DISABLED,
+    # 点子库拆分存储的内部读取路径：POST /api/library 的三道防护要在**已持有**
+    # LIBRARY_LOCK 的情况下读一次现有库，读-判定-写这一串必须是原子的。
+    # （LIBRARY_LOCK 已改为 RLock，同线程重入是安全的。）
+    _ensure_library_split, _read_library_split, _library_store_ready, _read_library_file,
+    # 封面用途登记（/api/cover_roles）：复用同一套 outputs/ 边界校验与用途键名
+    _cover_candidate_path, COVER_ROLE_KEYS,
 )
 
 # 日志历史回放最多从文件末尾回读这么多字节（够装远超 100 行了）
 _LOG_TAIL_BYTES = 256 * 1024
-from prompt_pipeline import _parse_prompt_slots, _format_prompt_block, _chat, _aux_model
+from prompt_pipeline import (
+    _parse_prompt_slots, _format_prompt_block, _chat, _aux_model,
+    prompt_slots_list, optimize_video_prompts_for_sequence,
+)
 from frame_generator import (
     _image_generation_model_for_request,
     _image_quality_to_label,
@@ -41,7 +59,12 @@ from frame_generator import (
     _run_async_image_generation,
     _run_async_image_edit
 )
-from fx_control import FX_CONTROL, FxQueueCancelled, FxQueueTimeout
+from video_operations import VideoOperationStore, VideoOperationConflict, validate_request_id, request_fingerprint
+
+_VIDEO_OPERATIONS = VideoOperationStore()
+_VIDEO_OPERATION_LOCK = threading.RLock()
+
+from fx_control import FX_CONTROL, FxQueueCancelled, FxQueueTimeout, holds_fx_slot
 from fx_console import FX_CONFIG_SPEC, FxConfigStore, apply_direct_env
 
 # Per-IP sliding-window rate-limit state used by rate_ok() (managed mode only)
@@ -50,15 +73,62 @@ _RATE_BUCKET = collections.defaultdict(list)
 _RATE_LOCK = threading.Lock()
 
 
+def prompt_delivery_block_reason(payload):
+    """历史提示词质量标记不再拦截；编号与资源可用性在各操作入口校验。"""
+    return None
+
+
 
 def background_worker(task_id, config, dimensions):
     t = get_or_create_task(task_id, dimensions)
+    if isinstance(t.get('runtime_version'), dict):
+        t['runtime_version']['policy_version'] = MILESTONE_POLICY_VERSION
     start_time = time.time()
     # 本轮运行的身份令牌：重试复用 task_id 时 prepare_task_for_run 会换新
     # cancel_event。取消已被 /api/compose-cancel 立即终态化，旧线程可能还卡在
     # 几十秒的 LLM 请求里没死透——它凭令牌发现自己已被接管后必须静默退出，
     # 绝不能把过期事件/结果写进新一轮运行的记录。
     run_token = t["cancel_event"]
+    with ACTIVE_TASKS_LOCK:
+        t.setdefault("last_client_poll_at", None)
+        t["last_worker_progress_at"] = start_time
+        t["failure_code"] = None
+        t["timings"] = {"last_worker_progress_at": start_time, "batch_durations": []}
+    watchdog_done = threading.Event()
+
+    def compose_watchdog():
+        no_progress_limit = max(30, int(config.get('composeNoProgressTimeoutSeconds', 180)))
+        soft_limit = max(no_progress_limit, int(config.get('composeTaskSoftTimeoutSeconds', 480)))
+        hard_limit = max(no_progress_limit, int(config.get('composeTaskHardTimeoutSeconds', 720)))
+        soft_warned = False
+        while not watchdog_done.wait(1.0):
+            payload = None
+            with ACTIVE_TASKS_LOCK:
+                if t.get('cancel_event') is not run_token or t.get('status') != 'running':
+                    return
+                now = time.time()
+                code = None
+                if not soft_warned and now - start_time >= soft_limit:
+                    soft_warned = True
+                    payload = {
+                        'stage': 'compose_soft_timeout',
+                        'details': {'elapsed_seconds': round(now - start_time, 2),
+                                    'deadline_remaining_seconds': max(0, round(hard_limit - (now - start_time), 2))},
+                    }
+                    t['events'].append(('progress', payload))
+                if now - start_time >= hard_limit:
+                    code = 'COMPOSE_TIMEOUT'
+                elif now - float(t.get('last_worker_progress_at') or start_time) >= no_progress_limit:
+                    code = 'COMPOSE_STALLED'
+                if code:
+                    t['failure_code'] = code
+                    t['watchdog_failure_code'] = code
+                    run_token.set()
+                    return
+            if payload:
+                notify_listeners(task_id, 'progress', payload)
+
+    threading.Thread(target=compose_watchdog, name=f'compose-watchdog-{task_id}', daemon=True).start()
 
     def run_cancelled():
         return run_token.is_set() or t.get("cancel_event") is not run_token
@@ -70,6 +140,15 @@ def background_worker(task_id, config, dimensions):
             if stage == 'cancel_check':
                 # 纯取消探针（重试循环的 attempt 边界调用），不产生事件
                 return False
+            now = time.time()
+            t["last_worker_progress_at"] = now
+            t.setdefault("timings", {})["last_worker_progress_at"] = now
+            if stage == 'batch_generated' and isinstance(details, dict):
+                t["timings"].setdefault("batch_durations", []).append({
+                    "batch_index": details.get("batch_index"),
+                    "duration_seconds": details.get("elapsed_seconds", 0),
+                    "attempt": details.get("attempt", 1),
+                })
             if stage == 'text_chunk':
                 t["events"].append(('text_chunk', details))
             else:
@@ -89,6 +168,11 @@ def background_worker(task_id, config, dimensions):
         if isinstance(config, dict):
             config['_skipped_checks'] = 0
             config['_beat_audit'] = []
+            config['_frame_state_contract'] = []
+            config['_frame_state_contract_errors'] = []
+            config['_outline_contract'] = {}
+            config['_outline_prompt_audit'] = {}
+            config['_outline_delivery_ledger'] = []
         content = call_llm(config, dimensions, on_progress=on_progress)
         result = parse_sections(content)
 
@@ -105,13 +189,23 @@ def background_worker(task_id, config, dimensions):
         beat_audit = config.get('_beat_audit') if isinstance(config, dict) else None
         if beat_audit:
             structural_beats = [r for r in beat_audit if r.get('structural')]
-            unfixed = [r for r in structural_beats if not r.get('reworked')]
+            # 「修没修」以回读校验为准（repair_verified，见 prompt_pipeline.reverify_beat_repairs）：
+            # 回炉自报 reworked=True、回读却仍有残留的拍必须算进未修好的那一堆，否则
+            # 「审计报了没修」这类硬伤（2026-08-02 终帧倒退事故）在面板上看着是绿的。
+            unfixed = [r for r in structural_beats
+                       if not r.get('reworked') or r.get('repair_verified') is False]
+            rework_failed = [r for r in beat_audit if r.get('milestone_status') == 'rework_failed']
             milestone_rows = [r for r in beat_audit if r.get('milestone_name')]
             milestone_ok = [r for r in milestone_rows if r.get('milestone_status') in ('passed', 'reworked')]
             lines = [f"### 直出校验留痕（{len(beat_audit)} 拍有记录）", '']
             if milestone_rows:
                 lines.append(
                     f"- **显著阶段里程碑骨架：{len(milestone_ok)}/{len(milestone_rows)} 拍通过或已回炉**")
+            if rework_failed:
+                lines.append(
+                    f"- **回炉后回读校验未通过：{len(rework_failed)} 拍**（"
+                    + '、'.join(f"第 {r['beat']} 拍" for r in rework_failed)
+                    + "）——这些拍的修复只是自报成功，最终提示词里问题仍在")
             for rec in beat_audit:
                 milestone_prefix = (f"「{rec.get('milestone_name')}」· "
                                     if rec.get('milestone_name') else '')
@@ -127,14 +221,71 @@ def background_worker(task_id, config, dimensions):
                                   else 'IMAGE 回炉未通过，保留原稿' if img_rw is False
                                   else '仅留痕')
                     lines.append(f"- 第 {rec['beat']} 拍 · {milestone_prefix}风格瑕疵（{style_note}）：" + '；'.join(rec['style']))
+                if rec.get('residual'):
+                    lines.append(f"- ⚠️ 第 {rec['beat']} 拍 · {milestone_prefix}**回读校验残留**（回炉未真正生效，"
+                                 f"最终提示词里问题仍在）：" + '；'.join(str(x) for x in rec['residual']))
             result['audit_md'] = ((result.get('audit_md') or '').rstrip() + '\n\n' + '\n'.join(lines)).strip()
-            if structural_beats:
+            if structural_beats or rework_failed:
                 summary = (f"直出校验发现 {len(structural_beats)} 拍存在结构性硬伤"
-                           f"（{len(structural_beats) - len(unfixed)} 拍已定向回炉重写"
-                           + (f"，{len(unfixed)} 拍回炉未通过保留原稿——生成帧序列前建议先处理" if unfixed else "")
-                           + "），详情见下方审核报告。")
+                           f"（{len(structural_beats) - len(unfixed)} 拍已回炉并通过回读校验"
+                           + (f"，{len(unfixed)} 拍未修好——生成帧序列前建议先处理" if unfixed else "")
+                           + "）"
+                           + (f"；另有 {len(rework_failed)} 拍回炉后回读校验未通过" if rework_failed else "")
+                           + "，详情见下方审核报告。")
                 result['repair_md'] = summary
             result['beat_audit'] = beat_audit
+        frame_state_contract = (config.get('_frame_state_contract')
+                                if isinstance(config, dict) else None)
+        if frame_state_contract:
+            result['frame_state_contract'] = frame_state_contract
+            state_note = (
+                f"### Frame-state preflight\n\n"
+                f"- {len(frame_state_contract)} transitions validated before prompt writing.\n"
+                f"- Contract: one visible delta per frame; prior completed state is preserved; "
+                f"later-stage results are forbidden."
+            )
+            result['audit_md'] = ((result.get('audit_md') or '').rstrip()
+                                  + '\n\n' + state_note).strip()
+        # 卡片工序交付体检表（2026-08-05）。下面那份映射 diff 回答的是"发生了什么改写"，
+        # 回答不了用户最想问的"我照着挑的这 14 条工序，最后落实了几条、落在第几帧"——
+        # 数据散在 _outline_contract（规划期）/ _beat_audit（按拍的回炉流水）两处，谁也
+        # 拼不出按工序索引的那一张表。总账在合成收尾时已经算好并挂在
+        # config['_outline_delivery_ledger'] 上（prompt_pipeline.stash_outline_delivery_ledger），
+        # 这里只是把它接到审核面板最上方，与 _beat_audit / _outline_contract 同一套约定。
+        outline_ledger = (config.get('_outline_delivery_ledger')
+                          if isinstance(config, dict) else None)
+        if outline_ledger:
+            from prompt_pipeline import render_outline_delivery_md, outline_delivery_alert
+            result['outline_delivery_ledger'] = outline_ledger
+            ledger_md = render_outline_delivery_md(outline_ledger)
+            if ledger_md:
+                result['audit_md'] = ((result.get('audit_md') or '').rstrip()
+                                      + '\n\n' + ledger_md).strip()
+            # 一条工序都没被认领（规划耗尽重试退回通用施工序）必须顶到 repair_md 上：
+            # 那是整张卡的工序被静默换掉，混在审核报告深处等于没报。
+            ledger_alert = outline_delivery_alert(outline_ledger)
+            if ledger_alert:
+                base = (result.get('repair_md') or '').strip()
+                result['repair_md'] = (ledger_alert if base.upper().startswith('PASS')
+                                       else f"{base} {ledger_alert}")
+        # 大纲 ↔ milestone 映射 diff 可见化（2026-08-05）。合并/拆分/新增/被吞并此前
+        # 只打进 server.log 的 [OUTLINE] 行，用户在结果页上完全看不出"卡片上那条工序
+        # 去哪了"——而他正是照着那份清单挑的选题。数据早就算好并挂在
+        # config['_outline_contract'] 上（prompt_pipeline.outline_milestone_contract），
+        # 这里只是把它接到审核面板上，与 _beat_audit / _frame_state_contract 同一套约定。
+        outline_contract = (config.get('_outline_contract')
+                            if isinstance(config, dict) else None)
+        if isinstance(outline_contract, dict) and outline_contract.get('declared'):
+            from prompt_pipeline import render_outline_contract_md
+            outline_md, uncovered_note = render_outline_contract_md(outline_contract)
+            result['outline_contract'] = outline_contract
+            if outline_md:
+                result['audit_md'] = ((result.get('audit_md') or '').rstrip()
+                                      + '\n\n' + outline_md).strip()
+            if uncovered_note:
+                base = (result.get('repair_md') or '').strip()
+                result['repair_md'] = (uncovered_note if base.upper().startswith('PASS')
+                                       else f"{base} {uncovered_note}")
         result['skipped_checks_count'] = config.get('_skipped_checks', 0) if isinstance(config, dict) else 0
         
         usage = stop_and_get_accounting()
@@ -144,8 +295,37 @@ def background_worker(task_id, config, dimensions):
         images, videos = _parse_prompt_slots(result['prompt_block'])
         result['image_count'] = len(images)
         result['video_count'] = len(videos)
+        # 槽位数的显式契约（2026-08-02 元数据不自洽复盘）：dimensions.beats_count 是
+        # **规划期的施工拍上限**，不是交付的拍数，更不是帧数——before 帧（IMAGE 1）是
+        # 隐式插入的、不进 count。下游一律读这一份，别再拿 beats_count 做切片。
+        from prompt_pipeline import frame_slot_counts, prompt_slots_list
+        _declared = dimensions.get('beats_count') if isinstance(dimensions, dict) else None
+        result['slot_counts'] = frame_slot_counts(len(videos), declared_beats_count=_declared)
+        if result['slot_counts'].get('declared_matches_delivered') is False:
+            # beats_count/beat_count_mode 从来只约束施工拍；过门/穿越运镜由
+            # expand_spatial_transition_beats 按拓扑另外展开 3~5 个子拍，不占用这个
+            # 额度，adaptive 和 fixed 两态都一样。旧文案统一写"属正常自适应收缩/扩张"，
+            # fixed 模式下这么说不准确——差额本来就不是"收缩/扩张"，而是过门子拍展开
+            # 带来的（2026-08-06）。
+            # 2026-08-07：有卡片清单时合成走一比一模式（compose_anchor_and_packet 的
+            # _outline_strict 分支），过门/重构图这类"额外产出拍"整段停用，
+            # compose_anchor_and_packet 也已经把这次实际生效的 beats_count 回写进
+            # dimensions——理论上不应该再出现不一致。这里出现说明回写路径本身出了问题
+            # 或者走的是没有清单的兜底路径，按真事故级别记录，不再当作"正常留痕"。
+            _has_outline = bool(dimensions.get('beat_outline')) if isinstance(dimensions, dict) else False
+            _mode = (dimensions.get('beat_count_mode') if isinstance(dimensions, dict) else None) or 'adaptive'
+            if _has_outline:
+                _level, _reason = 'WARN', '有卡片清单却仍出现差额，一比一回写路径可能失效，需要排查'
+            else:
+                _level, _reason = ('INFO', '施工拍已按 fixed 声明值交付，差额来自过门子拍展开，仅留痕'
+                                   if str(_mode).lower() == 'fixed' else
+                                   '属正常自适应收缩/扩张，仅留痕')
+            log(_level, 'COMPOSE',
+                f"交付拍数与卡片声明不一致（{_reason}）："
+                f"beats_count={result['slot_counts'].get('declared_beats_count')} / "
+                f"施工拍={result['slot_counts']['construction_beats']} / "
+                f"帧={result['slot_counts']['image_slots']}")
         # 结构化槽位契约：前端优先消费，避免前后端双实现解析漂移（帧配对错位事故前提）
-        from prompt_pipeline import prompt_slots_list
         result['prompt_slots'] = prompt_slots_list(result['prompt_block'])
 
         # 发布用双语标题行（TikTok 英文标题+tags / 国内社媒中文标题+话题），失败不阻塞出单
@@ -162,10 +342,37 @@ def background_worker(task_id, config, dimensions):
         # 最后一段模型调用。model 跟随任务结果落盘，之后即使全局模型切换，历史
         # 卡片仍能正确默认选中本次实际使用的模型。
         result['model'] = config.get('model') if isinstance(config, dict) else None
-        result['project_key'] = make_idea_project_key(task_id, result.get('title'))
+        # project_key 在任务创建时就已定下（ensure_task_project_key，用的是灵感卡片
+        # 的选题名 task_label）。这里只是把它抄进结果里，不再用 LLM 生成的 title
+        # 重算一遍——重算会得到与运行中那个键不一样的值，工作台/画廊按主键关联时
+        # 就会把同一条创意拆成两份。dimensions 缺 label 的老调用路径回落到旧算法。
+        result['project_key'] = (
+            (dimensions or {}).get('project_key')
+            or make_idea_project_key(task_id, result.get('title')))
         result['timings'] = {
-            'total_duration_seconds': round(time.time() - start_time, 2)
+            'total_duration_seconds': round(time.time() - start_time, 2),
+            'last_worker_progress_at': t.get('last_worker_progress_at', start_time),
+            'batch_durations': list((t.get('timings') or {}).get('batch_durations') or []),
+            'model_requests': list((config or {}).get('_compose_request_timings') or []),
         }
+        placeholder_count = int((config or {}).get('_compose_placeholder_count') or 0)
+        result['generation_source'] = 'llm'
+        result['degraded'] = bool((config or {}).get('_compose_degraded'))
+        result['diagnostic_mode'] = bool((config or {}).get('_compose_diagnostic'))
+        result['failure_code'] = None
+        result['quality_gate'] = {'status': 'retired', 'reviewed': False}
+        # 交付总账再落一份进项目 manifest：帧渲染完之后用户手动触发的一致性审查跑在
+        # 另一个任务/进程生命周期里，config 上这份到不了那边，而它正是画面层要判的
+        # 「这拍该交付哪几条卡片工序」的唯一来源（见 persist_outline_delivery_ledger）。
+        # 项目目录此刻通常还没建（封面/首帧才建），故由该函数按需创建。
+        if outline_ledger:
+            try:
+                from pipeline_orchestrator import persist_outline_delivery_ledger
+                persist_outline_delivery_ledger(
+                    _get_project_dir(result['project_key']), outline_ledger,
+                    title=result.get('title'))
+            except Exception as e:
+                log('WARN', 'COMPOSE', f"工序交付总账落盘失败（不影响本单交付）: {e}")
 
         with ACTIVE_TASKS_LOCK:
             # 终态化必须在锁内复核取消/换代：/api/compose-cancel 可能刚把记录切
@@ -179,7 +386,7 @@ def background_worker(task_id, config, dimensions):
             t["events"].append(('result', result))
 
         notify_listeners(task_id, 'result', result)
-        save_tasks_to_disk()
+        save_task_to_disk(task_id)
 
     except ConnectionError:
         # GenerationCancelled 走这里（其子类）。/api/compose-cancel 通常已抢先把
@@ -188,14 +395,22 @@ def background_worker(task_id, config, dimensions):
         finalize = False
         with ACTIVE_TASKS_LOCK:
             if t.get("cancel_event") is run_token and t["status"] == "running":
-                t["status"] = "cancelled"
-                t["error"] = "用户取消了生成任务"
+                watchdog_code = t.pop('watchdog_failure_code', None)
+                t["status"] = "failed" if watchdog_code else "cancelled"
+                t["failure_code"] = watchdog_code or "USER_CANCELLED"
+                failure_message = (
+                    '合成任务超过硬时限。' if watchdog_code == 'COMPOSE_TIMEOUT'
+                    else '合成任务长时间没有有效进展。' if watchdog_code == 'COMPOSE_STALLED'
+                    else '用户取消了生成任务')
+                t["error"] = failure_message
                 t["events"] = [evt for evt in t["events"] if evt[0] != 'text_chunk']
-                t["events"].append(('error', {'message': '用户取消了生成任务'}))
+                t["events"].append(('error', {
+                    'message': failure_message, 'failure_code': t['failure_code']}))
                 finalize = True
         if finalize:
-            notify_listeners(task_id, 'error', {'message': '用户取消了生成任务'})
-            save_tasks_to_disk()
+            notify_listeners(task_id, 'error', {
+                'message': failure_message, 'failure_code': t.get('failure_code')})
+            save_task_to_disk(task_id)
     except Exception as e:
         if sys.stdout:
             print(f"[DEBUG] background task {task_id} failed: {e}")
@@ -204,17 +419,30 @@ def background_worker(task_id, config, dimensions):
             if t.get("cancel_event") is run_token and t["status"] == "running":
                 if run_token.is_set():
                     # 取消引发的连带异常（连接被掐等）应记为取消，而不是失败
-                    t["status"] = "cancelled"
-                    error_msg = "用户取消了生成任务"
+                    watchdog_code = t.pop('watchdog_failure_code', None)
+                    t["status"] = "failed" if watchdog_code else "cancelled"
+                    t["failure_code"] = watchdog_code or "USER_CANCELLED"
+                    error_msg = (
+                        '合成任务超过硬时限。' if watchdog_code == 'COMPOSE_TIMEOUT'
+                        else '合成任务长时间没有有效进展。' if watchdog_code == 'COMPOSE_STALLED'
+                        else '用户取消了生成任务')
                 else:
                     t["status"] = "failed"
                     error_msg = str(e)
+                    t["failure_code"] = (
+                        getattr(e, 'failure_code', None)
+                        or ('UPSTREAM_FAILURE' if isinstance(e, (TimeoutError, OSError))
+                            else 'COMPOSE_FAILED'))
                 t["error"] = error_msg
                 t["events"] = [evt for evt in t["events"] if evt[0] != 'text_chunk']
-                t["events"].append(('error', {'message': error_msg}))
+                t["events"].append(('error', {
+                    'message': error_msg, 'failure_code': t.get('failure_code')}))
         if error_msg is not None:
-            notify_listeners(task_id, 'error', {'message': error_msg})
-            save_tasks_to_disk()
+            notify_listeners(task_id, 'error', {
+                'message': error_msg, 'failure_code': t.get('failure_code')})
+            save_task_to_disk(task_id)
+    finally:
+        watchdog_done.set()
 
 
 def auto_run_worker(task_id, config, dimensions):
@@ -222,11 +450,17 @@ def auto_run_worker(task_id, config, dimensions):
     packet -> remaining beats -> remaining frames -> videos) as one background task,
     reusing the same ACTIVE_TASKS/SSE plumbing as the three manual stages."""
     t = get_or_create_task(task_id, dimensions)
+    if isinstance(t.get('runtime_version'), dict):
+        t['runtime_version']['policy_version'] = MILESTONE_POLICY_VERSION
     start_time = time.time()
-    project_label = None
-    if isinstance(dimensions, dict):
-        project_label = dimensions.get('task_label') or dimensions.get('theme')
-    project_key = make_idea_project_key(task_id, project_label)
+    # 与 compose 走同一个键：get_or_create_task 已经通过 ensure_task_project_key
+    # 把它写进 dimensions 了，这里直接取，不再各算各的
+    project_key = (dimensions or {}).get('project_key')
+    if not project_key:
+        project_label = None
+        if isinstance(dimensions, dict):
+            project_label = dimensions.get('task_label') or dimensions.get('theme')
+        project_key = make_idea_project_key(task_id, project_label)
     set_project_key_context(project_key)
     set_log_context(task_id)
     log('INFO', 'AUTORUN', "开始自治管线任务")
@@ -235,20 +469,14 @@ def auto_run_worker(task_id, config, dimensions):
         start_accounting()
 
         def progress_cb(stage, details):
-            if stage == 'cancel_check':
-                return t["cancel_event"].is_set()
-            # 已取消 → 不再追加事件/广播，直接 raise 让 worker 快速退出
-            if t["cancel_event"].is_set():
-                raise GenerationCancelled("Generation cancelled by user")
-            with ACTIVE_TASKS_LOCK:
-                t["events"].append((stage, details))
-            notify_listeners(task_id, stage, details)
+            return _video_progress(task_id, t, stage, details)
 
         from pipeline_orchestrator import run_autonomous_pipeline
         # 自治管线的渲染/视频阶段驱动共享 FX 浏览器：全程持有 FX 串行锁
         # （_FX_SERIAL_LOCK 定义在本模块靠后位置，调用时才解析，安全）
-        with _fx_browser_slot(task_id, 'auto', t['cancel_event']):
-            result = run_autonomous_pipeline(config, dimensions, on_progress=progress_cb)
+        with _pipeline_generation_slot(config, task_id, 'auto', t['cancel_event']):
+            result = run_autonomous_pipeline(_pipeline_first_pass_config(config), dimensions, on_progress=progress_cb)
+        result = _continue_pipeline_videos(task_id, config, result, progress_cb, t['cancel_event'])
 
         usage = stop_and_get_accounting()
         if usage:
@@ -258,7 +486,11 @@ def auto_run_worker(task_id, config, dimensions):
         result.setdefault('timings', {})['total_duration_seconds'] = round(time.time() - start_time, 2)
 
         with ACTIVE_TASKS_LOCK:
+            if t['cancel_event'].is_set() or t['status'] != 'running':
+                raise GenerationCancelled('Generation cancelled by user')
             t["status"] = "completed"
+            if result.get('completion_state'):
+                t['outcome'] = result['completion_state']
             t["result"] = result
             t["events"].append(('result', result))
         notify_listeners(task_id, 'result', result)
@@ -276,14 +508,19 @@ def auto_run_worker(task_id, config, dimensions):
         log('WARN', 'AUTORUN', "自治管线任务已被用户取消")
     except Exception as e:
         log_exception('AUTORUN')
+        finalized = False
         with ACTIVE_TASKS_LOCK:
-            t["status"] = "failed"
-            t["error"] = str(e)
-            t["events"].append(('error', {'message': str(e)}))
-        notify_listeners(task_id, 'error', {'message': str(e)})
+            if t['status'] == 'running':
+                t['status'] = 'cancelled' if t['cancel_event'].is_set() else 'failed'
+                t['error'] = '用户取消了生成任务' if t['cancel_event'].is_set() else str(e)
+                t['events'].append(('error', {'message': t['error']}))
+                finalized = True
+        if finalized:
+            notify_listeners(task_id, 'error', {'message': t['error']})
         log('ERROR', 'AUTORUN', f"自治管线任务失败: {e}")
     finally:
-        save_tasks_to_disk()
+        _release_flow_project_run(config, task_id)
+        save_task_to_disk(task_id)
         set_log_context(None)
         set_project_key_context(None)
 
@@ -297,6 +534,45 @@ def _client_ip(handler):
         return handler.client_address[0]
     except Exception:
         return 'unknown'
+
+
+def _own_host_ips():
+    """本机自己的 IP 集合（含各网卡地址），用于判断请求是不是从这台机器发出的。
+    取不到就返回空集合——调用方只用它做"额外放行"，拿不到不影响回环那条主路。"""
+    ips = set()
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None):
+            addr = info[4][0].split('%')[0]  # 剥掉 IPv6 的 zone id（fe80::1%en0）
+            ips.add(addr)
+    except Exception:
+        pass
+    return ips
+
+
+def _is_same_machine_client(handler):
+    """请求是不是来自跑服务端的这台电脑本身。
+
+    不能拿字面量比 '127.0.0.1'：服务端监听的是 IPv6 双栈套接字，浏览器从
+    http://127.0.0.1 连过来时 client_address 是 IPv4-mapped 形式
+    ::ffff:127.0.0.1（这正是"定位本地文件"最初对本机也报 403 的原因）。
+    统一按 ipaddress 解析后判回环，并额外放行本机自己的网卡地址——用户在
+    主机上按局域网 IP 打开页面也算同一台机器；别的机器过来 IP 不同，仍会被挡。
+    这里只信 socket 的真实对端地址，绝不看 X-Forwarded-For 之类可伪造的头。
+    """
+    import ipaddress
+    try:
+        raw = str(handler.client_address[0]).split('%')[0]
+    except Exception:
+        return False
+    try:
+        ip = ipaddress.ip_address(raw)
+    except ValueError:
+        return raw == 'localhost'
+    if getattr(ip, 'ipv4_mapped', None):
+        ip = ip.ipv4_mapped
+    if ip.is_loopback:
+        return True
+    return str(ip) in _own_host_ips()
 
 
 def access_ok(handler):
@@ -359,6 +635,12 @@ def _get_account_pool():
     return account_pool.AccountPool()
 
 
+def _get_proxy_pool():
+    """Google FX 代理号池服务（出口代理，与账号池对称）。"""
+    from integrations.google_fx.utils import proxy_pool
+    return proxy_pool.ProxyPool()
+
+
 def _require_fx_admission(handler, required=True):
     if not required:
         return True
@@ -369,19 +651,17 @@ def _require_fx_admission(handler, required=True):
     return False
 
 
-# FX 运行配置：白名单、校验与版本栈都在 fx_console.py（那套规则本身有独立的测试面，
+# FX 运行配置：白名单、校验都在 fx_console.py（那套规则本身有独立的测试面，
 # 塞在 HTTP 路由旁边会淹没）。这里只保留一个进程内单例。
 FX_CONFIG = FxConfigStore(
     config=SERVER_CONFIG,
     config_file=SERVER_CONFIG_FILE,
-    versions_file=os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                               'runtime', 'fx_config_versions.jsonl'),
     apply_overrides=apply_google_fx_runtime_overrides,
     audit=FX_CONTROL.audit,
 )
 
 
-_FX_TASK_TYPES = {'frames', 'videos', 'staged_render', 'auto'}
+_FX_TASK_TYPES = {'frames', 'videos', 'staged_render', 'auto', 'video_chain'}
 
 
 def _is_fx_task(task_id, task):
@@ -391,6 +671,73 @@ def _is_fx_task(task_id, task):
     task_id = str(task_id or '')
     return task_type in _FX_TASK_TYPES or task_id.startswith(
         ('frames_', 'videos_', 'staged_', 'auto_'))
+
+
+def _task_outcome(task):
+    """Read-only business outcome for summaries, including older frame results."""
+    status = task.get('status') or 'unknown'
+    if status != 'completed':
+        return status  # A retry may still carry the previous run's result/outcome.
+    result = task.get('result')
+    if not isinstance(result, dict):
+        return task.get('outcome') or status
+    dimensions = task.get('dimensions') or {}
+    task_type = dimensions.get('type') or ''
+    frame_task = task_type == 'frames'
+    explicit = result.get('completion_state') or (None if frame_task else task.get('outcome'))
+    rows = result.get('frames' if frame_task else 'videos') or []
+    failed = (result.get('has_failures') or result.get('error')
+              or (result.get('halted_at_sequence') if frame_task else result.get('merge_error')))
+    failed = failed or any(isinstance(row, dict) and (
+        row.get('status') in ('failed', 'error', 'cancelled', 'blocked') or row.get('error')) for row in rows)
+    if failed or explicit == 'partial_failed':
+        return 'partial_failed'
+    if result.get('has_quality_warnings') or explicit == 'completed_with_warnings':
+        return 'completed_with_warnings'
+    return explicit or 'completed'
+
+
+def _auto_video_runtime_snapshot(result):
+    """Project referenced child terminal state without changing durable media data."""
+    if not isinstance(result, dict):
+        return result
+    handoff = result.get('auto_video')
+    if not isinstance(handoff, dict) or not isinstance(handoff.get('task_id'), str):
+        return result
+    with ACTIVE_TASKS_LOCK:
+        child = ACTIVE_TASKS.get(handoff['task_id'])
+        if not child or child.get('status') not in ('failed', 'cancelled', 'completed'):
+            # Missing history does not prove that a remote operation has stopped.
+            return result
+        child_result = child.get('result') if isinstance(child.get('result'), dict) else {}
+        terminal_info = child_result.get('auto_video')
+        if not isinstance(terminal_info, dict) or terminal_info.get('task_id') not in (
+                None, handoff['task_id']):
+            terminal_info = {}
+        if child['status'] == 'failed':
+            state = 'blocked'
+            message = child.get('error') or '自动视频任务已失败，生成已停止。'
+        elif child['status'] == 'cancelled':
+            state = 'cancelled'
+            message = child.get('error') or (
+                terminal_info.get('message') if terminal_info.get('status') == state else None
+            ) or '自动视频已取消。'
+        else:
+            outcome = _task_outcome(child)
+            terminal_states = {'completed', 'completed_with_warnings', 'partial_failed',
+                               'cancelled', 'blocked', 'skipped'}
+            if outcome in ('partial_failed', 'completed_with_warnings'):
+                state = outcome
+            else:
+                state = terminal_info.get('status')
+                if state not in terminal_states:
+                    state = outcome if outcome in terminal_states else 'completed'
+            messages = {'partial_failed': '自动视频部分完成，请检查未成功的片段。',
+                        'completed_with_warnings': '自动视频已完成，请查看提示。',
+                        'completed': '自动视频已完成。'}
+            message = terminal_info.get('message') if terminal_info.get('status') == state else None
+            message = message or messages.get(state) or '自动视频任务已结束。'
+    return {**result, 'auto_video': {**handoff, 'status': state, 'message': message}}
 
 
 def _fx_task_stage(task):
@@ -482,6 +829,208 @@ def google_fx_status_snapshot(force=False):
     return value
 
 
+def _inert_config_notes(config):
+    """列出"存进去了、也热生效了，但被别的配置项压住跑不起来"的字段。
+
+    保存接口用它给出如实回执。此前这类冲突只有一个后果：控制台弹"已保存并热生效"，
+    实际行为一点没变，而唯一的解释写在手册第 4.1 节里。
+    """
+    return [
+        '旧换号节拍仅保留兼容，不再按请求数换号；优先复用有余额的已打开浏览器，'
+        '额度不足后周期禁用 24 小时、关闭旧浏览器，再换号继续。'
+    ]
+
+
+# ── 并发作战板（P0：只读观测）────────────────────────────────────────────────
+# 把控制面的 board()（容量/租约/等待/历史）与任务表、号池合成控制台要的一份数据。
+# 不启动/关闭浏览器、不打 AdsPower：和状态快照一样按秒级轮询，成本只能是读内存+读本地 JSON。
+_FX_BOARD_STAGE_BY_TYPE = {'frames': 'frames', 'staged_render': 'frames',
+                           'videos': 'videos', 'video_chain': 'videos'}
+_FX_BOARD_PROJECT_WINDOW_SECONDS = 2 * 3600
+_FX_BOARD_PROJECT_LIMIT = 12
+_FX_BOARD_ACCOUNT_LIMIT = 24
+
+
+def _fx_board_task_meta(task_id, task):
+    """从任务记录取作战板需要的项目信息；探针等没有任务记录的返回空项目。"""
+    dims = (task.get('dimensions') if isinstance(task, dict) else None) or {}
+    task_type = str(dims.get('type') or '').strip().lower()
+    task_id = str(task_id or '')
+    stage = _FX_BOARD_STAGE_BY_TYPE.get(task_type) or (
+        'frames' if task_id.startswith(('frames_', 'staged_')) else
+        'videos' if task_id.startswith('videos_') else '')
+    return {
+        'project_key': dims.get('project_key') or '',
+        'project_label': dims.get('task_label') or dims.get('theme') or '',
+        'stage': stage,
+    }
+
+
+def _fx_board_account_rows(accounts):
+    now = datetime.now().astimezone()
+    min_credit = accounts[0].get('min_credit', 15) if accounts else 15
+    rows = []
+    for account in accounts:
+        credit = account.get('credit')
+        state = 'ready'
+        cooldown_until = account.get('cooldown_until')
+        cooling = False
+        if cooldown_until:
+            try:
+                cooling = datetime.fromisoformat(cooldown_until) > now
+            except (TypeError, ValueError):
+                cooling = False
+        if account.get('disabled'):
+            state = 'disabled'
+        elif cooling:
+            state = 'cooling'
+        elif credit is None:
+            state = 'unprobed'
+        elif isinstance(credit, (int, float)) and credit < min_credit:
+            state = 'low_credit'
+        serial = str(account.get('serial_number') or '').strip()
+        rows.append({
+            'user_id': str(account.get('user_id') or ''),
+            'label': f'#{serial}' if serial else (account.get('name') or str(account.get('user_id') or '')),
+            'name': account.get('name') or '',
+            'credit': credit,
+            'state': state,
+        })
+    return rows[:_FX_BOARD_ACCOUNT_LIMIT]
+
+
+def _attach_fx_queue_marks(project_rows):
+    """给项目行标注"是否正排队等浏览器 / 正占着浏览器"（项目卡徽标用，只读）。
+
+    没有浏览器任务的项目显式写 None，避免行对象被复用时残留上一次的标记。
+    """
+    try:
+        board = FX_CONTROL.board()
+    except Exception:
+        board = {'leases': [], 'waiting': []}
+    marks = {}
+    for row in board.get('leases') or []:
+        marks[str(row['task_id'])] = {'state': 'active', 'task_id': row['task_id']}
+    for row in board.get('waiting') or []:
+        blocked = (row.get('blocked_by') or [{}])[0]
+        marks[str(row['task_id'])] = {
+            'state': 'waiting', 'task_id': row['task_id'], 'position': row.get('position'),
+            'waited_seconds': row.get('waited_seconds'), 'holder_task': blocked.get('holder_task')}
+    for project in project_rows:
+        ids = [str((project.get('task') or {}).get('id') or '')]
+        ids += [str(job.get('id') or '') for job in project.get('sub_jobs') or []]
+        hits = [marks[i] for i in ids if i in marks]
+        waiting = [m for m in hits if m['state'] == 'waiting']
+        project['fx_queue'] = (waiting or hits or [None])[0]
+
+
+_FX_R2_REPORTED = set()
+
+
+def _annotate_project_conflicts(board):
+    """R2 观察模式：同一项目、不同阶段的任务同时在用/排队时，给等待项补一条 project 阻塞原因。
+
+    P1 只提示，不拦截（排队行为不变）；P2 起同项目同阶段互斥才会改成直接拒绝。
+    """
+    ahead = [row for row in board.get('leases') or []]
+    for row in board.get('waiting') or []:
+        key, stage = row.get('project_key'), row.get('stage')
+        if any(item.get('type') == 'project' for item in row.get('blocked_by') or []):
+            ahead.append(row)  # 控制面已按租约判出项目互斥，不重复提示
+            continue
+        if key and stage:
+            other = next((o for o in ahead if o.get('project_key') == key
+                          and o.get('stage') and o.get('stage') != stage
+                          and o.get('task_id') != row.get('task_id')), None)
+            if other:
+                row.setdefault('blocked_by', []).append({
+                    'type': 'project', 'holder_task': other['task_id'], 'rule': 'R2', 'enforced': False})
+                marker = (row['task_id'], other['task_id'])
+                if marker not in _FX_R2_REPORTED:
+                    if len(_FX_R2_REPORTED) > 500:
+                        _FX_R2_REPORTED.clear()
+                    _FX_R2_REPORTED.add(marker)
+                    FX_CONTROL.audit('project.conflict_observed', task_id=row['task_id'], details={
+                        'project_key': key, 'stage': stage, 'holder_task': other['task_id'],
+                        'holder_stage': other.get('stage'), 'enforced': False})
+        ahead.append(row)
+
+
+def _build_fx_board(accounts=None):
+    """控制台「并发作战板」的数据契约。字段含义见 docs/plans/multi_project_concurrency_plan.md §6.3。"""
+    board = FX_CONTROL.board()
+    if accounts is None:
+        try:
+            accounts = _get_account_pool().list_accounts(heal=False)  # heal=False：不打 AdsPower
+        except Exception:
+            accounts = []
+    account_rows = _fx_board_account_rows(accounts)
+    label_by_user = {row['user_id']: row['label'] for row in account_rows}
+
+    with ACTIVE_TASKS_LOCK:
+        meta_cache = {}
+
+        def meta_for(task_id):
+            if task_id not in meta_cache:
+                meta_cache[task_id] = _fx_board_task_meta(task_id, ACTIVE_TASKS.get(task_id))
+            return meta_cache[task_id]
+
+        def enrich(row):
+            for key, value in meta_for(row.get('task_id')).items():
+                if value or not row.get(key):
+                    row[key] = value
+            user_id = row.get('user_id') or row.get('account_pin') or ''
+            row['account_label'] = label_by_user.get(str(user_id), str(user_id))
+            return row
+
+        for key in ('leases', 'waiting', 'history'):
+            board[key] = [enrich(row) for row in board[key]]
+
+        waiting_ids = {row['task_id'] for row in board['waiting']}
+        active_ids = {row['task_id'] for row in board['leases']}
+        now = time.time()
+        latest = {}
+        for task_id, task in ACTIVE_TASKS.items():
+            if not _is_fx_task(task_id, task):
+                continue
+            meta = meta_for(task_id)
+            if not meta['stage']:
+                continue
+            key = meta['project_key'] or meta['project_label'] or task_id
+            running = task.get('status') == 'running'
+            last_active = float(task.get('last_active') or 0)
+            if not running and now - last_active > _FX_BOARD_PROJECT_WINDOW_SECONDS:
+                continue
+            if task_id in waiting_ids:
+                state = 'waiting'
+            elif task_id in active_ids:
+                state = 'running'
+            elif running:
+                state = 'running_idle'   # 任务在跑但此刻不持有浏览器（例如在做文本/落盘）
+            else:
+                outcome = _task_outcome(task)
+                state = ('failed' if outcome in ('failed', 'partial_failed') else
+                         'cancelled' if outcome == 'cancelled' else 'done')
+            slot = latest.setdefault(key, {
+                'project_key': meta['project_key'], 'label': meta['project_label'] or key,
+                'stages': {}, 'last_active': 0.0})
+            slot['last_active'] = max(slot['last_active'], last_active)
+            if not slot['label'] or slot['label'] == key:
+                slot['label'] = meta['project_label'] or slot['label']
+            prev = slot['stages'].get(meta['stage'])
+            if prev is None or last_active >= prev['last_active']:
+                slot['stages'][meta['stage']] = {
+                    'state': state, 'task_id': task_id, 'last_active': last_active}
+        projects = sorted(latest.values(), key=lambda row: row['last_active'], reverse=True)
+        board['projects'] = projects[:_FX_BOARD_PROJECT_LIMIT]
+    board['accounts'] = account_rows
+    _annotate_project_conflicts(board)
+    board['open_browsers'] = _fx_open_browser_rows(board)
+    board['open_browsers_error'] = _FX_OPEN_STATE['error']
+    board['mode'] = {'max_concurrent': board['capacity']['max'], 'phase': 'P2'}
+    return board
+
+
 def _google_fx_status_snapshot():
     """返回控制台所需的非敏感 FX 运维快照；不启动或关闭任何浏览器。
 
@@ -542,9 +1091,15 @@ def _google_fx_status_snapshot():
     now = datetime.now().astimezone()
     enabled = disabled = cooling = low_credit = ready = unprobed = login_required = 0
     stale_credit = probe_failed = 0
+    # 「积分不够」的口径统一到用户配的「选号最低积分」，不再各处自己跟 0 比：
+    # 余额低于阈值的号后端本来就已经自动停用了，统计里却不算进 low_credit，
+    # 面板上就会出现"一堆号被停用，但积分不足数是 0"这种对不上的读数。
+    min_credit = accounts[0].get('min_credit', 15) if accounts else 15
     for account in accounts:
         if account.get('disabled'):
             disabled += 1
+            if account.get('disabled_reason') == 'zero_credit' or (isinstance(account.get('credit'), (int, float)) and account.get('credit') < min_credit):
+                low_credit += 1
             continue
         enabled += 1
         is_cooling = False
@@ -565,7 +1120,7 @@ def _google_fx_status_snapshot():
             unprobed += 1
         elif account.get('credit_stale'):
             stale_credit += 1
-        elif isinstance(credit, (int, float)) and credit <= 0:
+        elif isinstance(credit, (int, float)) and credit < min_credit:
             low_credit += 1
         elif account.get('credit_trustworthy', account.get('last_probe_status') != 'failed') and not is_cooling:
             ready += 1
@@ -594,6 +1149,42 @@ def _google_fx_status_snapshot():
         diagnostics.append({'level': 'warn', 'code': 'accounts_probe_failed',
                             'message': f'{probe_failed} 个账号最近一次积分探测失败，请检查登录或选择器'})
 
+    # 代理号池摘要：只读一个本地 JSON，不做连通性检测（检测要走网络，秒级轮询扛不住）
+    proxies = {'total': 0, 'enabled': 0, 'disabled': 0, 'ok': 0, 'failed': 0,
+               'unchecked': 0, 'bound': 0}
+    try:
+        proxies = _get_proxy_pool().summary()
+    except Exception as e:
+        diagnostics.append({'level': 'warn', 'code': 'proxy_pool_unavailable',
+                            'message': f'代理号池读取失败：{e}'})
+    if proxies.get('failed'):
+        diagnostics.append({
+            'level': 'warn', 'code': 'proxies_failed',
+            'message': f'{proxies["failed"]} 条代理最近一次连通性检测失败，不会参与轮换',
+        })
+
+    # 序列生成默认环境：钉了一个不在池子里/已禁用的环境，生成时会静默降级成自动
+    # 选号——那正是最难自查的一类"配了但没生效"，在这里先报出来。
+    sequence_user_id = str(cfg.get('googleFxSequenceUserId') or '').strip()
+    sequence_locked = bool(cfg.get('googleFxSequenceUserLock')) and bool(sequence_user_id)
+    if sequence_user_id:
+        picked = next((a for a in accounts if str(a.get('user_id')) == sequence_user_id), None)
+        if picked is None:
+            diagnostics.append({
+                'level': 'warn', 'code': 'sequence_account_missing',
+                'message': (f'序列生成默认浏览器环境 {sequence_user_id} 不在号池里，'
+                            '生成时会退回自动选号'),
+            })
+        elif picked.get('disabled'):
+            diagnostics.append({
+                'level': 'warn', 'code': 'sequence_account_disabled',
+                'message': f'序列生成默认浏览器环境 {sequence_user_id} 已禁用，生成时会退回自动选号',
+            })
+    diagnostics.append({
+        'level': 'info', 'code': 'switch_interval_inert',
+        'message': _inert_config_notes(cfg)[0],
+    })
+
     selector_warnings = [row for row in selector_rows
                          if row.get('miss', 0) > 0 or row.get('primary_ratio', 1) < 0.8]
     if selector_warnings:
@@ -619,6 +1210,7 @@ def _google_fx_status_snapshot():
                 'id': task_id,
                 'type': dimensions.get('type') or 'fx',
                 'status': task.get('status'),
+                'outcome': _task_outcome(task),
                 'stage': _fx_task_stage(task),
                 'theme': dimensions.get('task_label') or dimensions.get('theme') or '',
                 'account': account,
@@ -632,14 +1224,14 @@ def _google_fx_status_snapshot():
                 'elapsed_seconds': active_row.get('elapsed_seconds'),
                 'overdue': bool(active_row.get('overdue')),
                 'timeline': timeline,
-                'stuck_stage': next((row for row in reversed(timeline) if row.get('slow')), None),
-                'manual_intervention': _fx_manual_intervention(task_id, account),
+                'stuck_stage': timeline[-1] if running and timeline and timeline[-1].get('slow') else None,
+                'manual_intervention': _fx_manual_intervention(task_id, account) if running else None,
             })
     fx_tasks.sort(key=lambda row: row['last_active'], reverse=True)
-    recent_failures = [row for row in fx_tasks if row['status'] == 'failed'][:5]
+    recent_failures = [row for row in fx_tasks if row['outcome'] in ('failed', 'partial_failed')][:5]
     if recent_failures:
-        diagnostics.append({'level': 'warn', 'code': 'recent_failures',
-                            'message': f'最近记录中有 {len(recent_failures)} 个 FX 任务失败'})
+        diagnostics.append({'level': 'info', 'code': 'recent_failures',
+                            'message': f'历史记录：最近有 {len(recent_failures)} 个 FX 任务未全部完成，可在任务日志中查看'})
     blocked = [row for row in fx_tasks if row.get('manual_intervention')]
     if blocked:
         first = blocked[0]['manual_intervention']
@@ -664,7 +1256,7 @@ def _google_fx_status_snapshot():
             'message': (f'上次进程退出时有 {len(queue_snapshot["orphaned"])} 个任务仍在队列中'
                         '（服务被强制结束或崩溃），它们不会自动恢复'),
         })
-    if queue_snapshot.get('mode') != 'running':
+    if queue_snapshot.get('mode') not in ('accepting', 'running'):
         diagnostics.append({
             'level': 'warn', 'code': 'service_not_accepting',
             'message': f'服务处于 {queue_snapshot.get("mode")} 模式，新任务会被拒绝',
@@ -716,12 +1308,19 @@ def _google_fx_status_snapshot():
             'image_model': cfg.get('googleFxImageModel') or 'Nano Banana 2',
             'video_model': cfg.get('videoModel') or 'Veo 3.1 - Lite [Lower Priority]',
             'video_duration': cfg.get('videoDuration') or '',
+            'video_resolution': cfg.get('videoResolution') or '720p',
+            'video_ref_mode': cfg.get('videoRefMode') or 'VIDEO_FRAMES',
             'account_switch_requests': _account_switch_interval(cfg),
+            'account_switch_effective': False,
+            'account_reuse_policy': 'until_exhausted',
             'selected_user_id': selected_user_id,
+            'sequence_user_id': sequence_user_id,
+            'sequence_user_locked': sequence_locked,
             'ip_rotation_enabled': rotation['effective'],
             'ip_rotation': rotation,
             'dry_run': os.environ.get('FX_DRY_RUN', '0') in ('1', 'true', 'yes'),
             'debug_capture': os.environ.get('GOOGLE_FX_DEBUG_CAPTURE', '1') not in ('0', 'false', 'no'),
+            'silent_mode': os.environ.get('ADSPOWER_SILENT_MODE', '1') not in ('0', 'false', 'no'),
         },
         'accounts': {
             'total': len(accounts),
@@ -735,8 +1334,10 @@ def _google_fx_status_snapshot():
             'login_required': login_required,
             'ready': ready,
         },
+        'proxies': proxies,
         'tasks': fx_tasks[:20],
         'queue': queue_snapshot,
+        'board': _build_fx_board(accounts),
         'recent_failures': recent_failures,
         'selectors': {
             'families': len(selector_rows),
@@ -777,23 +1378,25 @@ def _fx_log_path():
         return _LOG_PATH
 
 
-def _fx_log_tail(task_id='', keyword='', limit=120, fx_only=True):
-    """从日志文件尾部回读并按 FX 模块 / task_id / 关键字过滤。
+def _fx_log_records(task_id='', keyword='', limit=120, fx_only=True, level='all'):
+    """从日志文件尾部回读，按完整记录过滤，级别只取明确的记录头标记。
 
     /api/logs/stream 是全量流：排查 FX 问题时 LLM 合成、技能契约等日志会把有用的
     行冲走。这里只回读文件末尾一段（日志上限本来就有轮转），不整份读进内存。
+    limit 限制记录数，保留命中记录的所有续行，避免把真正的错误原因截掉。
     """
     limit = max(1, min(int(limit), 800))
+    level = str(level or 'all').strip().lower()
+    if level not in ('all', 'warning', 'error'):
+        raise ValueError('日志级别应为 all、warning 或 error')
     task_id = str(task_id or '').strip()
     keyword = str(keyword or '').strip().lower()
     log_path = _fx_log_path()
-    if not os.path.exists(log_path):
-        return []
     try:
         with open(log_path, 'rb') as handle:
             size = os.fstat(handle.fileno()).st_size
-            # 过滤越严就要回读越多才能凑够 limit 行
-            window = _LOG_TAIL_BYTES * (4 if (task_id or keyword) else 1)
+            # 过滤越严就要回读越多才能凑够 limit 条记录
+            window = _LOG_TAIL_BYTES * (4 if (task_id or keyword or level != 'all') else 1)
             if size > window:
                 handle.seek(size - window)
                 raw = handle.read()
@@ -802,26 +1405,751 @@ def _fx_log_tail(task_id='', keyword='', limit=120, fx_only=True):
             else:
                 raw = handle.read()
         lines = raw.decode('utf-8', errors='replace').splitlines()
-    except Exception:
+    except FileNotFoundError:
         return []
+    except OSError:
+        raise OSError('日志读取失败，请稍后重试') from None
+
+    # FX logger 的多行消息只有首行带时间/模块/任务标签；逐行筛选会只留下
+    # “生成失败: warning”，丢掉后面的 unusual activity 和未扣费说明。
+    # stdout 混用的两套结构化日志及旧 print 标签也必须切开，不能把另一个
+    # 模块/任务的正文接到上一条 FX 记录里。回读窗口开头的孤立续行没有归属。
+    fx_header = re.compile(r'^\[\d{2}:\d{2}:\d{2}\]\s*│\s*([^│]*?)\s*│\s*([^│]+?)\s*│\s*(.*)$')
+    server_header = re.compile(
+        r'^\d{2}:\d{2}:\d{2}(?:\.\d+)?\s+\[([A-Z]+)\s*\]\s+\[([^\]]+)\]\s*(.*)$')
+    legacy_header = re.compile(r'^\[([A-Za-z][A-Za-z0-9 _-]*)\]\s*(.*)$')
+    task_header = re.compile(r'^\[(?:task=)?([^\]\s]+)\](?:\s|$)')
+    stdout_header = re.compile(
+        r'^(?:\[?\d{4}-\d{2}-\d{2}[ T]|\[?\d{2}:\d{2}:\d{2}|'
+        r'(?:LOG|DEBUG|INFO|WARN(?:ING)?|ERROR|CRITICAL|Warning|Error):|'
+        r'\S+\s+-\s+-\s+\[|=+\s*SPARK server log|Starting SPARK server|'
+        r'Persisted library file|Skill (?:contract|profile))')
+    ansi = re.compile(r'\x1b\[[0-9;?]*[ -/]*[@-~]')
+    records = []
+    current = None
+    level_names = {'ERROR': 'error', 'CRITICAL': 'error', 'FATAL': 'error',
+                   'WARN': 'warning', 'WARNING': 'warning', 'DEBUG': 'debug'}
+
+    def icon_level(text):
+        # 仅识别消息开头的显式图标，不因正文出现“失败后已恢复”而报错。
+        text = text.lstrip()
+        if text.startswith(('❌', '⛔', '🚨')):
+            return 'error'
+        if text.startswith('⚠'):
+            return 'warning'
+        return 'info'
+
+    for line in lines:
+        clean = ansi.sub('', line)
+        fx_match = fx_header.match(clean)
+        server_match = server_header.match(clean)
+        legacy_match = legacy_header.match(clean)
+        if fx_match or server_match or legacy_match:
+            if fx_match:
+                icon, module, body = fx_match.groups()
+                severity = icon_level(icon)
+            elif server_match:
+                declared_level, module, body = server_match.groups()
+                severity = level_names.get(declared_level, 'info')
+            else:
+                module, body = legacy_match.groups()
+                severity = level_names.get(module.upper(), 'info')
+            task_match = task_header.match(body)
+            message = body[task_match.end():] if task_match else body
+            if not server_match and severity == 'info':
+                severity = icon_level(message)
+            module = module.strip()
+            # FX logger 的 Error/Warning 是专用前缀，也写入同一日志；原先模块
+            # 白名单漏掉了这些记录，会把致命失败和人工处理超时一起隐藏。
+            is_fx = module in _FX_LOG_MODULES or bool(fx_match and module in ('Error', 'Warning'))
+            current = (is_fx, task_match.group(1) if task_match else '', severity, [line])
+            records.append(current)
+        elif stdout_header.match(clean):
+            marker = re.match(r'^([A-Za-z]+):', clean)
+            severity = level_names.get(marker.group(1).upper(), 'info') if marker else 'info'
+            current = (False, '', severity, [line])
+            records.append(current)
+        elif current is not None:
+            current[3].append(line)
+        else:
+            current = (False, '', 'info', [line])
+            records.append(current)
 
     picked = []
-    for line in reversed(lines):
-        if task_id and f'[{task_id}]' not in line and task_id not in line:
+    for is_fx, record_task, severity, record_lines in reversed(records):
+        if task_id and record_task != task_id:
             continue
-        if keyword and keyword not in line.lower():
+        if keyword and keyword not in '\n'.join(record_lines).lower():
             continue
-        if fx_only and not any(module in line for module in _FX_LOG_MODULES):
+        if fx_only and not is_fx:
             continue
-        picked.append(line)
+        if level == 'error' and severity != 'error':
+            continue
+        if level == 'warning' and severity not in ('warning', 'error'):
+            continue
+        picked.append({'level': severity, 'lines': record_lines})
         if len(picked) >= limit:
             break
-    picked.reverse()
-    return picked
+    return list(reversed(picked))
+
+
+def _fx_log_tail(task_id='', keyword='', limit=120, fx_only=True, level='all'):
+    """兼容旧调用方：仍返回选中记录的原始文本行。"""
+    return [line for record in _fx_log_records(task_id, keyword, limit, fx_only, level)
+            for line in record['lines']]
+
+
+def _media_task_progress_snapshot(task):
+    """Recover media progress from the complete task history, not its last 50 events."""
+    dimensions = task.get('dimensions') or {}
+    kind = dimensions.get('type')
+    if kind not in ('frames', 'videos', 'video_chain'):
+        return None
+    targets = dimensions.get('target_sequences' if kind == 'frames' else 'target_slots')
+    targets = sorted({int(slot) for slot in (targets or [])
+                      if type(slot) is int and slot > 0})
+    total = len(targets)
+    slots, phase, label = {}, 'pending', ''
+    for event in task.get('events') or []:
+        if not isinstance(event, (list, tuple)) or len(event) < 2:
+            continue
+        stage, details = event[:2]
+        if stage == 'progress' and isinstance(details, dict) and details.get('stage'):
+            stage, details = details['stage'], details.get('details')
+        if not isinstance(details, dict):
+            continue
+        event_total = details.get('total')
+        if type(event_total) is int and event_total > 0 and not targets:
+            total = max(total, event_total)
+        slot = None
+        state = None
+        if kind == 'frames':
+            if stage in ('frame', 'frame_ready'):
+                frame = details.get('frame') or {}
+                slot = frame.get('sequence') or frame.get('slot') or details.get('sequence')
+                state = 'done'
+            elif stage in ('frame_start', 'frame_retry', 'frame_continuity_retry'):
+                slot = details.get('sequence') or details.get('slot')
+                state = 'active'
+            elif stage in ('frame_continuity_failed', 'chain_guard_halt'):
+                slot = details.get('sequence') or details.get('slot')
+                state = 'failed'
+        else:
+            if stage == 'video_recovery':
+                for recovered in details.get('completed_slots') or []:
+                    if type(recovered) is int and (not targets or recovered in targets):
+                        slots[str(recovered)] = 'done'
+                for recovering in details.get('slots') or []:
+                    if type(recovering) is int and (not targets or recovering in targets):
+                        slots[str(recovering)] = 'recovering'
+            slot = details.get('index')
+            if stage in ('video_done', 'video_skip_cut', 'video_skip_bridge_hold'):
+                state = 'done'
+            elif stage == 'video_error':
+                state = 'failed'
+            elif stage in ('video_start', 'request_submitting', 'request_submitted', 'request_accepted'):
+                state = 'active'
+        if type(slot) is int and slot > 0 and state and (not targets or slot in targets):
+            slots[str(slot)] = state
+        if stage != 'text_chunk':
+            phase = stage
+            if details.get('message'):
+                label = str(details['message'])
+    recovering = any(state == 'recovering' for state in slots.values())
+    current = sum(state == 'done' or state == 'failed' and not recovering for state in slots.values())
+    total = max(total, len(slots))
+    percent = min(95, round(5 + 90 * current / total)) if total else 0
+    return {'taskType': kind, 'total': total, 'current': current,
+            'slotStatus': slots, 'slot_status': slots, 'phase': phase,
+            'label': label, 'message': label, 'percent': percent}
+
+
+def _configure_frame_auto_video(config, body):
+    enabled = body.get('auto_generate_videos', True)
+    if type(enabled) is not bool:
+        raise ValueError('auto_generate_videos 必须为布尔值')
+    preference_explicit = body.get('auto_generate_videos_preference_explicit')
+    if preference_explicit is not None and type(preference_explicit) is not bool:
+        raise ValueError('auto_generate_videos_preference_explicit 必须为布尔值')
+    slots = body.get('video_target_slots')
+    if slots is not None and (not isinstance(slots, list) or not slots
+            or any(type(slot) is not int or slot <= 0 for slot in slots)):
+        raise ValueError('video_target_slots 必须为正整数槽位列表')
+    config['_auto_generate_videos'] = enabled
+    config['_auto_generate_videos_explicit'] = 'auto_generate_videos' in body
+    config['_auto_generate_videos_preference_explicit'] = preference_explicit
+    config['_auto_video_target_slots'] = sorted(set(slots)) if slots is not None else None
+    config['_merge_speed'] = body.get('merge_speed', 4)
+    if enabled:
+        config['videoFramePairing'] = 'auto'
+
+
+class _ProgressiveAutoVideo:
+    """Queue settled frame pairs; a separate video worker never holds up images."""
+
+    def __init__(self, task_id, task, config, title, prompt_block, progress_cb,
+                 target_sequences=None):
+        self.parent_id, self.parent = task_id, task
+        self.config = {**config, 'videoFramePairing': 'auto'}
+        self.config.pop('_flow_project_claim', None)
+        self.title, self.prompt_block, self.progress_cb = title, prompt_block, progress_cb
+        self.project_dir = _get_project_dir(config.get('_project_key') or title)
+        self.enabled = bool(config.get('_auto_generate_videos'))
+        self.explicit = config.get('_auto_generate_videos_explicit', False)
+        self.preference_explicit = config.get('_auto_generate_videos_preference_explicit')
+        images, self.videos = _parse_prompt_slots(prompt_block)
+        targets = config.get('_auto_video_target_slots')
+        self.targets = targets
+        self.target_sequences = target_sequences
+        self.selected = sorted(self.videos if targets is None else set(targets).intersection(self.videos))
+        self.image_count = max(images, default=0)
+        self.awaiting_replacement = set(images if target_sequences is None else target_sequences)
+        self.replaced = set()
+        self.processed, self.queued, self.blocked = set(), set(), {}
+        self.failed_slots, self.cancelled_slots = set(), set()
+        self.revised_slots = set()
+        self.ready = set()
+        self.child_id = None
+        self.child = None
+        self.request_id = 'auto_video:' + task_id
+        self.closed = False
+        self.initialized = False
+        self.error = None
+        self.pairs = [{'slot': slot, **resolve_video_frame_anchors(slot, self.videos[slot], self.config)}
+                      for slot in self.selected] if self.enabled else []
+        self.info = None
+        self._state_lock = threading.RLock()
+        self._queue = queue.Queue()
+        self.worker_thread = None
+        self.worker_done = threading.Event()
+        self._optimizing_slots = set()
+        self._aborted = False
+        self._video_usage = None
+        self._accounting_finished = False
+        # Shared per-slot paid-submission budget, and failed slots waiting for an
+        # in-run retry (monotonic due time) instead of waiting for every segment.
+        self.attempt_counts = {}
+        self.retry_due = {}
+
+    def _record(self, status, message='', emit=True):
+        info = {'status': status, 'request_id': self.request_id,
+                'frame_pairs': self.pairs, 'target_slots': self.selected,
+                'ready_slots': sorted(self.ready), 'queued_slots': sorted(self.queued),
+                'pending_slots': sorted(set(self.selected) - self.ready),
+                'blocked_slots': sorted(self.blocked), 'message': message}
+        if self.child_id:
+            info['task_id'] = self.child_id
+        if status == 'started' and self.info:
+            info.update({key: self.info[key] for key in
+                ('phase', 'slots', 'retry_round', 'next_retry_at', 'completed_slots') if key in self.info})
+        self.info = info
+        with manifest_lock(self.project_dir):
+            manifest = read_manifest(self.project_dir) or {}
+            manifest.update(auto_generate_videos=True, video_frame_pairing='auto', auto_video=info)
+            if self.preference_explicit is not None:
+                manifest['auto_generate_videos_preference_explicit'] = self.preference_explicit
+            write_manifest(self.project_dir, manifest)
+            if read_manifest(self.project_dir) != manifest:
+                raise RuntimeError('自动视频清单保存失败，已停止继续提交')
+        with ACTIVE_TASKS_LOCK:
+            if self.parent.get('status') == 'running':
+                self.parent['result'] = manifest
+            if self.child:
+                self.child['result'] = manifest
+        if emit:
+            event = 'auto_video_blocked' if status == 'blocked' else 'auto_video_updated'
+            # The image SSE may already have ended. The independent video SSE
+            # must still report scheduling/terminal state after the final image.
+            try:
+                self.progress_cb(event, info)
+            except ConnectionError:
+                pass
+            if self.child:
+                with ACTIVE_TASKS_LOCK:
+                    self.child['events'].append((event, info))
+                notify_listeners(self.child_id, event, info)
+        return manifest
+
+    def _ensure_child(self, manifest):
+        if self.child_id:
+            return True
+        with _VIDEO_OPERATION_LOCK:
+            if self.parent['cancel_event'].is_set():
+                raise GenerationCancelled('Generation cancelled by user')
+            project_key = self.config.get('_project_key') or self.title
+            if self.config.get('videoProvider') != 'flow2api':
+                admitted, message = FX_CONTROL.admission()
+                if not admitted:
+                    raise RuntimeError(message)
+            key = _safe_project_name(project_key)
+            with ACTIVE_TASKS_LOCK:
+                live = next((tid for tid, task in ACTIVE_TASKS.items()
+                    if tid != self.parent_id and task.get('status') == 'running'
+                    and (task.get('dimensions') or {}).get('type') in ('videos', 'video_chain')
+                    and _safe_project_name((task.get('dimensions') or {}).get('project_key')
+                        or (task.get('dimensions') or {}).get('theme') or '') == key), None)
+            if live:
+                raise RuntimeError('该项目已有视频任务运行，请等待原任务完成。')
+            operation, created = _VIDEO_OPERATIONS.reserve(self.request_id,
+                request_fingerprint({'title': project_key, 'prompt_block': self.prompt_block,
+                                     'target_slots': self.selected}, 'auto_video_progressive'))
+            if not created:
+                # A replay must reconnect to the existing child, never submit again.
+                self.child_id = operation['task_id']
+                self.child = ACTIVE_TASKS.get(self.child_id)
+                self.processed.update(self.selected)
+                self._record('started', '已恢复原自动视频任务。')
+                return False
+            self.child_id = operation['task_id']
+            self.child = get_or_create_task(self.child_id, {
+                'type': 'videos', 'theme': self.title, 'project_key': project_key,
+                'request_id': self.request_id, 'parent_frame_task_id': self.parent_id,
+                'video_provider': self.config.get('videoProvider') or 'google_fx',
+                'target_slots': self.selected, 'progressive': True,
+                'userId': None if self.config.get('videoProvider') == 'flow2api'
+                          else self.config.get('googleFxUserId') or None})
+            # Keep the image parent's claim until its worker exits, and keep
+            # cancellation independent so stopping videos cannot stop images.
+            self._record('started', '对应首尾帧已就绪，正在逐段生成视频。', emit=False)
+            if not save_task_to_disk(self.child_id) or not save_task_to_disk(self.parent_id):
+                raise RuntimeError('自动视频任务登记保存失败，未提交生成。')
+            if self.parent['cancel_event'].is_set():
+                raise GenerationCancelled('Generation cancelled by user')
+            self.progress_cb('auto_video_started', self.info)
+            return True
+
+    def _video_progress(self, stage, details):
+        if self.parent['cancel_event'].is_set():
+            self.child['cancel_event'].set()
+        with self._state_lock:
+            if stage == 'video_done':
+                self.failed_slots.discard(details.get('index'))
+            elif stage == 'video_error':
+                self.failed_slots.add(details.get('index'))
+            elif stage == 'video_recovery':
+                self.info.update({key: details[key] for key in
+                    ('phase', 'slots', 'retry_round', 'next_retry_at', 'completed_slots') if key in details})
+                self._record('started', details.get('message') or '正在自动恢复未完成视频。')
+        if stage == 'start':
+            # The generator starts one subset at a time; the UI represents the full run.
+            details = {**details, 'total': len(self.selected), 'slots': self.selected}
+        elif isinstance(details, dict) and 'total' in details:
+            details = {**details, 'total': len(self.selected)}
+        return _video_progress(self.child_id, self.child, stage, details)
+
+    def advance(self, details=None):
+        with self._state_lock:
+            return self._advance_ready(details)
+
+    def _advance_ready(self, details=None):
+        if not self.enabled or self.closed or self.error:
+            return
+        if self.parent['cancel_event'].is_set():
+            if self.child:
+                self.child['cancel_event'].set()
+            raise GenerationCancelled('Generation cancelled by user')
+        if self.child and self.child['cancel_event'].is_set():
+            return
+        if details:
+            frame = details.get('frame') or {}
+            sequence = details.get('sequence') or details.get('slot') or frame.get('sequence') or frame.get('slot')
+            if sequence:
+                self.awaiting_replacement.discard(int(sequence))
+                if not details.get('skipped'):
+                    self.replaced.add(int(sequence))
+        with manifest_lock(self.project_dir):
+            manifest = read_manifest(self.project_dir) or {}
+            if not self.initialized:
+                # The submitted prompt may contain edits newer than disk. Seed
+                # it once; later frame repairs/optimizations become authoritative.
+                # Auto video starts before the image renderer creates its folders.
+                os.makedirs(self.project_dir, exist_ok=True)
+                manifest.update(prompt_block=self.prompt_block,
+                                prompt_slots=prompt_slots_list(self.prompt_block))
+                write_manifest(self.project_dir, manifest)
+                self.initialized = True
+            if details and self.target_sequences is not None:
+                # Retried anchors can make untouched downstream images stale.
+                # Settle their lineage before spending on any new video pair.
+                existing_videos = manifest.get('videos', [])
+                update_manifest_stale_status(manifest, self.project_dir,
+                    regenerated_sequences=self.target_sequences, finalize=True)
+                manifest['videos'] = existing_videos
+                write_manifest(self.project_dir, manifest)
+        current_block = manifest.get('prompt_block') or self.prompt_block
+        if current_block != self.prompt_block:
+            self.prompt_block = current_block
+            previous_videos = self.videos
+            _, self.videos = _parse_prompt_slots(current_block)
+            # An accepted frame repair may also change a previously generated
+            # video's action or anchors. Treat that revision as new work.
+            changed = {slot for slot in self.processed - self._optimizing_slots
+                       if previous_videos.get(slot) != self.videos.get(slot)}
+            self.processed.difference_update(changed)
+            self.revised_slots.update(changed)
+            for slot in changed:
+                self.blocked.pop(slot, None)
+            self.selected = sorted(self.videos if self.targets is None else set(self.targets).intersection(self.videos))
+            self.pairs = [{'slot': slot, **resolve_video_frame_anchors(slot, self.videos[slot], self.config)}
+                          for slot in self.selected]
+            if self.child:
+                self.child['dimensions']['target_slots'] = self.selected
+        frames, quality = load_slot_frames(manifest, os.path.join(self.project_dir, 'frames'), self.image_count)
+        self.ready = {pair['slot'] for pair in self.pairs
+            if all(anchor not in self.awaiting_replacement and frames.get(anchor)
+                and os.path.isfile(frames[anchor]) and os.path.getsize(frames[anchor]) > 0
+                for anchor in (pair['start_anchor_slot'], pair['end_anchor_slot']) if anchor is not None)}
+        eligible = sorted(self.ready - self.processed)
+        if not eligible:
+            if self.selected:
+                self._record('started' if self.child_id else 'waiting',
+                             '等待下一段视频的对应首尾帧。')
+            return
+        try:
+            plans = plan_video_slots(self.videos, frames, quality, os.path.join(self.project_dir, 'videos'),
+                strict=strict_gates_enabled(self.config), gate_level=qa_gate_level(self.config),
+                stale_slots=load_stale_slots(manifest), existing_videos=manifest.get('videos', []),
+                config=self.config)
+            by_slot = {plan['slot']: plan for plan in plans}
+            submit = []
+            for slot in eligible:
+                plan = by_slot.get(slot) or {}
+                if plan.get('action') == 'blocked':
+                    self.blocked[slot] = plan.get('reason') or '首尾帧未通过视频生成检查'
+                    self.processed.add(slot)
+                elif plan.get('action') in ('reuse', 'skip_cut', 'skip_bridge_hold') and slot not in self.revised_slots and not any(
+                        anchor in self.replaced for anchor in (
+                            plan.get('start_anchor_slot'), plan.get('end_anchor_slot'))):
+                    self.processed.add(slot)
+                else:
+                    submit.append(slot)
+            if submit:
+                ensure_video_submissions_resolved(self.config.get('_project_key') or self.title,
+                    submit, manifest=manifest, provider=self.config.get('videoProvider') or 'google_fx')
+                if not self._ensure_child(manifest):
+                    return
+                self.queued.update(submit)
+                self.processed.update(submit)  # A replayed frame boundary cannot reset retries.
+                self.revised_slots.difference_update(submit)
+                self._record('started', '首尾帧已就绪，正在生成：' + '、'.join(f'视频 {s}' for s in submit))
+                self._queue.put(submit)
+                if self.worker_thread is None:
+                    # Do not inherit the image thread's FX lease ContextVars.
+                    self.worker_thread = threading.Thread(target=contextvars.Context().run,
+                        args=(self._run,), daemon=True,
+                        name=f'auto-video-{self.child_id}')
+                    self.worker_thread.start()
+        except ConnectionError:
+            raise
+        except Exception as error:
+            self.error = str(error)
+            self._record('blocked', f'自动视频已停止：{error}；图片将继续生成。')
+
+    def _run(self):
+        set_project_key_context(self.config.get('_project_key'))
+        set_log_context(self.child_id)
+        from prompt_pipeline import start_accounting
+        start_accounting()
+        try:
+            while True:
+                if self.parent['cancel_event'].is_set():
+                    self.child['cancel_event'].set()
+                if self.child['cancel_event'].is_set():
+                    raise GenerationCancelled('用户取消了自动视频生成')
+                # A due retry goes ahead of newly ready segments so one failure
+                # is repaired during the run rather than after every other clip.
+                submit = self._take_due_retries()
+                from_queue = submit is None
+                if from_queue:
+                    try:
+                        submit = self._queue.get(timeout=.1)
+                    except queue.Empty:
+                        continue
+                    if submit is None:
+                        break
+                try:
+                    with self._state_lock:
+                        latest = read_manifest(self.project_dir) or {}
+                        block = latest.get('prompt_block') or self.prompt_block
+                        self._optimizing_slots.update(submit)
+                    try:
+                        block = optimize_video_prompts_for_sequence(self.config, self.title, block,
+                            on_progress=self._video_progress, target_slots=submit, force=False) or block
+                    except ConnectionError:
+                        raise
+                    except Exception as error:
+                        log('WARN', 'VIDEOS', f'视频提示词优化异常，沿用原提示词: {error}', title=self.title)
+                    finally:
+                        with self._state_lock:
+                            latest = read_manifest(self.project_dir) or {}
+                            block = latest.get('prompt_block') or block
+                            _, optimized_videos = _parse_prompt_slots(block)
+                            baseline_images, _ = _parse_prompt_slots(self.prompt_block)
+                            for slot in submit:
+                                if slot in optimized_videos:
+                                    self.videos[slot] = optimized_videos[slot]
+                            # Only rebase this optimizer's slots. Unrelated
+                            # accepted frame repairs still need advance() to
+                            # discover revised videos rather than silently lose them.
+                            self.prompt_block = _format_prompt_block(baseline_images, self.videos)
+                            self._optimizing_slots.difference_update(submit)
+                            current_frames, _ = load_slot_frames(latest,
+                                os.path.join(self.project_dir, 'frames'), self.image_count)
+                            deferred = []
+                            for slot in submit:
+                                item = optimized_videos.get(slot)
+                                anchors = resolve_video_frame_anchors(slot, item, self.config) if item else {}
+                                needed = [anchors.get('start_anchor_slot'), anchors.get('end_anchor_slot')]
+                                if not item or any(anchor is not None and (
+                                        anchor in self.awaiting_replacement or not current_frames.get(anchor)
+                                        or not os.path.isfile(current_frames[anchor])
+                                        or os.path.getsize(current_frames[anchor]) == 0) for anchor in needed):
+                                    deferred.append(slot)
+                                    self.processed.discard(slot)
+                                    self.ready.discard(slot)
+                            if deferred:
+                                submit = [slot for slot in submit if slot not in deferred]
+                                self._record('started', '首尾帧已修订，等待新图片就绪：'
+                                    + '、'.join(f'视频 {slot}' for slot in deferred))
+                    if not submit:
+                        continue
+                    def generate_ready_round(*args, **kwargs):
+                        if kwargs.get('override_flagged') is False:
+                            kwargs.pop('override_flagged')
+                        with _video_generation_slot(self.config, self.child_id, self.child['cancel_event']):
+                            return generate_video_sequence(*args, **kwargs)
+                    batch_result = execute_video_generation_with_recovery(self.config, self.title, block,
+                        on_progress=self._video_progress, target_slots=submit,
+                        generate_fn=generate_ready_round, project_dir=self.project_dir, first_pass_only=True,
+                        attempt_counts=self.attempt_counts)
+                    last_run = (batch_result.get('video_generation_stats') or {}).get('last_run') or {}
+                    with self._state_lock:
+                        self.failed_slots.update(last_run.get('failed_slots') or [])
+                        self.cancelled_slots.update(last_run.get('cancelled_slots') or [])
+                        self._record('started', '本段视频已处理，等待下一段首尾帧或继续处理已就绪视频。')
+                    self._schedule_retries(submit, batch_result)
+                finally:
+                    if from_queue:
+                        self._queue.task_done()
+            if (self.config.get('videoContinuousGeneration') is True and not self._aborted
+                    and not self.child['cancel_event'].is_set()):
+                with self._state_lock:
+                    latest = read_manifest(self.project_dir) or {}
+                    block = latest.get('prompt_block') or self.prompt_block
+                    recoverable = sorted(set(self.selected) & self.processed - set(self.blocked))
+                if recoverable:
+                    def generate_round(*args, **kwargs):
+                        with _video_generation_slot(self.config, self.child_id, self.child['cancel_event']):
+                            return generate_video_sequence(*args, **kwargs)
+                    try:
+                        execute_video_generation_with_recovery(self.config, self.title, block,
+                            on_progress=self._video_progress, target_slots=recoverable,
+                            generate_fn=generate_round, project_dir=self.project_dir, recovery_only=True,
+                            attempt_counts=self.attempt_counts)
+                    except VideoRecoveryExhaustedError as error:
+                        # Give up only these slots; finish as partial_failed, not as a hang.
+                        with self._state_lock:
+                            for slot in error.slots:
+                                self.blocked[slot] = error.reasons.get(slot) or str(error)
+                            self._record('started', str(error))
+            with self._state_lock:
+                self._finish_videos(aborted=self._aborted)
+        except ConnectionError:
+            with self._state_lock:
+                self.child['cancel_event'].set()
+                self._finish_videos(aborted=True)
+        except Exception as error:
+            with self._state_lock:
+                self.error = str(error)
+                self._finish_videos(aborted=True)
+        finally:
+            with self._state_lock:
+                release_frame_run(self.project_dir, self.child_id)
+                save_task_to_disk(self.child_id)
+                self.worker_done.set()
+            set_log_context(None)
+            set_project_key_context(None)
+
+    def _take_due_retries(self):
+        if not self.retry_due:
+            return None
+        now = time.monotonic()
+        with self._state_lock:
+            due = sorted(slot for slot, at in self.retry_due.items() if at <= now)
+            if not due:
+                return None
+            for slot in due:
+                self.retry_due.pop(slot, None)
+            delivered = delivered_slots(read_manifest(self.project_dir) or {}, self.project_dir)
+            # A revised slot was released from ``processed``; advance() re-queues it.
+            due = [slot for slot in due if slot in self.processed and slot in self.selected
+                   and slot not in self.blocked and slot not in delivered]
+        return due or None
+
+    def _schedule_retries(self, submitted, manifest):
+        if self.config.get('videoContinuousGeneration') is not True:
+            return
+        delivered = delivered_slots(manifest, self.project_dir)
+        limit = max_slot_attempts(self.config)
+        now = time.monotonic()
+        exhausted = []
+        with self._state_lock:
+            for slot in submitted:
+                if slot in delivered or slot in self.blocked or slot not in self.processed:
+                    self.retry_due.pop(slot, None)
+                    continue
+                count = self.attempt_counts.get(slot, 0)
+                if count >= limit:
+                    exhausted.append(slot)
+                    self.retry_due.pop(slot, None)
+                    continue
+                delay = VIDEO_RETRY_DELAYS[min(max(count, 1) - 1, len(VIDEO_RETRY_DELAYS) - 1)]
+                self.retry_due[slot] = now + delay
+            if exhausted:
+                message = exhausted_message(exhausted, self.attempt_counts, manifest)
+                for slot in exhausted:
+                    self.blocked[slot] = exhausted_message([slot], self.attempt_counts, manifest)
+                self._record('started', message)
+            waiting = sorted(self.retry_due)
+            soonest = min(self.retry_due.values(), default=now)
+        if waiting:
+            seconds = max(0, round(soonest - now))
+            self._video_progress('video_recovery', {
+                'phase': 'waiting', 'slots': waiting, 'retry_round': 0,
+                'next_retry_at': time.time() + seconds, 'completed_slots': [],
+                'message': '、'.join(f'视频 {slot}' for slot in waiting)
+                           + f' 未成功，约 {seconds} 秒后自动重试，其余片段继续生成'})
+
+    def _merge_result(self, result):
+        if result is not None:
+            latest = read_manifest(self.project_dir) or {}
+            result.update({key: latest[key] for key in ('auto_generate_videos', 'video_frame_pairing',
+                'auto_generate_videos_preference_explicit', 'auto_video', 'videos', 'video_generation_stats',
+                'merged_video', 'prompt_block', 'prompt_slots') if key in latest})
+        return result
+
+    def finish(self, result=None, aborted=False):
+        with self._state_lock:
+            if self.closed:
+                return self._merge_result(result)
+            if self.enabled and not aborted:
+                self._advance_ready()
+            self.closed = True
+            self._aborted = aborted
+            if self.child and self.parent['cancel_event'].is_set():
+                self.child['cancel_event'].set()
+            if self.worker_thread is not None:
+                if not self.worker_done.is_set():
+                    holder = transfer_frame_run(self.project_dir, self.parent_id, self.child_id)
+                    if holder:
+                        self.error = '项目生成占位转交失败，自动视频已停止。'
+                        self.child['cancel_event'].set()
+                    self._queue.put(None)
+                return self._merge_result(result)
+            try:
+                return self._finish_videos(result, aborted)
+            finally:
+                self.worker_done.set()
+
+    def _finish_videos(self, result=None, aborted=False):
+        if self.worker_thread is threading.current_thread() and not self._accounting_finished:
+            from prompt_pipeline import stop_and_get_accounting
+            self._video_usage = stop_and_get_accounting()
+            self._accounting_finished = True
+        if not self.enabled:
+            if self.explicit:
+                with manifest_lock(self.project_dir):
+                    manifest = read_manifest(self.project_dir) or dict(result or {})
+                    manifest['auto_generate_videos'] = False
+                    if self.preference_explicit is not None:
+                        manifest['auto_generate_videos_preference_explicit'] = self.preference_explicit
+                    manifest.pop('auto_video', None)
+                    write_manifest(self.project_dir, manifest)
+                if result is not None:
+                    result.update(auto_generate_videos=False)
+                    if self.preference_explicit is not None:
+                        result['auto_generate_videos_preference_explicit'] = self.preference_explicit
+                    result.pop('auto_video', None)
+            self.closed = True
+            return result
+        try:
+            cancelled = self.parent['cancel_event'].is_set() or bool(
+                self.child and self.child['cancel_event'].is_set())
+            unresolved = set(self.selected) - self.processed
+            if cancelled:
+                self._record('cancelled', '用户取消了自动视频生成', emit=False)
+            if self.child and self.child.get('status') == 'running':
+                if cancelled or self.error:
+                    self.child.update(status='cancelled' if cancelled else 'failed',
+                                      error='用户取消了自动视频生成' if cancelled else self.error)
+                    self.child['events'].append(('error', {'message': self.child['error']}))
+                    notify_listeners(self.child_id, 'error', {'message': self.child['error']})
+                    self._record('cancelled' if cancelled else 'blocked', self.child['error'], emit=False)
+                else:
+                    with manifest_lock(self.project_dir):
+                        latest = read_manifest(self.project_dir) or dict(result or {})
+                        stats = latest.setdefault('video_generation_stats', {})
+                        stats['last_run'] = {**(stats.get('last_run') or {}),
+                            'failed_slots': sorted(self.failed_slots | unresolved | set(self.blocked)
+                                                   | (set(self.selected) if aborted else set())),
+                            'cancelled_slots': sorted(self.cancelled_slots),
+                            'planned_slots': len(self.selected)}
+                        write_manifest(self.project_dir, latest)
+                    self.prompt_block = latest.get('prompt_block') or self.prompt_block
+                    latest = _finish_video_generation(latest, self.config, self.title, self.prompt_block,
+                        self._video_progress, self.child['cancel_event'].is_set)
+                    if unresolved or self.blocked or aborted:
+                        latest.update(completion_state='partial_failed', has_failures=True)
+                    state = latest.get('completion_state', 'completed')
+                    self._record(state, '逐段视频生成已结束。' + ''.join(
+                        f'{reason}。' for reason in dict.fromkeys(self.blocked.values())))
+                    latest['auto_video'] = self.info
+                    if self._video_usage:
+                        latest['token_usage'] = self._video_usage
+                    with ACTIVE_TASKS_LOCK:
+                        if self.child['cancel_event'].is_set() or self.child['status'] != 'running':
+                            raise GenerationCancelled('Generation cancelled by user')
+                        self.child.update(status='completed', outcome=state, result=latest)
+                        self.child['events'].append(('result', latest))
+                    notify_listeners(self.child_id, 'result', latest)
+            elif not self.child_id:
+                state = 'skipped' if not self.selected else ('blocked' if unresolved or self.blocked or self.error else 'completed')
+                reasons = list(self.blocked.values())
+                if unresolved:
+                    reasons.append('以下视频首尾帧尚未就绪或未通过检查：' + '、'.join(map(str, sorted(unresolved))))
+                self._record(state, self.error or '；'.join(reasons) or
+                    ('没有可生成的视频提示词。' if not self.selected else '已有视频均可复用。'), emit=not aborted)
+        except ConnectionError:
+            if self.child:
+                self.child.update(status='cancelled', error='用户取消了自动视频生成')
+                self.child['events'].append(('error', {'message': self.child['error']}))
+                notify_listeners(self.child_id, 'error', {'message': self.child['error']})
+            self._record('cancelled', '用户取消了自动视频生成', emit=False)
+            raise
+        except Exception as error:
+            if self.child:
+                with ACTIVE_TASKS_LOCK:
+                    self.child.update(status='failed', error=str(error))
+                    self.child['events'].append(('error', {'message': str(error)}))
+            try:
+                self._record('blocked', f'自动视频收尾失败：{error}', emit=not aborted)
+            finally:
+                if self.child:
+                    # A terminal error must close the child SSE, including
+                    # unexpected encoding/manifest failures after images end.
+                    notify_listeners(self.child_id, 'error', {'message': str(error)})
+        finally:
+            self.closed = True
+            if self.child_id:
+                release_frame_run(self.project_dir, self.child_id)
+                save_task_to_disk(self.child_id)
+        return self._merge_result(result)
+
 
 
 def generate_frames_worker(task_id, config, title, prompt_block, target_sequences):
     t = get_or_create_task(task_id)
+    auto_video = None
     set_project_key_context(config.get('_project_key') if isinstance(config, dict) else None)
     # 之后本线程里所有 log() 调用自动带上 [task=task_id]，日志面板可以按任务过滤
     # （见 server_common.log 的说明），不用在每一处调用手动传 task_id。
@@ -838,6 +2166,11 @@ def generate_frames_worker(task_id, config, title, prompt_block, target_sequence
             with ACTIVE_TASKS_LOCK:
                 t["events"].append((stage, details))
             notify_listeners(task_id, stage, details)
+            if stage == 'frame_ready' and auto_video:
+                auto_video.advance(details)
+
+        auto_video = _ProgressiveAutoVideo(task_id, t, config, title, prompt_block,
+                                          progress_cb, target_sequences)
 
         # 上游失败即时广播：每次尝试失败立刻推 SSE 'upstream_retry'，
         # 前端不再在后台重试退避链（最长分钟级）里干等着看"生成中"
@@ -851,16 +2184,14 @@ def generate_frames_worker(task_id, config, title, prompt_block, target_sequence
         # （重）试前都会探测这个回调，取消能在下一次尝试前就生效。
         set_cancel_check_sink(lambda: t["cancel_event"].is_set())
         try:
-            # google_fx 后端共享同一个 AdsPower 浏览器、外部脚本的运行锁，以及
-            # builtins.google_fx_cancelled 这个 SPARK 内部旗标：必须与视频生成互斥，
-            # 否则新任务开跑时重置旗标/抢浏览器，会把另一个在跑的 FX 任务搅乱
-            # （跨任务串片事故的同族问题）。请求 ID 由队列上下文绑定到当前任务，
-            # 取消端点只撤销对应任务，不再影响队列中的其他任务。
+            # Keep the image browser lease throughout the run. Its video child
+            # gets a separate lease/account and queues independently when shared
+            # browser capacity is unavailable; images never await that queue.
             with _fx_serial_lock_for(config, task_id, 'frames', t['cancel_event']):
+                auto_video.advance()
                 if target_sequences is None:
-                    # 整单渲染走编排层：分段渲染+检查点现实校准+链尾回望。
-                    # 此前一次性端点直调 generate_frame_sequence，这些机制对主界面的
-                    # 帧序列按钮完全不生效。单帧/子集重试仍走原直调路径。
+                    # 整单渲染走编排层（渲染期不做任何审查，见 pipeline_orchestrator
+                    # 模块头）；单帧/子集重试走 generate_frame_sequence 直调路径。
                     from pipeline_orchestrator import render_frames_for_task
                     result = render_frames_for_task(
                         config, title, prompt_block, on_progress=progress_cb,
@@ -871,39 +2202,16 @@ def generate_frames_worker(task_id, config, title, prompt_block, target_sequence
                         on_progress=progress_cb,
                         target_sequences=target_sequences
                     )
-                    # 手动逐帧/子集重试路径本不挂一致性防护（见上面「整单渲染走编排层」
-                    # 的注释）；但如果这次调用后整套序列的所有帧都已在磁盘落地，说明这
-                    # 正是逐帧点完的最后一帧——趁此机会补跑一次链尾回望+整套一致性复审，
-                    # 否则纯手动逐帧点满整个序列会永远吃不到这层保护（2026-07-22 喀斯特
-                    # 洞穴/沙漠花岗岩两单实测：全程逐帧手动生成，第4帧门框清除失败、
-                    # 第12帧严重跑偏，复审机制全程未被触发过，manifest 里所有帧的
-                    # quality_gate 停留在初始的 pending_manual_review，从未被真正复审）。
-                    try:
-                        from pipeline_orchestrator import (
-                            _frame_path, _chain_drift_lookback, _sequence_consistency_review,
-                        )
-                        images, _videos = _parse_prompt_slots(prompt_block)
-                        if images and all(os.path.exists(_frame_path(title, s)) for s in images):
-                            project_dir = _get_project_dir(title)
-                            _chain_drift_lookback(config, title, prompt_block, project_dir,
-                                                  on_progress=progress_cb)
-                            _sequence_consistency_review(config, title, prompt_block, project_dir,
-                                                         on_progress=progress_cb)
-                            result = read_manifest(project_dir) or result
-                    except ConnectionError:
-                        raise
-                    except Exception as review_err:
-                        log('WARN', 'FRAMES',
-                            f"子集/手动生成后补跑一致性复审失败（不影响已生成的帧）: {review_err}",
-                            title=title)
         finally:
             set_upstream_event_sink(None)
             set_cancel_check_sink(None)
         usage = stop_and_get_accounting()
         if usage:
             result['token_usage'] = usage
-            
+        result = auto_video.finish(result)
         with ACTIVE_TASKS_LOCK:
+            if t['cancel_event'].is_set() or t['status'] != 'running':
+                raise GenerationCancelled('Generation cancelled by user')
             t["status"] = "completed"
             t["result"] = result
             t["events"].append(('result', result))
@@ -930,24 +2238,119 @@ def generate_frames_worker(task_id, config, title, prompt_block, target_sequence
         notify_listeners(task_id, 'error', {'message': str(e)})
         log('ERROR', 'FRAMES', f"帧序列任务失败: {e}", title=title)
     finally:
+        if auto_video and not auto_video.closed:
+            try:
+                auto_video.finish(aborted=True)
+            except ConnectionError:
+                pass
+            except Exception as error:
+                log('ERROR', 'FRAMES', f'自动视频收尾失败: {error}', title=title)
         release_frame_run(_get_project_dir(title), task_id)
-        save_tasks_to_disk()
+        save_task_to_disk(task_id)
         set_log_context(None)
         set_project_key_context(None)
 
 
-def fix_frame_issue_worker(task_id, config, title, prompt_block, sequence, manual_reason=None):
+def generate_frames_selection_worker(task_id, config, title, prompt_block, target_sequences, candidate_count=4):
+    """4选1 AI鉴别迭代生成后台工作线程：每帧生成4张候选图，多模态AI模型鉴别并选出最佳一张，
+    落盘并作为下一帧的参考图，依次类推。"""
+    t = get_or_create_task(task_id)
+    auto_video = None
+    set_project_key_context(config.get('_project_key') if isinstance(config, dict) else None)
+    set_log_context(task_id)
+    log('INFO', 'FRAMES_SEL', f"开始帧序列 4选1 智能生成任务 {'（整单）' if target_sequences is None else f'（子集 {target_sequences}）'}", title=title)
+    try:
+        from prompt_pipeline import start_accounting, stop_and_get_accounting
+        start_accounting()
+        def progress_cb(stage, details):
+            if stage == 'cancel_check':
+                return t["cancel_event"].is_set()
+            if t["cancel_event"].is_set():
+                raise GenerationCancelled("Generation cancelled by user")
+            with ACTIVE_TASKS_LOCK:
+                t["events"].append((stage, details))
+            notify_listeners(task_id, stage, details)
+            if stage == 'frame_ready' and auto_video:
+                auto_video.advance(details)
+
+        auto_video = _ProgressiveAutoVideo(task_id, t, config, title, prompt_block,
+                                          progress_cb, target_sequences)
+
+        from frame_generator import set_upstream_event_sink, set_cancel_check_sink
+        set_upstream_event_sink(lambda ev: progress_cb('upstream_retry', ev))
+        set_cancel_check_sink(lambda: t["cancel_event"].is_set())
+        try:
+            from candidate_selection_pipeline import run_candidate_selection_frame_sequence
+            with _fx_serial_lock_for(config, task_id, 'frames_selection', t['cancel_event']):
+                auto_video.advance()
+                result = run_candidate_selection_frame_sequence(
+                    config, title, prompt_block,
+                    on_progress=progress_cb,
+                    target_sequences=target_sequences,
+                    candidate_count=candidate_count
+                )
+        finally:
+            set_upstream_event_sink(None)
+            set_cancel_check_sink(None)
+        usage = stop_and_get_accounting()
+        if usage:
+            result['token_usage'] = usage
+        result = auto_video.finish(result)
+        with ACTIVE_TASKS_LOCK:
+            if t['cancel_event'].is_set() or t['status'] != 'running':
+                raise GenerationCancelled('Generation cancelled by user')
+            t["status"] = "completed"
+            t["result"] = result
+            t["events"].append(('result', result))
+        notify_listeners(task_id, 'result', result)
+        log('INFO', 'FRAMES_SEL', "帧序列 4选1 任务完成", title=title)
+    except ConnectionError:
+        finalize = False
+        with ACTIVE_TASKS_LOCK:
+            if t["status"] == "running":
+                t["status"] = "cancelled"
+                t["error"] = "用户取消了 4选1 帧序列生成"
+                t["events"].append(('error', {'message': '用户取消了 4选1 帧序列生成'}))
+                finalize = True
+        if finalize:
+            notify_listeners(task_id, 'error', {'message': '用户取消了 4选1 帧序列生成'})
+        log('WARN', 'FRAMES_SEL', "帧序列 4选1 任务已被用户取消", title=title)
+    except Exception as e:
+        log_exception('FRAMES_SEL')
+        with ACTIVE_TASKS_LOCK:
+            t["status"] = "failed"
+            t["error"] = str(e)
+            t["events"].append(('error', {'message': str(e)}))
+        notify_listeners(task_id, 'error', {'message': str(e)})
+        log('ERROR', 'FRAMES_SEL', f"帧序列 4选1 任务失败: {e}", title=title)
+    finally:
+        if auto_video and not auto_video.closed:
+            try:
+                auto_video.finish(aborted=True)
+            except ConnectionError:
+                pass
+            except Exception as error:
+                log('ERROR', 'FRAMES_SEL', f'自动视频收尾失败: {error}', title=title)
+        release_frame_run(_get_project_dir(title), task_id)
+        save_task_to_disk(task_id)
+        set_log_context(None)
+        set_project_key_context(None)
+
+
+def fix_frame_issue_worker(task_id, config, title, prompt_block, sequence, manual_reason=None, cascade_downstream=False):
     """人工在帧网格点击「修复此帧问题」后台工作线程：读取该帧记录的问题原因、
     优化提示词后图生图重渲（pipeline_orchestrator.fix_frame_issue）。与
     generate_frames_worker 共用同一个项目级互斥（claim_frame_run）——两者都会
     整体改写同一份 manifest.json，不能并发跑。
 
     manual_reason 是人工在修复对话框里现场写下的问题描述（可为空——此时只修
-    manifest 上已记录的问题），会先落盘再参与改写，见 fix_frame_issue。"""
+    manifest 上已记录的问题），会先落盘再参与改写，见 fix_frame_issue。
+
+    cascade_downstream=True 时，修完当前帧后顺带链式重渲后续下游帧，消除血统过期断层。"""
     t = get_or_create_task(task_id)
     set_project_key_context(config.get('_project_key') if isinstance(config, dict) else None)
     set_log_context(task_id)
-    log('INFO', 'FRAMES', f"开始修复第 {sequence} 帧问题", title=title)
+    log('INFO', 'FRAMES', f"开始修复第 {sequence} 帧问题" + (" (并向后连带重渲)" if cascade_downstream else ""), title=title)
     try:
         from prompt_pipeline import start_accounting, stop_and_get_accounting
         start_accounting()
@@ -968,7 +2371,8 @@ def fix_frame_issue_worker(task_id, config, title, prompt_block, sequence, manua
             from pipeline_orchestrator import fix_frame_issue
             with _fx_serial_lock_for(config, task_id, 'frame_fix', t['cancel_event']):
                 result = fix_frame_issue(config, title, prompt_block, sequence,
-                                         on_progress=progress_cb, manual_reason=manual_reason)
+                                         on_progress=progress_cb, manual_reason=manual_reason,
+                                         cascade_downstream=cascade_downstream)
         finally:
             set_upstream_event_sink(None)
             set_cancel_check_sink(None)
@@ -1003,22 +2407,26 @@ def fix_frame_issue_worker(task_id, config, title, prompt_block, sequence, manua
         log('ERROR', 'FRAMES', f"第 {sequence} 帧修复失败: {e}", title=title)
     finally:
         release_frame_run(_get_project_dir(title), task_id)
-        save_tasks_to_disk()
+        save_task_to_disk(task_id)
         set_log_context(None)
         set_project_key_context(None)
 
 
-def sequence_review_worker(task_id, config, title, prompt_block):
+def sequence_review_worker(task_id, config, title, prompt_block, full=False):
     """人工在帧网格点击「运行一致性审查」后台工作线程：2026-07-24 起该审查不再随
     帧序列渲染自动触发，改成用户确认整套序列已渲染完成后手动点按钮才跑
     （pipeline_orchestrator.run_sequence_consistency_review）。与
     generate_frames_worker/fix_frame_issue_worker 共用同一个项目级互斥
     （claim_frame_run）——都会整体改写同一份 manifest.json，不能并发跑。只标记
-    quality_gate，不改 prompt_block、不生成图片，故不需要 FX 串行锁。"""
+    quality_gate，不改 prompt_block、不生成图片，故不需要 FX 串行锁。
+
+    full=True＝前端点的是「全量重审」：不复用任何既有结论。默认走增量，只重审
+    结论已失效的那几拍。"""
     t = get_or_create_task(task_id)
     set_project_key_context(config.get('_project_key') if isinstance(config, dict) else None)
     set_log_context(task_id)
-    log('INFO', 'FRAMES', "开始整套序列一致性审查", title=title)
+    log('INFO', 'FRAMES', "开始整套序列一致性审查（全量重审）" if full else "开始整套序列一致性审查",
+        title=title)
     try:
         from prompt_pipeline import start_accounting, stop_and_get_accounting
         start_accounting()
@@ -1037,7 +2445,8 @@ def sequence_review_worker(task_id, config, title, prompt_block):
         set_cancel_check_sink(lambda: t["cancel_event"].is_set())
         try:
             from pipeline_orchestrator import run_sequence_consistency_review
-            reviewed_prompt_block = run_sequence_consistency_review(config, title, prompt_block, on_progress=progress_cb)
+            reviewed_prompt_block = run_sequence_consistency_review(
+                config, title, prompt_block, on_progress=progress_cb, full=full)
         finally:
             set_upstream_event_sink(None)
             set_cancel_check_sink(None)
@@ -1073,7 +2482,7 @@ def sequence_review_worker(task_id, config, title, prompt_block):
         log('ERROR', 'FRAMES', f"一致性审查失败: {e}", title=title)
     finally:
         release_frame_run(_get_project_dir(title), task_id)
-        save_tasks_to_disk()
+        save_task_to_disk(task_id)
         set_log_context(None)
         set_project_key_context(None)
 
@@ -1094,13 +2503,7 @@ def render_staged_worker(task_id, config, title, prompt_block):
         start_accounting()
 
         def progress_cb(stage, details):
-            if stage == 'cancel_check':
-                return t["cancel_event"].is_set()
-            if t["cancel_event"].is_set():
-                raise GenerationCancelled("Generation cancelled by user")
-            with ACTIVE_TASKS_LOCK:
-                t["events"].append((stage, details))
-            notify_listeners(task_id, stage, details)
+            return _video_progress(task_id, t, stage, details)
 
         from pipeline_orchestrator import run_staged_frame_rendering
         from frame_generator import set_cancel_check_sink
@@ -1109,8 +2512,9 @@ def render_staged_worker(task_id, config, title, prompt_block):
         set_cancel_check_sink(lambda: t["cancel_event"].is_set())
         try:
             # 分步渲染尾段总会驱动 FX 视频生成：全程持有 FX 串行锁
-            with _fx_browser_slot(task_id, 'staged_render', t['cancel_event']):
-                result = run_staged_frame_rendering(config, title, prompt_block, on_progress=progress_cb)
+            with _pipeline_generation_slot(config, task_id, 'staged_render', t['cancel_event']):
+                result = run_staged_frame_rendering(_pipeline_first_pass_config(config), title, prompt_block, on_progress=progress_cb)
+            result = _continue_pipeline_videos(task_id, config, result, progress_cb, t['cancel_event'])
         finally:
             set_cancel_check_sink(None)
 
@@ -1119,7 +2523,11 @@ def render_staged_worker(task_id, config, title, prompt_block):
             result['token_usage'] = usage
 
         with ACTIVE_TASKS_LOCK:
+            if t['cancel_event'].is_set() or t['status'] != 'running':
+                raise GenerationCancelled('Generation cancelled by user')
             t["status"] = "completed"
+            if result.get('completion_state'):
+                t['outcome'] = result['completion_state']
             t["result"] = result
             t["events"].append(('result', result))
         notify_listeners(task_id, 'result', result)
@@ -1137,15 +2545,182 @@ def render_staged_worker(task_id, config, title, prompt_block):
         log('WARN', 'STAGED', "分步渲染任务已被用户取消", title=title)
     except Exception as e:
         log_exception('STAGED')
+        finalized = False
         with ACTIVE_TASKS_LOCK:
-            t["status"] = "failed"
-            t["error"] = str(e)
-            t["events"].append(('error', {'message': str(e)}))
-        notify_listeners(task_id, 'error', {'message': str(e)})
+            if t['status'] == 'running':
+                t['status'] = 'cancelled' if t['cancel_event'].is_set() else 'failed'
+                t['error'] = '用户取消了生成任务' if t['cancel_event'].is_set() else str(e)
+                t['events'].append(('error', {'message': t['error']}))
+                finalized = True
+        if finalized:
+            notify_listeners(task_id, 'error', {'message': t['error']})
         log('ERROR', 'STAGED', f"分步渲染任务失败: {e}", title=title)
     finally:
+        _release_flow_project_run(config, task_id)
         release_frame_run(_get_project_dir(title), task_id)
-        save_tasks_to_disk()
+        save_task_to_disk(task_id)
+        set_log_context(None)
+        set_project_key_context(None)
+
+
+def stepped_pipeline_start_worker(task_id, config, dimensions):
+    """Run all generation stages without the retired review pauses."""
+    t = get_or_create_task(task_id, dimensions)
+    set_project_key_context(config.get('_project_key') if isinstance(config, dict) else None)
+    set_log_context(task_id)
+    log('INFO', 'STEPPED', "开始分步管线任务")
+    try:
+        from prompt_pipeline import start_accounting, stop_and_get_accounting
+        start_accounting()
+
+        def progress_cb(stage, details):
+            return _video_progress(task_id, t, stage, details)
+
+        from stepped_pipeline import start_stepped_pipeline
+        from frame_generator import set_cancel_check_sink
+        set_cancel_check_sink(lambda: t["cancel_event"].is_set())
+        try:
+            with _pipeline_generation_slot(config, task_id, 'stepped', t['cancel_event']):
+                pipeline_state = start_stepped_pipeline(_pipeline_first_pass_config(config), dimensions, on_progress=progress_cb)
+            pipeline_state = _continue_pipeline_videos(task_id, config, pipeline_state, progress_cb, t['cancel_event'])
+        finally:
+            set_cancel_check_sink(None)
+
+        usage = stop_and_get_accounting()
+
+        status = 'partial_failed' if pipeline_state.get('has_failures') else 'completed'
+        result = {
+            'status': status,
+            'stage': pipeline_state.get('stage'),
+            'title': pipeline_state.get('title'),
+            'pipeline_state': pipeline_state,
+        }
+        if usage:
+            result['token_usage'] = usage
+
+        with ACTIVE_TASKS_LOCK:
+            if t['cancel_event'].is_set() or t['status'] != 'running':
+                raise GenerationCancelled('Generation cancelled by user')
+            # 生成终态；质量审查停点已退役。
+            t["status"] = status
+            t["result"] = result
+            t["events"].append(('result', result))
+        notify_listeners(task_id, 'result', result)
+        log('INFO', 'STEPPED', f"分步管线完成于 {pipeline_state.get('stage')}", title=pipeline_state.get('title'))
+    except ConnectionError:
+        finalize = False
+        with ACTIVE_TASKS_LOCK:
+            if t["status"] == "running":
+                t["status"] = "cancelled"
+                t["error"] = "用户取消了分步管线任务"
+                t["events"].append(('error', {'message': '用户取消了分步管线任务'}))
+                finalize = True
+        if finalize:
+            notify_listeners(task_id, 'error', {'message': '用户取消了分步管线任务'})
+        log('WARN', 'STEPPED', "分步管线任务已被用户取消")
+    except Exception as e:
+        log_exception('STEPPED')
+        finalized = False
+        with ACTIVE_TASKS_LOCK:
+            if t['status'] == 'running':
+                t['status'] = 'cancelled' if t['cancel_event'].is_set() else 'failed'
+                t['error'] = '用户取消了生成任务' if t['cancel_event'].is_set() else str(e)
+                t['events'].append(('error', {'message': t['error']}))
+                finalized = True
+        if finalized:
+            notify_listeners(task_id, 'error', {'message': t['error']})
+        log('ERROR', 'STEPPED', f"分步管线任务失败: {e}")
+    finally:
+        _release_flow_project_run(config, task_id)
+        save_task_to_disk(task_id)
+        set_log_context(None)
+        set_project_key_context(None)
+
+
+def stepped_pipeline_advance_worker(task_id, config, title, action):
+    """Advances a paused stepped pipeline: approve/retry/skip the current review gate."""
+    t = get_or_create_task(task_id)
+    set_project_key_context(config.get('_project_key') if isinstance(config, dict) else None)
+    set_log_context(task_id)
+    log('INFO', 'STEPPED', f"推进分步管线: action={action}", title=title)
+    try:
+        from prompt_pipeline import start_accounting, stop_and_get_accounting
+        start_accounting()
+
+        def progress_cb(stage, details):
+            return _video_progress(task_id, t, stage, details)
+
+        from stepped_pipeline import advance_stepped_pipeline
+        from frame_generator import set_cancel_check_sink
+        set_cancel_check_sink(lambda: t["cancel_event"].is_set())
+        try:
+            with _pipeline_generation_slot(config, task_id, 'stepped', t['cancel_event']):
+                pipeline_state = advance_stepped_pipeline(title, action=action, on_progress=progress_cb,
+                                                         config=_pipeline_first_pass_config(config))
+            pipeline_state = _continue_pipeline_videos(task_id, config, pipeline_state, progress_cb, t['cancel_event'])
+        finally:
+            set_cancel_check_sink(None)
+
+        usage = stop_and_get_accounting()
+        stage = pipeline_state.get('stage', '')
+        is_completed = stage == 'completed'
+        is_paused = stage in ('review_anchor', 'review_batch', 'final_review')
+
+        result = {
+            'status': 'completed' if is_completed else ('paused' if is_paused else 'running'),
+            'stage': stage,
+            'title': title,
+            'pipeline_state': pipeline_state,
+        }
+        for key in ('completion_state', 'has_failures', 'has_quality_warnings'):
+            if key in pipeline_state:
+                result[key] = pipeline_state[key]
+        if result.get('has_failures'):
+            result['status'] = 'partial_failed'
+        if usage:
+            result['token_usage'] = usage
+        if is_completed and pipeline_state.get('prompt_block'):
+            result['prompt_block'] = pipeline_state['prompt_block']
+            from prompt_pipeline import prompt_slots_list
+            result['prompt_slots'] = prompt_slots_list(pipeline_state['prompt_block'])
+
+        with ACTIVE_TASKS_LOCK:
+            if t['cancel_event'].is_set() or t['status'] != 'running':
+                raise GenerationCancelled('Generation cancelled by user')
+            t["status"] = "completed" if is_completed else ("paused" if is_paused else "running")
+            t["result"] = result
+            if result.get('completion_state'):
+                t['outcome'] = result['completion_state']
+            event_name = 'result' if is_completed else 'stepped_paused'
+            t["events"].append((event_name, result))
+        notify_listeners(task_id, event_name, result)
+        log('INFO', 'STEPPED', f"分步管线推进至 {stage}", title=title)
+    except ConnectionError:
+        finalize = False
+        with ACTIVE_TASKS_LOCK:
+            if t["status"] == "running":
+                t["status"] = "cancelled"
+                t["error"] = "用户取消了分步管线推进"
+                t["events"].append(('error', {'message': '用户取消了分步管线推进'}))
+                finalize = True
+        if finalize:
+            notify_listeners(task_id, 'error', {'message': '用户取消了分步管线推进'})
+        log('WARN', 'STEPPED', "分步管线推进已被用户取消", title=title)
+    except Exception as e:
+        log_exception('STEPPED')
+        finalized = False
+        with ACTIVE_TASKS_LOCK:
+            if t['status'] == 'running':
+                t['status'] = 'cancelled' if t['cancel_event'].is_set() else 'failed'
+                t['error'] = '用户取消了生成任务' if t['cancel_event'].is_set() else str(e)
+                t['events'].append(('error', {'message': t['error']}))
+                finalized = True
+        if finalized:
+            notify_listeners(task_id, 'error', {'message': t['error']})
+        log('ERROR', 'STEPPED', f"分步管线推进失败: {e}", title=title)
+    finally:
+        _release_flow_project_run(config, task_id)
+        save_task_to_disk(task_id)
         set_log_context(None)
         set_project_key_context(None)
 
@@ -1165,8 +2740,8 @@ def render_staged_worker(task_id, config, title, prompt_block):
 _FX_SERIAL_LOCK = threading.Lock()
 
 # 兜底互斥锁的最长等待：正常情况下 FX_CONTROL 已保证单活跃，走到超时说明有调用方
-# 绕过了队列（回归测试 tests/test_fx_serial_lock_guard.py 覆盖这个场景）。
-_FX_GUARD_LOCK_TIMEOUT_SECONDS = 300
+# 绕过了队列。设为 10s 避免孤儿锁挂住整个 FX_CONTROL 队列。
+_FX_GUARD_LOCK_TIMEOUT_SECONDS = 10
 
 
 @contextlib.contextmanager
@@ -1198,8 +2773,12 @@ def _fx_guard_lock(label, cancel_check=None, timeout=None):
 
 
 @contextlib.contextmanager
-def _fx_browser_slot(task_id, kind, cancel_event=None, priority=0, cancel_check=None):
-    """排队进入 FX 浏览器临界区。嵌套调用由 FX_CONTROL 自己的可重入判断放行。"""
+def _fx_browser_slot(task_id, kind, cancel_event=None, priority=0, cancel_check=None, want_account=None):
+    """排队进入 FX 浏览器临界区（申请租约）。嵌套调用由 FX_CONTROL 自己的可重入判断放行。
+
+    want_account：任务明确要用的 AdsPower 环境。没传时取任务记录里用户指定的环境（userId /
+    googleFxUserId）；都没有 = 自动选号，由选号时的原子占用保证不撞号。
+    """
     if cancel_check is None and cancel_event is not None:
         cancel_check = cancel_event.is_set
     account_pin = _fx_account_pin_for(task_id)
@@ -1209,9 +2788,29 @@ def _fx_browser_slot(task_id, kind, cancel_event=None, priority=0, cancel_check=
     from integrations.google_fx.utils.logger import set_task_label, reset_task_label
     log_token = set_task_label(task_id)
     try:
+        # FX_CONTROL.slot 对同一执行上下文是可重入的；底层 threading.Lock 不是。
+        # 视频/图片任务在持锁期间调用 pick_account()，会嵌套做 stale 积分探测。
+        # 旧代码虽然让控制面直接放行，却又在这里二次 acquire 同一把锁，最终把
+        # 自锁超时误报成“浏览器被其它 FX 任务占用、排队 100s”。外层已经持有
+        # admission 槽位和兜底锁时，嵌套调用只需复用它们。
+        already_inside = holds_fx_slot()
+        with ACTIVE_TASKS_LOCK:
+            task_record = ACTIVE_TASKS.get(task_id)
+            meta = _fx_board_task_meta(task_id, task_record)
+            dims = (task_record.get('dimensions') if isinstance(task_record, dict) else None) or {}
+        want_account = (want_account or account_pin or dims.get('userId')
+                        or dims.get('googleFxUserId') or None)
         with FX_CONTROL.slot(task_id, kind, cancel_check=cancel_check,
-                             priority=priority, account_pin=account_pin):
-            with _fx_guard_lock(f'{kind}:{task_id}', cancel_check=cancel_check):
+                             priority=priority, account_pin=account_pin,
+                             project_key=meta['project_key'], stage=meta['stage'],
+                             want_account=want_account,
+                             parallel_parent_task_id=(dims.get('parent_frame_task_id')
+                                 if kind == 'videos' and dims.get('progressive') is True else None)):
+            # 并发（N>1）时兜底串行锁必须让路，否则它会把第二个任务挡成 10s 超时报错；
+            # 互斥改由租约的准入条件保证。N=1 时保持原样。
+            guard = (contextlib.nullcontext() if already_inside or FX_CONTROL.max_concurrent() > 1 else
+                     _fx_guard_lock(f'{kind}:{task_id}', cancel_check=cancel_check))
+            with guard:
                 yield
     finally:
         reset_task_label(log_token)
@@ -1239,6 +2838,95 @@ def _fx_serial_lock_for(config, task_id=None, kind='frames', cancel_event=None):
     return _fx_browser_slot(task_id, kind, cancel_event)
 
 
+def _video_generation_slot(config, task_id, cancel_event):
+    if (config or {}).get('videoProvider') == 'flow2api':
+        return contextlib.nullcontext()
+    return _fx_browser_slot(task_id, 'videos', cancel_event)
+
+
+def _pipeline_uses_fx(config):
+    return ((config or {}).get('imageBackend') == 'google_fx'
+            or (config or {}).get('videoProvider') != 'flow2api')
+
+
+def _pipeline_generation_slot(config, task_id, kind, cancel_event):
+    if not _pipeline_uses_fx(config):
+        return contextlib.nullcontext()
+    return _fx_browser_slot(task_id, kind, cancel_event)
+
+
+def _pipeline_first_pass_config(config):
+    # Frame rendering still owns its existing browser scope. Defer the entire
+    # video phase so its first submission and later waits share the same guards.
+    if (config or {}).get('videoContinuousGeneration') is True and _pipeline_uses_fx(config):
+        return {**config, '_defer_video_to_worker': True}
+    return config
+
+
+def _continue_pipeline_videos(task_id, config, result, progress_cb, cancel_event):
+    if (config or {}).get('videoContinuousGeneration') is not True or not isinstance(result, dict):
+        return result
+    video_key = 'video_result' if isinstance(result.get('video_result'), dict) else 'videos'
+    first_pass = result.get(video_key)
+    block = result.get('prompt_block')
+    if not isinstance(first_pass, dict) or not block:
+        return result
+    title = result.get('title') or (ACTIVE_TASKS.get(task_id, {}).get('dimensions') or {}).get('theme')
+    if not title:
+        raise ValueError('持续视频恢复缺少项目标题')
+
+    def generate_round(*args, **kwargs):
+        with _video_generation_slot(config, task_id, cancel_event):
+            return generate_video_sequence(*args, **kwargs)
+
+    recovered = execute_video_generation_with_recovery(config, title, block,
+        on_progress=progress_cb, generate_fn=generate_round, recovery_only=not _pipeline_uses_fx(config),
+        project_dir=result.get('project_dir') or _get_project_dir(title))
+    recovered = _finish_video_generation(recovered, config, title, block, progress_cb, cancel_event.is_set)
+    result[video_key] = recovered
+    result.update({key: recovered[key] for key in
+        ('completion_state', 'has_failures', 'has_quality_warnings', 'merged_video') if key in recovered})
+    if result.get('status') in ('completed', 'partial_failed'):
+        result['status'] = 'partial_failed' if result['has_failures'] else 'completed'
+    if video_key == 'video_result' and result.get('stage') in ('completed', 'render_videos'):
+        result['stage'] = 'completed'
+        from stepped_pipeline import _save_state
+        _save_state(title, result)
+        progress_cb('stepped_stage', {'stage': 'completed',
+            'completion_state': result['completion_state'], 'has_failures': result['has_failures'],
+            'message': '视频已全部完成并合并。' if not result['has_failures'] else '视频已完成，合并失败。'})
+    return result
+
+
+def _claim_flow_project_run(config, task_id, project_key):
+    """Keep one mutable manifest snapshot per project until its worker exits."""
+    recovery_holder = _video_recovery_project_holder(project_key)
+    if recovery_holder:
+        return recovery_holder
+    if (config or {}).get('videoProvider') != 'flow2api' or not project_key:
+        return None
+    project_dir = _get_project_dir(project_key)
+    holder = claim_frame_run(project_dir, task_id, until_released=True)
+    if not holder:
+        config['_flow_project_claim'] = project_dir
+    return holder
+
+
+def _video_recovery_project_holder(project_key):
+    if not project_key:
+        return None
+    key = os.path.normcase(os.path.abspath(_get_project_dir(project_key)))
+    with server_common._ACTIVE_FRAME_RUNS_LOCK:
+        holder = server_common._ACTIVE_FRAME_RUNS.get(key)
+        return holder if holder and holder.startswith('video_recovery_') else None
+
+
+def _release_flow_project_run(config, task_id):
+    project_dir = (config or {}).get('_flow_project_claim')
+    if project_dir:
+        release_frame_run(project_dir, task_id)
+
+
 # ── FX 运行时装配（2026-07-26）────────────────────────────────────────────────
 # 内置包里需要浏览器的"旁路动作"（积分探针、选择器探针、自检）过去直接启浏览器，
 # 完全绕开队列：生成任务跑着的时候点"刷新积分"就会去抢同一个 AdsPower profile。
@@ -1248,13 +2936,27 @@ def _fx_serial_lock_for(config, task_id=None, kind='frames', cancel_event=None):
 
 # 自带墙钟预算的旁路动作：它们占用浏览器的时间是有界的，所以别的旁路动作可以安心
 # 排在它们后面，不必像遇到生成任务那样直接拒绝（见 /api/account-pool/refresh）。
-FX_BOUNDED_BYPASS_KINDS = {'credit_probe', 'selector_probe', 'selftest'}
+# auto_login 的预算是 auto_login.DEFAULT_TIMEOUT_SECONDS（180s），同样有界。
+FX_BOUNDED_BYPASS_KINDS = {'credit_probe', 'selector_probe', 'selftest', 'auto_login'}
 
 
-def _fx_browser_gate(kind, cancel_check=None, priority=0, task_id=None):
-    """browser_gate 的宿主实现：把包内旁路动作接进 FX_CONTROL 队列。"""
+def _fx_browser_gate(kind, cancel_check=None, priority=0, task_id=None, user_id=None):
+    """browser_gate 的宿主实现：把包内旁路动作接进 FX_CONTROL 队列。
+
+    user_id：旁路动作要操作的环境；没传时按账号解析链取默认环境（与它之后 get_ads_ws_url
+    会用的是同一个），这样探针也不会去碰正被别的任务占用的环境。
+    """
     task_id = str(task_id or f'{kind}_{int(time.time() * 1000)}')
-    return _fx_browser_slot(task_id, kind, priority=priority, cancel_check=cancel_check)
+    if not user_id:
+        try:
+            from integrations.google_fx.utils import account_binding
+            from integrations.google_fx.config import get_runtime_default_user_id, DEFAULT_USER_ID
+            user_id = account_binding.resolve_account(
+                fallback=get_runtime_default_user_id() or DEFAULT_USER_ID) or None
+        except Exception:
+            user_id = None
+    return _fx_browser_slot(task_id, kind, priority=priority, cancel_check=cancel_check,
+                            want_account=user_id)
 
 
 def _fx_queue_account_pin():
@@ -1266,7 +2968,150 @@ def _fx_queue_account_pin():
         return None
 
 
+# ── 开着的浏览器对账（并发方案 P1 / R9）──────────────────────────────────────
+# 作战板要回答"有没有谁开着浏览器却没人在用"。这要问 AdsPower，所以不能放进秒级轮询的
+# 状态快照里：由这条后台线程每 30s 问一次，结果缓存在内存，board 只读缓存。
+# 判定（只标记，从不自动关）：
+#   leased   被当前租约占用            → 正常
+#   warm     无租约，但本进程 30 分钟内用过 → 正常（生成结束后保温复用）
+#   orphan   无租约、近 30 分钟没被本进程用过，且已被观察到超过宽限期 → 无主，可一键清理
+_FX_OPEN_RECONCILE_STARTED = threading.Event()
+_FX_OPEN_LOCK = threading.Lock()
+_FX_OPEN_STATE = {'at': 0.0, 'ids': [], 'first_seen': {}, 'error': None}
+_FX_ORPHAN_GRACE_SECONDS = int(os.environ.get('SPARK_FX_ORPHAN_GRACE_SECONDS', '60'))
+_FX_ORPHAN_IDLE_SECONDS = 30 * 60
+
+
+def _fx_reconcile_interval_seconds():
+    try:
+        return max(0, int(os.environ.get('SPARK_FX_RECONCILE_SECONDS', '30')))
+    except (TypeError, ValueError):
+        return 30
+
+
+def _fx_refresh_open_browsers(now=None):
+    """问一次 AdsPower 当前开着哪些环境，更新缓存。失败时保留上次结果并记错误。"""
+    now = float(now if now is not None else time.time())
+    try:
+        from integrations.google_fx.utils.browser import list_running_ads_browsers
+        ids = sorted({str(row['user_id']) for row in list_running_ads_browsers(strict=True)})
+        error = None
+    except Exception as exc:
+        with _FX_OPEN_LOCK:
+            _FX_OPEN_STATE['error'] = f'{type(exc).__name__}: {exc}'
+        return
+    with _FX_OPEN_LOCK:
+        first_seen = _FX_OPEN_STATE['first_seen']
+        for user_id in ids:
+            first_seen.setdefault(user_id, now)
+        for user_id in [uid for uid in first_seen if uid not in ids]:
+            del first_seen[user_id]
+        _FX_OPEN_STATE.update(at=now, ids=ids, error=error)
+
+
+def _fx_open_browser_reconciler():
+    while True:
+        try:
+            _fx_refresh_open_browsers()
+        except Exception:
+            pass
+        time.sleep(_fx_reconcile_interval_seconds() or 30)
+
+
+def _fx_open_browser_rows(board, now=None):
+    """把缓存的"开着的环境"与租约/历史合成带判定的行。纯内存，不碰 AdsPower。"""
+    now = float(now if now is not None else time.time())
+    leased = {str(row.get('user_id') or row.get('account_pin') or '') for row in board.get('leases') or []}
+    last_used = {}
+    for row in board.get('history') or []:
+        uid = str(row.get('user_id') or '')
+        if uid:
+            last_used[uid] = max(last_used.get(uid, 0.0), float(row.get('ended_ts') or 0))
+    with _FX_OPEN_LOCK:
+        ids = list(_FX_OPEN_STATE['ids'])
+        first_seen = dict(_FX_OPEN_STATE['first_seen'])
+    labels = {row['user_id']: row['label'] for row in board.get('accounts') or []}
+    rows = []
+    for user_id in ids:
+        is_leased = user_id in leased
+        warm = (not is_leased) and now - last_used.get(user_id, 0.0) <= _FX_ORPHAN_IDLE_SECONDS
+        seen_seconds = max(0.0, now - first_seen.get(user_id, now))
+        rows.append({
+            'user_id': user_id,
+            'label': labels.get(user_id, user_id),
+            'leased': is_leased,
+            'warm': warm,
+            'orphan': (not is_leased) and (not warm) and seen_seconds >= _FX_ORPHAN_GRACE_SECONDS,
+            'seen_seconds': round(seen_seconds, 1),
+        })
+    return rows
+
+
 _FX_WATCHDOG_STARTED = threading.Event()
+_FX_HARD_STUCK_REPORTED = set()
+_FX_SELECTOR_DRIFT_STARTED = threading.Event()
+
+
+def _fx_selector_drift_interval_seconds():
+    """选择器漂移巡检间隔（小时）。设 0 / 负数 = 关闭。"""
+    try:
+        hours = float(os.environ.get('GOOGLE_FX_SELECTOR_DRIFT_INTERVAL_HOURS', '24'))
+    except (TypeError, ValueError):
+        hours = 24.0
+    return hours * 3600.0 if hours > 0 else 0.0
+
+
+def _fx_selector_drift_watchdog():
+    """定期跑只读选择器探针，和上次的基线对比，退化就告警。
+
+    2026-09-05 复盘的第 3 条：探针和自检此前只有手动 HTTP 入口，没人定时跑，
+    于是"Flow 改版了"这件事只能靠下一单真任务失败 + 烧一批积分来通知我们。
+
+    三条自我约束，免得巡检自己变成故障源：
+      * 只在 FX 空闲时跑——真任务正占着浏览器时直接跳过，等下一轮；
+      * 只读探针，不提交、不改配置，不花积分；
+      * 任何异常都只记日志，绝不影响主服务。
+    """
+    interval = _fx_selector_drift_interval_seconds()
+    if interval <= 0:
+        return
+    # 启动后先等一会儿再跑第一次：服务刚起来时 AdsPower 往往还没就绪，
+    # 而且开机那几分钟通常有真任务要跑，别去抢浏览器。
+    time.sleep(min(interval, 600))
+    while True:
+        try:
+            if FX_CONTROL.snapshot().get('busy'):
+                log('INFO', 'FX_SELECTOR', '选择器巡检：FX 正忙，本轮跳过')
+            else:
+                from integrations.google_fx.services import google_fx_diagnostics
+                outcome = google_fx_diagnostics.run_selector_drift_check()
+                if outcome.get('status') != 'ok':
+                    log('WARN', 'FX_SELECTOR',
+                        f"选择器巡检未成功: {outcome.get('message')}")
+                else:
+                    changes = outcome.get('changes') or []
+                    alerts = outcome.get('alerts') or []
+                    if changes or alerts:
+                        log('ERROR', 'FX_SELECTOR',
+                            f"选择器巡检发现 {len(changes)} 处退化、{len(alerts)} 条必需族告警，"
+                            f"疑似 Flow 改版；详情见「选择器巡检」日志与 "
+                            f"runtime/selector_baseline.json")
+                        FX_CONTROL.audit('diagnostics.selector_drift', details={
+                            'changes': [c.get('message') for c in changes],
+                            'alerts': [a.get('message') for a in alerts],
+                        }, actor='watchdog')
+        except Exception as e:
+            log('WARN', 'FX_SELECTOR', f"选择器巡检异常: {type(e).__name__}: {e}")
+        time.sleep(interval)
+
+
+def _cancel_auto_video_children(parent_task_id, reason='用户取消了自动视频生成', actor='local'):
+    with ACTIVE_TASKS_LOCK:
+        children = [task_id for task_id, task in ACTIVE_TASKS.items()
+                    if task.get('status') == 'running'
+                    and (task.get('dimensions') or {}).get('parent_frame_task_id') == parent_task_id]
+    for child_id in children:
+        _cancel_fx_task(child_id, reason, actor)
 
 
 def _cancel_fx_task(task_id, reason, actor='local'):
@@ -1288,7 +3133,8 @@ def _cancel_fx_task(task_id, reason, actor='local'):
                 finalized = True
     if finalized:
         notify_listeners(task_id, 'error', {'message': reason})
-        save_tasks_to_disk()
+        save_task_to_disk(task_id)
+    _cancel_auto_video_children(task_id, reason, actor)
     hit = False
     try:
         hit = bool(get_fx_cancel_flag().cancel_request(task_id))
@@ -1300,7 +3146,14 @@ def _cancel_fx_task(task_id, reason, actor='local'):
 
 
 def _fx_timeout_watchdog():
-    """执行超时踢出：发取消信号；若超限过久线程硬卡死，强行释班 Slot 保障号池可用。"""
+    """执行超时看门狗：发取消信号，但不伪造槽位已经释放。
+
+    Python 无法安全杀掉持有 Playwright/CDP 与全局浏览器锁的线程。旧逻辑在超时
+    10 秒后只从 FX_CONTROL.active 删除记录；底层线程和 _FX_SERIAL_LOCK 仍活着，
+    下一任务会被控制面放行后堵在第二层锁上，控制台却错误显示旧任务已经结束。
+    现在槽位由真实 worker 的 context-manager finally 释放；持续硬卡死如实告警，
+    由关闭对应 AdsPower profile/重启服务处理，不允许两个任务同时碰同一画布。
+    """
     while True:
         time.sleep(5)
         try:
@@ -1315,20 +3168,52 @@ def _fx_timeout_watchdog():
                                  {'elapsed_seconds': elapsed,
                                   'kind': row.get('kind')}, actor='watchdog')
                 _cancel_fx_task(task_id, reason, actor='watchdog')
-                # 超过限额 10 秒后底层仍未能放行槽位，判定为底线硬卡死，强制剔除以防全号池自锁
+                # 超过限额 10 秒仍未退出：保留 active 租约并告警。不能仅删除控制面
+                # 记录，因为那不会终止底层线程，也不会释放全局浏览器锁。
                 if limit > 0 and elapsed > limit + 10:
-                    log('WARN', 'FX_WATCHDOG', f"任务 {task_id} 超时后 10s 内未自行退出临界区，看门狗执行强行槽位释放")
-                    FX_CONTROL.force_release_active(task_id=task_id, actor='watchdog')
+                    if task_id in _FX_HARD_STUCK_REPORTED:
+                        continue
+                    _FX_HARD_STUCK_REPORTED.add(task_id)
+                    log('ERROR', 'FX_WATCHDOG',
+                        f"任务 {task_id} 超时后 10s 内未退出；槽位仍保持占用以防并发污染。"
+                        "请关闭对应 AdsPower 环境或重启服务，勿强行放行下一任务")
+                    FX_CONTROL.audit('queue.hard_stuck', task_id, {
+                        'elapsed_seconds': elapsed,
+                        'kind': row.get('kind'),
+                        'lease_retained': True,
+                    }, actor='watchdog')
         except Exception:
             continue
 
 
 def bootstrap_fx_runtime():
     """启动时装配 FX 运行时的宿主钩子。幂等，测试里也可以直接调。"""
+    admission_root = '/Users/fly/flow2api'
+    admission_bridge = os.path.join(admission_root, 'local/account_admission_bridge.py')
+    if os.path.isdir(admission_root):
+        try:
+            if not os.path.isfile(admission_bridge):
+                raise FileNotFoundError()
+            import importlib.util
+            spec = importlib.util.spec_from_file_location('_spark_flow_account_admission', admission_bridge)
+            bridge = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(bridge)
+            FX_CONTROL.account_admission_factory = bridge.profile_generation_lease
+        except Exception:
+            def admission_unavailable(_profile_id):
+                raise RuntimeError('busy_state_unknown')
+            FX_CONTROL.account_admission_factory = admission_unavailable
+            log('WARN', 'FX', '账号凭证维护锁初始化失败，浏览器账号使用已安全暂停: busy_state_unknown')
     try:
         from integrations.google_fx.utils import browser_gate, account_binding
         browser_gate.install(_fx_browser_gate)
         account_binding.install_pin_resolver(_fx_queue_account_pin)
+        account_binding.install_account_observer(FX_CONTROL.note_account)
+        from integrations.google_fx.utils import lease_registry
+        lease_registry.install(FX_CONTROL)
+        FX_CONTROL.acknowledge_recovery()
+        from integrations.google_fx.utils import egress
+        FX_CONTROL.egress_resolver = egress.egress_id_for
     except Exception as e:
         log('WARN', 'FX', f"Google FX 运行时钩子安装失败，旁路动作将不受队列约束: {e}")
     # 换 IP 全局关停（server_common 的 _IP_ROTATE_DISABLED）过去只在每次生成前
@@ -1338,13 +3223,113 @@ def bootstrap_fx_runtime():
         FX_CONFIG.migrate_deprecated_values()
         apply_google_fx_runtime_overrides(SERVER_CONFIG)
         apply_direct_env(FX_CONFIG.current())
-        FX_CONFIG.ensure_baseline()
     except Exception as e:
         log('WARN', 'FX', f"Google FX 运行时环境变量初始化失败: {e}")
     if not _FX_WATCHDOG_STARTED.is_set():
         _FX_WATCHDOG_STARTED.set()
         threading.Thread(target=_fx_timeout_watchdog, name='fx-timeout-watchdog',
                          daemon=True).start()
+    if (not _FX_OPEN_RECONCILE_STARTED.is_set() and _fx_reconcile_interval_seconds() > 0
+            and not os.environ.get('PYTEST_CURRENT_TEST')):
+        _FX_OPEN_RECONCILE_STARTED.set()
+        threading.Thread(target=_fx_open_browser_reconciler,
+                         name='fx-open-browser-reconciler', daemon=True).start()
+    if not _FX_SELECTOR_DRIFT_STARTED.is_set() and _fx_selector_drift_interval_seconds() > 0:
+        _FX_SELECTOR_DRIFT_STARTED.set()
+        threading.Thread(target=_fx_selector_drift_watchdog,
+                         name='fx-selector-drift-watchdog', daemon=True).start()
+
+
+def _video_operation_response(operation):
+    task_id = operation.get('task_id')
+    if not task_id:
+        return {'status': 'cancelled', 'request_id': operation['request_id'], 'task_id': None}
+    task = ACTIVE_TASKS.get(task_id) or {}
+    return {'status': 'ok', 'request_id': operation['request_id'], 'task_id': task_id,
+            'task_status': task.get('status', 'unavailable'),
+            'cancel_requested': bool(operation.get('cancel_requested'))}
+
+
+def _video_progress(task_id, task, stage, details):
+    if stage == 'cancel_check':
+        return task['cancel_event'].is_set()
+    dimensions = task.get('dimensions') or {}
+    receipt_scope = {}
+    project_key = dimensions.get('project_key') or dimensions.get('theme')
+    if project_key:
+        receipt_scope['project_key'] = _safe_project_name(project_key)
+    if dimensions.get('video_provider'):
+        receipt_scope['provider'] = dimensions['video_provider']
+    if dimensions.get('request_id'):
+        receipt_scope['request_id'] = dimensions['request_id']
+    # A receipt must survive cancellation arriving just after the remote click.
+    if stage in ('request_submitting', 'request_submitted', 'request_accepted', 'request_resolved'):
+        _VIDEO_OPERATIONS.record_submission(task_id, {**details, **receipt_scope})
+    elif stage in ('video_done', 'video_error'):
+        receipt = ((details.get('video') or {}).get('last_attempt')
+                   if stage == 'video_done' else details.get('last_attempt')) or {}
+        if receipt.get('submission_id'):
+            _VIDEO_OPERATIONS.record_submission(task_id, {
+                **receipt, 'index': details.get('index'),
+                'current': details.get('current'), 'total': details.get('total'),
+                **receipt_scope,
+            })
+    if task['cancel_event'].is_set():
+        raise GenerationCancelled('Generation cancelled by user')
+    with ACTIVE_TASKS_LOCK:
+        task['events'].append((stage, details))
+        task['last_worker_progress_at'] = time.time()
+    if stage in ('request_submitting', 'request_submitted', 'request_accepted', 'request_resolved',
+                 'video_done', 'video_error', 'video_recovery', 'merge_done'):
+        if not save_task_to_disk(task_id):
+            raise RuntimeError('视频任务进度保存失败，已停止继续提交')
+    notify_listeners(task_id, stage, details)
+
+
+def _finish_video_generation(result, config, title, prompt_block, progress_cb, cancel_check):
+    """Local encoding is outside the browser slot, so queued generation can start."""
+    if cancel_check():
+        raise GenerationCancelled('Generation cancelled by user')
+    result['prompt_block'] = prompt_block
+    result['prompt_slots'] = prompt_slots_list(prompt_block)
+    _, expected_videos = _parse_prompt_slots(prompt_block)
+    videos = [v for v in result.get('videos', []) if isinstance(v, dict)]
+    by_slot = {v.get('slot'): v for v in videos}
+    last_run = (result.get('video_generation_stats') or {}).get('last_run') or {}
+    has_failures = bool(last_run.get('failed_slots') or last_run.get('cancelled_slots')) or any(
+        by_slot.get(slot, {}).get('status') not in ('success', 'skipped_cut', 'skipped_bridge_hold')
+        for slot in expected_videos)
+    has_warnings = any(v.get('process_warned') or v.get('anchor_mismatch_overridden') for v in videos)
+    completion = 'partial_failed' if has_failures else ('completed_with_warnings' if has_warnings else 'completed')
+    if not has_failures:
+        try:
+            speed = config.get('_merge_speed', 4)
+            progress_cb('merge_start', {'message': f'正在自动以 {speed}x 速率合并视频...'})
+            project_dir = _get_project_dir(title)
+            merged = merge_project_videos(
+                project_dir, speed=speed, cover_burn=config.get('_cover_burn', COVER_BURN_DEFAULT),
+                config=config, on_progress=progress_cb, cancel_check=cancel_check)
+            if merged:
+                result['merged_video'] = merged
+                with manifest_lock(project_dir):
+                    manifest = read_manifest(project_dir)
+                    if manifest is not None:
+                        manifest['merged_video'] = merged
+                        write_manifest(project_dir, manifest)
+            progress_cb('merge_done', {'merged_video': merged})
+        except ConnectionError:
+            raise
+        except Exception as error:
+            log('ERROR', 'VIDEOS', f'自动合并视频失败: {error}', title=title)
+            progress_cb('merge_error', {'message': f'自动合并视频失败: {error}'})
+            result['merge_error'] = str(error)
+            completion = 'partial_failed'
+    else:
+        progress_cb('merge_skip', {'message': '本次有失败或未完成的片段，已保留原视频并跳过自动合并。'})
+    if cancel_check():
+        raise GenerationCancelled('Generation cancelled by user')
+    result.update(completion_state=completion, has_failures=has_failures, has_quality_warnings=bool(has_warnings))
+    return result
 
 
 def generate_videos_worker(task_id, config, title, prompt_block, target_slots, override_flagged=False):
@@ -1356,72 +3341,38 @@ def generate_videos_worker(task_id, config, title, prompt_block, target_slots, o
         from prompt_pipeline import start_accounting, stop_and_get_accounting
         start_accounting()
         def progress_cb(stage, details):
-            if stage == 'cancel_check':
-                return t["cancel_event"].is_set()
-            if t["cancel_event"].is_set():
-                raise GenerationCancelled("Generation cancelled by user")
-            with ACTIVE_TASKS_LOCK:
-                t["events"].append((stage, details))
-            notify_listeners(task_id, stage, details)
+            return _video_progress(task_id, t, stage, details)
 
         progress_cb('queue', {'message': '视频生成请求已加入队列，正在等待排队生成...'})
 
-        with _fx_browser_slot(task_id, 'videos', t['cancel_event']):
-            result = generate_video_sequence(
-                config, title, prompt_block,
-                on_progress=progress_cb,
-                target_slots=target_slots,
-                override_flagged=override_flagged
+        # 视频生成前优化门：根据真实渲染的帧序列画面差量优化所有视频提示词，以防跳变
+        try:
+            prompt_block = optimize_video_prompts_for_sequence(
+                config, title, prompt_block, on_progress=progress_cb, target_slots=target_slots, force=False
             )
-            
-            usage = stop_and_get_accounting()
-            if usage:
-                result['token_usage'] = usage
-            
-            # Check if all expected videos are successfully generated
-            _, expected_videos = _parse_prompt_slots(prompt_block)
-            expected_slots = list(expected_videos.keys())
-            manifest_videos = result.get('videos', [])
-            manifest_video_slots = {v['slot']: v for v in manifest_videos}
-            
-            has_failures = False
-            for slot in expected_slots:
-                if slot not in manifest_video_slots:
-                    has_failures = True
-                    break
-                # 'skipped_cut'（声明式硬切槽位）是预期缺失，不算失败——合并门禁
-                # （merge_project_videos）同样按预期缺失处理；'skipped_bridge_hold'
-                # 已停用，仅为兼容旧 manifest 保留
-                if manifest_video_slots[slot].get('status') not in ('success', 'skipped_cut', 'skipped_bridge_hold'):
-                    has_failures = True
-                    break
+        except ConnectionError:
+            raise
+        except Exception as opt_err:
+            log('WARN', 'VIDEOS', f"视频提示词优化门跳过或异常（继续按原提示词生成）: {opt_err}", title=title)
 
-            if has_failures:
-                progress_cb('merge_skip', {'message': '检测到存在生成失败或缺失的视频片段，已跳过自动合并视频。'})
-            else:
-                # Try to automatically merge videos
-                try:
-                    progress_cb('merge_start', {'message': '正在自动合并并加速视频...'})
-                    project_dir = _get_project_dir(title)
-                    merged_info = merge_project_videos(project_dir)
-                    if merged_info:
-                        result['merged_video'] = merged_info
-                        # Also update manifest file on disk (locked read-modify-write)
-                        try:
-                            with manifest_lock(project_dir):
-                                mdata = read_manifest(project_dir)
-                                if mdata is not None:
-                                    mdata['merged_video'] = merged_info
-                                    write_manifest(project_dir, mdata)
-                        except Exception as e:
-                            log('WARN', 'VIDEOS', f"更新 manifest.json 的 merged_video 字段失败: {e}", title=title)
-                    progress_cb('merge_done', {'merged_video': merged_info})
-                except Exception as merge_err:
-                    log('ERROR', 'VIDEOS', f"自动合并视频失败: {merge_err}", title=title)
-                    progress_cb('merge_error', {'message': f'自动合并视频失败: {str(merge_err)}'})
+        def generate_round(*args, **kwargs):
+            with _video_generation_slot(config, task_id, t['cancel_event']):
+                return generate_video_sequence(*args, **kwargs)
+        result = execute_video_generation_with_recovery(config, title, prompt_block,
+            on_progress=progress_cb, target_slots=target_slots,
+            override_flagged=override_flagged, generate_fn=generate_round,
+            project_dir=_get_project_dir(title))
+        usage = stop_and_get_accounting()
+        if usage:
+            result['token_usage'] = usage
+        result = _finish_video_generation(result, config, title, prompt_block, progress_cb, t['cancel_event'].is_set)
 
         with ACTIVE_TASKS_LOCK:
+            if t['cancel_event'].is_set() or t['status'] != 'running':
+                raise GenerationCancelled('Generation cancelled by user')
             t["status"] = "completed"
+            # status 保持兼容现有轮询协议；outcome 提供准确的业务终态。
+            t["outcome"] = result.get('completion_state', 'completed')
             t["result"] = result
             t["events"].append(('result', result))
         notify_listeners(task_id, 'result', result)
@@ -1440,23 +3391,103 @@ def generate_videos_worker(task_id, config, title, prompt_block, target_slots, o
         # 取消不关浏览器（2026-07-26）：见 /api/compose-cancel 里的同款说明。
     except Exception as e:
         log_exception('VIDEOS')
+        finalized = False
         with ACTIVE_TASKS_LOCK:
-            t["status"] = "failed"
-            t["error"] = str(e)
-            t["events"].append(('error', {'message': str(e)}))
-        notify_listeners(task_id, 'error', {'message': str(e)})
+            if t['status'] == 'running':
+                t['status'] = 'cancelled' if t['cancel_event'].is_set() else 'failed'
+                t['error'] = '用户取消了视频生成' if t['cancel_event'].is_set() else str(e)
+                t['events'].append(('error', {'message': t['error']}))
+                finalized = True
+        if finalized:
+            notify_listeners(task_id, 'error', {'message': t['error']})
         log('ERROR', 'VIDEOS', f"视频任务失败: {e}", title=title)
     finally:
-        save_tasks_to_disk()
+        _release_flow_project_run(config, task_id)
+        save_task_to_disk(task_id)
         set_log_context(None)
         set_project_key_context(None)
 
 
-def generate_cover_worker(task_id, config, parent_task_id, title, theme, prompt_block):
+def generate_video_chain_worker(task_id, config, title, prompt_block, target_slots, override_flagged=False):
+    t = get_or_create_task(task_id)
+    set_project_key_context(config.get('_project_key') if isinstance(config, dict) else None)
+    set_log_context(task_id)
+    log('INFO', 'VIDEOS', f"开始纯视频提示词链式生成任务{f'（子集 {target_slots}）' if target_slots else '（整单）'}", title=title)
+    try:
+        from prompt_pipeline import start_accounting, stop_and_get_accounting
+        start_accounting()
+        def progress_cb(stage, details):
+            return _video_progress(task_id, t, stage, details)
+
+        progress_cb('queue', {'message': '纯视频提示词链式生成请求已加入队列，正在等待排队生成...'})
+
+        def generate_round(*args, **kwargs):
+            with _video_generation_slot(config, task_id, t['cancel_event']):
+                return generate_video_chain_sequence(*args, **kwargs, auto_merge=False)
+        result = execute_video_generation_with_recovery(config, title, prompt_block,
+            on_progress=progress_cb, target_slots=target_slots,
+            override_flagged=override_flagged, generate_fn=generate_round,
+            project_dir=_get_project_dir(title), is_chain=True)
+        usage = stop_and_get_accounting()
+        if usage:
+            result['token_usage'] = usage
+        result = _finish_video_generation(result, config, title, prompt_block, progress_cb, t['cancel_event'].is_set)
+        with ACTIVE_TASKS_LOCK:
+            if t['cancel_event'].is_set() or t['status'] != 'running':
+                raise GenerationCancelled('Generation cancelled by user')
+            t['status'] = 'completed'
+            t['outcome'] = result['completion_state']
+            t['result'] = result
+            t['events'].append(('result', result))
+        notify_listeners(task_id, 'result', result)
+        log('INFO', 'VIDEOS', '纯视频提示词链式生成任务完成', title=title)
+    except ConnectionError:
+        finalize = False
+        with ACTIVE_TASKS_LOCK:
+            if t["status"] == "running":
+                t["status"] = "cancelled"
+                t["error"] = "用户取消了视频生成"
+                t["events"].append(('error', {'message': '用户取消了视频生成'}))
+                finalize = True
+        if finalize:
+            notify_listeners(task_id, 'error', {'message': '用户取消了视频生成'})
+        log('WARN', 'VIDEOS', "纯视频链式生成任务已被用户取消", title=title)
+    except Exception as e:
+        log_exception('VIDEOS')
+        finalized = False
+        with ACTIVE_TASKS_LOCK:
+            if t['status'] == 'running':
+                t['status'] = 'cancelled' if t['cancel_event'].is_set() else 'failed'
+                t['error'] = '用户取消了视频生成' if t['cancel_event'].is_set() else str(e)
+                t['events'].append(('error', {'message': t['error']}))
+                finalized = True
+        if finalized:
+            notify_listeners(task_id, 'error', {'message': t['error']})
+        log('ERROR', 'VIDEOS', f"纯视频链式生成任务失败: {e}", title=title)
+    finally:
+        _release_flow_project_run(config, task_id)
+        save_task_to_disk(task_id)
+        set_log_context(None)
+        set_project_key_context(None)
+
+
+def generate_cover_worker(task_id, config, parent_task_id, title, theme, prompt_block,
+                          project_key=None, concurrent=False, count=4):
     t = get_or_create_task(task_id)
     set_log_context(task_id)
-    log('INFO', 'COVER', "开始封面任务", title=title)
+    # 封面落进项目自己的目录（outputs/<项目>/cover_*.webp），跟帧/视频/成片同住：
+    # 与帧任务同款的线程级命名空间，标题只用于提示词与日志。
+    set_project_key_context(project_key or None)
+
+    def run_cancelled():
+        with ACTIVE_TASKS_LOCK:
+            cur = ACTIVE_TASKS.get(task_id)
+            return bool(cur and cur.get("status") == "cancelled")
+
+    log('INFO', 'COVER', f"开始封面任务{' (并发模式: ' + str(count) + ' 并发)' if (concurrent and count > 1) else ''}", title=title)
     try:
+        if run_cancelled():
+            raise GenerationCancelled("Generation cancelled by user")
         # Generate a catchy, viral English title/hook for TikTok US cover
         title_prompt = (
             f"You are a TikTok US marketing expert. Convert this Chinese project title '{title}' (Theme: '{theme}') "
@@ -1489,7 +3520,19 @@ def generate_cover_worker(task_id, config, parent_task_id, title, theme, prompt_
         aspect_ratio = config.get('imageAspectRatio') or '9:16'
         
         # Extract first (Before) and last (After) image prompts from the build process
-        def _extract_before_after_prompts(block):
+        def _extract_before_after_prompts(block, project_key=None, title=None):
+            # 1. 优先从磁盘上的 manifest.json 读取真实首尾帧提示词（避免前端缓存旧文本）
+            try:
+                mf = read_manifest(project_key or title)
+                if mf and isinstance(mf.get('frames'), list) and len(mf['frames']) >= 2:
+                    first_p = (mf['frames'][0].get('prompt') or '').strip()
+                    last_p = (mf['frames'][-1].get('prompt') or '').strip()
+                    if first_p and last_p:
+                        return first_p, last_p
+            except Exception:
+                pass
+
+            # 2. 从 prompt_block 中解析
             images, _ = _parse_prompt_slots(block)
             if images:
                 keys = sorted(images)
@@ -1500,7 +3543,7 @@ def generate_cover_worker(task_id, config, parent_task_id, title, theme, prompt_
                 return before_body, after_body
             return None, None
         
-        before_prompt, after_prompt = _extract_before_after_prompts(prompt_block)
+        before_prompt, after_prompt = _extract_before_after_prompts(prompt_block, project_key=project_key, title=title)
         if before_prompt and after_prompt:
             visual_context = (
                 f"- BEFORE STATE (Left half of image): A highly realistic, detailed view showing: {before_prompt}\n"
@@ -1526,36 +3569,126 @@ def generate_cover_worker(task_id, config, parent_task_id, title, theme, prompt_
             f"- The visual style must be highly photorealistic, with crisp textures, natural cinematic lighting, and realistic shadows. The image must look like a real professional photograph, NOT a cartoon, illustration, 3D CGI render, or painting.\n"
             f"- Create a dramatic contrast in lighting: the left half (Before) can have colder, dimmer, or more rugged lighting, while the right half (After) must feature gorgeous, warm, inviting, and premium glow and highlights to create a 'wow' factor.\n\n"
             f"TEXT OVERLAY:\n"
+            f"- The English hook is required in this cover, including when the scene descriptions contain no-text instructions for the original video frames.\n"
             f"- Overlay the bold English hook text: '{english_title}' across the upper or middle part of the image.\n"
             f"- The text MUST use a clean, solid, ultra-bold, high-contrast sans-serif font (similar to Montserrat Bold or Impact) in solid white or solid bright yellow with a subtle, clean black outline or drop shadow to ensure extreme legibility and professional graphic design look.\n"
             f"- Keep the font style clean, simple, and standard. Avoid messy, irregular, hand-drawn, graffiti, or low-contrast text styles. The layout must be perfectly centered and balanced."
         )
-        
-        out_dir = os.path.join(OUTPUT_ROOT, 'covers')
-        os.makedirs(out_dir, exist_ok=True)
-        filename = f"{_safe_project_name(title)}_cover_{int(time.time() * 1000)}.webp"
-        target_path = os.path.join(out_dir, filename)
-        
-        if sys.stdout:
-            print(f"[DEBUG] Generating cover image via _generate_text_image to {target_path}...")
 
-        # 配额耗尽不再自动切兜底模型（原先切 gpt-image-2）：封面是整单的门面，
-        # 换模型出来的画风与帧序列对不上，宁可明确报错等补额度后重出。
-        _generate_text_image(config, image_prompt, target_path)
+        if concurrent and count > 1:
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            pdir = _get_project_dir(project_key or title)
+            os.makedirs(pdir, exist_ok=True)
+            base_ts = int(time.time() * 1000)
 
-        rel_path = os.path.relpath(target_path, os.path.dirname(os.path.abspath(__file__))).replace('\\', '/')
-        image_content = '/' + rel_path
-        
+            tasks = []
+            for i in range(count):
+                c_idx = i + 1
+                cand_path = os.path.join(pdir, f"{COVER_FILENAME_PREFIX}{base_ts}_{c_idx}.webp")
+                var_prompt = image_prompt
+                if i > 0:
+                    var_prompt = f"{image_prompt}\n\n[Variation #{c_idx}]"
+                tasks.append((c_idx, cand_path, var_prompt))
+
+            notify_listeners(task_id, 'cover_generating', {
+                'completed': 0,
+                'total': count,
+                'message': f"正在并发生成 {count} 张封面图..."
+            })
+
+            def _worker(c_idx, path, prompt):
+                set_log_context(task_id)
+                set_project_key_context(project_key or None)
+                try:
+                    if run_cancelled():
+                        raise GenerationCancelled("Generation cancelled by user")
+                    _generate_text_image(config, prompt, path, allow_text=True)
+                    if os.path.exists(path) and os.path.getsize(path) > 0:
+                        rel = os.path.relpath(path, os.path.dirname(os.path.abspath(__file__))).replace('\\', '/')
+                        return c_idx, '/' + rel
+                    raise RuntimeError(f"Cover candidate #{c_idx} file is missing or empty")
+                finally:
+                    set_log_context(None)
+                    set_project_key_context(None)
+
+            generated_results = {}
+            errors = []
+            completed_count = 0
+
+            with ThreadPoolExecutor(max_workers=count) as pool:
+                futures = {
+                    pool.submit(_worker, c_idx, path, prompt): (c_idx, path)
+                    for c_idx, path, prompt in tasks
+                }
+                for fut in as_completed(futures):
+                    c_idx, path = futures[fut]
+                    if run_cancelled():
+                        for f in futures:
+                            f.cancel()
+                        raise GenerationCancelled("Generation cancelled by user")
+                    try:
+                        res_idx, rel_url = fut.result()
+                        generated_results[res_idx] = rel_url
+                        completed_count += 1
+                        notify_listeners(task_id, 'cover_generating', {
+                            'completed': completed_count,
+                            'total': count,
+                            'cover_url': rel_url,
+                            'message': f"正在并发生成封面图 ({completed_count}/{count})..."
+                        })
+                        log('INFO', 'COVER', f"封面候选 #{res_idx} 生成完成 ({completed_count}/{count}): {rel_url}")
+                    except GenerationCancelled:
+                        for f in futures:
+                            f.cancel()
+                        raise
+                    except Exception as gen_err:
+                        log('ERROR', 'COVER', f"封面候选 #{c_idx} 生成失败: {gen_err}")
+                        errors.append(gen_err)
+
+            if not generated_results:
+                raise RuntimeError(f"所有封面并发生成均失败: {errors[0] if errors else '未知错误'}")
+
+            generated_covers = [generated_results[k] for k in sorted(generated_results.keys())]
+            image_content = generated_covers[0]
+            target_path = os.path.join(pdir, os.path.basename(image_content.lstrip('/')))
+        else:
+            target_path = project_cover_path(project_key or title)
+            if sys.stdout:
+                print(f"[DEBUG] Generating cover image via _generate_text_image to {target_path}...")
+            _generate_text_image(config, image_prompt, target_path, allow_text=True)
+            rel_path = os.path.relpath(target_path, os.path.dirname(os.path.abspath(__file__))).replace('\\', '/')
+            image_content = '/' + rel_path
+            generated_covers = [image_content]
+
+        # 就地登记进 manifest。`resolve_cover_reference` 的文档写着「manifest 里登记的
+        # cover_roles.frame1 / 主封面——无头调用与断线恢复只认磁盘上的这份」，可这个字段
+        # 一直只有前端手选封面那条路（/api/project/covers）会写：自动生成的封面从来没被
+        # 登记过，谁想找它都只能靠「按项目目录 listdir 挑 mtime 最新的一张」，键一对不上
+        # 就静默找不到。这里补上那个缺失的写入方。
+        # 只写 active_cover，不碰 cover_roles：后者是用户对具体用途的明确指定，而
+        # manifest_cover_role 先读 frame1 再读 active_cover，用户选过的那张始终优先。
+        try:
+            cover_project_dir = os.path.dirname(target_path)
+            with manifest_lock(cover_project_dir):
+                mdata = read_manifest(cover_project_dir) or {}
+                mdata['active_cover'] = image_content
+                write_manifest(cover_project_dir, mdata)
+        except Exception as reg_err:
+            # 登记失败不影响这张封面本身——回落的 listdir 那条路仍在。
+            log('WARN', 'COVER', f"封面登记进 manifest 失败（不影响出图）: {reg_err}")
+
         # Persist cover details in parent task result
         if parent_task_id:
             with ACTIVE_TASKS_LOCK:
                 task = ACTIVE_TASKS.get(str(parent_task_id)) or ACTIVE_TASKS.get(parent_task_id)
-                if task and task.get("result"):
+                if task:
+                    if not task.get("result") or not isinstance(task["result"], dict):
+                        task["result"] = {}
                     if "covers" not in task["result"] or not isinstance(task["result"]["covers"], list):
                         task["result"]["covers"] = []
-                    cover_rel_url = image_content
-                    if cover_rel_url not in task["result"]["covers"]:
-                        task["result"]["covers"].append(cover_rel_url)
+                    for c_url in generated_covers:
+                        if c_url not in task["result"]["covers"]:
+                            task["result"]["covers"].append(c_url)
                     task["result"]["english_title"] = english_title
                     if social.get('tiktok') and not task["result"].get("social_title_en"):
                         task["result"]["social_title_en"] = social['tiktok']
@@ -1564,6 +3697,7 @@ def generate_cover_worker(task_id, config, parent_task_id, title, theme, prompt_
 
         result_data = {
             'content': image_content,
+            'covers': generated_covers,
             'english_title': english_title
         }
         if social.get('tiktok'):
@@ -1577,8 +3711,15 @@ def generate_cover_worker(task_id, config, parent_task_id, title, theme, prompt_
             t["events"].append(('result', result_data))
 
         notify_listeners(task_id, 'result', result_data)
-        log('INFO', 'COVER', "封面任务完成", title=title)
+        log('INFO', 'COVER', f"封面任务完成，共生成 {len(generated_covers)} 张封面", title=title)
 
+    except GenerationCancelled as ce:
+        with ACTIVE_TASKS_LOCK:
+            t["status"] = "cancelled"
+            t["error"] = str(ce)
+            t["events"].append(('error', {'message': '封面任务已被用户取消'}))
+        notify_listeners(task_id, 'error', {'message': '封面任务已被用户取消'})
+        log('WARN', 'COVER', "封面任务已被用户取消", title=title)
     except Exception as e:
         log_exception('COVER')
         with ACTIVE_TASKS_LOCK:
@@ -1588,11 +3729,123 @@ def generate_cover_worker(task_id, config, parent_task_id, title, theme, prompt_
         notify_listeners(task_id, 'error', {'message': str(e)})
         log('ERROR', 'COVER', f"封面任务失败: {e}", title=title)
     finally:
-        save_tasks_to_disk()
+        save_task_to_disk(task_id)
         set_log_context(None)
+        set_project_key_context(None)
 
 
-class DualStackHTTPServer(ThreadingMixIn, HTTPServer):
+class _QuietConnResetMixin:
+    """把"客户端悄悄掐掉空闲 keep-alive 连接"这类噪音从满屏 traceback 降成一行。
+
+    HTTP/1.1 之后浏览器会留着若干条空闲连接备用，用完/离开页面时直接 RST。服务端
+    正阻塞在 handle_one_request 的 readline 上，于是收到 WinError 10054/10053，
+    socketserver 默认把它当成"处理请求时出异常"打整段 traceback——server.log 里
+    实测 42 段全是这一种，纯噪音，却把真正的报错顶出了视野。
+    """
+
+    def handle_error(self, request, client_address):
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (ConnectionResetError, ConnectionAbortedError,
+                            BrokenPipeError, TimeoutError)):
+            log('DEBUG', 'HTTP', f'客户端断开空闲连接: {type(exc).__name__}')
+            return
+        super().handle_error(request, client_address)
+
+
+HTTPD_INSTANCE = None
+_AUTO_RELOAD_TRIGGERED = False
+
+
+def _beat_pack_busy():
+    """排队或运行中的提示词包生成任务（形如 beat_pack:<id>）。
+
+    重启和自动重载都会掐断进程里正在计费的模型调用，所以它们得像 ACTIVE_TASKS 里的运行中任务一样让路；
+    模块出任何问题都按"不忙"处理，不能让一个附属功能挡住整个服务的重启。"""
+    try:
+        import beat_pack
+        return [f'beat_pack:{job_id}' for job_id in beat_pack.running_job_ids()]
+    except Exception:
+        return []
+
+
+def restart_server_process():
+    """优雅重启后端服务进程"""
+    global _AUTO_RELOAD_TRIGGERED, HTTPD_INSTANCE
+    _AUTO_RELOAD_TRIGGERED = True
+    time.sleep(0.4)
+    try:
+        if HTTPD_INSTANCE is not None:
+            HTTPD_INSTANCE.server_close()
+    except Exception:
+        pass
+
+    script_path = os.path.abspath(sys.argv[0] if sys.argv else 'server.py')
+    args = [sys.executable, script_path] + sys.argv[1:]
+
+    if sys.platform == 'win32':
+        import subprocess
+        flags = 0
+        if hasattr(subprocess, 'CREATE_NEW_PROCESS_GROUP'):
+            flags |= subprocess.CREATE_NEW_PROCESS_GROUP
+        if hasattr(subprocess, 'DETACHED_PROCESS'):
+            flags |= subprocess.DETACHED_PROCESS
+        subprocess.Popen(args, creationflags=flags)
+        os._exit(0)
+    else:
+        # macOS / Linux
+        os.execv(sys.executable, args)
+
+
+def _start_auto_reload_watcher():
+    """后台监听核心文件改动，在无活跃任务时自动重启进程（防代码更新后跑陈旧内存实例）。"""
+    def _watch():
+        global _AUTO_RELOAD_TRIGGERED
+        time.sleep(3.0)
+        while not _AUTO_RELOAD_TRIGGERED:
+            time.sleep(1.5)
+            try:
+                # Read the file on each pass so toggling autoReload takes effect
+                # without a restart. The shared loader also applies env overrides.
+                cfg = server_common._load_server_config()
+                if not cfg.get('autoReload', True):
+                    continue
+
+                report = code_staleness_report()
+                if not report.get('stale'):
+                    continue
+
+                active_running = False
+                with ACTIVE_TASKS_LOCK:
+                    for t in ACTIVE_TASKS.values():
+                        if (isinstance(t, dict)
+                                and (t.get('status') == 'running' or t.get('_cookie_login') is True)):
+                            active_running = True
+                            break
+                if active_running or _beat_pack_busy():
+                    continue
+
+                time.sleep(1.0)
+                # A maintenance/login worker can start during the delay above.
+                # Serialize the final decision with its running-task registration.
+                with ACTIVE_TASKS_LOCK:
+                    if any(isinstance(t, dict)
+                           and (t.get('status') == 'running' or t.get('_cookie_login') is True)
+                           for t in ACTIVE_TASKS.values()) or _beat_pack_busy():
+                        continue
+                    _AUTO_RELOAD_TRIGGERED = True
+                if sys.stdout:
+                    files_str = ', '.join(report.get('stale_files', [])[:3])
+                    print(f"[AUTO-RELOAD] 检测到核心源文件更新 ({files_str})，正在自动重启服务...")
+                restart_server_process()
+                break
+            except Exception:
+                pass
+
+    t = threading.Thread(target=_watch, daemon=True, name="AutoReloadWatcher")
+    t.start()
+
+
+class DualStackHTTPServer(_QuietConnResetMixin, ThreadingMixIn, HTTPServer):
     # ThreadingMixIn so a long-running /api/compose call (the skill can take 60-180s)
     # does not block static file serving or library reads in the same browser session.
     address_family = socket.AF_INET6
@@ -1600,6 +3853,12 @@ class DualStackHTTPServer(ThreadingMixIn, HTTPServer):
     # “重复实例越积越多”的根源；显式 False + SO_EXCLUSIVEADDRUSE 让第二次启动立刻报错。
     allow_reuse_address = (sys.platform != 'win32')
     daemon_threads = True
+    # listen backlog：基类默认只有 5。一次页面加载要并发拉 20 个 js + 8 个 css，
+    # Chromium 每源开 6 条连接，再叠上 SSE 与另一个标签页，瞬时未 accept 的连接很容易
+    # 超过 5，超出的会被内核直接拒掉，表现就是随机某个 <script> 加载失败。
+    # tests/test_slot_grid_render.py 和 test_frames_cancel_settles_slots.py 里的静态
+    # 桩服务早就按同样理由写了 128，唯独真正对外服务的这两个类一直漏掉。
+    request_queue_size = 128
 
     def server_bind(self):
         if self.address_family == socket.AF_INET6:
@@ -1609,11 +3868,12 @@ class DualStackHTTPServer(ThreadingMixIn, HTTPServer):
         super().server_bind()
 
 
-class IPv4HTTPServer(ThreadingMixIn, HTTPServer):
+class IPv4HTTPServer(_QuietConnResetMixin, ThreadingMixIn, HTTPServer):
     """IPv4 回退：本机禁用 IPv6 时 DualStackHTTPServer 无法启动。"""
     address_family = socket.AF_INET
     allow_reuse_address = (sys.platform != 'win32')
     daemon_threads = True
+    request_queue_size = 128  # 同 DualStackHTTPServer，理由见那边注释
 
     def server_bind(self):
         if sys.platform == 'win32' and hasattr(socket, 'SO_EXCLUSIVEADDRUSE'):
@@ -1621,69 +3881,7 @@ class IPv4HTTPServer(ThreadingMixIn, HTTPServer):
         super().server_bind()
 
 
-def check_video_prompt_semantically(config, video_prompt, vlm_reason):
-    """
-    Use LLM to determine if the video transition prompt has semantic or logical issues
-    and is responsible for the VLM QA failure.
-    """
-    system_prompt = (
-        "You are a video transition auditor. Your job is to check if the VIDEO transition prompt "
-        "has any logical errors, contradictions, or is responsible for a VLM QA failure.\n"
-        "You will be given the VIDEO prompt and the VLM QA failure reason (in Chinese).\n\n"
-        "Determine if the video prompt itself has issues (e.g., describes impossible actions, has camera pan/zoom/tilt when it must be static, or is contradictory).\n"
-        "Response format:\n"
-        "- If the video prompt has issues, respond EXACTLY in this format: FAIL: <reason in Chinese>\n"
-        "- If the video prompt is completely fine and doesn't need to be corrected, respond EXACTLY with: PASS"
-    )
-    user_prompt = f"VIDEO prompt:\n{video_prompt}\n\nVLM Failure Reason:\n{vlm_reason}"
-    from prompt_pipeline import _chat, _aux_model
-    try:
-        response = _chat(config, system_prompt, user_prompt, temperature=0.2, timeout=45, model=_aux_model(config))
-        return response.strip()
-    except Exception as e:
-        if sys.stdout:
-            print(f"[DEBUG] check_video_prompt_semantically failed: {e}")
-        return "PASS"
-
-
-def fix_video_prompt_with_vlm_feedback(config, original_video_prompt, vlm_reason, validation_errors=None):
-    """
-    Use LLM (auxModel) to generate a corrected video prompt based on the VLM QA audit failure reason and any validation errors.
-    """
-    system_prompt = (
-        "You are an expert prompt engineering assistant. Your job is to modify a video transition prompt "
-        "to fix specific errors detected by a visual quality auditor (VLM) or rule validation errors.\n"
-        "You will be given the original video transition prompt, the VLM failure reason (in Chinese), "
-        "and optionally any rule validation errors.\n\n"
-        "Please provide a corrected video transition prompt that:\n"
-        "- Corrects the action or pacing so it matches the image changes or fixes the VLM failure.\n"
-        "- Ensures there are no forbidden camera movement instructions (like zoom, pan, tilt) if the camera must remain static.\n"
-        "- Fixes any coordinates, pacing, or rule validation errors listed.\n"
-        "- Keeps the original action intent, style, and duration constraints intact.\n"
-        "- Do NOT output any explanations, markdown code fences, or headers. Output ONLY the raw corrected prompt text in English."
-    )
-    user_prompt = (
-        f"Original VIDEO prompt:\n{original_video_prompt}\n\n"
-        f"VLM Audit Failure Reason:\n{vlm_reason}\n\n"
-    )
-    if validation_errors:
-        user_prompt += f"Rule Validation Errors:\n" + "\n".join(f"- {e}" for e in validation_errors) + "\n\n"
-    user_prompt += "Please output the corrected VIDEO prompt in English."
-
-    from prompt_pipeline import _chat, _aux_model, _strip_markdown_fences_only
-    try:
-        response = _chat(
-            config, system_prompt, user_prompt,
-            temperature=0.3, timeout=60, model=_aux_model(config)
-        )
-        return _strip_markdown_fences_only(response).strip()
-    except Exception as e:
-        if sys.stdout:
-            print(f"[DEBUG] fix_video_prompt_with_vlm_feedback failed: {e}")
-        return original_video_prompt
-
-
-class SparkRequestHandler(SimpleHTTPRequestHandler):
+class SparkRequestHandler(StaticFilesMixin, SimpleHTTPRequestHandler):
     timeout = 60
     # HTTP/1.0（此前的隐式默认值）不支持持久连接：每个页面加载要拉 14 个 js +
     # 8 个 css，每一个都得单独 TCP 三次握手再关闭。本机高频开关连接在 Windows
@@ -1696,12 +3894,54 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
     # 补齐；SSE 是无边界流，改为显式 close_connection 避免连接复用歧义。
     protocol_version = 'HTTP/1.1'
 
+    # 访问日志此前无差别 print(f"LOG: ...")：实测 server.log 里 81% 的行是它产生的
+    # （43,284 行中 35,249 行），且绝大多数是 "GET /outputs/xxx.mp4 304"——播放器
+    # 反复回源验证缓存的正常往返，对"生成得怎么样"零信息量，却把真正有用的行冲得
+    # 找不到。现在按状态码分级：4xx/5xx 里真正的异常照常留痕，正常往返只在显式
+    # 打开 logHttpAccess 时才记（见 server_common.http_access_logging）。
+    def _log_access(self, msg):
+        if http_access_logging():
+            log('INFO', 'HTTP', msg)
+
+    def log_request(self, code='-', size='-'):
+        try:
+            status = int(code)
+        except (TypeError, ValueError):
+            status = 0
+        path = (self.path or '').split('?')[0]
+        line = f'"{getattr(self, "requestline", "-")}" {code} {size}'
+        if status >= 500:
+            log('ERROR', 'HTTP', line)
+        elif status >= 400 and not (status == 404 and path.startswith('/outputs/')):
+            # /outputs 下的 404 例外：帧/视频文件名是确定性的，前端会在文件生成
+            # 之前就来取，那个 404 是预期中的"还没好"，不是故障（end_headers 里
+            # 那段缓存压制注释说的是同一件事）。
+            log('WARN', 'HTTP', line)
+        else:
+            self._log_access(line)
+
+    def log_error(self, format, *args):
+        # send_error() 会先 log_error("code %d, message %s") 再走 send_response()，
+        # 而后者已经经由 log_request 记过一条带状态码、且分好级的了——原样保留等于
+        # 同一个 404 记两遍。"Request timed out" 同理：HTTP/1.1 持久连接到点自然
+        # 过期，不是故障（实测 328 次全是这个）。这两类并进访问日志，其余按 WARN。
+        try:
+            msg = format % args
+        except Exception:
+            msg = str(format)
+        if msg.startswith('code ') or msg.startswith('Request timed out'):
+            self._log_access(msg)
+        else:
+            log('WARN', 'HTTP', msg)
+
     def log_message(self, format, *args):
-        if sys.stdout:
-            try:
-                sys.stdout.write(f"LOG: {format % args}\n")
-            except Exception:
-                pass
+        # http.server 里只有 log_request/log_error 会调到这里，两者都已单独覆盖。
+        # 留一个兜底覆盖，是为了不让基类实现把无级别的裸文本直接甩给 stderr。
+        try:
+            msg = format % args
+        except Exception:
+            msg = str(format)
+        self._log_access(msg)
 
     def send_response(self, code, message=None):
         # 记住本次响应状态码，供 end_headers 判断是否要压制 404 的隐式缓存
@@ -1710,20 +3950,16 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
 
     def end_headers(self):
         # Enable CORS for local development flexibility
-        self.send_header('Access-Control-Allow-Origin', '*')
-        self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
-        self.send_header('Access-Control-Allow-Headers', 'Content-Type, Authorization')
-        # Never let browsers / Cloudflare serve stale front-end assets. This is what
-        # caused "multiple UI forms" (old cached HTML/CSS shown alongside the new one).
-        # no-store（而非 no-cache）：no-cache 只是要求每次都带条件请求去服务端"问一下"，
-        # 但那次协商行为本身是在响应第一次被缓存时就已经和浏览器约定好的——如果某个
-        # URL 是在这条 no-cache 规则生效之前就被缓存下来的（更早的部署/没有这个头的
-        # 历史版本），浏览器压根不会再发请求去验证，永远沿用旧缓存，导致"必须开无痕
-        # 才能看到最新改动"。no-store 直接禁止缓存这个响应本身，不存在"沿用旧协商结果"
-        # 这个坑，每次加载都是从磁盘整份重新拉取。
-        p = (self.path or '').split('?')[0]
-        if p.endswith(('.html', '.css', '.js')) or p.endswith('/'):
-            self.send_header('Cache-Control', 'no-store')
+        # Local Codex can execute tools: never expose its control API to other sites.
+        # Beat-pack generation spends the user's model quota: same rule.
+        if not (self.path or '').startswith(('/api/codex-video-editor/', '/api/beat-pack/')):
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+            self.send_header('Access-Control-Allow-Headers', 'Content-Type, Authorization, Range')
+        self.send_header('Access-Control-Expose-Headers', 'Content-Range, Accept-Ranges, Content-Length')
+        # HTML refreshes content versions on every load. Only public JS/CSS with
+        # the current content hash may be immutable; old URLs revalidate.
+        p = urllib.parse.unquote((self.path or '').split('?')[0]).lower()
         # 帧/视频文件名是确定性的（img_001.webp 等），生成前请求会先拿到 404——
         # 404 在 RFC 7231 里是浏览器默认可启发式缓存的状态码，Safari 对此尤其
         # 激进。不加这个头，浏览器可能把"还没生成"的 404 缓存下来，等真正生成
@@ -1739,16 +3975,27 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
             # 验证：未变走 304（只有头部往返，不重新下载，不会回到旧的重复全量
             # 下载问题），覆盖后立即拿新图，删除后立即 404。
             self.send_header('Cache-Control', 'no-cache')
+        elif p.endswith('.html') or p.endswith('/'):
+            self.send_header('Cache-Control', 'no-store')
+        elif p.endswith(('.js', '.css')):
+            policy = 'no-store' if p.startswith('/api/') else getattr(self, '_spark_static_cache_control', 'no-store')
+            self.send_header('Cache-Control', policy)
         super().end_headers()
 
     def _send_json(self, obj, status=200):
         body = json.dumps(obj, ensure_ascii=False).encode('utf-8')
+        headers = getattr(self, 'headers', {})
+        body, encoding = compress_response(body, headers.get('Accept-Encoding', ''))
         try:
             self.send_response(status)
             self.send_header('Content-type', 'application/json; charset=utf-8')
+            self.send_header('Vary', 'Accept-Encoding')
+            if encoding:
+                self.send_header('Content-Encoding', encoding)
             self.send_header('Content-Length', str(len(body)))
             self.end_headers()
-            self.wfile.write(body)
+            if getattr(self, 'command', 'GET') != 'HEAD':
+                self.wfile.write(body)
         except (ConnectionError, BrokenPipeError) as e:
             # 客户端在响应写回前就断了（慢接口上很常见：积分探测要几十秒，用户
             # 中途刷新页面）。这时候连"再回一个 500"都写不出去，只会让 do_POST 的
@@ -1781,6 +4028,338 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
         except UnicodeDecodeError:
             text = raw.decode('gbk', errors='replace')
         return json.loads(text)
+
+    def _codex_editor_gate(self, mutation=False):
+        """Accept local pages and explicitly configured public pages through the local proxy."""
+        import ipaddress
+        if not self._gate():
+            return False
+        allowed = _is_same_machine_client(self)
+        host = self.headers.get('Host', '')
+        try:
+            parsed_host = urllib.parse.urlsplit('//' + host)
+            hostname = parsed_host.hostname or ''
+            allowed = allowed and not any(ord(char) <= 32 or ord(char) == 127 for char in host)
+            allowed = allowed and not (parsed_host.username or parsed_host.password)
+            allowed = allowed and not (parsed_host.path or parsed_host.query or parsed_host.fragment)
+
+            def https_origin(value):
+                if not isinstance(value, str) or any(ord(char) <= 32 or ord(char) == 127 for char in value):
+                    return None
+                parsed = urllib.parse.urlsplit(value)
+                if (parsed.scheme != 'https' or not parsed.hostname
+                        or parsed.username or parsed.password
+                        or parsed.path or '?' in value or '#' in value
+                        or parsed.netloc.endswith(':')):
+                    return None
+                port = 443 if parsed.port is None else parsed.port
+                return (parsed.hostname.lower(), port) if 0 < port <= 65535 else None
+
+            configured = SERVER_CONFIG.get('codexEditorAllowedOrigins', [])
+            public_origins = set()
+            if isinstance(configured, (list, tuple)):
+                for value in configured:
+                    try:
+                        key = https_origin(value)
+                    except (ValueError, TypeError):
+                        continue
+                    if key:
+                        public_origins.add(key)
+            public_origin = https_origin('https://' + host)
+            origin = self.headers.get('Origin')
+            if public_origin in public_origins:
+                # The browser sends this non-simple header; unrelated websites
+                # cannot dispatch work because this API does not allow CORS.
+                allowed = allowed and self.headers.get('X-SPARK-Codex-Editor') == '1'
+                if origin:
+                    allowed = allowed and https_origin(origin) == public_origin
+                elif mutation:
+                    allowed = False
+            else:
+                service_port = self.server.server_port
+                allowed = allowed and (parsed_host.port or 80) == service_port
+                local_names = {'localhost', socket.gethostname().lower()}
+                host_allowed = hostname.lower() in local_names
+                if not host_allowed:
+                    addr = ipaddress.ip_address(hostname.split('%')[0])
+                    addr = getattr(addr, 'ipv4_mapped', None) or addr
+                    host_allowed = addr.is_loopback or str(addr) in _own_host_ips()
+                allowed = allowed and host_allowed
+                if origin:
+                    parsed_origin = urllib.parse.urlsplit(origin)
+                    allowed = allowed and parsed_origin.scheme == 'http'
+                    allowed = allowed and parsed_origin.netloc.lower() == host.lower()
+                    allowed = allowed and not (parsed_origin.path or parsed_origin.query or parsed_origin.fragment)
+            allowed = allowed and self.headers.get('Sec-Fetch-Site', 'same-origin') in ('same-origin', 'none')
+        except (ValueError, TypeError, AttributeError):
+            allowed = False
+        if not allowed:
+            self._send_json({'message': '请从本机页面或已配置的公网地址使用 Codex 精剪'}, status=403)
+            return False
+        if mutation and self.headers.get('Content-Type', '').split(';', 1)[0].strip().lower() != 'application/json':
+            self._send_json({'message': '精剪请求需要使用 JSON 格式'}, status=415)
+            return False
+        return True
+
+    def _handle_codex_editor(self, path, query=None):
+        mutation = self.command == 'POST'
+        if not self._codex_editor_gate(mutation=mutation):
+            return
+        import codex_video_editor
+        try:
+            if not mutation and path == '/api/codex-video-editor/capabilities':
+                payload = codex_video_editor.capabilities()
+            elif not mutation and path == '/api/codex-video-editor/jobs':
+                payload = {'jobs': codex_video_editor.list_jobs((query or {}).get('source', [''])[0])}
+            elif mutation and path in ('/api/codex-video-editor/jobs', '/api/codex-video-editor/cancel'):
+                body = self._read_json_body()
+                if not isinstance(body, dict):
+                    self._send_json({'message': '精剪请求格式不正确'}, status=400)
+                    return
+                if path.endswith('/cancel'):
+                    job = codex_video_editor.cancel(body.get('id', ''))
+                else:
+                    job = codex_video_editor.start(
+                        source=body.get('source', ''), mode=body.get('mode', 'trim'),
+                        notes=body.get('notes', ''), request_id=body.get('request_id', ''),
+                        model=body.get('model'), reasoning_effort=body.get('reasoning_effort'),
+                        engine=body.get('engine'),
+                    )
+                payload = {'job': job}
+            else:
+                self._send_json({'message': '精剪接口不存在'}, status=404)
+                return
+            self._send_json(payload)
+        except codex_video_editor.VideoEditError as exc:
+            self._send_json({'message': str(exc), 'code': exc.code}, status=exc.status)
+        except (ValueError, TypeError):
+            self._send_json({'message': '精剪请求参数不正确'}, status=400)
+        except Exception as exc:
+            log('ERROR', 'Codex 精剪', str(exc))
+            self._send_json({'message': '精剪服务暂时无法处理请求，请稍后重试'}, status=500)
+
+    def _handle_beat_pack(self, path, query=None):
+        """Claude 提示词包生成：创建/查看/取消/续跑任务，并把完成的包导入项目工作台。
+
+        只有文本模型调用（不执行任何本机工具），所以走普通访问码门禁；但它按量计费，
+        因此和 Codex 精剪一样不开放跨站：响应不带 CORS 头（见 end_headers），
+        写请求必须是 application/json，浏览器里的第三方页面发不出预检通过的请求。"""
+        import beat_pack
+        mutation = self.command == 'POST'
+        if not self._gate(with_rate=mutation and path in ('/api/beat-pack/jobs', '/api/beat-pack/resume'),
+                          rate_action='beat_pack'):
+            return
+        if mutation and self.headers.get('Content-Type', '').split(';', 1)[0].strip().lower() != 'application/json':
+            self._send_json({'message': '提示词包请求需要使用 JSON 格式'}, status=415)
+            return
+        query = query or {}
+
+        def arg(name):
+            return (query.get(name) or [''])[0]
+        try:
+            beat_pack.set_concurrency(SERVER_CONFIG.get('beatPackConcurrency', 1))
+            body = self._read_json_body() if mutation else {}
+            if not isinstance(body, dict):
+                self._send_json({'message': '提示词包请求格式不正确'}, status=400)
+                return
+            if path == '/api/beat-pack/capabilities':
+                payload = beat_pack.capabilities(effective_config(body.get('config')))
+            elif not mutation and path == '/api/beat-pack/jobs':
+                payload = {'jobs': beat_pack.list_jobs()}
+            elif not mutation and path == '/api/beat-pack/job':
+                payload = {'job': beat_pack.get_job(arg('id'))}
+            elif not mutation and path == '/api/beat-pack/prompt':
+                name = arg('name') or '完整提示词.txt'
+                payload = {'name': name, 'text': beat_pack.prompt_text(arg('id'), name)}
+            elif mutation and path == '/api/beat-pack/jobs':
+                payload = {'job': beat_pack.start(body, effective_config(body.get('config')), request_id=body.get('request_id', ''))}
+            elif mutation and path == '/api/beat-pack/cancel':
+                payload = {'job': beat_pack.cancel(body.get('id'))}
+            elif mutation and path == '/api/beat-pack/resume':
+                payload = {'job': beat_pack.resume(body.get('id'), effective_config(body.get('config')))}
+            elif mutation and path == '/api/beat-pack/import':
+                payload = {'job': beat_pack.import_job(body.get('id'), body.get('title'))}
+            else:
+                self._send_json({'message': '提示词包接口不存在'}, status=404)
+                return
+            self._send_json(payload)
+        except beat_pack.BeatPackError as exc:
+            self._send_json({'message': str(exc), 'code': exc.code}, status=exc.status)
+        except (ValueError, TypeError):
+            self._send_json({'message': '提示词包请求参数不正确'}, status=400)
+        except Exception as exc:
+            log('ERROR', '提示词包', str(exc))
+            self._send_json({'message': '提示词包服务暂时无法处理请求，请稍后重试'}, status=500)
+
+    def _reconcile_video_operation(self, body):
+        """Claim the project while checking/downloading original submissions."""
+        import uuid
+        from video_submission_recovery import reconcile_video_submissions
+        if not isinstance(body, dict):
+            raise ValueError('核对请求格式无效')
+        project_key = body.get('title')
+        slots = body.get('target_slots')
+        if not isinstance(project_key, str) or not project_key.strip():
+            raise ValueError('缺少项目标识')
+        if (not isinstance(slots, list) or not 1 <= len(slots) <= 20
+                or any(type(slot) is not int or slot <= 0 for slot in slots)):
+            raise ValueError('请指定 1 至 20 个要核对的视频槽位')
+        config = {**effective_config(None), 'videoProvider': 'flow2api'}
+        claim_id = 'video_recovery_' + uuid.uuid4().hex
+        key = _safe_project_name(project_key)
+        from project_archive import MUTATION_LOCK, archived_request
+        with MUTATION_LOCK, _VIDEO_OPERATION_LOCK:
+            if archived_request(body):
+                self._send_json({'status': 'error', 'failure_code': 'PROJECT_ARCHIVED',
+                    'message': '项目已归档，不能接回视频'}, status=409)
+                return
+            with ACTIVE_TASKS_LOCK:
+                live = next((tid for tid, task in ACTIVE_TASKS.items()
+                    if task.get('status') == 'running'
+                    and _safe_project_name((task.get('dimensions') or {}).get('project_key')
+                        or (task.get('dimensions') or {}).get('theme') or '') == key), None)
+            holder = live or _claim_flow_project_run(config, claim_id, project_key)
+            if holder:
+                self._send_json({'status': 'error', 'failure_code': 'PROJECT_BUSY',
+                    'message': '该项目仍有任务运行，请等原任务退出后核对', 'task_id': holder}, status=409)
+                return
+
+        def checkpoint(task_id, receipt, manifest):
+            with ACTIVE_TASKS_LOCK:
+                task = ACTIVE_TASKS.get(task_id)
+                if task is None:
+                    return
+                result = task.get('result')
+                if not isinstance(result, dict):
+                    result = task['result'] = {}
+                if isinstance(result, dict):
+                    result.update(manifest)
+                    by_slot = {v.get('slot'): v for v in manifest.get('videos', []) if isinstance(v, dict)}
+                    _, declared = _parse_prompt_slots(result.get('prompt_block') or manifest.get('prompt_block') or '')
+                    expected = set(declared) or set(by_slot)
+                    failed = any(slot not in by_slot
+                        or (by_slot[slot].get('last_attempt') or {}).get('submission_pending') is True
+                        or ((by_slot[slot].get('last_attempt') or {}).get('status', by_slot[slot].get('status')) != 'success'
+                            and by_slot[slot].get('status') not in ('skipped_cut', 'skipped_bridge_hold'))
+                        for slot in expected)
+                    result.update(has_failures=failed,
+                                  completion_state='partial_failed' if failed else 'completed')
+                task.setdefault('events', []).append(('submission_reconciled', {
+                    'index': receipt.get('slot'), 'submission_id': receipt.get('submission_id'),
+                    'operation_id': receipt.get('operation_id'),
+                    'submission_pending': receipt.get('submission_pending'),
+                    'recovery_state': receipt.get('recovery_state')}))
+            if not save_task_to_disk(task_id):
+                raise RuntimeError('原任务核对记录保存失败')
+        try:
+            response = reconcile_video_submissions(project_key, slots, config,
+                store=_VIDEO_OPERATIONS, on_checkpoint=checkpoint)
+            self._send_json(response)
+        finally:
+            _release_flow_project_run(config, claim_id)
+
+    def _dispatch_video_operation(self, body, route):
+        import uuid
+        request_id = validate_request_id(body.get('request_id') or uuid.uuid4().hex)
+        fingerprint = request_fingerprint(body, route)
+        # Serialize registration/cancellation, including durable task creation before dispatch.
+        with _VIDEO_OPERATION_LOCK:
+            existing = _VIDEO_OPERATIONS.lookup(request_id)
+            if existing:
+                if existing.get('fingerprint') and existing['fingerprint'] != fingerprint:
+                    raise VideoOperationConflict('同一 request_id 不能用于不同的视频生成请求')
+                self._send_json(_video_operation_response(existing))
+                return
+            if not rate_ok(_client_ip(self), 'videos'):
+                self._send_json({'error': '请求过于频繁，请稍后再试'}, status=429)
+                return
+            config = effective_config(body.get('config'))
+            if 'videoFixedUserId' in body:
+                if config.get('videoProvider', 'google_fx') != 'google_fx':
+                    raise ValueError('固定 AdsPower 环境仅适用于 Google FX 视频通道')
+                fixed = server_common.validate_video_fixed_user_id(body['videoFixedUserId'])
+                config['videoFixedUserId'] = fixed
+                config['googleFxUserId'] = fixed
+            if config.get('videoProvider') != 'flow2api' and not _require_fx_admission(self):
+                return
+            project_key = body.get('title', '')
+            title = body.get('display_title') or project_key
+            config['_project_key'] = project_key
+            config['_merge_speed'] = body.get('merge_speed', 4)
+            project_dir = _get_project_dir(project_key or title)
+            manifest = read_manifest(project_dir) if project_dir else None
+            if (manifest or {}).get('video_frame_pairing') == 'auto' and 'videoFramePairing' not in config:
+                config['videoFramePairing'] = 'auto'
+            with ACTIVE_TASKS_LOCK:
+                pending_auto = next((tid for tid, task in ACTIVE_TASKS.items()
+                    if task.get('status') == 'running'
+                    and (task.get('dimensions') or {}).get('auto_generate_videos') is True
+                    and _safe_project_name((task.get('dimensions') or {}).get('project_key') or '')
+                        == _safe_project_name(project_key)), None)
+            if pending_auto:
+                self._send_json({'status': 'error', 'failure_code': 'PROJECT_BUSY',
+                    'message': '图片任务将自动接续生成视频，请等待原任务完成。',
+                    'task_id': pending_auto}, status=409)
+                return
+            is_chain = route == '/api/generate_video_chain' or config.get('generation_channel') == 'video_chain'
+            if not is_chain:
+                is_chain = bool(manifest and manifest.get('generation_channel') == 'video_chain')
+            try:
+                ensure_video_submissions_resolved(project_key or title,
+                    video_submission_slots(body.get('prompt_block', ''), body.get('target_slots'), is_chain),
+                    manifest=manifest or {}, provider=config.get('videoProvider') or 'google_fx')
+            except VideoSubmissionPendingError as error:
+                pending = []
+                for item in error.pending:
+                    details = dict(item)
+                    task_id = item.get('task_id')
+                    receipts = _VIDEO_OPERATIONS.submissions(task_id) if task_id else []
+                    receipt = next((r for r in reversed(receipts)
+                                    if r.get('slot') == item['slot'] and r.get('submission_pending') is True), {})
+                    attempt = next(((v.get('last_attempt') or {}) for v in (manifest or {}).get('videos', [])
+                                    if v.get('slot') == item['slot']), {})
+                    dimensions = (ACTIVE_TASKS.get(task_id) or {}).get('dimensions') or {}
+                    provider = receipt.get('provider') or attempt.get('provider') or dimensions.get('video_provider')
+                    if provider:
+                        details['provider'] = provider
+                    if receipt.get('fixed_video_account') is True or attempt.get('fixed_video_account') is True:
+                        details['fixed_video_account'] = True
+                    pending.append(details)
+                self._send_json({'status': 'error', 'failure_code': 'SUBMISSION_PENDING',
+                                 'message': str(error), 'pending_submissions': pending}, status=409)
+                return
+            operation, created = _VIDEO_OPERATIONS.reserve(request_id, fingerprint, 'vchain' if is_chain else 'videos')
+            if created:
+                task_id = operation['task_id']
+                task = get_or_create_task(task_id, {
+                    'type': 'video_chain' if is_chain else 'videos', 'theme': title,
+                    'project_key': project_key, 'request_id': request_id,
+                    'video_provider': config.get('videoProvider') or 'google_fx',
+                    'video_fixed_user_id': config.get('videoFixedUserId'),
+                    'target_slots': body.get('target_slots'),
+                    'userId': None if config.get('videoProvider') == 'flow2api' else config.get('googleFxUserId') or None})
+                holder = _claim_flow_project_run(config, task_id, project_key or title)
+                if holder:
+                    task.update(status='failed', failure_code='PROJECT_BUSY',
+                                error='该项目仍有生成任务未退出，请等它结束后再生成视频')
+                    save_task_to_disk(task_id)
+                    self._send_json({'status': 'error', 'message': task['error'],
+                                     'failure_code': 'PROJECT_BUSY', 'task_id': holder}, status=409)
+                    return
+                if not save_task_to_disk(task_id):
+                    task.update(status='failed', error='视频任务登记保存失败，未提交生成')
+                    _release_flow_project_run(config, task_id)
+                    raise RuntimeError(task['error'])
+                try:
+                    threading.Thread(target=generate_video_chain_worker if is_chain else generate_videos_worker,
+                        args=(task_id, config, title, body.get('prompt_block', ''), body.get('target_slots'),
+                              bool(body.get('override_flagged'))), daemon=True).start()
+                except Exception as error:
+                    task.update(status='failed', error=str(error))
+                    save_task_to_disk(task_id)
+                    _release_flow_project_run(config, task_id)
+                    raise
+            self._send_json(_video_operation_response(operation))
 
     def _open_sse_stream(self):
         """Start a Server-Sent-Events response and return (send_event, stop).
@@ -1820,9 +4399,10 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 self.wfile.flush()
                 last_send[0] = time.time()
 
-        def send_event(event_type, data):
+        def send_event(event_type, data, event_id=None):
             try:
-                _raw_write(f"event: {event_type}\ndata: {json.dumps({'type': event_type, 'data': data}, ensure_ascii=False)}\n\n")
+                prefix = f'id: {event_id}\n' if event_id is not None else ''
+                _raw_write(prefix + f"event: {event_type}\ndata: {json.dumps({'type': event_type, 'data': data}, ensure_ascii=False)}\n\n")
             except Exception as e:
                 stop_evt.set()
                 if sys.stdout:
@@ -1843,6 +4423,47 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
         threading.Thread(target=_heartbeat, daemon=True).start()
         return send_event, stop_evt
 
+    def _stream_task_events(self, task, send_event, stop_evt, last_event_id=None):
+        # Video operations have append-only histories and stable task identities.
+        indexed = (task.get('dimensions') or {}).get('type') in ('videos', 'video_chain')
+        try:
+            sent = int(last_event_id) if indexed and last_event_id else 0
+        except (ValueError, TypeError):
+            sent = 0
+        if sent < 0 or sent > len(task['events']):
+            sent = 0
+        drain_lock = threading.Lock()
+
+        def drain(*_ignored):
+            nonlocal sent
+            # A notification can race with another one. Read the ordered history
+            # under one connection lock instead of emitting callback arguments.
+            with drain_lock:
+                with ACTIVE_TASKS_LOCK:
+                    pending = list(task['events'][sent:])
+                for event_type, event_data in pending:
+                    if indexed:
+                        send_event(event_type, event_data, event_id=sent + 1)
+                    else:
+                        send_event(event_type, event_data)
+                    sent += 1
+
+        try:
+            while True:
+                drain()
+                with ACTIVE_TASKS_LOCK:
+                    if sent < len(task['events']):
+                        continue
+                    if task['status'] in ('completed', 'failed', 'cancelled'):
+                        return
+                    task['listeners'].add((drain, stop_evt))
+                    break
+            stop_evt.wait()
+        finally:
+            stop_evt.set()
+            with ACTIVE_TASKS_LOCK:
+                task['listeners'].discard((drain, stop_evt))
+
     def do_OPTIONS(self):
         self.send_response(200)
         self.send_header('Content-Length', '0')
@@ -1854,24 +4475,59 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
         path = parsed.path
         query = parse_qs(parsed.query)
 
-        if path == '/api/library':
-            if not self._gate():
-                return
+        if path.startswith('/api/codex-video-editor/'):
+            self._handle_codex_editor(path, query)
+        elif path.startswith('/api/beat-pack/'):
+            self._handle_beat_pack(path, query)
+        elif path == '/api/library':
+            # 整表兼容层：老前端（saveLibrary/loadLibrary 与 api_client.js 里
+            # 十几处调用）仍按"始终持有完整数组"的契约工作。数据现在存在拆分库
+            # library/ 里，这里重组回一个完整数组给它们。
             # 读失败必须报 500 而不是静默返回 []：前端拿到空列表后一次保存
             # 就会把整个创意库覆盖成空——这是真实存在过的整库清零路径
-            with LIBRARY_LOCK:
-                if not os.path.exists(DB_FILE):
-                    self._send_json([])
-                    return
-                try:
-                    with open(DB_FILE, 'r', encoding='utf-8') as f:
-                        data = json.load(f)
-                except Exception as e:
-                    if sys.stdout:
-                        print(f"Error reading {DB_FILE}: {e}")
-                    self._send_json({'error': f'创意库文件读取失败: {e}'}, status=500)
-                    return
+            if not self._gate():
+                return
+            try:
+                data = read_library()
+            except Exception as e:
+                if sys.stdout:
+                    print(f"Error reading library: {e}")
+                self._send_json({'error': f'创意库读取失败: {e}'}, status=500)
+                return
+            if data is None:
+                self._send_json({'error': '创意库文件读取失败（格式损坏）'}, status=500)
+                return
             self._send_json(data)
+        elif path == '/api/library/index':
+            # 新契约：列表渲染只要索引（几 KB），正文按需单条拉。
+            # 老接口一次回的是全库正文——实测 2 条创意就 208KB。
+            if not self._gate():
+                return
+            try:
+                index = read_library_index()
+            except Exception as e:
+                self._send_json({'error': f'创意库索引读取失败: {e}'}, status=500)
+                return
+            if index is None:
+                self._send_json({'error': '创意库索引损坏'}, status=500)
+                return
+            self._send_json({'items': index, 'count': len(index)})
+        elif path == '/api/library/item':
+            if not self._gate():
+                return
+            item_id = query.get('id', [''])[0]
+            if not item_id:
+                self._send_json({'error': '缺少 id'}, status=400)
+                return
+            try:
+                item = read_library_item(item_id)
+            except Exception as e:
+                self._send_json({'error': f'创意读取失败: {e}'}, status=500)
+                return
+            if item is None:
+                self._send_json({'error': 'Not found'}, status=404)
+                return
+            self._send_json(item)
         elif path == '/api/get_manifest':
             if not self._gate():
                 return
@@ -1890,11 +4546,93 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 try:
                     with open(manifest_path, 'r', encoding='utf-8') as f:
                         data = json.load(f)
-                    self._send_json(data)
+                    self._send_json(_auto_video_runtime_snapshot(data))
                 except Exception as e:
                     self._send_json({'error': str(e)}, status=500)
             else:
                 self._send_json({'error': 'Not found'}, status=404)
+        elif path == '/api/get_frame_candidates':
+            if not self._gate():
+                return
+            title = query.get('title', [''])[0]
+            seq_str = query.get('sequence', [''])[0]
+            if not title or not seq_str:
+                self._send_json({'error': 'Missing title or sequence parameter'}, status=400)
+                return
+            try:
+                seq = int(seq_str)
+            except ValueError:
+                self._send_json({'error': 'sequence must be an integer'}, status=400)
+                return
+            project_dir = _get_project_dir(title)
+            frames_dir = os.path.join(project_dir, 'frames')
+            manifest = read_manifest(project_dir) or {}
+            target_frame = next((f for f in (manifest.get('frames') or []) if f.get('sequence') == seq or f.get('slot') == seq), None)
+            from candidate_selection_pipeline import sync_frame_candidates_pool
+            cands, chosen_idx, meta_payload = sync_frame_candidates_pool(frames_dir, seq, current_frame=target_frame, auto_archive_current=True)
+            self._send_json({
+                'status': 'ok',
+                'sequence': seq,
+                'candidates': cands,
+                'chosen_candidate_index': chosen_idx,
+                'ai_evaluation': target_frame.get('ai_evaluation') if target_frame else None,
+                'candidate_selection_reason': ((target_frame.get('candidate_selection_reason')
+                                                or target_frame.get('vlm_qa_reason')) if target_frame else None),
+            })
+        elif path == '/api/deleted_slots':
+            # 这单删过哪些拍、哪些还能撤销。数据源是 /api/delete_slot 写下的
+            # .deleted_slots/<id>/ 快照目录，见 /api/restore_slot。
+            if not self._gate():
+                return
+            title = query.get('title', [''])[0]
+            if not title:
+                self._send_json({'error': 'Missing title'}, status=400)
+                return
+            project_dir = _get_project_dir(title)
+            root = os.path.join(project_dir, '.deleted_slots')
+            items = []
+            try:
+                if os.path.isdir(root):
+                    current_fp = manifest_fingerprint(read_manifest(project_dir) or {})
+                    for name in sorted(os.listdir(root), reverse=True):
+                        # 恢复点（*_restorepoint_of_*）是恢复操作自己留的底，
+                        # 不是可撤销的删除，不列进来
+                        if not re.fullmatch(r'\d{8}_\d{6}_\d+_slot_\d{3}', name):
+                            continue
+                        d = os.path.join(root, name)
+                        if not os.path.isdir(d):
+                            continue
+                        state, removed = {}, {}
+                        for fname, target in (('state.json', 'state'), ('removed.json', 'removed')):
+                            fp = os.path.join(d, fname)
+                            if os.path.isfile(fp):
+                                try:
+                                    with open(fp, 'r', encoding='utf-8') as f:
+                                        loaded = json.load(f) or {}
+                                except (json.JSONDecodeError, OSError):
+                                    loaded = {}
+                                if target == 'state':
+                                    state = loaded
+                                else:
+                                    removed = loaded
+                        expected_fp = state.get('manifest_after_fingerprint')
+                        items.append({
+                            'id': name,
+                            'sequence': state.get('sequence') or removed.get('sequence'),
+                            'created_at': state.get('created_at'),
+                            'restored_at': state.get('restored_at'),
+                            # 早于本次改造的快照没有 state.json，恢复仍可进行，
+                            # 只是没法判断这单在删除之后有没有被改动过
+                            'has_fingerprint': bool(expected_fp),
+                            'diverged': bool(expected_fp) and expected_fp != current_fp,
+                            'image_prompt': (removed.get('image_prompt') or '')[:160],
+                            'video_prompt': (removed.get('video_prompt') or '')[:160],
+                            'archived_frame_slots': state.get('archived_frame_slots') or [],
+                            'archived_video_slots': state.get('archived_video_slots') or [],
+                        })
+                self._send_json({'status': 'ok', 'snapshots': items})
+            except OSError as e:
+                self._send_json({'error': str(e)}, status=500)
         elif path == '/api/logs/stream':
             # 服务日志包含内部路径/任务详情，必须过门禁（EventSource 用 ?access_code= 传码）
             if not self._gate():
@@ -1962,6 +4700,44 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
             finally:
                 if stop_evt:
                     stop_evt.set()
+        elif path == '/api/tasks/summary':
+            if not self._gate():
+                return
+            cleanup_old_tasks()
+            with ACTIVE_TASKS_LOCK:
+                tasks = sorted(ACTIVE_TASKS.values(),
+                               key=lambda task: task.get('last_active') or 0, reverse=True)
+                running = [task for task in tasks if task.get('status') == 'running']
+                counts = {
+                    'running': len(running),
+                    'ideation_running': sum(
+                        str((task.get('dimensions') or {}).get('type') or '') in PROJECT_TASK_TYPES
+                        for task in running),
+                }
+                rows = []
+                for task in tasks[:100]:
+                    dimensions = task.get('dimensions') or {}
+                    result = task.get('result')
+                    outcome = _task_outcome(task)
+                    entry = {
+                        'id': task.get('id'), 'status': task.get('status'),
+                        'outcome': outcome, 'last_active': task.get('last_active') or 0,
+                        'dimensions': {key: dimensions[key] for key in
+                                       ('type', 'project_key', 'title', 'theme', 'task_label')
+                                       if key in dimensions},
+                    }
+                    if isinstance(result, dict):
+                        summary = {}
+                        if result.get('project_key'):
+                            summary['project_key'] = result['project_key']
+                        if task.get('status') == 'completed':
+                            summary.update(completion_state=outcome,
+                                           has_failures=outcome == 'partial_failed')
+                        if summary:
+                            entry['result'] = summary
+                    rows.append(entry)
+                total_count = len(tasks)
+            self._send_json({'tasks': rows, 'counts': counts, 'total_count': total_count})
         elif path == '/api/tasks':
             if not self._gate():
                 return
@@ -1974,13 +4750,37 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                     pass
             with ACTIVE_TASKS_LOCK:
                 res = []
-                for tid, t in ACTIVE_TASKS.items():
+                project_key = query.get('project_key', [''])[0]
+                include_ids = set(query.get('include_id', []))
+                candidates = []
+                for tid, task in ACTIVE_TASKS.items():
+                    if project_key and tid not in include_ids and task.get('id') not in include_ids:
+                        dimensions = task.get('dimensions') or {}
+                        result = task.get('result')
+                        result = result if isinstance(result, dict) else {}
+                        owner_key = dimensions.get('project_key') or result.get('project_key')
+                        # Legacy media tasks may only have a title. A hard key
+                        # always wins; title prefixes and fuzzy matches never do.
+                        owner_key = owner_key or dimensions.get('title')
+                        if str(owner_key or '') != project_key:
+                            continue
+                    candidates.append((tid, task))
+                candidates.sort(key=lambda row: row[1].get('last_active') or 0, reverse=True)
+                total_count = len(candidates)
+                if limit > 0:
+                    candidates = candidates[:limit]
+                for tid, t in candidates:
                     # 列表接口只回瘦身摘要：完整 result（提示词全文/封面/帧清单）
                     # 会被 2.5s 一次的角标轮询反复整包下载
-                    full_result = t.get("result")
+                    full_result = _auto_video_runtime_snapshot(t.get("result"))
+                    outcome = _task_outcome(t)
                     result_summary = None
                     if isinstance(full_result, dict):
                         result_summary = {}
+                        if t["status"] == "completed":
+                            result_summary["completion_state"] = outcome
+                            result_summary["has_failures"] = outcome == "partial_failed"
+                            result_summary["has_quality_warnings"] = bool(full_result.get("has_quality_warnings"))
                         if full_result.get("timings"):
                             result_summary["timings"] = full_result["timings"]
                         if full_result.get("token_usage"):
@@ -2006,26 +4806,103 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                     entry = {
                         "id": t["id"],
                         "status": t["status"],
+                        "outcome": outcome,
                         "dimensions": t["dimensions"],
                         "result": result_summary,
                         "error": t["error"],
                         "last_active": t["last_active"]
                     }
+                    if isinstance(full_result, dict) and full_result.get('auto_video'):
+                        entry['auto_video'] = full_result['auto_video']
                     if events_summary is not None:
                         entry["events"] = events_summary
+                        progress = _media_task_progress_snapshot(t)
+                        if progress is not None:
+                            entry['progress'] = progress
+                            parent = ACTIVE_TASKS.get((t.get('dimensions') or {}).get('parent_frame_task_id'))
+                            result = _auto_video_runtime_snapshot(
+                                t.get('result') or (parent or {}).get('result') or {})
+                            if isinstance(result, dict) and result.get('auto_video'):
+                                entry['auto_video'] = result['auto_video']
                     res.append(entry)
-            # 按活跃时间排序：任务 ID 是「毫秒时间戳」和「frames_<uuid>」混排，
-            # 旧的字符串排序会把两类 ID 搅在一起
-            res.sort(key=lambda x: x.get("last_active") or 0, reverse=True)
-            total_count = len(res)
-            if limit and limit > 0:
-                sliced = res[:limit]
-            else:
-                sliced = res
             self._send_json({
-                "tasks": sliced,
+                "tasks": res,
                 "total_count": total_count
             })
+        elif path == '/api/projects':
+            # 项目工作台的唯一数据源：任务/点子库/台账/outputs 四路按 project_key
+            # 合流成一张项目表（见 server_common.build_projects_index）。前端不再
+            # 并发拉三个源自己 join，也不再靠标题模糊匹配互相反查。
+            # 参数：state=all|running|completed|saved|failed  q=搜索  sort=newest|oldest|title
+            #      limit/offset=分页（默认 60 条，点子库现在是全量渲染无分页）
+            #      scope=active|archived 分区；未传时保留历史全量行为
+            #      assets=0 跳过 outputs/ 目录统计（轮询仍读取精剪任务小型状态文件）
+            if not self._gate():
+                return
+            cleanup_old_tasks()
+            try:
+                with_assets = query.get('assets', ['1'])[0] not in ('0', 'false', 'no')
+                all_rows = build_projects_index(with_assets=with_assets)
+                archived_rows = [row for row in all_rows if row.get('archived') or row.get('state') == 'archived']
+                scope = query.get('scope', [''])[0]
+                if scope == 'active':
+                    rows = [row for row in all_rows if not row.get('archived') and row.get('state') != 'archived']
+                elif scope == 'archived':
+                    rows = archived_rows
+                else:
+                    rows = all_rows
+                filtered = filter_projects(
+                    rows,
+                    state=query.get('state', [''])[0],
+                    query=query.get('q', [''])[0],
+                    sort=query.get('sort', ['newest'])[0],
+                )
+                try:
+                    limit = int(query.get('limit', ['60'])[0])
+                except ValueError:
+                    limit = 60
+                try:
+                    offset = max(0, int(query.get('offset', ['0'])[0]))
+                except ValueError:
+                    offset = 0
+                sliced = filtered[offset:offset + limit] if limit > 0 else filtered[offset:]
+                _attach_fx_queue_marks(sliced)
+                self._send_json({
+                    'projects': sliced,
+                    'total_count': len(rows),
+                    'filtered_count': len(filtered),
+                    'offset': offset,
+                    # chips 上的角标：在完整表上统计，不受当前筛选影响
+                    'counts': {
+                        'all': len(rows),
+                        'active': len(all_rows) - len(archived_rows),
+                        'running': len([r for r in rows if r.get('state') == 'running']),
+                        'completed': len([r for r in rows if r.get('state') == 'completed']),
+                        'saved': len([r for r in rows if r.get('saved')]),
+                        'archived': len(archived_rows),
+                        'failed': len([r for r in rows if r.get('state') in ('failed', 'cancelled')
+                                       or r.get('has_failed_jobs')]),
+                    },
+                })
+            except Exception as e:
+                if sys.stdout:
+                    print(f"Error building projects index: {e}")
+                self._send_json({'error': f'项目索引构建失败: {e}'}, status=500)
+        elif path == '/api/video-operation':
+            if not self._gate():
+                return
+            try:
+                request_id = validate_request_id(query.get('request_id', [None])[0])
+                with _VIDEO_OPERATION_LOCK:
+                    operation = _VIDEO_OPERATIONS.lookup(request_id)
+                    if operation:
+                        self._send_json(_video_operation_response(operation))
+                    else:
+                        self._send_json({'status': 'not_found', 'request_id': request_id}, status=404)
+            except ValueError as error:
+                self._send_json({'status': 'error', 'message': str(error)}, status=400)
+            except Exception as error:
+                self._send_json({'status': 'error', 'message': str(error)}, status=500)
         elif path == '/api/compose-stream':
             if not self._gate():
                 return
@@ -2041,40 +4918,12 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 
             send_event, stop_evt = self._open_sse_stream()
 
-            # 追赶式重放 + 原子注册：事件追加和监听器注册都在 ACTIVE_TASKS_LOCK
-            # 下进行，所以「锁内确认无未发事件后立即注册」能确保零丢失。
-            # 旧写法在快照历史和注册监听器之间有窗口——任务恰好在这期间完成
-            # 的话，终态事件永远送不到，前端只能对着心跳干等。
-            sent = 0
-            is_terminal = False
-            while True:
-                with ACTIVE_TASKS_LOCK:
-                    pending = list(task["events"][sent:])
-                    if not pending:
-                        is_terminal = task["status"] in ("completed", "failed", "cancelled")
-                        if not is_terminal:
-                            task["listeners"].add((send_event, stop_evt))
-                        break
-                for event_type, event_data in pending:
-                    try:
-                        send_event(event_type, event_data)
-                    except Exception:
-                        stop_evt.set()
-                        return
-                    sent += 1
-
-            # Task already finished — history fully replayed, close the stream
-            if is_terminal:
+            cursor = getattr(self, 'headers', {}).get('Last-Event-ID') or query.get('last_event_id', [None])[0]
+            try:
+                self._stream_task_events(task, send_event, stop_evt, cursor)
+            except ConnectionError:
                 stop_evt.set()
-                return
 
-            # Block until stream is stopped
-            stop_evt.wait()
-
-            # Clean up listener
-            with ACTIVE_TASKS_LOCK:
-                task["listeners"].discard((send_event, stop_evt))
-                
         elif path == '/api/compose-status':
             if not self._gate():
                 return
@@ -2090,22 +4939,71 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 
             with ACTIVE_TASKS_LOCK:
                 task["last_active"] = time.time()
+                task["last_client_poll_at"] = task["last_active"]
                 res = {
                     "id": task["id"],
                     "status": task["status"],
-                    "result": task["result"],
+                    "result": _auto_video_runtime_snapshot(task["result"]),
                     "error": task["error"],
-                    "dimensions": task["dimensions"]
+                    "dimensions": task["dimensions"],
+                    "generation_source": ((task.get("result") or {}).get("generation_source")
+                                          if isinstance(task.get("result"), dict) else None),
+                    "degraded": bool((task.get("result") or {}).get("degraded", False))
+                                if isinstance(task.get("result"), dict) else False,
+                    "failure_code": task.get("failure_code"),
+                    "quality_gate": ((task.get("result") or {}).get("quality_gate")
+                                     if isinstance(task.get("result"), dict) else None),
+                    "timings": task.get("timings") or {},
+                    "last_client_poll_at": task.get("last_client_poll_at"),
+                    "last_worker_progress_at": task.get("last_worker_progress_at"),
+                    "runtime_version": task.get("runtime_version"),
                 }
+                if isinstance(res['result'], dict) and res['result'].get('auto_video'):
+                    res['auto_video'] = res['result']['auto_video']
+                if task['status'] == 'running':
+                    progress = _media_task_progress_snapshot(task)
+                    if progress is not None:
+                        res['progress'] = progress
+                        parent = ACTIVE_TASKS.get((task.get('dimensions') or {}).get('parent_frame_task_id'))
+                        result = _auto_video_runtime_snapshot(
+                            task.get('result') or (parent or {}).get('result') or {})
+                        if isinstance(result, dict) and result.get('auto_video'):
+                            res['auto_video'] = result['auto_video']
             self._send_json(res)
         elif path == '/api/mode':
             # Public: tells the frontend whether to hide the API settings and prompt for an access code.
             # 技能契约缺失也在这里上报：它只影响生成质量、不影响接口可用性，因此过去
             # 只写进启动日志——而日常从浏览器用的人根本不看那个终端，等于没有告知。
+            # skill_contract 保持"当前激活的那个 profile"的形状（前端横幅按它渲染）；
+            # skill_contracts 是全部 profile 的清单——只报激活的那个，等于把"另一个
+            # 包没装好"留到用户切模型的那一刻才炸。
+            # skill_profile_rules：「视频模型名含哪个子串 → 走哪个 profile」的规则表
+            # 原样下发。激发页脚的链路选择器停在 auto 时要显示"现在实际会走哪条"，
+            # 前端照这张表匹配即可——在前端硬编码一份 'omni' 判断，就是给同一件事
+            # 留了第二个会漂移的真相源（服务端那份见 SKILL_PROFILE_VIDEO_MODEL_RULES）。
+            _active = active_skill_profile()
+            # runtime_version：这个进程从哪个 git 状态/什么时候启动，磁盘上现在是否
+            # 已经有比它更新的核心代码。前端据此判断"眼前这次失败是不是代码已经修好、
+            # 只是服务还没重启"（见 server_common.runtime_version_report）。
+            _runtime_version = runtime_version_report()
+            _runtime_version['policy_version'] = MILESTONE_POLICY_VERSION
             self._send_json({
                 'server_managed': SERVER_MANAGED,
                 'needs_access_code': bool(ACCESS_CODE),
-                'skill_contract': skill_contract_report(),
+                'skill_profile': _active,
+                'skill_profile_default': DEFAULT_SKILL_PROFILE,
+                'skill_profile_rules': [list(r) for r in SKILL_PROFILE_VIDEO_MODEL_RULES],
+                'skill_contract': skill_contract_report(_active),
+                'skill_contracts': skill_contract_reports(),
+                'runtime_version': _runtime_version,
+                'image_gateway_models': get_image_gateway_model_catalog(),
+                'video_config': server_common.video_service_config_report(),
+                # 质量门禁总表（server_common.GATE_SETTINGS）：键名/类型/默认值/
+                # 选项/文案 + 服务端当前生效值。配置中心的开关面板照它渲染，
+                # 前端不再抄一份默认值——抄一份就是又开了一个会漂移的真相源
+                # （白名单漂移那一类 bug 的老路，见 effective_config 上方注释）。
+                'gate_settings': gate_settings_report(),
+                'quality_reviews_retired': True,
             })
         elif path == '/api/image/task/status':
             if not self._gate():
@@ -2170,6 +5068,61 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 })
             except Exception as e:
                 self._send_json({'error': str(e)}, status=500)
+        elif path == '/api/logs-info':
+            # 日志占用体积：server.log 及其轮转兄弟（.1/.2）。文件名会回给前端，
+            # 而它们只是 basename（不含目录），不泄露服务端路径。
+            if not self._gate():
+                return
+            try:
+                self._send_json(log_files_info())
+            except Exception as e:
+                self._send_json({'error': str(e)}, status=500)
+        elif path.startswith('/api/gallery/download-zip/'):
+            import gallery_downloads
+            try:
+                with gallery_downloads.open_download(path.rsplit('/', 1)[-1]) as (stream, info):
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'application/zip')
+                    self.send_header('Content-Disposition', 'attachment; filename="' + info['filename'] + '"')
+                    self.send_header('Content-Length', str(info['size_bytes']))
+                    self.send_header('Cache-Control', 'no-store')
+                    self.send_header('Referrer-Policy', 'no-referrer')
+                    self.end_headers()
+                    shutil.copyfileobj(stream, self.wfile, length=1024 * 1024)
+            except gallery_downloads.GalleryDownloadError as exc:
+                self._send_json({'message': str(exc)}, status=exc.status)
+            except (BrokenPipeError, ConnectionResetError):
+                self.close_connection = True
+        elif path in ('/api/gallery/index', '/api/gallery/items'):
+            if not self._gate():
+                return
+            import gallery_index
+            try:
+                options = {
+                    'filter': query.get('filter', ['all'])[0],
+                    'q': query.get('q', [''])[0],
+                    'sort': query.get('sort', ['newest'])[0],
+                    'refresh': query.get('refresh', ['0'])[0] == '1',
+                    'scanner': scan_gallery,
+                    'collect_references': gallery_collect_references,
+                }
+                if path.endswith('/index'):
+                    result = gallery_index.gallery_index(**options)
+                else:
+                    result = gallery_index.gallery_items(
+                        query.get('group', [''])[0],
+                        offset=query.get('offset', ['0'])[0],
+                        limit=query.get('limit', ['12'])[0],
+                        revision=query.get('revision', [''])[0], **options)
+                self._send_json(result)
+            except gallery_index.GallerySnapshotChanged as exc:
+                self._send_json({'error': 'snapshot_changed', 'revision': exc.revision}, status=409)
+            except gallery_index.GalleryGroupNotFound:
+                self._send_json({'error': '画廊分组不存在'}, status=404)
+            except (ValueError, TypeError) as exc:
+                self._send_json({'error': str(exc)}, status=400)
+            except Exception as exc:
+                self._send_json({'error': str(exc)}, status=500)
         elif path == '/api/gallery':
             # 画廊：扫描 outputs/ 下全部历史媒体（封面/帧序列/视频/图像工坊），
             # 并标注引用关系（封面 in_use / 项目组 orphan）。引用收集失败时降级
@@ -2223,6 +5176,70 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 self._send_json({'error': '联网参考归档文件读取失败'}, status=500)
                 return
             self._send_json({'status': 'ok', 'refs': list(reversed(archive))})
+        elif path == '/api/project/references':
+            # 检索项目绑定的参考帧与原片拼图
+            if not self._gate():
+                return
+            try:
+                from prompt_pipeline import find_reference_frames_with_roles
+                
+                title = query.get('title', [''])[0].strip()
+                total_beats = None
+                try:
+                    total_beats = int(query.get('total_beats', [''])[0])
+                except Exception:
+                    pass
+
+                pdir = None
+                # 按 title / project_key 查找
+                if not pdir and title:
+                    candidate = _get_project_dir(title)
+                    if candidate and os.path.exists(candidate):
+                        pdir = candidate
+                    else:
+                        safe = server_common._safe_project_name(title)
+                        out_dir = os.path.join(OUTPUT_ROOT, safe)
+                        if os.path.exists(out_dir):
+                            pdir = out_dir
+                        else:
+                            for d in sorted(os.listdir(OUTPUT_ROOT) if os.path.isdir(OUTPUT_ROOT) else []):
+                                if safe and safe in d:
+                                    pdir = os.path.join(OUTPUT_ROOT, d)
+                                    break
+                                elif title and title in d:
+                                    pdir = os.path.join(OUTPUT_ROOT, d)
+                                    break
+
+                ref_dict = {}
+                role_dict = {}
+                src_collage = None
+                if pdir and os.path.exists(pdir):
+                    refs, roles, collage = find_reference_frames_with_roles(pdir, total_beats)
+                    if refs:
+                        for k, v in refs.items():
+                            if v:
+                                u = str(v).replace('\\', '/')
+                                if '/outputs/' in u:
+                                    u = u[u.index('/outputs/'):]
+                                ref_dict[int(k)] = u
+                        # 过门梯那几格是包络端点而非对标基准，前端据此换措辞。
+                        for k, v in (roles or {}).items():
+                            if v and int(k) in ref_dict:
+                                role_dict[int(k)] = str(v)
+                    if collage:
+                        cu = str(collage).replace('\\', '/')
+                        if '/outputs/' in cu:
+                            cu = cu[cu.index('/outputs/'):]
+                        src_collage = cu
+
+                self._send_json({
+                    'status': 'ok',
+                    'ref_frames': ref_dict,
+                    'ref_frame_roles': role_dict,
+                    'source_collage_url': src_collage,
+                })
+            except Exception as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
         elif path == '/api/account-pool':
             # 视频生成号池:列出已添加的 Flow 账号(命名/备注/已知积分/上次检查时间/
             # 是否禁用)。池子为空时前端应显示"未启用号池"，行为回退到手动单选。
@@ -2232,7 +5249,18 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 pool = _get_account_pool()
                 sort_by = query.get('sort_by', [None])[0] if 'sort_by' in query else None
                 sort_order = query.get('sort_order', ['desc'])[0] if 'sort_order' in query else 'desc'
-                self._send_json({'status': 'ok', 'accounts': pool.list_accounts(sort_by=sort_by, sort_order=sort_order)})
+                self._send_json({'status': 'ok', 'accounts': pool.list_accounts(heal=False, sort_by=sort_by, sort_order=sort_order)})
+            except Exception as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
+        elif path == '/api/proxy-pool':
+            # 代理号池：出口代理列表（密码只报 has_password，不回传明文）。
+            # 与 /api/account-pool 对称：那个是"用哪个号"，这个是"从哪个出口走"。
+            if not self._gate():
+                return
+            try:
+                pool = _get_proxy_pool()
+                self._send_json({'status': 'ok', 'proxies': pool.list_proxies(),
+                                 'summary': pool.summary()})
             except Exception as e:
                 self._send_json({'status': 'error', 'message': str(e)}, status=500)
         elif path == '/api/account-pool/adspower-profiles':
@@ -2240,8 +5268,20 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
             if not self._gate():
                 return
             try:
+                force = query.get('force', ['0'])[0] in ('1', 'true', 'True')
                 pool = _get_account_pool()
-                self._send_json({'status': 'ok', 'profiles': pool.list_adspower_profiles()})
+                self._send_json({'status': 'ok', 'profiles': pool.list_adspower_profiles(force=force)})
+            except Exception as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
+        elif path == '/api/account-pool/export':
+            # 导出号池配置（可选是否包含明文凭据 include_credentials=1）
+            if not self._gate():
+                return
+            try:
+                inc = query.get('include_credentials', ['0'])[0] in ('1', 'true', 'True')
+                pool = _get_account_pool()
+                export_data = pool.export_config(include_credentials=inc)
+                self._send_json(export_data)
             except Exception as e:
                 self._send_json({'status': 'error', 'message': str(e)}, status=500)
         elif path == '/api/google-fx/status':
@@ -2252,6 +5292,15 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
             try:
                 force = query.get('force', ['0'])[0] in ('1', 'true')
                 self._send_json(google_fx_status_snapshot(force=force))
+            except Exception as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
+
+        elif path == '/api/google-fx/board':
+            # 并发作战板：容量/租约/等待/近 30 分钟历史/项目阶段。只读，不碰浏览器。
+            if not self._gate():
+                return
+            try:
+                self._send_json({'status': 'ok', 'board': _build_fx_board()})
             except Exception as e:
                 self._send_json({'status': 'error', 'message': str(e)}, status=500)
 
@@ -2280,6 +5329,12 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 })
             except Exception as e:
                 self._send_json({'status': 'error', 'message': str(e)}, status=500)
+        elif path == '/api/engagement-cta/settings':
+            # 配置中心「成片引导」：精剪成片自动烧录片尾引导动画（见 cta_burn.py）
+            if not self._gate():
+                return
+            import cta_burn
+            self._send_json({'status': 'ok', **cta_burn.public_settings()})
         elif path == '/api/google-fx/config':
             if not self._gate():
                 return
@@ -2287,7 +5342,7 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 'status': 'ok',
                 'config': FX_CONFIG.current(),
                 'schema': FX_CONFIG.schema(),
-                'versions': FX_CONFIG.versions(int(query.get('limit', ['20'])[0] or 20)),
+                'versions': [],
                 'audit': FX_CONTROL.recent_audit(20, action_prefix='config.'),
             })
         elif path == '/api/google-fx/logs':
@@ -2296,15 +5351,20 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
             if not self._gate():
                 return
             try:
+                records = _fx_log_records(
+                    task_id=(query.get('task_id', [''])[0] or ''),
+                    keyword=(query.get('q', [''])[0] or ''),
+                    limit=int(query.get('limit', ['120'])[0] or 120),
+                    fx_only=query.get('all', ['0'])[0] not in ('1', 'true'),
+                    level=query.get('level', ['all'])[0],
+                )
                 self._send_json({
                     'status': 'ok',
-                    'lines': _fx_log_tail(
-                        task_id=(query.get('task_id', [''])[0] or ''),
-                        keyword=(query.get('q', [''])[0] or ''),
-                        limit=int(query.get('limit', ['120'])[0] or 120),
-                        fx_only=query.get('all', ['0'])[0] not in ('1', 'true'),
-                    ),
+                    'records': records,
+                    'lines': [line for record in records for line in record['lines']],
                 })
+            except (ValueError, TypeError) as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=400)
             except Exception as e:
                 self._send_json({'status': 'error', 'message': str(e)}, status=500)
         elif path == '/api/google-fx/manual':
@@ -2314,13 +5374,13 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 return
             try:
                 manual = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                      'docs', 'google_fx_console_manual.md')
+                                      'docs', 'guides', 'google_fx_console_manual.md')
                 with open(manual, 'r', encoding='utf-8') as handle:
                     self._send_json({'status': 'ok', 'markdown': handle.read(),
-                                     'path': 'docs/google_fx_console_manual.md'})
+                                     'path': 'docs/guides/google_fx_console_manual.md'})
             except FileNotFoundError:
                 self._send_json({'status': 'error',
-                                 'message': '说明书文件缺失：docs/google_fx_console_manual.md'},
+                                 'message': '说明书文件缺失：docs/guides/google_fx_console_manual.md'},
                                 status=404)
             except Exception as e:
                 self._send_json({'status': 'error', 'message': str(e)}, status=500)
@@ -2382,11 +5442,28 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 self._send_json({'error': f'Volcengine API HTTP {e.code}', 'detail': detail}, status=e.code)
             except Exception as e:
                 self._send_json({'error': str(e)}, status=500)
+        elif path == '/api/stepped/status':
+            if not self._gate():
+                return
+            title = (query.get('title', [''])[0] or '').strip()
+            if not title:
+                self._send_json({'status': 'error', 'message': 'title 参数缺失'}, status=400)
+                return
+            try:
+                from stepped_pipeline import get_stepped_status
+                state = get_stepped_status(title)
+                if state is None:
+                    self._send_json({'status': 'error', 'message': f'未找到 {title} 的分步管线状态'}, status=404)
+                    return
+                self._send_json({'status': 'ok', 'pipeline_state': state})
+            except Exception as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
+
         else:
             if not self._static_path_allowed(path):
                 self.send_error(404, "Not found")
                 return
-            super().do_GET()
+            self._serve_static_file(is_head=False)
 
     # ── 静态兜底路由封锁 ─────────────────────────────────────────────
     # 服务绑定在所有网卡且 CORS 为 *：兜底静态路由绝不允许吐出密钥配置、
@@ -2404,7 +5481,10 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
     _BLOCKED_SUFFIXES = ('.py', '.pyc', '.bat', '.pid', '.log')
 
     def _static_path_allowed(self, path):
-        low = path.split('?', 1)[0].lower()
+        low = urllib.parse.unquote(path.split('?', 1)[0]).lower()
+        # 生成目录内的隐藏状态文件和缓存也不通过静态路由公开。
+        if any(part.startswith('.') for part in low.split('/') if part):
+            return False
         if any(low.endswith(sfx) for sfx in self._BLOCKED_SUFFIXES):
             return False
         if any(low.startswith(pfx) for pfx in self._BLOCKED_PREFIXES):
@@ -2420,9 +5500,35 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
         if not self._static_path_allowed(urlparse(self.path).path):
             self.send_error(404, "Not found")
             return
-        super().do_HEAD()
+        self._serve_static_file(is_head=True)
 
     def do_POST(self):
+        from project_archive import MUTATION_LOCK, PROJECT_MUTATIONS
+        import gallery_index
+        path = urllib.parse.urlsplit(self.path).path
+        original_send = self._send_json
+        if path in gallery_index.MUTATION_PATHS:
+            def send_mutation_result(payload, status=200):
+                success = (200 <= status < 300 and isinstance(payload, dict)
+                           and payload.get('status') not in ('error', 'failed')
+                           and not payload.get('error'))
+                preview = False
+                if success and path == '/api/projects/archive':
+                    try:
+                        preview = self._read_json_body().get('preview', True) is True
+                    except (ValueError, TypeError, AttributeError):
+                        preview = True
+                if success and not preview:
+                    gallery_index.invalidate()
+                return original_send(payload, status=status)
+            self._send_json = send_mutation_result
+        try:
+            with MUTATION_LOCK if path in PROJECT_MUTATIONS and path != '/api/video-operation/reconcile' else contextlib.nullcontext():
+                self._do_POST_impl()
+        finally:
+            self._send_json = original_send
+
+    def _do_POST_impl(self):
         from urllib.parse import urlparse, parse_qs
         parsed = urlparse(self.path)
         path = parsed.path
@@ -2435,50 +5541,150 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
         # hasattr 兜底：单测里有一批用 object.__new__(SparkRequestHandler) 直接
         # 拼一个只够跑单个分支的假 handler（不走真实 socket，没有 .headers/.rfile，
         # _read_json_body 也被单测自己打桩替换掉了），这里没有真实连接可读也不需要读。
+        if path.startswith('/api/codex-video-editor/'):
+            raw_length = self.headers.get('Content-Length', '0').strip()
+            duplicate_lengths = len(self.headers.get_all('Content-Length', [])) > 1
+            if (not re.fullmatch(r'[0-9]+', raw_length) or duplicate_lengths
+                    or self.headers.get('Transfer-Encoding')):
+                self.close_connection = True
+                self._send_json({'message': '精剪请求长度不正确'}, status=400)
+                return
         content_length = int(self.headers.get('Content-Length', 0) or 0) if hasattr(self, 'headers') else 0
+        if path.startswith('/api/codex-video-editor/') and content_length > 16384:
+            self.close_connection = True
+            self._send_json({'message': '剪辑要求过长，请精简后重试'}, status=413)
+            return
+        if path.startswith('/api/beat-pack/') and content_length > 262144:
+            self.close_connection = True
+            self._send_json({'message': '提示词包请求过长（创意主题与参考框架合计请控制在 20 万字以内）'}, status=413)
+            return
+        if path == '/api/engagement-cta/custom':
+            import cta_burn
+            if content_length > cta_burn.MAX_CUSTOM_BYTES:
+                self.close_connection = True
+                self._send_json({'status': 'error', 'message': f'视频超过 {cta_burn.MAX_CUSTOM_BYTES // 1048576} MB 上限'}, status=413)
+                return
+        if content_length > 1024 * 1024 * 1024:
+            self._send_json({'status': 'error', 'message': '请求体大小超过 1GB 上限'}, status=413)
+            return
         self._body_bytes = self.rfile.read(content_length) if content_length else b''
 
-        if path == '/api/library':
+        from project_archive import PROJECT_MUTATIONS, ARCHIVE_ALLOWED, archived_request
+        if path in PROJECT_MUTATIONS and path != '/api/video-operation/reconcile':
+            content_type = getattr(self, 'headers', {}).get('Content-Type', '')
+            if not content_type.startswith('multipart/'):
+                try:
+                    recovery_body = self._read_json_body()
+                except (ValueError, TypeError):
+                    self._send_json({'status': 'error', 'message': '请求数据无效'}, status=400)
+                    return
+                if isinstance(recovery_body, dict):
+                    source = recovery_body.get('item') if isinstance(recovery_body.get('item'), dict) else recovery_body
+                    dims = source.get('dimensions') if isinstance(source.get('dimensions'), dict) else {}
+                    project = source.get('project_key') or source.get('title') or dims.get('project_key')
+                    holder = _video_recovery_project_holder(project)
+                    if holder:
+                        self._send_json({'status': 'error', 'failure_code': 'PROJECT_BUSY',
+                            'message': '该项目正在核对并接回原视频，请等核对结束后继续',
+                            'task_id': holder}, status=409)
+                        return
+        if path in PROJECT_MUTATIONS and path not in ARCHIVE_ALLOWED:
+            content_type = getattr(self, 'headers', {}).get('Content-Type', '')
+            if not content_type.startswith('multipart/'):
+                try:
+                    if archived_request(self._read_json_body()):
+                        self._send_json({'status': 'error', 'message': '项目已归档，请在项目工作台查看保留文件',
+                                         'failure_code': 'PROJECT_ARCHIVED'}, status=409)
+                        return
+                except (ValueError, TypeError):
+                    self._send_json({'status': 'error', 'message': '请求数据无效'}, status=400)
+                    return
+
+        # 整表覆盖写（POST /api/library）已于 2026-07-31 移除。
+        #
+        # 它的契约是"客户端始终持有完整数组、整份 POST 回来覆盖"，因此任何一次
+        # 状态错乱的写入都是一次静默的数据丢失——为此曾经挂着三道闸门（空库拒写、
+        # 同一条创意内部 prompt_slots/frameRun 数量自洽、未声明的缩量 409）。那三道
+        # 防线是对的，但它们防的是"整份覆盖"这个动作本身；现在所有写入都走下面的
+        # /api/library/item（一次只碰一条记录的正文文件 + 索引行），这个动作不存在
+        # 了，闸门也就没有了要守的门。
+        #
+        # 读路径 GET /api/library 保留：全量导出与外部脚本还在用它。
+        # 判定函数 library_shrink_verdict 也保留——创意台账的整表回写仍在用
+        # （见 server_common.write_ledger）。
+        if path.startswith('/api/codex-video-editor/'):
+            self._handle_codex_editor(path)
+        elif path.startswith('/api/beat-pack/'):
+            self._handle_beat_pack(path)
+        elif path == '/api/library/item':
+            # 新契约：写一条创意只碰它自己的正文文件 + 索引，绝不重写别的记录。
+            # 因此这条路径上没有"整表覆盖"可言，也就不需要空库/缩量/槽位自洽
+            # 那三道防线——它们防的是整份覆盖这个动作本身。
             if not self._gate():
                 return
             try:
-                data = self._read_json_body()
-                # 加锁 + 原子替换：直接 open('w') 在写一半崩溃时会留下半截 JSON
-                with LIBRARY_LOCK:
-                    # 2026-07-12 整库清零事故（library.json 被某个 savedIdeas 为空的客户端
-                    # 会话全量覆盖成 []）后的双保险：
-                    # 1) 空列表覆盖非空库一律拒绝——删除单条走 /api/library/delete_item 后
-                    #    的全量回写永远至少剩 0..N-1 条，只有状态错乱的客户端才会 POST []；
-                    # 2) 任何成功覆盖前把现有非空库轮换到 library.json.bak，误写可回滚一版。
-                    existing_count = 0
-                    if os.path.exists(DB_FILE):
-                        try:
-                            with open(DB_FILE, 'r', encoding='utf-8') as f:
-                                _old = json.load(f)
-                            existing_count = len(_old) if isinstance(_old, list) else 1
-                        except Exception:
-                            existing_count = 1  # 读不出来按“非空”保守处理
-                    incoming_count = len(data) if isinstance(data, list) else 0
-                    if incoming_count == 0 and existing_count > 0:
-                        if sys.stdout:
-                            print(f"[LIBRARY GUARD] 拒绝空列表覆盖非空创意库（现有 {existing_count} 条）")
-                        self._send_json({
-                            'status': 'rejected',
-                            'message': f'拒绝将非空创意库（{existing_count} 条）覆盖为空：客户端库状态疑似错乱，'
-                                       f'请刷新页面重新加载库后再操作；如确要清空请逐条删除。'
-                        }, status=409)
-                        return
-                    if existing_count > 0:
-                        try:
-                            shutil.copyfile(DB_FILE, DB_FILE + '.bak')
-                        except Exception as _bak_err:
-                            if sys.stdout:
-                                print(f"[LIBRARY GUARD] 备份 {DB_FILE}.bak 失败（继续写入）: {_bak_err}")
-                    write_json_atomic(DB_FILE, data)
-                self._send_json({'status': 'success'})
+                body = self._read_json_body()
+                item = body.get('item') if isinstance(body, dict) and 'item' in body else body
+                if not isinstance(item, dict) or item.get('id') in (None, ''):
+                    self._send_json({
+                        'status': 'error',
+                        'message': '请求体必须是带 id 的创意对象，或 {"item": {...}}',
+                    }, status=400)
+                    return
+                entry = write_library_item(item)
+                self._send_json({'status': 'success', 'entry': entry})
             except Exception as e:
                 if sys.stdout:
-                    print(f"Error writing {DB_FILE}: {e}")
+                    print(f"Error writing library item: {e}")
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
+
+        elif path in ('/api/library/item/delete', '/api/library/items/bulk_delete'):
+            # 按 id 删单条或批量删。与创意台账的 /api/ledger/delete 同一个道理：按 id 删
+            # 天然带着"确有意图"的证据，不吃缩量闸门，删到最后一条也不会被 409。
+            if not self._gate():
+                return
+            try:
+                body = self._read_json_body()
+                item_ids = body.get('ids')
+                if not isinstance(item_ids, list):
+                    single_id = body.get('id')
+                    item_ids = [single_id] if single_id not in (None, '') else []
+                if not item_ids:
+                    self._send_json({'status': 'error', 'message': '缺少 id 或 ids'}, status=400)
+                    return
+                # 顺带清掉这些创意生成的图片/视频文件（与老的
+                # /api/library/delete_item 同一套清理，前端不必再多打一次请求）
+                deleted_items = []
+                for item_id in item_ids:
+                    item = read_library_item(item_id)
+                    title = (body.get('title') if len(item_ids) == 1 else None) \
+                             or (item or {}).get('project_key') \
+                             or (item or {}).get('title')
+                    covers = (body.get('covers') if len(item_ids) == 1 else None)
+                    if covers is None:
+                        covers = (item or {}).get('covers') or []
+                    deleted_files = None
+                    if title:
+                        try:
+                            deleted_files = delete_idea_output_files(title, covers)
+                        except Exception as e:
+                            if sys.stdout:
+                                print(f"[LIBRARY] 删除创意产物失败（记录仍会删除）: {e}")
+                    removed = delete_library_item(item_id)
+                    deleted_items.append({'id': item_id, 'removed': removed, 'deleted': deleted_files})
+
+                if len(item_ids) == 1 and 'ids' not in body:
+                    res0 = deleted_items[0]
+                    self._send_json({'status': 'ok', 'removed': res0['removed'], 'deleted': res0['deleted']})
+                else:
+                    self._send_json({
+                        'status': 'ok',
+                        'count': len([x for x in deleted_items if x['removed']]),
+                        'items': deleted_items,
+                    })
+            except Exception as e:
+                if sys.stdout:
+                    print(f"Error deleting library item(s): {e}")
                 self._send_json({'status': 'error', 'message': str(e)}, status=500)
 
         elif path == '/api/ledger':
@@ -2592,12 +5798,17 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                     except Exception:
                         pass
                     count = FX_CONTROL.force_release_active(task_id=tid, actor=actor)
+                    try:
+                        if _FX_SERIAL_LOCK.locked():
+                            _FX_SERIAL_LOCK.release()
+                    except RuntimeError:
+                        pass
                     if tid and tid in ACTIVE_TASKS:
                         with ACTIVE_TASKS_LOCK:
                             t = ACTIVE_TASKS[tid]
                             t["status"] = "cancelled"
                             t["error"] = "用户强行释放了底层任务槽位"
-                        save_tasks_to_disk()
+                        save_task_to_disk(tid)
                     snapshot = FX_CONTROL.snapshot()
                 else:
                     snapshot = FX_CONTROL.set_mode(action, actor=actor)
@@ -2610,32 +5821,49 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
             except Exception as e:
                 self._send_json({'status': 'error', 'message': str(e)}, status=500)
 
+        elif path in ('/api/engagement-cta/settings', '/api/engagement-cta/custom',
+                      '/api/engagement-cta/custom/delete'):
+            if not self._gate(with_rate=path == '/api/engagement-cta/custom', rate_action='engagement_cta_upload'):
+                return
+            import cta_burn
+            try:
+                if path == '/api/engagement-cta/settings':
+                    body = self._read_json_body()
+                    payload = cta_burn.save_settings(body.get('patch') if isinstance(body, dict) else None)
+                elif path == '/api/engagement-cta/custom':
+                    # 原始视频字节直接作为请求体；文件名走 URL 编码的请求头
+                    filename = urllib.parse.unquote(self.headers.get('X-Filename', ''))
+                    payload = cta_burn.store_custom(self._body_bytes, filename)
+                else:
+                    payload = cta_burn.remove_custom()
+                self._send_json({'status': 'ok', **payload})
+            except cta_burn.CtaSettingsError as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=e.status)
+            except (ValueError, TypeError):
+                self._send_json({'status': 'error', 'message': '请求数据无效'}, status=400)
+            except Exception as e:
+                log('ERROR', '成片引导', str(e))
+                self._send_json({'status': 'error', 'message': '保存失败，请稍后重试'}, status=500)
+
         elif path == '/api/google-fx/config':
             if not self._gate():
                 return
             try:
                 body = self._read_json_body()
                 actor = _client_ip(self)
-                action = str(body.get('action') or '').strip()
-                if action in ('rollback', 'restore', 'redo'):
-                    # 版本栈：可以连续往前回退，也可以重做（原实现只能退一步，
-                    # 而且第二次点击是重复套用同一份 before = 空操作）
-                    outcome = FX_CONFIG.restore(
-                        version_id=body.get('version_id') or None,
-                        actor=actor,
-                        direction='forward' if action == 'redo' else 'back')
-                else:
-                    outcome = FX_CONFIG.save(body.get('patch'), actor=actor)
+                outcome = FX_CONFIG.save(body.get('patch'), actor=actor)
                 self._send_json({
                     'status': 'ok',
                     'config': outcome['config'],
                     'changed': outcome.get('changed') or {},
-                    'version': outcome.get('version'),
-                    'versions': FX_CONFIG.versions(20),
+                    'version': None,
+                    'versions': [],
                     # 命中 hot=False 的字段时如实告诉用户要重启，别谎称热生效
                     'restart_required': sorted(
                         key for key in (outcome.get('changed') or {})
                         if not FX_CONFIG_SPEC[key].get('hot')),
+                    # 写进去了、也热生效了，但被别的配置项压住跑不起来的字段
+                    'inert': _inert_config_notes(outcome.get('config') or {}),
                 })
             except KeyError as e:
                 self._send_json({'status': 'error', 'message': str(e)}, status=404)
@@ -2686,7 +5914,48 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 FX_CONTROL.audit('diagnostics.selector_probe', actor=_client_ip(self))
                 from integrations.google_fx.services import google_fx_diagnostics
                 self._send_json(google_fx_diagnostics.probe_selectors_live(
+                    user_id=(body.get('user_id') or '').strip() or None,
+                    deep=bool(body.get('deep'))))
+            except Exception as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
+
+        elif path == '/api/google-fx/canvas-snapshot':
+            # 把**当前画布**原样存一份现场（截图 + 去样式 HTML + DOM 骨架 +
+            # 画布卡片结构 dump）。只读：不点击、不导航、不新建项目——这次取证的
+            # 全部价值就在于画布上那批已生成的视频，把画布弄没了就白跑了。
+            if not self._gate(with_rate=True, rate_action='fx_selector_probe'):
+                return
+            try:
+                body = self._read_json_body()
+                allowed, message = FX_CONTROL.admission()
+                if not allowed:
+                    self._send_json({'status': 'error', 'code': 'FX_NOT_ACCEPTING',
+                                     'message': message}, status=503)
+                    return
+                FX_CONTROL.audit('diagnostics.canvas_snapshot', actor=_client_ip(self))
+                from integrations.google_fx.services import google_fx_diagnostics
+                self._send_json(google_fx_diagnostics.capture_canvas_snapshot(
                     user_id=(body.get('user_id') or '').strip() or None))
+            except Exception as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
+
+        elif path == '/api/google-fx/selector-drift':
+            # 跑一次只读探针并与基线对比，报出"比上次更差了"的族。
+            # 不提交、不改配置、不花积分。定时巡检走的是同一个函数。
+            if not self._gate(with_rate=True, rate_action='fx_selector_probe'):
+                return
+            try:
+                body = self._read_json_body()
+                allowed, message = FX_CONTROL.admission()
+                if not allowed:
+                    self._send_json({'status': 'error', 'code': 'FX_NOT_ACCEPTING',
+                                     'message': message}, status=503)
+                    return
+                FX_CONTROL.audit('diagnostics.selector_drift_manual', actor=_client_ip(self))
+                from integrations.google_fx.services import google_fx_diagnostics
+                self._send_json(google_fx_diagnostics.run_selector_drift_check(
+                    user_id=(body.get('user_id') or '').strip() or None,
+                    save=bool(body.get('save', True))))
             except Exception as e:
                 self._send_json({'status': 'error', 'message': str(e)}, status=500)
 
@@ -2706,8 +5975,21 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
             except Exception as e:
                 self._send_json({'status': 'error', 'message': str(e)}, status=500)
 
+        elif path in ('/api/google-fx/captures/clear', '/api/google-fx/captures'):
+            # 清空所有失败现场取证文件与本地目录
+            if not self._gate():
+                return
+            try:
+                from integrations.google_fx.utils import forensics
+                cleared = forensics.clear_captures()
+                FX_CONTROL.audit('diagnostics.captures_clear',
+                                 details={'cleared': cleared}, actor=_client_ip(self))
+                self._send_json({'status': 'ok', 'cleared': cleared, 'message': f'已成功清空 {cleared} 个失败现场目录/文件'})
+            except Exception as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
+
         elif path == '/api/account-pool':
-            # 号池新增/改名/改备注: {user_id, name, note}（同一 upsert 入口，
+            # 号池新增/改名/改备注/改重置日期: {user_id, name, note, expires_at}（同一 upsert 入口，
             # name=账号命名留空回退邮箱，note=备注按传入值直接覆盖）
             if not self._gate():
                 return
@@ -2718,8 +6000,38 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                     self._send_json({'status': 'error', 'message': '缺少 user_id'}, status=400)
                     return
                 pool = _get_account_pool()
-                entry = pool.add_account(user_id, body.get('name') or '', body.get('note') or '', serial_number=body.get('serial_number') or '')
+                entry = pool.add_account(
+                    user_id,
+                    body.get('name') or '',
+                    body.get('note') or '',
+                    serial_number=body.get('serial_number') or '',
+                    expires_at=body.get('expires_at')
+                )
                 self._send_json({'status': 'ok', 'account': entry})
+            except Exception as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
+
+        elif path == '/api/account-pool/expires-at':
+            # 设置账号重置日期（支持单账号或多选批量设置）
+            if not self._gate():
+                return
+            try:
+                body = self._read_json_body()
+                expires_at = body.get('expires_at')
+                user_ids = body.get('user_ids')
+                user_id = str(body.get('user_id') or '').strip()
+                pool = _get_account_pool()
+                if isinstance(user_ids, list):
+                    updated = pool.set_expires_at_multiple(user_ids, expires_at)
+                    self._send_json({'status': 'ok', 'updated_count': len(updated), 'accounts': updated})
+                elif user_id:
+                    account = pool.set_expires_at(user_id, expires_at)
+                    if account is None:
+                        self._send_json({'status': 'error', 'message': f'账号 {user_id} 不在号池里'}, status=404)
+                    else:
+                        self._send_json({'status': 'ok', 'account': account})
+                else:
+                    self._send_json({'status': 'error', 'message': '缺少 user_id 或 user_ids'}, status=400)
             except Exception as e:
                 self._send_json({'status': 'error', 'message': str(e)}, status=500)
 
@@ -2741,38 +6053,67 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
             except Exception as e:
                 self._send_json({'status': 'error', 'message': str(e)}, status=500)
 
-        elif path == '/api/account-pool/delete':
-            # 号池移除账号（显式 user_id 即确认过的意图，同 /api/ledger/delete 约定）
+        elif path == '/api/account-pool/import':
+            # 导入号池配置 JSON 报文（含环境、状态及凭据）
             if not self._gate():
                 return
             try:
                 body = self._read_json_body()
-                user_id = str(body.get('user_id') or '').strip()
-                if not user_id:
-                    self._send_json({'status': 'error', 'message': '缺少 user_id'}, status=400)
-                    return
+                overwrite = bool(body.get('overwrite', False))
                 pool = _get_account_pool()
-                pool.remove_account(user_id)
-                self._send_json({'status': 'ok'})
+                result = pool.import_config(body, overwrite=overwrite)
+                self._send_json({
+                    'status': 'ok',
+                    'added': result['added'],
+                    'updated': result['updated'],
+                    'credentials_saved': result['credentials_saved'],
+                    'errors': result['errors'],
+                    'accounts': result['accounts'],
+                })
+            except Exception as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
+
+        elif path == '/api/account-pool/delete':
+            # 号池移除账号（显式 user_id 或 user_ids 即确认过的意图，同 /api/ledger/delete 约定）
+            if not self._gate():
+                return
+            try:
+                body = self._read_json_body()
+                user_ids = body.get('user_ids')
+                user_id = str(body.get('user_id') or '').strip()
+                pool = _get_account_pool()
+                if isinstance(user_ids, list):
+                    count = pool.remove_accounts(user_ids)
+                    self._send_json({'status': 'ok', 'removed_count': count})
+                elif user_id:
+                    pool.remove_account(user_id)
+                    self._send_json({'status': 'ok'})
+                else:
+                    self._send_json({'status': 'error', 'message': '缺少 user_id 或 user_ids'}, status=400)
             except Exception as e:
                 self._send_json({'status': 'error', 'message': str(e)}, status=500)
 
         elif path == '/api/account-pool/toggle':
-            # 启用/禁用账号: {user_id, disabled}
+            # 启用/禁用账号: {user_id, disabled} 或 {user_ids: [...], disabled}
             if not self._gate():
                 return
             try:
                 body = self._read_json_body()
+                user_ids = body.get('user_ids')
                 user_id = str(body.get('user_id') or '').strip()
-                if not user_id:
-                    self._send_json({'status': 'error', 'message': '缺少 user_id'}, status=400)
-                    return
+                disabled = bool(body.get('disabled'))
                 pool = _get_account_pool()
-                entry = pool.set_disabled(user_id, bool(body.get('disabled')))
-                if entry is None:
-                    self._send_json({'status': 'error', 'message': '账号不存在'}, status=404)
-                    return
-                self._send_json({'status': 'ok', 'account': entry})
+                if isinstance(user_ids, list):
+                    entries = pool.set_disabled_multiple(user_ids, disabled)
+                    self._send_json({'status': 'ok', 'accounts': entries, 'count': len(entries)})
+                elif user_id:
+                    entry = pool.set_disabled(user_id, disabled)
+                    if entry is None:
+                        self._send_json({'status': 'error', 'message': '账号不存在'}, status=404)
+                        return
+                    self._send_json({'status': 'ok', 'account': entry})
+                else:
+                    self._send_json({'status': 'error', 'message': '缺少 user_id 或 user_ids'}, status=400)
             except Exception as e:
                 self._send_json({'status': 'error', 'message': str(e)}, status=500)
 
@@ -2824,7 +6165,8 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                     }, status=409)
                     return
                 pool = _get_account_pool()
-                entry = pool.refresh_credit(user_id, force=True)
+                # 人亲手点的「立即探测」：连失败退避一起跳过，必须真探一次。
+                entry = pool.refresh_credit(user_id, force=True, ignore_backoff=True)
                 if entry is None:
                     self._send_json({'status': 'error', 'message': '账号不存在'}, status=404)
                     return
@@ -2853,20 +6195,133 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 return
             try:
                 body = self._read_json_body()
+                user_ids = body.get('user_ids')
                 user_id = str(body.get('user_id') or '').strip()
-                if not user_id:
-                    self._send_json({'status': 'error', 'message': '缺少 user_id'}, status=400)
-                    return
-                entry = _get_account_pool().clear_cooldown(user_id)
-                if entry is None:
-                    self._send_json({'status': 'error', 'message': '账号不存在'}, status=404)
-                    return
-                self._send_json({'status': 'ok', 'account': entry})
+                pool = _get_account_pool()
+                if isinstance(user_ids, list):
+                    entries = pool.clear_cooldown_multiple(user_ids)
+                    self._send_json({'status': 'ok', 'accounts': entries, 'count': len(entries)})
+                elif user_id:
+                    entry = pool.clear_cooldown(user_id)
+                    if entry is None:
+                        self._send_json({'status': 'error', 'message': '账号不存在'}, status=404)
+                        return
+                    self._send_json({'status': 'ok', 'account': entry})
+                else:
+                    self._send_json({'status': 'error', 'message': '缺少 user_id 或 user_ids'}, status=400)
             except Exception as e:
                 self._send_json({'status': 'error', 'message': str(e)}, status=500)
 
         elif path == '/api/account-pool/close-browser' or path == '/api/account-pool/close':
-            # 关闭指定 user_id 的 AdsPower 浏览器实例
+            # 关闭指定 user_id 或 user_ids 的 AdsPower 浏览器实例
+            if not self._gate():
+                return
+            try:
+                body = self._read_json_body()
+                user_ids = body.get('user_ids')
+                user_id = str(body.get('user_id') or '').strip()
+                pool = _get_account_pool()
+                if isinstance(user_ids, list):
+                    results = pool.close_browsers(user_ids)
+                    self._send_json({'status': 'ok', 'results': results, 'count': len(user_ids)})
+                elif user_id:
+                    success, msg = pool.close_browser(user_id)
+                    if not success:
+                        self._send_json({'status': 'error', 'message': msg}, status=500)
+                        return
+                    self._send_json({'status': 'ok', 'message': msg, 'user_id': user_id})
+                else:
+                    self._send_json({'status': 'error', 'message': '缺少 user_id 或 user_ids'}, status=400)
+            except Exception as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
+
+        elif path == '/api/google-fx/orphans/close':
+            # 关闭"无主浏览器"（开着、无租约、近 30 分钟没被本进程用过）。只处理 board 判定为
+            # orphan 的环境；每次都用最新租约重新判定，被租着/保温中的一律跳过并如实回报。
+            if not self._gate():
+                return
+            try:
+                body = self._read_json_body()
+                requested = {str(u).strip() for u in (body.get('user_ids') or []) if str(u).strip()}
+                _fx_refresh_open_browsers()
+                rows = _build_fx_board()['open_browsers']
+                targets = [r for r in rows if not requested or r['user_id'] in requested]
+                from integrations.google_fx.utils.browser import close_ads_browser
+                results = []
+                for row in targets:
+                    if not row['orphan']:
+                        reason = '正被任务租用' if row['leased'] else ('近期刚用过，保温中' if row['warm'] else '尚在宽限期')
+                        results.append({'user_id': row['user_id'], 'closed': False, 'skipped': reason})
+                        continue
+                    ok, message = close_ads_browser(user_id=row['user_id'])
+                    FX_CONTROL.audit('orphan.close', details={'user_id': row['user_id'], 'ok': ok, 'message': message},
+                                     actor='console')
+                    results.append({'user_id': row['user_id'], 'closed': bool(ok), 'message': message})
+                _fx_refresh_open_browsers()
+                self._send_json({'status': 'ok', 'results': results,
+                                 'closed': sum(1 for r in results if r['closed'])})
+            except Exception as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
+
+        elif path == '/api/account-pool/credentials':
+            # 保存账号的自动登录凭据: {user_id, email?, password?, totp_secret?}
+            # 或批量设置密码/凭据: {user_ids: [...], password?, email?, totp_secret?}
+            #
+            # ⚠️ 字段缺省 = "这一项不改"，传空字符串 = "清空这一项"。这个区分不能
+            # 简化：列表接口从不回传密码明文，前端编辑表单里的密码框天然是空的，
+            # 若把"空"一律当成"清空"，用户改个邮箱就会把密码抹掉（而且是静默的：
+            # 下一次掉登录直接退回等人工，用户以为凭据还在）。
+            if not self._gate():
+                return
+            try:
+                body = self._read_json_body()
+                user_ids = body.get('user_ids')
+                user_id = str(body.get('user_id') or '').strip()
+                from integrations.google_fx.utils import account_credentials, account_pool
+                if isinstance(user_ids, list):
+                    pool = account_pool.AccountPool()
+                    acc_map = {a['user_id']: a for a in pool.list_accounts(heal=False)}
+                    saved_entries = []
+                    for uid in user_ids:
+                        uid_str = str(uid).strip()
+                        if not uid_str:
+                            continue
+                        existing_cred = account_credentials.get(uid_str)
+                        email = body.get('email') if 'email' in body else None
+                        if email is None:
+                            if existing_cred and existing_cred.get('email'):
+                                email = existing_cred['email']
+                            elif uid_str in acc_map and acc_map[uid_str].get('name'):
+                                raw_name = acc_map[uid_str]['name']
+                                match = re.search(r'[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+', raw_name)
+                                email = match.group(0) if match else raw_name
+                        entry = account_credentials.save(
+                            uid_str,
+                            email=email,
+                            password=body.get('password') if 'password' in body else None,
+                            totp_secret=body.get('totp_secret') if 'totp_secret' in body else None,
+                        )
+                        saved_entries.append(entry)
+                    self._send_json({'status': 'ok', 'count': len(saved_entries), 'credentials': saved_entries})
+                elif user_id:
+                    entry = account_credentials.save(
+                        user_id,
+                        email=body.get('email') if 'email' in body else None,
+                        password=body.get('password') if 'password' in body else None,
+                        totp_secret=body.get('totp_secret') if 'totp_secret' in body else None,
+                    )
+                    self._send_json({'status': 'ok', 'credentials': entry})
+                else:
+                    self._send_json({'status': 'error', 'message': '缺少 user_id 或 user_ids'}, status=400)
+            except ValueError as e:
+                # TOTP 密钥格式错误走这里（TotpSecretError 是 ValueError 子类）。
+                # 400 而不是 500：是用户填错了，不是服务故障，文案能直接照着改。
+                self._send_json({'status': 'error', 'message': str(e)}, status=400)
+            except Exception as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
+
+        elif path == '/api/account-pool/credentials/delete':
+            # 删除某账号的登录凭据（账号本身留在号池，只是不再自动登录）
             if not self._gate():
                 return
             try:
@@ -2875,12 +6330,274 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 if not user_id:
                     self._send_json({'status': 'error', 'message': '缺少 user_id'}, status=400)
                     return
-                pool = _get_account_pool()
-                success, msg = pool.close_browser(user_id)
-                if not success:
-                    self._send_json({'status': 'error', 'message': msg}, status=500)
+                from integrations.google_fx.utils import account_credentials
+                removed = account_credentials.remove(user_id)
+                self._send_json({'status': 'ok', 'removed': removed})
+            except Exception as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
+
+        elif path == '/api/account-pool/reset-breaker':
+            # 人工解除自动登录熔断。改凭据会自动清零计数，这个入口是给"确认凭据
+            # 没问题、上次失败是环境原因"的情况用的。
+            if not self._gate():
+                return
+            try:
+                body = self._read_json_body()
+                user_id = str(body.get('user_id') or '').strip()
+                if not user_id:
+                    self._send_json({'status': 'error', 'message': '缺少 user_id'}, status=400)
                     return
-                self._send_json({'status': 'ok', 'message': msg, 'user_id': user_id})
+                from integrations.google_fx.utils import account_credentials
+                entry = account_credentials.reset_breaker(user_id)
+                if entry is None:
+                    self._send_json({'status': 'error', 'message': '这个账号没有凭据记录'}, status=404)
+                    return
+                self._send_json({'status': 'ok', 'credentials': entry})
+            except Exception as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
+
+        elif path == '/api/account-pool/login-sync':
+            # Explicit pool recovery: the host owns a real browser lease and
+            # validates the session without writing Flow account cookies.
+            if not self._gate(with_rate=True, rate_action='account_refresh'):
+                return
+            try:
+                body = self._read_json_body()
+            except (ValueError, UnicodeError):
+                self._send_json({'status': 'error', 'code': 'invalid_login_request'}, status=400)
+                return
+            try:
+                import asyncio as _pool_login_asyncio
+                import importlib.util as _pool_login_importlib_util
+                from pathlib import Path as _pool_login_Path
+                import uuid as _pool_login_uuid
+                import threading as _pool_login_threading
+                import time as _pool_login_time
+                host_path = _pool_login_Path('/Users/fly/flow2api/local/sync_adspower_login_host.py')
+                if not host_path.is_file() or host_path.is_symlink():
+                    self._send_json({'status': 'deferred', 'code': 'login_host_unavailable'}, status=409)
+                    return
+                spec = _pool_login_importlib_util.spec_from_file_location(
+                    '_pool_login_host_' + _pool_login_uuid.uuid4().hex, host_path)
+                if spec is None or spec.loader is None:
+                    self._send_json({'status': 'deferred', 'code': 'login_host_unavailable'}, status=409)
+                    return
+                host = _pool_login_importlib_util.module_from_spec(spec)
+                spec.loader.exec_module(host)
+
+                def snapshot():
+                    with ACTIVE_TASKS_LOCK:
+                        # The host only needs statuses; no task content or
+                        # account/transport credentials cross this boundary.
+                        tasks = [{'task_id': tid, 'status': row.get('status'),
+                                  'maintenance': 'cookie_login' if row.get('_cookie_login') is True else None,
+                                  'profile_id': row.get('profile_id'),
+                                  'cancelled': bool(row.get('cancel_event') and row['cancel_event'].is_set())}
+                                 if isinstance(row, dict) else {}
+                                 for tid, row in ACTIVE_TASKS.items()]
+                    return {'queue': FX_CONTROL.snapshot(),
+                            'board': FX_CONTROL.board(), 'tasks': tasks}
+
+                def task_started(task_id, profile_id):
+                    with ACTIVE_TASKS_LOCK:
+                        if _AUTO_RELOAD_TRIGGERED or task_id in ACTIVE_TASKS:
+                            raise host.LoginError('login_host_unavailable')
+                        ACTIVE_TASKS[task_id] = {
+                            'id': task_id, 'task_id': task_id, 'status': 'running', '_cookie_login': True,
+                            'profile_id': profile_id, 'events': [], 'listeners': set(),
+                            'cancel_event': _pool_login_threading.Event(), 'result': None, 'error': None,
+                            'last_active': _pool_login_time.time(),
+                            'dimensions': {'userId': profile_id, 'fx_capable': False,
+                                           'type': 'auto_login'},
+                        }
+
+                def task_finished(task_id):
+                    with ACTIVE_TASKS_LOCK:
+                        row = ACTIVE_TASKS.get(task_id)
+                        if isinstance(row, dict) and row.get('_cookie_login') is True:
+                            if row.get('status') == 'running':
+                                row['status'] = 'completed'
+                            for _, stop_event in list(row.get('listeners') or ()):
+                                stop_event.set()
+                            ACTIVE_TASKS.pop(task_id, None)
+
+                payload, status = _pool_login_asyncio.run(host.handle_login_sync(
+                    body, slot_factory=_fx_browser_slot, spark_snapshot=snapshot,
+                    task_started=task_started, task_finished=task_finished))
+                self._send_json(payload, status=status)
+            except Exception:
+                # Never expose exception text from authentication/transport.
+                self._send_json({'status': 'error', 'code': 'login_internal_error'}, status=500)
+
+        elif path == '/api/account-pool/login':
+            # 现在就用存好的凭据登一次（控制台「测试登录」）。开浏览器、走完整
+            # 登录表单，很慢，前端必须有 loading 态。
+            #
+            # 忙碌判定照抄 /api/account-pool/refresh：两者抢的是同一个 AdsPower
+            # profile，生成任务占着浏览器时直接回 409 让用户稍后再点，而不是让这个
+            # HTTP 请求静默长挂几分钟。
+            if not self._gate(with_rate=True, rate_action='account_refresh'):
+                return
+            try:
+                body = self._read_json_body()
+                user_id = str(body.get('user_id') or '').strip()
+                if not user_id:
+                    self._send_json({'status': 'error', 'message': '缺少 user_id'}, status=400)
+                    return
+                queue = FX_CONTROL.snapshot()
+                if queue.get('processing_paused'):
+                    self._send_json({
+                        'status': 'error', 'code': 'FX_PAUSED',
+                        'message': 'Google FX 队列处于暂停模式，测试登录拿不到浏览器；请先在控制台恢复处理',
+                    }, status=409)
+                    return
+                active_rows = queue.get('active_list') or []
+                blocking = [row for row in active_rows
+                            if str(row.get('kind')) not in FX_BOUNDED_BYPASS_KINDS]
+                if blocking:
+                    busy = blocking[0].get('task_id') or '其它任务'
+                    self._send_json({
+                        'status': 'error', 'code': 'FX_BUSY',
+                        'message': f'浏览器正被 {busy} 占用，测试登录需要同一个浏览器，请等它结束后再试',
+                    }, status=409)
+                    return
+
+                from integrations.google_fx.utils import auto_login
+                result = auto_login.run_standalone_login(user_id)
+                pool = _get_account_pool()
+                account = next((a for a in pool.list_accounts(heal=False)
+                                if a.get('user_id') == user_id), None)
+                if result.ok:
+                    self._send_json({'status': 'ok', 'reason': result.reason,
+                                     'message': result.message, 'account': account})
+                    return
+                # 409 = "现在不行，可以再试"；422 = "凭据/账号本身有问题，再点多少
+                # 次都一样"。前端据此决定是提示稍后重试还是提示去改凭据。
+                retryable = ('browser_busy', 'cancelled', 'browser_gone', 'timeout')
+                self._send_json(
+                    {'status': 'error', 'code': result.reason.upper(),
+                     'message': result.message, 'account': account},
+                    status=409 if result.reason in retryable else 422)
+            except Exception as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
+
+        elif path == '/api/proxy-pool':
+            # 代理号池新增/编辑：{proxy_id?, host, port, proxy_type, user, password,
+            # label, note}。带 proxy_id 即编辑；编辑时不传 password 表示沿用原密码
+            # （列表接口从不回传明文，否则改个备注就会把密码清空）。
+            if not self._gate():
+                return
+            try:
+                body = self._read_json_body()
+                pool = _get_proxy_pool()
+                entry = pool.add_proxy(
+                    host=body.get('host'), port=body.get('port'),
+                    proxy_type=body.get('proxy_type') or 'http',
+                    user=body.get('user') or '', password=body.get('password') or '',
+                    label=body.get('label') or '', note=body.get('note') or '',
+                    proxy_id=body.get('proxy_id') or '',
+                    keep_password=bool(body.get('proxy_id')),
+                )
+                self._send_json({'status': 'ok', 'proxy': entry})
+            except (ValueError, KeyError) as e:
+                self._send_json({'status': 'error', 'message': str(e).strip("'")}, status=400)
+            except Exception as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
+
+        elif path == '/api/proxy-pool/delete':
+            if not self._gate():
+                return
+            try:
+                body = self._read_json_body()
+                proxy_id = str(body.get('proxy_id') or '').strip()
+                if not proxy_id:
+                    self._send_json({'status': 'error', 'message': '缺少 proxy_id'}, status=400)
+                    return
+                if not _get_proxy_pool().remove_proxy(proxy_id):
+                    self._send_json({'status': 'error', 'message': '代理不存在'}, status=404)
+                    return
+                self._send_json({'status': 'ok'})
+            except Exception as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
+
+        elif path == '/api/proxy-pool/toggle':
+            # 启用/禁用代理：{proxy_id, disabled}。禁用的不参与轮换，也不能下发。
+            if not self._gate():
+                return
+            try:
+                body = self._read_json_body()
+                proxy_id = str(body.get('proxy_id') or '').strip()
+                if not proxy_id:
+                    self._send_json({'status': 'error', 'message': '缺少 proxy_id'}, status=400)
+                    return
+                entry = _get_proxy_pool().set_disabled(proxy_id, bool(body.get('disabled')))
+                if entry is None:
+                    self._send_json({'status': 'error', 'message': '代理不存在'}, status=404)
+                    return
+                self._send_json({'status': 'ok', 'proxy': entry})
+            except Exception as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
+
+        elif path == '/api/proxy-pool/check':
+            # 走这条代理拿一次真实出口 IP。纯网络请求，不开浏览器、不排 FX 队列，
+            # 所以不像 /api/account-pool/refresh 那样要看队列忙不忙。
+            if not self._gate(with_rate=True, rate_action='proxy_check'):
+                return
+            try:
+                body = self._read_json_body()
+                proxy_id = str(body.get('proxy_id') or '').strip()
+                if not proxy_id:
+                    self._send_json({'status': 'error', 'message': '缺少 proxy_id'}, status=400)
+                    return
+                entry = _get_proxy_pool().check_proxy(proxy_id)
+                if entry is None:
+                    self._send_json({'status': 'error', 'message': '代理不存在'}, status=404)
+                    return
+                if entry.get('last_check_status') != 'ok':
+                    self._send_json({
+                        'status': 'error', 'code': 'PROXY_CHECK_FAILED',
+                        'message': entry.get('last_check_error') or '代理不通',
+                        'proxy': entry,
+                    }, status=422)
+                    return
+                self._send_json({'status': 'ok', 'proxy': entry})
+            except Exception as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
+
+        elif path == '/api/proxy-pool/apply':
+            # 把代理写进某个 AdsPower 环境的 userProxyConfig：{proxy_id, user_id}。
+            # AdsPower 在浏览器启动时读代理，已开着的窗口要关掉重开才换出口。
+            if not self._gate():
+                return
+            try:
+                body = self._read_json_body()
+                proxy_id = str(body.get('proxy_id') or '').strip()
+                user_id = str(body.get('user_id') or '').strip()
+                if not proxy_id or not user_id:
+                    self._send_json({'status': 'error',
+                                     'message': '缺少 proxy_id 或 user_id'}, status=400)
+                    return
+                entry = _get_proxy_pool().apply_to_profile(proxy_id, user_id)
+                self._send_json({
+                    'status': 'ok', 'proxy': entry,
+                    'message': f'已写入环境 {user_id}，该浏览器下次启动时生效',
+                })
+            except KeyError as e:
+                self._send_json({'status': 'error', 'message': str(e).strip("'")}, status=404)
+            except ValueError as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=400)
+            except Exception as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
+
+        elif path == '/api/proxy-pool/import-legacy':
+            # 把老的 runtime/proxy_pool.txt（proxy_rotator list 模式那份纯文本）
+            # 并入代理号池，已存在的同 host:port 跳过。
+            if not self._gate():
+                return
+            try:
+                pool = _get_proxy_pool()
+                result = pool.import_legacy_txt()
+                self._send_json({'status': 'ok', 'proxies': pool.list_proxies(), **result})
             except Exception as e:
                 self._send_json({'status': 'error', 'message': str(e)}, status=500)
 
@@ -2939,203 +6656,6 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
             except Exception as e:
                 self._send_json({'online': False, 'message': str(e)})
 
-        elif path == '/api/vlm_qa':
-            if not self._gate(with_rate=True, rate_action='vlm_qa'):
-                return
-            try:
-                body = self._read_json_body()
-                config_req = effective_config(body.get('config', {}))
-                img_i_path = body.get('img_i_path')
-                img_ip1_path = body.get('img_ip1_path')
-                video_prompt = body.get('video_prompt')
-                is_bridge = bool(body.get('is_bridge', False))
-
-                # If img_i_path is empty, it means we are checking the first frame (no previous frame).
-                # In this case, we skip the check and directly return success.
-                if not img_i_path:
-                    self._send_json({
-                        'status': 'ok',
-                        'vlm_pass': True,
-                        'vlm_reason': 'First frame skipped'
-                    })
-                    return
-
-                if not img_ip1_path or not video_prompt:
-                    self._send_json({'status': 'error', 'message': 'Missing parameters: img_ip1_path and video_prompt are required'}, status=400)
-                    return
-
-                if not os.path.exists(img_i_path):
-                    self._send_json({'status': 'error', 'message': f'img_i_path does not exist: {img_i_path}'}, status=400)
-                    return
-
-                if not os.path.exists(img_ip1_path):
-                    self._send_json({'status': 'error', 'message': f'img_ip1_path does not exist: {img_ip1_path}'}, status=400)
-                    return
-
-                from prompt_pipeline import run_vlm_qa_check
-                vlm_pass, vlm_reason = run_vlm_qa_check(config_req, img_i_path, img_ip1_path, video_prompt, is_bridge=is_bridge)
-                self._send_json({
-                    'status': 'ok',
-                    'vlm_pass': bool(vlm_pass),
-                    'vlm_reason': vlm_reason
-                })
-            except Exception as e:
-                self._send_json({'status': 'error', 'message': str(e)}, status=500)
-
-        elif path == '/api/generate_image_with_vlm':
-            if not self._gate(with_rate=True, rate_action='image_vlm'):
-                return
-            try:
-                import requests
-                body = self._read_json_body()
-                config_req = effective_config(body.get('config', {}))
-                prompt = body.get('prompt')
-                reference_image = body.get('reference_image')
-                ratio = body.get('ratio', '9:16')
-                model = body.get('model', 'Nano Banana 2')
-                output_path = body.get('output_path')
-                video_prompt = body.get('video_prompt')
-                chain_index = int(body.get('chain_index', 1))
-                is_bridge = bool(body.get('is_bridge', False))
-                base_url = body.get('base_url', 'http://127.0.0.1:8000')
-
-                if reference_image and not os.path.exists(reference_image):
-                    self._send_json({'status': 'error', 'message': f'reference_image does not exist: {reference_image}'}, status=400)
-                    return
-
-                if not prompt or not output_path:
-                    self._send_json({'status': 'error', 'message': 'Missing parameters: prompt and output_path are required'}, status=400)
-                    return
-
-                current_prompt = prompt
-                last_generated_path = None
-                vlm_pass = True
-                vlm_reason = None
-                video_prompt_corrected = False
-
-                for attempt in range(3): # 1 initial + 2 retries = 3 total attempts
-                    # Prepare call to AdsPower AI service
-                    payload = {
-                        "prompts": [current_prompt],
-                        "ratio": ratio,
-                        "model": model,
-                        "output_path": output_path
-                    }
-                    if reference_image:
-                        payload["images"] = [reference_image]
-
-                    log_msg = f"[VLM QA Retry Flow] Generating image frame {chain_index} (attempt {attempt + 1}/3)..."
-                    if sys.stdout:
-                        print(log_msg)
-
-                    gen_url = f"{base_url.rstrip('/')}/generate_images_batch"
-                    headers = {"Content-Type": "application/json"}
-                    
-                    response = requests.post(gen_url, json=payload, headers=headers, timeout=600)
-                    
-                    if not response.ok:
-                        raise RuntimeError(f"AdsPower generation failed: HTTP {response.status_code} - {response.text}")
-                    
-                    res_data = response.json()
-                    img_path = None
-                    for k in ['generated_image_path', 'generated_image_url', 'image_url', 'output_path', 'local_path', 'path', 'url']:
-                        if isinstance(res_data.get(k), str) and res_data[k].strip():
-                            img_path = res_data[k].strip()
-                            break
-                    if not img_path and isinstance(res_data.get('image_urls'), list) and res_data['image_urls']:
-                        img_path = res_data['image_urls'][0]
-
-                    if not img_path or not os.path.exists(img_path):
-                        raise RuntimeError(f"Generated image path not found or does not exist: {img_path}")
-
-                    last_generated_path = img_path
-
-                    # Perform VLM Check if it's not the first frame and we have a reference image and video prompt
-                    if chain_index > 1 and reference_image and video_prompt:
-                        from prompt_pipeline import run_vlm_qa_check
-                        vlm_pass, vlm_reason = run_vlm_qa_check(config_req, reference_image, img_path, video_prompt, is_bridge=is_bridge)
-                        if vlm_pass:
-                            if sys.stdout:
-                                print(f"[VLM QA Retry Flow] Frame {chain_index} passed VLM check on attempt {attempt + 1}!")
-                            break
-                        else:
-                            if attempt < 2:
-                                if sys.stdout:
-                                    print(f"[VLM QA Retry Flow] Frame {chain_index} failed VLM check on attempt {attempt + 1}: {vlm_reason}.")
-                                
-                                # Run Quality Check on Video Prompt
-                                from prompt_pipeline import (
-                                    check_grid_coordinates,
-                                    check_nlvtr_violations,
-                                    check_video_opening,
-                                    check_out_and_in,
-                                    check_transition_shortcuts,
-                                    check_pacing_control,
-                                    check_camera_contradictions
-                                )
-                                video_errs = []
-                                video_errs.extend(check_grid_coordinates(video_prompt))
-                                video_errs.extend(check_nlvtr_violations(video_prompt))
-                                video_errs.extend(check_video_opening(chain_index - 1, video_prompt))
-                                video_errs.extend(check_out_and_in(video_prompt, is_bridge))
-                                video_errs.extend(check_transition_shortcuts(video_prompt))
-                                video_errs.extend(check_pacing_control(video_prompt, is_bridge))
-                                # 桥接段 TBCP 无条件禁 pan/tilt（reward 拍不会是桥接，无误伤面）
-                                video_errs.extend(check_camera_contradictions(video_prompt, is_bridge, ban_pan_tilt=is_bridge))
-                                
-                                vid_word_count = len(video_prompt.split())
-                                if vid_word_count > 380:
-                                    video_errs.append(f"VIDEO prompt word count ({vid_word_count}) exceeds limit of 380 words")
-                                
-                                semantic_res = check_video_prompt_semantically(config_req, video_prompt, vlm_reason)
-                                video_prompt_failed = bool(video_errs) or semantic_res.startswith("FAIL")
-                                
-                                if video_prompt_failed:
-                                    combined_errs = list(video_errs)
-                                    if semantic_res.startswith("FAIL"):
-                                        combined_errs.append(semantic_res)
-                                    if sys.stdout:
-                                        print(f"[VLM QA Retry Flow] Frame {chain_index} video prompt failed quality check. Errors: {combined_errs}")
-                                    
-                                    new_video_prompt = fix_video_prompt_with_vlm_feedback(config_req, video_prompt, vlm_reason, combined_errs)
-                                    if sys.stdout:
-                                        print(f"[VLM QA Retry Flow] Rewritten video prompt: {new_video_prompt}")
-                                    video_prompt = new_video_prompt
-                                    video_prompt_corrected = True
-                                else:
-                                    if sys.stdout:
-                                        print(f"[VLM QA Retry Flow] Frame {chain_index} video prompt passed quality check.")
-
-                                # Correct the image prompt as before
-                                from prompt_pipeline import fix_image_prompt_with_vlm_feedback
-                                current_prompt = fix_image_prompt_with_vlm_feedback(config_req, current_prompt, vlm_reason)
-                                if sys.stdout:
-                                    print(f"[VLM QA Retry Flow] Rewritten image prompt: {current_prompt}")
-                            else:
-                                if sys.stdout:
-                                    print(f"[VLM QA Retry Flow] Frame {chain_index} failed VLM check and retries exhausted.")
-                    else:
-                        vlm_pass = True
-                        break
-
-                res_payload = {
-                    'generated_image_path': last_generated_path,
-                    'vlm_pass': bool(vlm_pass)
-                }
-                if video_prompt_corrected:
-                    res_payload['corrected_video_prompt'] = video_prompt
-
-                if vlm_pass:
-                    res_payload['status'] = 'ok'
-                    self._send_json(res_payload)
-                else:
-                    res_payload['status'] = 'failed'
-                    res_payload['message'] = f"VLM QA failed: {vlm_reason}"
-                    self._send_json(res_payload)
-
-            except Exception as e:
-                self._send_json({'status': 'error', 'message': str(e)}, status=500)
-
         elif path == '/api/clear-cache':
             if not self._gate():
                 return
@@ -3144,6 +6664,24 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                     with open(CACHE_PATH, 'w', encoding='utf-8') as f:
                         json.dump({}, f, ensure_ascii=False, indent=2)
                 self._send_json({'status': 'success', 'message': '系统缓存清理成功'})
+            except Exception as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
+
+        elif path == '/api/clear-logs':
+            # 清空 server.log 及其轮转兄弟。日志文件被 RotatingFileStream 常驻
+            # 打开，清理必须走 clear_log_files()（内部持锁 + 关闭重开），外部
+            # 直接删文件会让日志句柄悬空，前端日志面板从此收不到新行。
+            if not self._gate():
+                return
+            try:
+                freed = clear_log_files()
+                # 这条会成为清空后的第一行，正好给日志面板一个"确实清过"的锚点。
+                print(f"[LOGS] 日志已由配置中心清理，释放 {freed} 字节")
+                self._send_json({
+                    'status': 'success',
+                    'message': '日志清理成功',
+                    'freed_bytes': freed,
+                })
             except Exception as e:
                 self._send_json({'status': 'error', 'message': str(e)}, status=500)
 
@@ -3157,25 +6695,27 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                     return
                 body = self._read_json_body()
                 config = effective_config(body.get('config'))
-                count = body.get('count', 8)
+                count = body.get('count', 5)
                 # 基础场景主题选择器已移除；theme/theme_label 仅为旧客户端兼容保留。
                 # trend_ref_ids=用户在联网参考案例库勾选的条目 id：非空时本批灵感
                 # 以选中案例为首要创意来源(不再自动联网搜索)
                 theme = body.get('theme')
                 theme_label = body.get('theme_label')
                 trend_ref_ids = body.get('trend_ref_ids') or []
+                pacing_skeleton_ids = body.get('pacing_skeleton_ids') or []
+                remix_seed = body.get('remix_seed')
 
                 result = run_ideate(config, count, theme=theme, theme_label=theme_label,
-                                    trend_ref_ids=trend_ref_ids)
-                # 激发成功即自动入账，而不是依赖用户逐张点“存入备选”。服务端原子
-                # 追加保证并发请求不会通过“GET + 整表 POST”互相覆盖；若台账损坏则
-                # 整个请求失败，避免把未受后续去重保护的创意交给前端。
-                ledger_result = register_ledger_candidates(result['ideas'])
+                                    trend_ref_ids=trend_ref_ids, remix_seed=remix_seed,
+                                    pacing_skeleton_ids=pacing_skeleton_ids)
+                for idea in result.get('ideas') or []:
+                    idea.setdefault('generation_source', result.get('generation_source', 'llm'))
+                    idea.setdefault('degraded', bool(result.get('degraded', False)))
                 self._send_json({
                     'status': 'ok',
                     'ideas': result['ideas'],
-                    'ledger_registered': ledger_result['added'],
-                    'ledger_duplicates': ledger_result['duplicates'],
+                    'generation_source': result.get('generation_source', 'llm'),
+                    'degraded': bool(result.get('degraded', False)),
                     # 本批注入过灵感 prompt 的联网参考(搜索词摘要/自定义网址摘要),
                     # 前端展示成可折叠面板,让用户能看到"搜到了什么"
                     'trend_refs': result.get('trend_refs') or [],
@@ -3197,6 +6737,19 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 task_id = body.get('task_id')
                 if not task_id:
                     task_id = str(int(time.time() * 1000))
+
+                # 灵感推荐只负责展示候选，不再整批入账。只有用户真正启动激发/合成
+                # 的那一条，前端才会随 dimensions 带上 ledger_candidate；在创建后台
+                # 任务前原子登记，确保未被激发的卡片不会污染台账及后续去重范围。
+                # 这是请求级持久化元数据，不属于创意维度；取走后再交给合成器，避免
+                # 它进入 LLM prompt、任务快照或断点续传指纹。
+                ledger_candidate = dimensions.pop('ledger_candidate', None)
+                if isinstance(ledger_candidate, dict):
+                    # 主键要在登记之前就位：台账行带上 project_key 之后，「回到激发
+                    # 项目」就是一次直查，不必再拿 DNA/一句话选题去撞标题。
+                    ledger_candidate = dict(ledger_candidate)
+                    ledger_candidate['project_key'] = ensure_task_project_key(task_id, dimensions)
+                    register_ledger_candidates([ledger_candidate], source='Creative Activation')
 
                 # Start background thread
                 cleanup_old_tasks()
@@ -3241,28 +6794,48 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 body = self._read_json_body()
                 dimensions = body.get('dimensions', {})
                 config = effective_config(body.get('config'))
-                if not _require_fx_admission(self):
+                if _pipeline_uses_fx(config) and not _require_fx_admission(self):
                     return
-                # 自治管线全程驱动 FX 浏览器：把浏览器编号带进 dimensions，
-                # /api/compose-cancel 取消时据此关闭正确的 AdsPower 窗口
+                # Persist the selected backends' capability; cancellation must not
+                # infer Ads usage merely from a pipeline task's name.
+                dimensions['fx_capable'] = _pipeline_uses_fx(config)
+                dimensions['video_provider'] = config.get('videoProvider') or 'google_fx'
                 dimensions['userId'] = config.get('googleFxUserId') or None
                 task_id = body.get('task_id')
                 if not task_id:
                     task_id = f"auto_{int(time.time() * 1000)}"
 
                 # Start background thread
-                cleanup_old_tasks()
-                # 同 /api/compose：重试复用 task_id 时原地覆盖旧记录，运行中防重复提交
-                _, already_running = prepare_task_for_run(task_id, dimensions)
-                if already_running:
-                    self._send_json({'status': 'ok', 'task_id': task_id, 'already_running': True})
-                    return
+                if config.get('videoProvider') == 'flow2api':
+                    existing = ACTIVE_TASKS.get(task_id)
+                    if existing and existing.get('status') == 'running':
+                        self._send_json({'status': 'ok', 'task_id': task_id, 'already_running': True})
+                        return
+                    project_key = ensure_task_project_key(task_id, dimensions) or make_idea_project_key(
+                        task_id, dimensions.get('task_label') or dimensions.get('theme'))
+                    dimensions['project_key'] = project_key
+                    holder = _claim_flow_project_run(config, task_id, project_key)
+                    if holder:
+                        self._send_json({'status': 'error', 'message': '该项目仍有生成任务未退出',
+                                         'failure_code': 'PROJECT_BUSY', 'task_id': holder}, status=409)
+                        return
 
-                threading.Thread(
-                    target=auto_run_worker,
-                    args=(task_id, config, dimensions),
-                    daemon=True
-                ).start()
+                try:
+                    cleanup_old_tasks()
+                    # 同 /api/compose：重试复用 task_id 时原地覆盖旧记录，运行中防重复提交
+                    _, already_running = prepare_task_for_run(task_id, dimensions)
+                    if already_running:
+                        self._send_json({'status': 'ok', 'task_id': task_id, 'already_running': True})
+                        return
+
+                    threading.Thread(
+                        target=auto_run_worker,
+                        args=(task_id, config, dimensions),
+                        daemon=True
+                    ).start()
+                except BaseException:
+                    _release_flow_project_run(config, task_id)
+                    raise
 
                 self._send_json({'status': 'ok', 'task_id': task_id})
             except Exception as e:
@@ -3274,9 +6847,21 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
             try:
                 body = self._read_json_body()
                 task_id = body.get('task_id')
+                request_id = body.get('request_id')
+                if request_id:
+                    with _VIDEO_OPERATION_LOCK:
+                        operation = _VIDEO_OPERATIONS.lookup(validate_request_id(request_id))
+                        if task_id and (not operation or operation.get('task_id') != task_id):
+                            self._send_json({'status': 'error', 'message': '任务与请求编号不匹配'}, status=409)
+                            return
+                        operation = _VIDEO_OPERATIONS.cancel(request_id)
+                        task_id = operation.get('task_id')
+                        if task_id in ACTIVE_TASKS:
+                            ACTIVE_TASKS[task_id]['cancel_event'].set()
                 if task_id and task_id in ACTIVE_TASKS:
                     log('INFO', 'CANCEL', "收到取消请求", task_id=task_id)
                     ACTIVE_TASKS[task_id]["cancel_event"].set()
+                    _cancel_auto_video_children(task_id)
 
                     # 所有类型的任务都立即终态化：旧写法只对非 FX 任务立即切
                     # cancelled，FX 任务（frames/videos/staged/auto）依赖 worker
@@ -3287,26 +6872,33 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                     dimensions = ACTIVE_TASKS[task_id].get("dimensions") or {}
                     id_prefix = str(task_id).split('_', 1)[0]
                     is_fx_capable = (
-                        id_prefix in ('frames', 'videos', 'staged', 'auto')
-                        or dimensions.get('type') in ('frames', 'videos', 'staged', 'auto_run')
+                        id_prefix in ('frames', 'videos', 'staged', 'auto', 'vchain')
+                        or dimensions.get('type') in ('frames', 'videos', 'staged', 'auto_run', 'video_chain')
                     )
+                    if isinstance(dimensions.get('fx_capable'), bool):
+                        is_fx_capable = dimensions['fx_capable']
+                    is_flow_video = (dimensions.get('video_provider') == 'flow2api' and
+                                     (id_prefix in ('videos', 'vchain') or
+                                      dimensions.get('type') in ('videos', 'video_chain')))
                     finalized = False
                     with ACTIVE_TASKS_LOCK:
                         t = ACTIVE_TASKS.get(task_id)
                         if t and t["status"] == "running":
                             t["status"] = "cancelled"
+                            t["failure_code"] = "USER_CANCELLED"
                             t["error"] = "用户取消了生成任务"
                             t["events"] = [evt for evt in t["events"] if evt[0] != 'text_chunk']
                             t["events"].append(('error', {'message': '用户取消了生成任务'}))
                             finalized = True
                     if finalized:
                         notify_listeners(task_id, 'error', {'message': '用户取消了生成任务'})
-                        save_tasks_to_disk()
-                    if is_fx_capable:
+                        save_task_to_disk(task_id)
+                    if is_fx_capable and not is_flow_video:
                         import builtins
                         # 纯 SPARK 内部旗标（video_generator 在腿边界读它）；外部 AdsPower
                         # 脚本自 2026-07 起不再读任何进程级全局标志。
-                        builtins.google_fx_cancelled = True
+                        if not dimensions.get('parent_frame_task_id'):
+                            builtins.google_fx_cancelled = True
 
                         # 取消 = 只发信号，不动浏览器（2026-07-26）。
                         # 原来这里会 stop_ads_browser()，那是"取消了半天停不下来、日志还在
@@ -3334,26 +6926,30 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
             except Exception as e:
                 self._send_json({'status': 'error', 'message': str(e)}, status=500)
 
-        elif path == '/api/tasks/delete':
+        elif path in ('/api/tasks/delete', '/api/tasks/bulk_delete'):
             if not self._gate():
                 return
             try:
                 body = self._read_json_body()
-                task_id = body.get('task_id')
-                if task_id:
-                    title = None
-                    with ACTIVE_TASKS_LOCK:
-                        task = ACTIVE_TASKS.get(task_id)
+                task_ids = body.get('task_ids')
+                if not isinstance(task_ids, list):
+                    single_id = body.get('task_id')
+                    task_ids = [single_id] if single_id else []
+                deleted_ids = []
+                with ACTIVE_TASKS_LOCK:
+                    for tid in task_ids:
+                        if not tid:
+                            continue
+                        task = ACTIVE_TASKS.get(tid)
                         if task:
                             # If it's running, cancel it first
                             task["cancel_event"].set()
-                            task_result = task.get("result") or {}
-                            title = task_result.get("project_key") or task_result.get("title")
-                            del ACTIVE_TASKS[task_id]
-                    if title:
-                        delete_idea_output_files(title)
-                    save_tasks_to_disk()
-                self._send_json({'status': 'ok'})
+                            del ACTIVE_TASKS[tid]
+                        deleted_ids.append(tid)
+                # 显式删任务自己的三份文件，绝不触碰 outputs/ 里的项目成片资产
+                for tid in deleted_ids:
+                    delete_task_files(tid)
+                self._send_json({'status': 'ok', 'count': len(deleted_ids), 'deleted_ids': deleted_ids})
             except Exception as e:
                 self._send_json({'status': 'error', 'message': str(e)}, status=500)
 
@@ -3369,6 +6965,24 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
             except Exception as e:
                 self._send_json({'status': 'error', 'message': str(e)}, status=500)
 
+        elif path == '/api/gallery/download-zip':
+            if not self._gate(with_rate=True, rate_action='gallery_zip'):
+                return
+            import gallery_downloads
+            try:
+                body = self._read_json_body()
+                if not isinstance(body, dict):
+                    self._send_json({'message': '请选择要下载的文件'}, status=400)
+                    return
+                self._send_json(gallery_downloads.prepare_download(body.get('paths')))
+            except gallery_downloads.GalleryDownloadError as exc:
+                self._send_json({'message': str(exc)}, status=exc.status)
+            except (ValueError, TypeError):
+                self._send_json({'message': '下载请求格式不正确'}, status=400)
+            except Exception as exc:
+                log('ERROR', '画廊下载', str(exc))
+                self._send_json({'message': '下载包准备失败，请稍后重试'}, status=500)
+
         elif path == '/api/gallery/delete':
             # 画廊删除：按路径删 outputs/ 内媒体文件（白名单校验在 gallery_delete_files 里），
             # 项目内文件删完后重同步该项目 manifest，保证帧/视频列表与磁盘一致
@@ -3380,14 +6994,76 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 if not isinstance(paths, list) or not paths:
                     self._send_json({'status': 'error', 'message': '缺少要删除的文件列表 paths'}, status=400)
                     return
-                result = gallery_delete_files(paths)
+                remove_empty = body.get('remove_empty_projects', True)
+                if not isinstance(remove_empty, bool):
+                    self._send_json({'status': 'error', 'message': '删除范围参数不正确'}, status=400)
+                    return
+                # Older clients retain their explicit legacy cleanup behavior.
+                result = gallery_delete_files(paths) if remove_empty else gallery_delete_files(paths, remove_empty_projects=False)
                 for pdir in result.pop('affected_project_dirs', []):
                     try:
-                        sync_project_manifest_with_disk(pdir)
+                        if remove_empty:
+                            sync_project_manifest_with_disk(pdir)
+                        else:
+                            sync_project_manifest_with_disk(pdir, migrate_media=False)
                     except Exception as e:
                         if sys.stdout:
                             print(f"[GALLERY] Manifest resync failed for {pdir}: {e}")
                 self._send_json({'status': 'ok', **result})
+            except Exception as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
+
+        elif path == '/api/reveal_file':
+            # 在本机文件管理器里定位某个媒体文件（成片/片段/帧/封面都行）。
+            # 打开的是**跑服务端的这台机器**上的 Finder/资源管理器，所以只对
+            # 本机来源的请求开放：远程访问（局域网/隧道）时点这个按钮不该在
+            # 别人的桌面上弹窗口，直接 403 让前端提示"仅本机可用"。
+            if not self._gate():
+                return
+            try:
+                if not _is_same_machine_client(self):
+                    self._send_json({
+                        'status': 'error',
+                        'message': '只有在运行服务端的这台电脑上打开页面时才能定位本地文件',
+                    }, status=403)
+                    return
+                body = self._read_json_body()
+                target = (body.get('path') or body.get('url') or '') if isinstance(body, dict) else ''
+                if not target:
+                    self._send_json({'status': 'error', 'message': '缺少要定位的文件路径 path'}, status=400)
+                    return
+                try:
+                    abs_p = reveal_media_in_file_manager(target)
+                except ValueError as ve:
+                    self._send_json({'status': 'error', 'message': str(ve)}, status=400)
+                    return
+                self._send_json({'status': 'ok', 'path': abs_p})
+            except Exception as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
+
+        elif path == '/api/notify/flash_taskbar':
+            # 在 Windows 任务栏闪烁/取消闪烁浏览器窗口
+            if not self._gate():
+                return
+            try:
+                body = self._read_json_body() if self._body_bytes else {}
+                title_hint = body.get('title_hint') if isinstance(body, dict) else None
+                stop = bool(body.get('stop', False)) if isinstance(body, dict) else False
+                register = bool(body.get('register', False)) if isinstance(body, dict) else False
+                if register:
+                    # 页面刚拿到焦点：把承载它的浏览器窗口句柄记下来，之后用户切标签页
+                    # 导致窗口标题变了也照样闪得到（标题匹配在那种情况下必然落空）。
+                    win_title = server_common.win_register_flash_target()
+                    self._send_json({'status': 'ok', 'registered': bool(win_title), 'window_title': win_title})
+                    return
+                info = win_flash_taskbar(title_hint=title_hint, stop=stop, detail=True)
+                # 把命中窗口数/是否已在前台/没闪的原因一并回给前端：
+                # 「点了没反应」得能当场说清是哪一步没走通。
+                self._send_json({'status': 'ok', 'flashed': bool(info.get('flashed')),
+                                 'matched': info.get('matched', 0),
+                                 'foreground': bool(info.get('foreground')),
+                                 'supported': bool(info.get('supported', True)),
+                                 'reason': info.get('reason', '')})
             except Exception as e:
                 self._send_json({'status': 'error', 'message': str(e)}, status=500)
 
@@ -3408,24 +7084,216 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
             except Exception as e:
                 self._send_json({'status': 'error', 'message': str(e)}, status=500)
 
+        elif path == '/api/projects/archive':
+            if not self._gate():
+                return
+            try:
+                from project_archive import archive_projects
+                body = self._read_json_body()
+                if not isinstance(body, dict) or not isinstance(body.get('preview', True), bool):
+                    raise ValueError('归档请求数据无效')
+                self._send_json(archive_projects(body.get('project_keys'), preview=body.get('preview', True)))
+            except ValueError as error:
+                self._send_json({'status': 'error', 'message': str(error)}, status=400)
+            except Exception as error:
+                self._send_json({'status': 'error', 'message': f'归档失败：{error}'}, status=500)
+
+        elif path == '/api/projects/delete':
+            # 项目工作台批量/单项彻底删除：一次性清理关联的点子库记录、生成任务记录、子作业及本地 outputs 媒体文件
+            if not self._gate():
+                return
+            try:
+                body = self._read_json_body()
+                projects = body.get('projects')
+                if not isinstance(projects, list):
+                    p_single = body.get('project')
+                    projects = [p_single] if isinstance(p_single, dict) else []
+                keys = body.get('keys') or body.get('project_keys')
+                if not projects and isinstance(keys, list):
+                    current_rows = build_projects_index(with_assets=False)
+                    key_set = set(keys)
+                    projects = [r for r in current_rows if r.get('project_key') in key_set]
+
+                if not projects:
+                    self._send_json({'status': 'error', 'message': '缺少待删除项目'}, status=400)
+                    return
+
+                deleted_tasks = []
+                deleted_library_ids = []
+                deleted_output_dirs = []
+
+                task_ids_to_delete = []
+                library_ids_to_delete = []
+                cleanup_targets = []
+
+                for p in projects:
+                    if not isinstance(p, dict):
+                        continue
+
+                    task_info = p.get('task') or {}
+                    if task_info.get('id'):
+                        task_ids_to_delete.append(task_info['id'])
+                    for sub in (p.get('sub_jobs') or []):
+                        if isinstance(sub, dict) and sub.get('id'):
+                            task_ids_to_delete.append(sub['id'])
+
+                    lib_info = p.get('library') or {}
+                    if lib_info.get('id'):
+                        library_ids_to_delete.append(lib_info['id'])
+                    elif p.get('saved') and p.get('id'):
+                        library_ids_to_delete.append(p.get('id'))
+
+                    title = p.get('project_key') or p.get('title')
+                    covers = []
+                    if p.get('cover'):
+                        covers.append(p.get('cover'))
+                    if p.get('covers'):
+                        covers.extend(p.get('covers'))
+                    if title:
+                        cleanup_targets.append((title, covers))
+
+                for title, covers in cleanup_targets:
+                    try:
+                        res = delete_idea_output_files(title, covers)
+                        if res.get('project_dir'):
+                            deleted_output_dirs.append(res['project_dir'])
+                    except Exception as e:
+                        if sys.stdout:
+                            print(f"[PROJECTS] 清理产物目录失败 {title}: {e}")
+
+                if task_ids_to_delete:
+                    with ACTIVE_TASKS_LOCK:
+                        for tid in task_ids_to_delete:
+                            t = ACTIVE_TASKS.get(tid)
+                            if t:
+                                t.get("cancel_event", threading.Event()).set()
+                                del ACTIVE_TASKS[tid]
+                            deleted_tasks.append(tid)
+                    for tid in task_ids_to_delete:
+                        try:
+                            delete_task_files(tid)
+                        except Exception:
+                            pass
+
+                if library_ids_to_delete:
+                    deleted_library_ids = delete_library_items(library_ids_to_delete)
+
+                self._send_json({
+                    'status': 'ok',
+                    'count': len(projects),
+                    'deleted_tasks_count': len(set(deleted_tasks)),
+                    'deleted_library_count': len(deleted_library_ids),
+                    'deleted_library_ids': deleted_library_ids,
+                })
+            except Exception as e:
+                if sys.stdout:
+                    print(f"Error deleting project(s): {e}")
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
+
         elif path == '/api/tasks/clear':
             if not self._gate():
                 return
             try:
                 body = self._read_json_body()
                 status_group = body.get('status_group')
+                base_dir = os.path.dirname(os.path.abspath(__file__))
+                library_items = read_library() or []
+                to_delete = []
                 with ACTIVE_TASKS_LOCK:
-                    to_delete = []
-                    for tid, t in ACTIVE_TASKS.items():
-                        if status_group == "completed" and t["status"] == "completed":
+                    for tid, t in list(ACTIVE_TASKS.items()):
+                        if status_group == "all":
                             to_delete.append(tid)
-                        elif status_group == "failed_cancelled" and t["status"] in ("failed", "cancelled"):
-                            to_delete.append(tid)
+                        elif status_group == "completed":
+                            if t.get("status") == "completed":
+                                to_delete.append(tid)
+                        elif status_group == "failed_cancelled":
+                            if t.get("status") in ("failed", "cancelled"):
+                                to_delete.append(tid)
+                        elif status_group == "no_cover":
+                            if t.get("status") != "running" and not task_has_cover(t, base_dir=base_dir, library_items=library_items):
+                                to_delete.append(tid)
                     for tid in to_delete:
-                        ACTIVE_TASKS[tid]["cancel_event"].set()
-                        del ACTIVE_TASKS[tid]
-                save_tasks_to_disk()
-                self._send_json({'status': 'ok', 'count': len(to_delete)})
+                        if tid in ACTIVE_TASKS:
+                            ACTIVE_TASKS[tid]["cancel_event"].set()
+                            del ACTIVE_TASKS[tid]
+                # 逐条显式删除任务文件
+                for tid in to_delete:
+                    delete_task_files(tid)
+
+                deleted_library_ids = []
+                # 清空全部：清空项目工作台与点子库，并清理 outputs/ 下的生成资产。
+                if status_group == "all":
+                    for item in library_items:
+                        if isinstance(item, dict):
+                            item_id = item.get('id')
+                            if item_id not in (None, ''):
+                                title = item.get('project_key') or item.get('title')
+                                covers = item.get('covers') or []
+                                if title:
+                                    try:
+                                        delete_idea_output_files(title, covers)
+                                    except Exception as e:
+                                        if sys.stdout:
+                                            print(f"[CLEAR] 清理点子产物失败: {e}")
+                                removed = delete_library_item(item_id)
+                                if removed:
+                                    deleted_library_ids.append(item_id)
+                    # 确保 library 索引完全清空
+                    try:
+                        with LIBRARY_LOCK:
+                            server_common._write_library_index([], None)
+                    except Exception as e:
+                        if sys.stdout:
+                            print(f"[CLEAR] 重置 library 索引异常: {e}")
+
+                    # 彻底清理 outputs/ 目录下的生成项目与媒体，仅保留 .gitkeep。
+                    try:
+                        outputs_dir = os.path.abspath(server_common.OUTPUT_ROOT if os.path.isabs(server_common.OUTPUT_ROOT) else os.path.join(base_dir, server_common.OUTPUT_ROOT))
+                        if os.path.isdir(outputs_dir):
+                            outputs_real = os.path.realpath(outputs_dir)
+                            for entry in os.listdir(outputs_dir):
+                                if entry == '.gitkeep':
+                                    continue
+                                ep = os.path.join(outputs_dir, entry)
+                                target_real = os.path.realpath(ep)
+                                if target_real == outputs_real or os.path.commonpath([outputs_real, target_real]) != outputs_real:
+                                    continue
+                                if os.path.isdir(ep):
+                                    shutil.rmtree(ep, ignore_errors=True)
+                                elif os.path.isfile(ep):
+                                    try:
+                                        os.remove(ep)
+                                    except Exception:
+                                        pass
+                    except Exception as e:
+                        if sys.stdout:
+                            print(f"[CLEAR] outputs 目录扫尾清理失败: {e}")
+                # 清空无封面：同步清空点子库中所有已收藏但无封面的条目。
+                elif status_group == "no_cover":
+                    for item in library_items:
+                        if isinstance(item, dict) and not library_item_has_cover(item, base_dir=base_dir):
+                            item_id = item.get('id')
+                            if item_id not in (None, ''):
+                                title = item.get('project_key') or item.get('title')
+                                covers = item.get('covers') or []
+                                if title:
+                                    try:
+                                        delete_idea_output_files(title, covers)
+                                    except Exception as e:
+                                        if sys.stdout:
+                                            print(f"[CLEAR] 清理无封面点子产物失败: {e}")
+                                removed = delete_library_item(item_id)
+                                if removed:
+                                    deleted_library_ids.append(item_id)
+
+                total_count = len(to_delete) + len(deleted_library_ids)
+                self._send_json({
+                    'status': 'ok',
+                    'count': total_count,
+                    'deleted_task_count': len(to_delete),
+                    'deleted_library_count': len(deleted_library_ids),
+                    'deleted_library_ids': deleted_library_ids,
+                })
             except Exception as e:
                 self._send_json({'status': 'error', 'message': str(e)}, status=500)
 
@@ -3438,7 +7306,13 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                     self._send_json({'error': '请求过于频繁，请稍后再试'}, status=429)
                     return
                 body = self._read_json_body()
+                block_reason = prompt_delivery_block_reason(body)
+                if block_reason:
+                    self._send_json({'status': 'error', 'message': block_reason,
+                                     'failure_code': 'PROMPT_DELIVERY_BLOCKED'}, status=409)
+                    return
                 config = effective_config(body.get('config'))
+                _configure_frame_auto_video(config, body)
                 if not _require_fx_admission(self, config.get('imageBackend') == 'google_fx'):
                     return
                 project_key = body.get('title', '')
@@ -3456,24 +7330,123 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 # 丢失"。已有 worker 在跑时不再起第二个，直接把它的 task_id 转告
                 # 前端重新挂流（与 compose 的 already_running 同款语义）。
                 project_dir = _get_project_dir(project_key)
-                holder = claim_frame_run(project_dir, task_id)
+                holder = claim_frame_run(project_dir, task_id,
+                    until_released=config.get('_auto_generate_videos', False))
                 if holder:
-                    self._send_json({'status': 'ok', 'task_id': holder, 'already_running': True})
+                    holder_type = (ACTIVE_TASKS.get(holder, {}).get('dimensions') or {}).get('type')
+                    if holder_type in ('videos', 'video_chain'):
+                        self._send_json({'status': 'error', 'failure_code': 'PROJECT_BUSY',
+                            'message': '该项目正在生成视频，请等待视频任务结束后再修改图片。',
+                            'task_id': holder}, status=409)
+                    else:
+                        self._send_json({'status': 'ok', 'task_id': holder, 'already_running': True})
                     return
 
                 # Register in ACTIVE_TASKS
                 cleanup_old_tasks()
                 # userId：本次使用的 AdsPower 浏览器编号，供 /api/compose-cancel 取消时
                 # 关闭正确的窗口（仅 google_fx 后端相关，api 后端留 None 无影响）
-                get_or_create_task(task_id, {"type": "frames", "theme": title, "userId": config.get('googleFxUserId') or None})
+                get_or_create_task(task_id, {"type": "frames", "theme": title, "project_key": project_key,
+                                             "target_sequences": target_sequences,
+                                             "auto_generate_videos": config.get("_auto_generate_videos", False),
+                                             "userId": config.get('googleFxUserId') or None})
+
+                # 模式判定见 server_common.resolve_candidate_selection_mode：请求里
+                # 没有 generation_mode_explicit 时，'standard' 只是前端的默认值
+                # （刷新页面/换浏览器后 checkbox 与 localStorage 都是空的），
+                # 压不过项目 manifest 自己记着的 candidate_selection。此前这里
+                # 读了 manifest 却没用，一刷新就把 4选1 的单降级成单图直出。
+                manifest = read_manifest(project_dir) if project_dir else {}
+                is_candidate_selection = resolve_candidate_selection_mode(
+                    body, config, manifest, default=False)
+                target_worker = generate_frames_selection_worker if is_candidate_selection else generate_frames_worker
 
                 threading.Thread(
-                    target=generate_frames_worker,
+                    target=target_worker,
                     args=(task_id, config, title, prompt_block, target_sequences),
                     daemon=True
                 ).start()
 
                 self._send_json({'status': 'ok', 'task_id': task_id})
+            except (ValueError, TypeError) as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=400)
+            except Exception as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
+
+        elif path == '/api/generate_frames_selection':
+            try:
+                if not access_ok(self):
+                    self._send_json({'error': '访问码无效或缺失'}, status=401)
+                    return
+                if not rate_ok(_client_ip(self), 'frames'):
+                    self._send_json({'error': '请求过于频繁，请稍后再试'}, status=429)
+                    return
+                body = self._read_json_body()
+                block_reason = prompt_delivery_block_reason(body)
+                if block_reason:
+                    self._send_json({'status': 'error', 'message': block_reason,
+                                     'failure_code': 'PROMPT_DELIVERY_BLOCKED'}, status=409)
+                    return
+                config = effective_config(body.get('config'))
+                _configure_frame_auto_video(config, body)
+                if not _require_fx_admission(self, config.get('imageBackend') == 'google_fx'):
+                    return
+                project_key = body.get('title', '')
+                title = body.get('display_title') or project_key
+                config['_project_key'] = project_key
+                prompt_block = body.get('prompt_block', '')
+                target_sequences = body.get('target_sequences')
+                candidate_count = int(body.get('candidate_count') or 4)
+
+                import uuid
+                task_id = f"frames_sel_{uuid.uuid4().hex}"
+
+                project_dir = _get_project_dir(project_key)
+                holder = claim_frame_run(project_dir, task_id,
+                    until_released=config.get('_auto_generate_videos', False))
+                if holder:
+                    holder_type = (ACTIVE_TASKS.get(holder, {}).get('dimensions') or {}).get('type')
+                    if holder_type in ('videos', 'video_chain'):
+                        self._send_json({'status': 'error', 'failure_code': 'PROJECT_BUSY',
+                            'message': '该项目正在生成视频，请等待视频任务结束后再修改图片。',
+                            'task_id': holder}, status=409)
+                    else:
+                        self._send_json({'status': 'ok', 'task_id': holder, 'already_running': True})
+                    return
+
+                cleanup_old_tasks()
+                get_or_create_task(task_id, {"type": "frames", "theme": title, "project_key": project_key,
+                                             "target_sequences": target_sequences,
+                                             "auto_generate_videos": config.get("_auto_generate_videos", False),
+                                             "userId": config.get('googleFxUserId') or None})
+
+                threading.Thread(
+                    target=generate_frames_selection_worker,
+                    args=(task_id, config, title, prompt_block, target_sequences, candidate_count),
+                    daemon=True
+                ).start()
+
+                self._send_json({'status': 'ok', 'task_id': task_id})
+            except (ValueError, TypeError) as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=400)
+            except Exception as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
+
+        elif path == '/api/switch_candidate':
+            try:
+                if not access_ok(self):
+                    self._send_json({'error': '访问码无效或缺失'}, status=401)
+                    return
+                body = self._read_json_body()
+                project_key = body.get('title', '')
+                sequence = body.get('sequence')
+                candidate_index = body.get('candidate_index')
+                if not isinstance(sequence, int) or not isinstance(candidate_index, int):
+                    self._send_json({'status': 'error', 'message': 'sequence 和 candidate_index 必须为整数'}, status=400)
+                    return
+                from candidate_selection_pipeline import switch_frame_candidate
+                updated_manifest = switch_frame_candidate(project_key, sequence, candidate_index)
+                self._send_json({'status': 'ok', 'manifest': updated_manifest})
             except Exception as e:
                 self._send_json({'status': 'error', 'message': str(e)}, status=500)
 
@@ -3499,6 +7472,7 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                     return
                 manual_reason = body.get('manual_reason')
                 manual_reason = manual_reason.strip() if isinstance(manual_reason, str) else None
+                cascade_downstream = bool(body.get('cascade_downstream') or body.get('cascade'))
 
                 import uuid
                 task_id = f"fixframe_{uuid.uuid4().hex}"
@@ -3506,21 +7480,127 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 # 与 /api/generate_frames 同款互斥：修复也会整体改写同一份 manifest，
                 # 不能跟另一个渲染/修复 worker 同时跑同一个项目。
                 project_dir = _get_project_dir(project_key)
+
+                # 模式与 /api/generate_frames 同一口径（default=True：修复线的历史
+                # 默认就是走 4选1，除非用户明确关掉）。判定结果写回 config 的三个
+                # 键，pipeline_orchestrator.fix_frame_issue 照读即可，不必再各判一次。
+                _fix_is_candidate = resolve_candidate_selection_mode(
+                    body, config, read_manifest(project_dir) if project_dir else {}, default=True)
+                config['candidateSelection'] = _fix_is_candidate
+                config['candidateSelectionMode'] = _fix_is_candidate
+                config['candidate_selection'] = _fix_is_candidate
+                config['generation_mode'] = 'candidate_selection' if _fix_is_candidate else 'standard'
+
                 holder = claim_frame_run(project_dir, task_id)
                 if holder:
                     self._send_json({'status': 'ok', 'task_id': holder, 'already_running': True})
                     return
 
                 cleanup_old_tasks()
-                get_or_create_task(task_id, {"type": "frames", "theme": title, "userId": config.get('googleFxUserId') or None})
+                get_or_create_task(task_id, {"type": "frames", "theme": title, "project_key": project_key,
+                                             "userId": config.get('googleFxUserId') or None})
 
                 threading.Thread(
                     target=fix_frame_issue_worker,
-                    args=(task_id, config, title, prompt_block, sequence, manual_reason),
+                    args=(task_id, config, title, prompt_block, sequence, manual_reason, cascade_downstream),
                     daemon=True
                 ).start()
 
                 self._send_json({'status': 'ok', 'task_id': task_id})
+            except Exception as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
+
+        elif path == '/api/undo_frame_fix':
+            # 撤销这一帧最近一次定向修复：把修复前存下的帧图、manifest 条目与两段
+            # 提示词正文原样放回（pipeline_orchestrator.undo_frame_fix）。纯文件+manifest
+            # 操作、不跑模型也不渲图，因此同步返回、不建后台任务（同 flag_frame_issue）。
+            try:
+                if not access_ok(self):
+                    self._send_json({'error': '访问码无效或缺失'}, status=401)
+                    return
+                body = self._read_json_body()
+                title = body.get('title', '')
+                sequence = body.get('sequence')
+                if not isinstance(sequence, int):
+                    self._send_json({'status': 'error', 'message': 'sequence 必须是整数'}, status=400)
+                    return
+                prompt_block = body.get('prompt_block', '')
+
+                # 与渲染/修复/审查 worker 同款项目级互斥：它们会拿着自己的 manifest
+                # 快照整体回写，此刻插进去的回滚会被覆盖掉。
+                import uuid
+                project_dir = _get_project_dir(title)
+                claim_id = f"undofix_{uuid.uuid4().hex}"
+                holder = claim_frame_run(project_dir, claim_id)
+                if holder:
+                    self._send_json({'status': 'error',
+                                     'message': '该创意的帧序列正在生成/修复中，请等它结束后再撤销'},
+                                    status=409)
+                    return
+                try:
+                    # 没有 fix_backup 记号就没有"可退回的上一版"。连带重渲（Level 3）
+                    # 之后刻意不盖这枚记号：快照里只有 K 这一帧，下游已经按新的 K 重渲
+                    # 过一轮，单独退回 K 会留下上游旧图 + 下游新血统的半截链——正是
+                    # 三联屏门禁拒绝自动做的那件事，手动入口同样不该敞着门。
+                    entry = None
+                    mf = read_manifest(project_dir) or {}
+                    for f in (mf.get('frames') or []):
+                        if f.get('sequence') == sequence:
+                            entry = f
+                            break
+                    if entry is not None and not isinstance(entry.get('fix_backup'), dict):
+                        self._send_json({'status': 'error',
+                                         'message': f'IMG {sequence:03d} 没有可撤销的修复记录'
+                                                    f'（连带重渲下游的那种修复不提供单帧撤销：'
+                                                    f'只退回这一帧会留下半截链）'}, status=400)
+                        return
+                    from pipeline_orchestrator import undo_frame_fix
+                    result = undo_frame_fix(title, sequence, prompt_block)
+                finally:
+                    release_frame_run(project_dir, claim_id)
+
+                log('INFO', 'FRAMES', f"撤销第 {sequence} 帧的定向修复（回到 {result.get('at')} 的版本）",
+                    title=title)
+                self._send_json({'status': 'ok', **result})
+            except Exception as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
+
+        elif path == '/api/adopt_rejected_fix':
+            # 采用被三联屏门禁退回的那一版：门禁判"这次修复把链改坏了"就会自动回滚，
+            # 但它是概率判定，判错的时候用户在帧网格上看得见。修后那一版留档在
+            # .frame_fixes/<seq>_rejected，这里把它放回去（pipeline_orchestrator
+            # .adopt_rejected_fix）。同 undo_frame_fix：纯文件+manifest 操作、不跑
+            # 模型也不渲图，同步返回、不建后台任务。
+            try:
+                if not access_ok(self):
+                    self._send_json({'error': '访问码无效或缺失'}, status=401)
+                    return
+                body = self._read_json_body()
+                title = body.get('title', '')
+                sequence = body.get('sequence')
+                if not isinstance(sequence, int):
+                    self._send_json({'status': 'error', 'message': 'sequence 必须是整数'}, status=400)
+                    return
+                prompt_block = body.get('prompt_block', '')
+
+                import uuid
+                project_dir = _get_project_dir(title)
+                claim_id = f"adoptfix_{uuid.uuid4().hex}"
+                holder = claim_frame_run(project_dir, claim_id)
+                if holder:
+                    self._send_json({'status': 'error',
+                                     'message': '该创意的帧序列正在生成/修复中，请等它结束后再采用'},
+                                    status=409)
+                    return
+                try:
+                    from pipeline_orchestrator import adopt_rejected_fix
+                    result = adopt_rejected_fix(title, sequence, prompt_block)
+                finally:
+                    release_frame_run(project_dir, claim_id)
+
+                log('INFO', 'FRAMES',
+                    f"采用第 {sequence} 帧被门禁退回的修复版（{result.get('at')}）", title=title)
+                self._send_json({'status': 'ok', **result})
             except Exception as e:
                 self._send_json({'status': 'error', 'message': str(e)}, status=500)
 
@@ -3569,43 +7649,14 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 self._send_json({'status': 'error', 'message': str(e)}, status=500)
 
         elif path == '/api/sequence_review':
-            try:
-                if not access_ok(self):
-                    self._send_json({'error': '访问码无效或缺失'}, status=401)
-                    return
-                if not rate_ok(_client_ip(self), 'frames'):
-                    self._send_json({'error': '请求过于频繁，请稍后再试'}, status=429)
-                    return
-                body = self._read_json_body()
-                config = effective_config(body.get('config'))
-                project_key = body.get('title', '')
-                title = body.get('display_title') or project_key
-                config['_project_key'] = project_key
-                prompt_block = body.get('prompt_block', '')
-
-                import uuid
-                task_id = f"seqreview_{uuid.uuid4().hex}"
-
-                # 与 /api/generate_frames、/api/fix_frame_issue 同款互斥：审查也会
-                # 整体改写同一份 manifest，不能跟另一个渲染/修复 worker 同时跑同一个项目。
-                project_dir = _get_project_dir(project_key)
-                holder = claim_frame_run(project_dir, task_id)
-                if holder:
-                    self._send_json({'status': 'ok', 'task_id': holder, 'already_running': True})
-                    return
-
-                cleanup_old_tasks()
-                get_or_create_task(task_id, {"type": "frames", "theme": title})
-
-                threading.Thread(
-                    target=sequence_review_worker,
-                    args=(task_id, config, title, prompt_block),
-                    daemon=True
-                ).start()
-
-                self._send_json({'status': 'ok', 'task_id': task_id})
-            except Exception as e:
-                self._send_json({'status': 'error', 'message': str(e)}, status=500)
+            if not access_ok(self):
+                self._send_json({'error': '访问码无效或缺失'}, status=401)
+                return
+            self._read_json_body()
+            self._send_json({
+                'status': 'retired', 'retired': True, 'skipped': True,
+                'message': '质量审查规则已永久退役，不再创建审查任务。',
+            }, status=410)
 
         elif path == '/api/render_staged':
             try:
@@ -3616,8 +7667,13 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                     self._send_json({'error': '请求过于频繁，请稍后再试'}, status=429)
                     return
                 body = self._read_json_body()
+                block_reason = prompt_delivery_block_reason(body)
+                if block_reason:
+                    self._send_json({'status': 'error', 'message': block_reason,
+                                     'failure_code': 'PROMPT_DELIVERY_BLOCKED'}, status=409)
+                    return
                 config = effective_config(body.get('config'))
-                if not _require_fx_admission(self):
+                if _pipeline_uses_fx(config) and not _require_fx_admission(self):
                     return
                 project_key = body.get('title', '')
                 title = body.get('display_title') or project_key
@@ -3631,19 +7687,145 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 # project manifest，不能跟另一个渲染 worker（含手动帧序列按钮）
                 # 同时跑同一个项目。
                 project_dir = _get_project_dir(project_key)
-                holder = claim_frame_run(project_dir, task_id)
+                holder = (_claim_flow_project_run(config, task_id, project_key)
+                          if config.get('videoProvider') == 'flow2api'
+                          else claim_frame_run(project_dir, task_id))
                 if holder:
-                    self._send_json({'status': 'ok', 'task_id': holder, 'already_running': True})
+                    if config.get('videoProvider') == 'flow2api':
+                        self._send_json({'status': 'error', 'message': '该项目仍有生成任务未退出',
+                                         'failure_code': 'PROJECT_BUSY', 'task_id': holder}, status=409)
+                    else:
+                        self._send_json({'status': 'ok', 'task_id': holder, 'already_running': True})
                     return
 
-                cleanup_old_tasks()
-                get_or_create_task(task_id, {"type": "staged_render", "theme": title, "userId": config.get('googleFxUserId') or None})
+                try:
+                    cleanup_old_tasks()
+                    get_or_create_task(task_id, {"type": "staged_render", "theme": title,
+                        "project_key": project_key, "video_provider": config.get('videoProvider') or 'google_fx',
+                        "fx_capable": _pipeline_uses_fx(config), "userId": config.get('googleFxUserId') or None})
 
-                threading.Thread(
-                    target=render_staged_worker,
-                    args=(task_id, config, title, prompt_block),
-                    daemon=True
-                ).start()
+                    threading.Thread(
+                        target=render_staged_worker,
+                        args=(task_id, config, title, prompt_block),
+                        daemon=True
+                    ).start()
+                except BaseException:
+                    _release_flow_project_run(config, task_id)
+                    raise
+
+                self._send_json({'status': 'ok', 'task_id': task_id})
+            except Exception as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
+
+        # ── 分步管线 (Stepped Pipeline) ─────────────────────────────────
+
+        elif path == '/api/stepped/start':
+            try:
+                if not access_ok(self):
+                    self._send_json({'error': '访问码无效或缺失'}, status=401)
+                    return
+                if not rate_ok(_client_ip(self), 'compose'):
+                    self._send_json({'error': '请求过于频繁，请稍后再试'}, status=429)
+                    return
+                body = self._read_json_body()
+                config = effective_config(body.get('config'))
+                if _pipeline_uses_fx(config) and not _require_fx_admission(self):
+                    return
+                dimensions = body.get('dimensions') or body
+                dimensions['fx_capable'] = _pipeline_uses_fx(config)
+                project_key = body.get('project_key') or body.get('title', '')
+                dimensions['project_key'] = project_key
+                dimensions['video_provider'] = config.get('videoProvider') or 'google_fx'
+                config['_project_key'] = project_key
+
+                import uuid
+                task_id = f"stepped_{uuid.uuid4().hex}"
+
+                holder = _claim_flow_project_run(config, task_id, project_key)
+                if holder:
+                    self._send_json({'status': 'error', 'message': '该项目仍有生成任务未退出',
+                                     'failure_code': 'PROJECT_BUSY', 'task_id': holder}, status=409)
+                    return
+
+                try:
+                    cleanup_old_tasks()
+                    get_or_create_task(task_id, {"type": "stepped", "theme": project_key,
+                                                 "project_key": project_key,
+                                                 "video_provider": dimensions['video_provider'],
+                                                 "fx_capable": dimensions['fx_capable'],
+                                                 "userId": config.get('googleFxUserId') or None})
+
+                    threading.Thread(
+                        target=stepped_pipeline_start_worker,
+                        args=(task_id, config, dimensions),
+                        daemon=True
+                    ).start()
+                except BaseException:
+                    _release_flow_project_run(config, task_id)
+                    raise
+
+                self._send_json({'status': 'ok', 'task_id': task_id})
+            except Exception as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
+
+        elif path == '/api/stepped/advance':
+            try:
+                if not access_ok(self):
+                    self._send_json({'error': '访问码无效或缺失'}, status=401)
+                    return
+                if not rate_ok(_client_ip(self), 'compose'):
+                    self._send_json({'error': '请求过于频繁，请稍后再试'}, status=429)
+                    return
+                body = self._read_json_body()
+                config = effective_config(body.get('config'))
+                if _pipeline_uses_fx(config) and not _require_fx_admission(self):
+                    return
+                title = body.get('title', '')
+                action = body.get('action', 'approve')
+                task_id = body.get('task_id', '')
+                config['_project_key'] = title
+
+                if not title:
+                    self._send_json({'status': 'error', 'message': 'title 不能为空'}, status=400)
+                    return
+                if action not in ('approve', 'retry', 'skip'):
+                    self._send_json({'status': 'error', 'message': f'不支持的 action: {action}'}, status=400)
+                    return
+
+                # 复用已有 task_id 或创建新的
+                if not task_id:
+                    import uuid
+                    task_id = f"stepped_adv_{uuid.uuid4().hex}"
+
+                if config.get('videoProvider') == 'flow2api':
+                    existing = ACTIVE_TASKS.get(task_id)
+                    if existing and existing.get('status') == 'running':
+                        self._send_json({'status': 'ok', 'task_id': task_id, 'already_running': True})
+                        return
+                holder = _claim_flow_project_run(config, task_id, title)
+                if holder:
+                    self._send_json({'status': 'error', 'message': '该项目仍有生成任务未退出',
+                                     'failure_code': 'PROJECT_BUSY', 'task_id': holder}, status=409)
+                    return
+
+                try:
+                    cleanup_old_tasks()
+                    # prepare_task_for_run 能正确处理 running/终态/不存在 三种情况
+                    t, already_running = prepare_task_for_run(task_id, {"type": "stepped_advance", "theme": title,
+                        "project_key": title, "video_provider": config.get('videoProvider') or 'google_fx',
+                        "fx_capable": _pipeline_uses_fx(config)})
+                    if already_running:
+                        self._send_json({'status': 'ok', 'task_id': task_id, 'already_running': True})
+                        return
+
+                    threading.Thread(
+                        target=stepped_pipeline_advance_worker,
+                        args=(task_id, config, title, action),
+                        daemon=True
+                    ).start()
+                except BaseException:
+                    _release_flow_project_run(config, task_id)
+                    raise
 
                 self._send_json({'status': 'ok', 'task_id': task_id})
             except Exception as e:
@@ -3658,6 +7840,11 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                     self._send_json({'status': 'error', 'message': '请求过于频繁，请稍后再试'}, status=429)
                     return
                 body = self._read_json_body()
+                block_reason = prompt_delivery_block_reason(body)
+                if block_reason:
+                    self._send_json({'status': 'error', 'message': block_reason,
+                                     'failure_code': 'PROMPT_DELIVERY_BLOCKED'}, status=409)
+                    return
                 config = effective_config(body.get('config'))
                 title = body.get('title', '')
                 prompt = body.get('prompt', '')
@@ -3668,21 +7855,21 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                     return
 
                 # Synchronous by design: a conversational agent calls this mid-turn and
-                # needs the verdict back directly, not a task_id to poll. The server is
-                # ThreadingMixIn, so blocking here does not stall other requests.
+                # needs the rendered frame back directly, not a task_id to poll. The server
+                # is ThreadingMixIn, so blocking here does not stall other requests.
+                # 2026-08-05：本端点此前还跑锚帧验收门；渲染期审查已整体移除，现在只渲。
                 from prompt_pipeline import start_accounting, stop_and_get_accounting
-                from pipeline_orchestrator import render_and_gate_single_frame
+                from pipeline_orchestrator import render_single_frame
                 start_accounting()
-                gate = render_and_gate_single_frame(config, title, sequence, prompt, meta=meta)
+                rendered = render_single_frame(config, title, sequence, prompt, meta=meta)
                 usage = stop_and_get_accounting()
 
                 response = {
                     'status': 'ok',
-                    'gate_status': gate['status'],
-                    'reason': gate['reason'],
-                    'prompt': gate['prompt'],
-                    'image_url': '/' + os.path.relpath(gate['image_path'], os.path.dirname(os.path.abspath(__file__))).replace('\\', '/'),
-                    'project_dir': gate['project_dir'],
+                    'gate_status': rendered['status'],
+                    'prompt': rendered['prompt'],
+                    'image_url': '/' + os.path.relpath(rendered['image_path'], os.path.dirname(os.path.abspath(__file__))).replace('\\', '/'),
+                    'project_dir': rendered['project_dir'],
                 }
                 if usage:
                     response['token_usage'] = usage
@@ -3690,38 +7877,49 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
             except Exception as e:
                 self._send_json({'status': 'error', 'message': str(e)}, status=500)
 
-        elif path == '/api/generate_videos':
+        elif path == '/api/video-operation/reconcile':
+            if not self._gate():
+                return
+            try:
+                self._reconcile_video_operation(self._read_json_body())
+            except (ValueError, TypeError) as error:
+                self._send_json({'status': 'error', 'message': str(error)}, status=400)
+            except Exception as error:
+                self._send_json({'status': 'error', 'message': str(error)}, status=500)
+
+        elif path in ('/api/generate_videos', '/api/generate_video_chain'):
+            if not self._gate():
+                return
+            try:
+                self._dispatch_video_operation(self._read_json_body(), path)
+            except VideoOperationConflict as error:
+                self._send_json({'status': 'error', 'message': str(error)}, status=409)
+            except (ValueError, TypeError) as error:
+                self._send_json({'status': 'error', 'message': str(error)}, status=400)
+            except Exception as error:
+                self._send_json({'status': 'error', 'message': str(error)}, status=500)
+
+        elif path == '/api/optimize_video_prompts':
             try:
                 if not access_ok(self):
                     self._send_json({'error': '访问码无效或缺失'}, status=401)
                     return
-                if not rate_ok(_client_ip(self), 'videos'):
-                    self._send_json({'error': '请求过于频繁，请稍后再试'}, status=429)
-                    return
                 body = self._read_json_body()
                 config = effective_config(body.get('config'))
-                if not _require_fx_admission(self):
-                    return
                 project_key = body.get('title', '')
                 title = body.get('display_title') or project_key
-                config['_project_key'] = project_key
                 prompt_block = body.get('prompt_block', '')
                 target_slots = body.get('target_slots')
-                override_flagged = bool(body.get('override_flagged'))
+                force = bool(body.get('force', True))
 
-                import uuid
-                task_id = f"videos_{uuid.uuid4().hex}"
-
-                cleanup_old_tasks()
-                get_or_create_task(task_id, {"type": "videos", "theme": title, "userId": config.get('googleFxUserId') or None})
-
-                threading.Thread(
-                    target=generate_videos_worker,
-                    args=(task_id, config, title, prompt_block, target_slots, override_flagged),
-                    daemon=True
-                ).start()
-
-                self._send_json({'status': 'ok', 'task_id': task_id})
+                optimized_prompt_block = optimize_video_prompts_for_sequence(
+                    config, title, prompt_block, target_slots=target_slots, force=force
+                )
+                self._send_json({
+                    'status': 'ok',
+                    'prompt_block': optimized_prompt_block,
+                    'prompt_slots': prompt_slots_list(optimized_prompt_block),
+                })
             except Exception as e:
                 self._send_json({'status': 'error', 'message': str(e)}, status=500)
 
@@ -3743,8 +7941,18 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 
                 # Run the merge. force/allow_partial=True 时用占位帧填充缺口（强制合并）。
                 force = bool(body.get('force') or body.get('allow_partial'))
+                # 首帧封面：请求不带 cover_burn 时用默认档（一帧）；cover 允许显式指定
+                # 某一张，不传则由 resolve_merge_cover 按 manifest 里登记的用途去挑。
+                cover_burn = body.get('cover_burn', COVER_BURN_DEFAULT)
                 try:
-                    merged_info = merge_project_videos(project_dir, allow_partial=force)
+                    merged_info = merge_project_videos(
+                        project_dir,
+                        allow_partial=force,
+                        speed=body.get('speed', 4),
+                        cover_burn=cover_burn,
+                        cover_path=body.get('cover'),
+                        config=effective_config(body.get('config')),
+                    )
                 except PartialMergeBlocked as blocked:
                     self._send_json({
                         'status': 'blocked',
@@ -3764,6 +7972,65 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                     write_manifest(project_dir, mdata)
 
                 self._send_json({'status': 'ok', 'merged_video': merged_info})
+            except Exception as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
+
+        elif path == '/api/cover_roles':
+            # 一个项目会出好几张封面，三个用途未必用同一张：带文案的那张适合当项目
+            # 封面/成片首帧，却会把文字污染进图生图的第一帧。所以按用途分别登记，
+            # 落进 manifest（服务端自动合并与断线恢复都只认磁盘上的这份）。
+            try:
+                if not access_ok(self):
+                    self._send_json({'error': '访问码无效或缺失'}, status=401)
+                    return
+                body = self._read_json_body()
+                title = body.get('title', '')
+                if not title:
+                    self._send_json({'error': '缺少项目标题 (title)'}, status=400)
+                    return
+                project_dir = _get_project_dir(title)
+                if not os.path.isdir(project_dir):
+                    self._send_json({'error': f'找不到项目目录: {title}'}, status=404)
+                    return
+
+                base_dir = os.path.dirname(os.path.abspath(__file__))
+
+                def _norm_cover(raw):
+                    """校验并归一成 /outputs/... 形式；越界或不存在返回 None。"""
+                    hit = _cover_candidate_path(raw)
+                    if not hit:
+                        return None
+                    outputs_dir = os.path.abspath(server_common.OUTPUT_ROOT if os.path.isabs(server_common.OUTPUT_ROOT) else os.path.join(base_dir, server_common.OUTPUT_ROOT))
+                    try:
+                        rel_to_out = os.path.relpath(hit, outputs_dir)
+                        if not rel_to_out.startswith('..'):
+                            return '/outputs/' + rel_to_out.replace('\\', '/')
+                    except ValueError:
+                        pass
+                    return '/' + os.path.relpath(hit, base_dir).replace('\\', '/')
+
+                roles_in = body.get('roles') if isinstance(body.get('roles'), dict) else {}
+                roles, rejected = {}, []
+                for role in COVER_ROLE_KEYS:
+                    raw = roles_in.get(role)
+                    if raw in (None, '', False):
+                        continue  # 该用途不覆盖，回落主封面
+                    normalized = _norm_cover(raw)
+                    if not normalized:
+                        rejected.append(role)
+                        continue
+                    roles[role] = normalized
+                active = _norm_cover(body.get('active_cover'))
+
+                with manifest_lock(project_dir):
+                    mdata = read_manifest(project_dir) or {}
+                    mdata['cover_roles'] = roles
+                    if active:
+                        mdata['active_cover'] = active
+                    write_manifest(project_dir, mdata)
+
+                self._send_json({'status': 'ok', 'cover_roles': roles,
+                                 'active_cover': active, 'rejected': rejected})
             except Exception as e:
                 self._send_json({'status': 'error', 'message': str(e)}, status=500)
 
@@ -3817,6 +8084,14 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                     self._send_json({'error': 'slot 必须是数字'}, status=400)
                     return
 
+                if _video_recovery_project_holder(title):
+                    self._send_json({'status': 'error', 'failure_code': 'PROJECT_BUSY',
+                                     'message': '该项目正在接回原视频，请等核对结束后上传素材'}, status=409)
+                    return
+                if archived_request({'title': title}):
+                    self._send_json({'status': 'error', 'message': '项目已归档，不能上传新素材',
+                                     'failure_code': 'PROJECT_ARCHIVED'}, status=409)
+                    return
                 project_dir = _get_project_dir(title)
                 if not os.path.exists(project_dir):
                     self._send_json({'error': f'找不到项目目录: {title}'}, status=404)
@@ -3867,7 +8142,8 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                                   "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac",
                                   "-movflags", "+faststart", normalized_path]
                     res = subprocess.run(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                          text=True, encoding='utf-8', errors='replace', timeout=120)
+                                          text=True, encoding='utf-8', errors='replace', timeout=120,
+                                          **get_subprocess_window_flags())
                     if res.returncode != 0 or not os.path.exists(normalized_path):
                         self._send_json({
                             'error': f'视频转码失败，文件可能已损坏或格式不受支持: {(res.stderr or "")[-300:]}'
@@ -3875,14 +8151,6 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                         return
 
                     ok, reason = verify_video_anchors(normalized_path, start_p, end_p, strict=False)
-                    if not ok and not force:
-                        self._send_json({
-                            'status': 'anchor_mismatch',
-                            'error': f'上传视频的首/尾帧与该槽位期望的锚点帧不符（{reason}），疑似传错文件。'
-                                     f'如确认无误，可勾选"强制覆盖"后重新上传。',
-                            'anchor_check': reason,
-                        }, status=409)
-                        return
 
                     for _attempt in range(5):
                         try:
@@ -4099,11 +8367,12 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                     return
                 try:
                     frames_dir = os.path.join(project_dir, 'frames')
+                    from frame_generator import _fx_relocate_frame_reference, _fx_extract_uuid
 
                     def _frame_path(seq):
                         return os.path.join(frames_dir, f'img_{seq:03d}.webp')
 
-                    def _rebase_frame(entry, seq, origin_seq):
+                    def _rebase_frame(entry, seq, origin_seq, fx_sidecars):
                         """把一条帧记录搬到另一格：描述这张图本身的字段（prompt / model /
                         质检结论…）跟着图走，只有槽位号与落盘路径属于新格子。血统在这里
                         断开（它不再派生自新位置的上一帧），parent_hash 清空。"""
@@ -4118,6 +8387,17 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                         moved['reference'] = None
                         moved['swapped_from_sequence'] = origin_seq
                         moved.pop('stale_lineage', None)
+                        # FX 留档已经跟着图改名，记录里的 fx_src/fx_uuid 必须指向新文件；
+                        # 这一格换上来的是没有画布 UUID 的图（手动上传/API 产出）就清干净，
+                        # 免得留个指向别人留档的 UUID。
+                        sidecar = fx_sidecars.get(seq)
+                        if sidecar:
+                            moved['fx_src'] = os.path.relpath(
+                                sidecar, os.path.dirname(os.path.abspath(__file__))).replace('\\', '/')
+                            moved['fx_uuid'] = _fx_extract_uuid(sidecar) or moved.get('fx_uuid')
+                        else:
+                            moved.pop('fx_src', None)
+                            moved.pop('fx_uuid', None)
                         return moved
 
                     with manifest_lock(project_dir):
@@ -4149,13 +8429,19 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                         else:
                             os.replace(src_path, dst_path)
 
+                        # FX 留档（frames/fx_src/img_NNN_<uuid>.jpg）跟着图一起换格：下一帧
+                        # 挂参考只认这个文件名里的画布 UUID，留在原位就等于让后续生成继续
+                        # 拿换位前的老图当参考。
+                        fx_sidecars = _fx_relocate_frame_reference(
+                            frames_dir, from_seq, to_seq, mode)
+
                         others = [f for f in frames_list
                                   if (f.get('sequence') or f.get('slot')) not in (from_seq, to_seq)]
-                        new_entries = [_rebase_frame(src_entry, to_seq, from_seq)]
+                        new_entries = [_rebase_frame(src_entry, to_seq, from_seq, fx_sidecars)]
                         if mode == 'copy':
                             new_entries.append(dict(src_entry))  # 源格原样留下
                         elif dst_has_file and dst_entry is not None:
-                            new_entries.append(_rebase_frame(dst_entry, from_seq, to_seq))
+                            new_entries.append(_rebase_frame(dst_entry, from_seq, to_seq, fx_sidecars))
                         # else：搬运，源格的记录随图一起离开
 
                         frames_list = others + new_entries
@@ -4170,6 +8456,9 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
 
                         # 图变了，按内容哈希记账的一致性审查结论自动作废
                         dropped = drop_stale_review_verdicts(mdata, project_dir)
+                        # 换位/搬运的两格：图整个换了人家，按帧号存的修复快照对不上了
+                        from pipeline_orchestrator import drop_fix_snapshots
+                        drop_fix_snapshots(project_dir, mdata, sorted(touched))
                         if 'merged_video' in mdata:
                             del mdata['merged_video']
                         write_manifest(project_dir, mdata)
@@ -4247,6 +8536,14 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                     self._send_json({'error': 'sequence 必须从 1 开始'}, status=400)
                     return
 
+                if _video_recovery_project_holder(title):
+                    self._send_json({'status': 'error', 'failure_code': 'PROJECT_BUSY',
+                                     'message': '该项目正在接回原视频，请等核对结束后上传素材'}, status=409)
+                    return
+                if archived_request({'title': title}):
+                    self._send_json({'status': 'error', 'message': '项目已归档，不能上传新素材',
+                                     'failure_code': 'PROJECT_ARCHIVED'}, status=409)
+                    return
                 project_dir = _get_project_dir(title)
                 if not os.path.exists(project_dir):
                     self._send_json({'error': f'找不到项目目录: {title}'}, status=404)
@@ -4284,6 +8581,12 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                         self._send_json({'error': f'图片解析失败，可能不是合法的图片文件: {e}'}, status=400)
                         return
 
+                    # The uploaded WebP has no Flow canvas UUID. Remove the old slot's UUID
+                    # sidecar and any converted-reference cache; otherwise generation of the
+                    # next frame mounts the pre-upload image instead of this new file.
+                    from frame_generator import _fx_clear_frame_reference
+                    cleared_fx_refs = _fx_clear_frame_reference(frames_dir, sequence)
+
                     rel_path = os.path.relpath(
                         dest_path, os.path.dirname(os.path.abspath(__file__))).replace('\\', '/')
 
@@ -4313,14 +8616,43 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                         target['source'] = 'manual_upload'
                         target['aspect_ratio'] = aspect_ratio
                         # 机器判定全部作废：这张图不是模型渲的，谁也没看过它
-                        target['quality_gate'] = 'pending_manual_review'
+                        target['quality_gate'] = 'retired'
                         target['vlm_qa_reason'] = None
                         for key in ('manual_issue', 'manual_flag_prev_gate', 'review_issues',
                                     'review_frames_sha256', 'stale_lineage'):
                             target.pop(key, None)
+                        # 这一格的画面已经被人工上传的图整个换掉：上一次修复前的那版
+                        # 快照不再是"这张图的上一版"，退回去等于把用户刚传的图静默抹掉
+                        from pipeline_orchestrator import drop_fix_snapshots
+                        drop_fix_snapshots(project_dir, None, [sequence])
+                        target.pop('fix_backup', None)
                         # i2i 血统在这一帧断开：它不派生自任何上一帧
                         target['parent_hash'] = ''
                         target['reference'] = None
+                        # Manual uploads are local files, not the old Google FX canvas asset.
+                        # Drop every field that could advertise or reuse the replaced asset.
+                        for key in ('fx_uuid', 'fx_src', 'backend', 'transport', 'actual_pixels',
+                                    'degraded_reason', 'anchor_reference'):
+                            target.pop(key, None)
+
+                        # 将手动上传的图片安全归档进候选池并同步至 manifest
+                        try:
+                            from candidate_selection_pipeline import sync_frame_candidates_pool
+                            up_cands, up_chosen_idx, _ = sync_frame_candidates_pool(
+                                frames_dir, sequence,
+                                current_frame={
+                                    'chosen_candidate_index': None,
+                                    'candidates': target.get('candidates', []),
+                                    'model': 'manual_upload',
+                                    'model_display': '手动上传',
+                                },
+                                target_path=dest_path,
+                                auto_archive_current=True
+                            )
+                            target['candidates'] = up_cands
+                            target['chosen_candidate_index'] = up_chosen_idx
+                        except Exception as cand_sync_err:
+                            log('WARN', 'FRAMES', f"手动上传归档候选池异常: {cand_sync_err}", title=title)
 
                         frames_list.sort(key=lambda f: f.get('sequence', 0))
                         # 其后的帧仍派生自被换掉的那张旧图——标 stale_lineage，
@@ -4341,6 +8673,7 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                                              if s >= 1 and s in existing_video_slots)
                     log('INFO', 'FRAMES',
                         f'手动上传第 {sequence} 帧图片，覆盖 {rel_path}'
+                        + (f'；已清理 {len(cleared_fx_refs)} 个旧 FX 参考留档' if cleared_fx_refs else '')
                         + (f'；受影响的视频槽位 {affected_videos}' if affected_videos else ''),
                         title=title)
                     self._send_json({'status': 'ok', 'frame': dict(target),
@@ -4351,9 +8684,152 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
             except Exception as e:
                 self._send_json({'status': 'error', 'message': str(e)}, status=500)
 
+        elif path == '/api/edit_prompts':
+            # 手动改写整份提示词集（提示词页的「✏️ 手动编辑」/「➕ 添加一拍」）。
+            # 合成出来的提示词不一定条条都对用户的口味，此前唯一的改法是重新激发整单
+            # 或走 fix_frame_issue 让模型改写；这里给出直接、可预期的人工入口。
+            #
+            # 服务端在这条路径上只做三件事，缺一不可：
+            #   1) 校验槽位契约——图片槽位号必须从 1 连续到 N（帧网格、配对门禁、合成
+            #      成片全按"槽位号即契约"推算，缺一格就会让下游每一处都得学会跳过它）；
+            #      视频槽位号必须落在 1..N 内。
+            #   2) 拦住"用手动编辑删拍"——删拍要同时动磁盘文件与 manifest 编号，那是
+            #      /api/delete_slot 的活（它还会写恢复快照）。这里只允许改写与追加。
+            #   3) 把提示词改过、但画面还是按旧提示词渲出来的帧/视频标脏（prompt_dirty），
+            #      否则界面上看不出这一格的图与它下面那段文字已经对不上了。
+            # 提示词块本身仍由前端落进创意库（与 delete_slot / fix_frame_issue 同一套
+            # applyPromptBlockToIdea 回写路径），服务端不重排、不重写用户的原文——
+            # 手动编辑要的就是"我写成什么样，存下来就是什么样"。
+            try:
+                if not access_ok(self):
+                    self._send_json({'error': '访问码无效或缺失'}, status=401)
+                    return
+                body = self._read_json_body()
+                title = body.get('title', '')
+                new_block = body.get('prompt_block') or ''
+                prev_block = body.get('prev_prompt_block') or ''
+
+                images, videos = _parse_prompt_slots(new_block)
+                if not images:
+                    self._send_json({'error': '提示词块里解析不到任何「图片 N:」槽位，拒绝保存'},
+                                    status=400)
+                    return
+                image_count = max(images)
+                missing = [n for n in range(1, image_count + 1) if n not in images]
+                if missing:
+                    self._send_json({'error': '图片槽位号必须从 1 连续编到 N，当前缺少：'
+                                              + '、'.join(f'图片 {n}' for n in missing)},
+                                    status=400)
+                    return
+                stray = sorted(n for n in videos if n < 1 or n > image_count)
+                if stray:
+                    self._send_json({'error': f'视频槽位号必须落在 1–{image_count} 内，越界的有：'
+                                              + '、'.join(f'视频 {n}' for n in stray)},
+                                    status=400)
+                    return
+
+                prev_images, prev_videos = _parse_prompt_slots(prev_block) if prev_block else ({}, {})
+                prev_count = max(prev_images) if prev_images else 0
+                if prev_count and image_count < prev_count:
+                    self._send_json({
+                        'status': 'rejected',
+                        'error': (f'手动编辑不能减少拍数（编辑前 {prev_count} 拍，'
+                                  f'现在 {image_count} 拍）。删拍要连磁盘文件和 manifest 编号'
+                                  '一起处理，请用帧卡片上的「删除」。'),
+                    }, status=409)
+                    return
+
+                def _slot_text(slots, n):
+                    item = slots.get(n) or {}
+                    return (item.get('body', ''), item.get('meta', ''))
+
+                # 提示词真的改过的槽位（正文或 [META] 任一变化）。新追加的拍不算"改过"：
+                # 它压根还没有对应的画面，标脏没有意义。
+                changed_images = sorted(n for n in prev_images
+                                        if n in images and _slot_text(images, n) != _slot_text(prev_images, n))
+                changed_videos = sorted(n for n in prev_videos
+                                        if n in videos and _slot_text(videos, n) != _slot_text(prev_videos, n))
+                added_beats = list(range(prev_count + 1, image_count + 1)) if prev_count else []
+
+                project_dir = _get_project_dir(title)
+                frames_out, videos_out = [], []
+                dirty_frames, dirty_videos = [], []
+                if os.path.isdir(project_dir) and read_manifest(project_dir):
+                    import uuid
+                    claim_id = f"editprompts_{uuid.uuid4().hex}"
+                    holder = claim_frame_run(project_dir, claim_id)
+                    if holder:
+                        self._send_json({'status': 'error',
+                                         'message': '该创意的帧序列正在生成/修复中，请等它结束后再改提示词'},
+                                        status=409)
+                        return
+                    try:
+                        with manifest_lock(project_dir):
+                            mdata = read_manifest(project_dir) or {}
+                            frame_slots = [f.get('sequence') or f.get('slot')
+                                           for f in (mdata.get('frames') or [])]
+                            frame_slots = [s for s in frame_slots if isinstance(s, int)]
+                            disk_max = max(frame_slots) if frame_slots else 0
+                            if disk_max > image_count:
+                                self._send_json({
+                                    'status': 'rejected',
+                                    'error': (f'磁盘上已经有 {disk_max} 张图片，提示词只剩 '
+                                              f'{image_count} 拍。手动编辑不负责删文件，'
+                                              '请先用帧卡片上的「删除」删掉多出来的拍。'),
+                                    'refresh_required': True,
+                                }, status=409)
+                                return
+
+                            stamp = datetime.now().isoformat(timespec='seconds')
+                            for f in (mdata.get('frames') or []):
+                                seq = f.get('sequence') or f.get('slot')
+                                if isinstance(seq, int) and seq in changed_images:
+                                    f['prompt_dirty'] = True
+                                    f['prompt_dirty_at'] = stamp
+                                    dirty_frames.append(seq)
+                            for v in (mdata.get('videos') or []):
+                                slot = v.get('slot')
+                                if isinstance(slot, int) and slot in changed_videos:
+                                    v['prompt_dirty'] = True
+                                    v['prompt_dirty_at'] = stamp
+                                    dirty_videos.append(slot)
+                            if dirty_frames or dirty_videos:
+                                # 成片是按旧提示词渲的那批素材拼的，提示词一改它就不再
+                                # 代表这一单——与 delete_slot 同款处理，去掉合并结果。
+                                mdata.pop('merged_video', None)
+                                write_manifest(project_dir, mdata)
+                            frames_out = mdata.get('frames') or []
+                            videos_out = mdata.get('videos') or []
+                    finally:
+                        release_frame_run(project_dir, claim_id)
+
+                log('INFO', 'FRAMES',
+                    f'手动编辑提示词集：共 {image_count} 拍'
+                    + (f'，新增 {len(added_beats)} 拍' if added_beats else '')
+                    + (f'，改写图片 {changed_images}' if changed_images else '')
+                    + (f'，改写视频 {changed_videos}' if changed_videos else '')
+                    + (f'；已标脏帧 {sorted(dirty_frames)}' if dirty_frames else ''),
+                    title=title)
+                self._send_json({'status': 'ok',
+                                 'prompt_block': new_block,
+                                 # 结构化槽位契约以后端解析为唯一权威（见 prompt_slots_list）
+                                 'prompt_slots': prompt_slots_list(new_block),
+                                 'frames': frames_out,
+                                 'videos': videos_out,
+                                 'image_count': image_count,
+                                 'added_beats': added_beats,
+                                 'changed_images': changed_images,
+                                 'changed_videos': changed_videos,
+                                 'dirty_frames': sorted(dirty_frames),
+                                 'dirty_videos': sorted(dirty_videos)})
+            except Exception as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
+
         elif path == '/api/delete_slot':
             # 删除一整拍（帧/视频卡片上的「删除」按钮）：图片 N 与视频 N 的提示词、落盘
-            # 文件、manifest 记录一起消失，其后所有图片/视频整体前移一位。
+            # 文件、manifest 记录一起从当前任务移除，其后所有图片/视频整体前移一位。
+            # 真正动文件前必须先写 .deleted_slots 恢复快照；这是与编号压缩同一个
+            # 临界区内的强制步骤，快照失败则整次删除失败，不允许降级成不可恢复删除。
             #
             # 为什么必须重新编号而不是留空洞：槽位号不是标签而是契约——视频 N 恒等于
             # IMG N → IMG N+1、视频数恒等于图片数-1，帧网格、配对门禁、合成成片全按这个
@@ -4397,6 +8873,27 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                     self._send_json({'error': f'找不到项目目录: {title}'}, status=404)
                     return
 
+                # 浏览器可能仍握着刷新前的旧 prompt_block。若它比磁盘 manifest 少一格，
+                # 继续按旧编号删除会把另一拍误当成目标，并再次压缩整个序列。删除属于
+                # 不可凭客户端旧状态猜测的操作：两边槽位数不一致时要求刷新后重试。
+                manifest_guard = read_manifest(project_dir) or {}
+                manifest_frame_slots = {
+                    item.get('sequence') or item.get('slot')
+                    for item in (manifest_guard.get('frames') or [])
+                    if isinstance(item.get('sequence') or item.get('slot'), int)
+                }
+                manifest_image_count = len(manifest_frame_slots)
+                if manifest_image_count and manifest_image_count != image_count:
+                    self._send_json({
+                        'status': 'rejected',
+                        'error': (f'页面槽位状态已过期（页面 {image_count} 张，磁盘 '
+                                  f'{manifest_image_count} 张）。已阻止删除，请刷新页面后再试。'),
+                        'refresh_required': True,
+                        'client_image_count': image_count,
+                        'manifest_image_count': manifest_image_count,
+                    }, status=409)
+                    return
+
                 import uuid
                 claim_id = f"delslot_{uuid.uuid4().hex}"
                 holder = claim_frame_run(project_dir, claim_id)
@@ -4433,6 +8930,62 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                         'video_prompt': (videos.get(sequence) or {}).get('body', ''),
                     }
 
+                    frames_dir = os.path.join(project_dir, 'frames')
+                    videos_dir = os.path.join(project_dir, 'videos')
+                    fx_src_dir = os.path.join(frames_dir, 'fx_src')
+
+                    # 槽位换号表先算出来：快照要据此判断"哪些文件这次会被真的删掉"，
+                    # 所以必须排在归档之前。
+                    frame_targets = {k: _image_target(k) for k in range(1, image_count + 1)}
+                    video_slots = set(range(1, image_count + 1)) | set(videos)
+                    video_targets = {k: _video_target(k) for k in sorted(video_slots)}
+
+                    # --- 可恢复快照：必须在任何 os.remove/os.replace 之前完成 ---
+                    # 除了被删那一格，还保留整份删除前 manifest 和 prompt_block，
+                    # 因为后续整体前移会改掉所有槽位号，单留一个媒体文件不足以可靠回滚。
+                    archive_stamp = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
+                    archive_dir = os.path.join(
+                        project_dir, '.deleted_slots',
+                        f'{archive_stamp}_slot_{sequence:03d}',
+                    )
+                    os.makedirs(archive_dir, exist_ok=False)
+                    manifest_before = os.path.join(project_dir, 'manifest.json')
+                    if os.path.isfile(manifest_before):
+                        shutil.copy2(manifest_before, os.path.join(archive_dir, 'manifest.before.json'))
+                    with open(os.path.join(archive_dir, 'prompt_block.before.txt'),
+                              'w', encoding='utf-8') as f:
+                        f.write(prompt_block)
+                    with open(os.path.join(archive_dir, 'removed.json'),
+                              'w', encoding='utf-8') as f:
+                        json.dump({'title': title, 'sequence': sequence, **removed},
+                                  f, ensure_ascii=False, indent=2)
+
+                    # 归档"这次会被物理删除"的全部文件，而不只是第 sequence 拍：
+                    # 删最后一拍时，跨过删除点的那一段视频（老槽位 image_count-1）
+                    # 前移后会超出"视频数=图片数-1"而被一并删除——它此前不在快照里，
+                    # 于是那种情况下的删除是不可逆的。
+                    archived_frame_slots = []
+                    archived_video_slots = []
+                    for old, target in sorted(frame_targets.items()):
+                        if target is not None:
+                            continue
+                        src = os.path.join(frames_dir, f'img_{old:03d}.webp')
+                        if os.path.isfile(src):
+                            shutil.copy2(src, os.path.join(archive_dir, os.path.basename(src)))
+                            archived_frame_slots.append(old)
+                        if os.path.isdir(fx_src_dir):
+                            for name in os.listdir(fx_src_dir):
+                                if name.startswith(f'img_{old:03d}_'):
+                                    shutil.copy2(os.path.join(fx_src_dir, name),
+                                                 os.path.join(archive_dir, name))
+                    for old, target in sorted(video_targets.items()):
+                        if target is not None:
+                            continue
+                        src = os.path.join(videos_dir, f'vid_{old:03d}.mp4')
+                        if os.path.isfile(src):
+                            shutil.copy2(src, os.path.join(archive_dir, os.path.basename(src)))
+                            archived_video_slots.append(old)
+
                     # --- 提示词块：重新编号后回写 ---
                     images_new = {}
                     for k, item in images.items():
@@ -4447,9 +9000,6 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                     new_prompt_block = _format_prompt_block(images_new, videos_new)
 
                     # --- 磁盘文件：删除目标、其余整体前移 ---
-                    frames_dir = os.path.join(project_dir, 'frames')
-                    videos_dir = os.path.join(project_dir, 'videos')
-
                     def _apply_moves(dir_path, name_of, targets):
                         """targets: {老槽位号: 新槽位号|None}。新号恒 <= 老号，因此按老号
                         升序处理时目标文件名必然已经腾空，不需要中转文件。"""
@@ -4463,16 +9013,11 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                             elif new != old:
                                 os.replace(src, os.path.join(dir_path, name_of(new)))
 
-                    frame_targets = {k: _image_target(k) for k in range(1, image_count + 1)}
-                    video_slots = set(range(1, image_count + 1)) | set(videos)
-                    video_targets = {k: _video_target(k) for k in sorted(video_slots)}
-
                     _apply_moves(frames_dir, lambda n: f'img_{n:03d}.webp', frame_targets)
                     _apply_moves(videos_dir, lambda n: f'vid_{n:03d}.mp4', video_targets)
 
                     # FX 路径给每帧留档的原始 jpg（frames/fx_src/img_NNN_<uuid>.jpg）跟着
                     # 一起改名：留在原位会让重试时按前缀找参考命中另一帧的旧图。
-                    fx_src_dir = os.path.join(frames_dir, 'fx_src')
                     if os.path.isdir(fx_src_dir):
                         for fname in sorted(os.listdir(fx_src_dir)):
                             m = re.match(r'^img_(\d+)_(.*)$', fname)
@@ -4536,12 +9081,32 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                             v['sequence'] = idx + 1
                         mdata['videos'] = videos_new_entries
 
-                        # 帧图整体换过位置：按帧号记账的审查结论与链回望结果全部失效
+                        # 帧图整体换过位置：按帧号记账的审查结论全部失效
                         dropped = drop_stale_review_verdicts(mdata, project_dir)
-                        mdata.pop('chain_drift', None)
+                        # 修复快照同样按帧号记账（.frame_fixes/005/）：编号整体前移之后，
+                        # fix_backup 记号跟着条目挪到 004，而 .frame_fixes/004 里躺的是
+                        # 另一帧的旧图——点「撤销修复」就会退回一张张冠李戴的画面。
+                        from pipeline_orchestrator import drop_fix_snapshots
+                        drop_fix_snapshots(project_dir, mdata)
                         if 'merged_video' in mdata:
                             del mdata['merged_video']
                         write_manifest(project_dir, mdata)
+
+                    # 删除后的状态指纹：撤销时据此判断这单在删除之后有没有被继续
+                    # 改动过（又生成/重试/上传/再删了别的拍）。指纹对不上仍可恢复，
+                    # 但要用户明确确认会丢弃删除之后的新内容，见 /api/restore_slot。
+                    with open(os.path.join(archive_dir, 'state.json'), 'w', encoding='utf-8') as f:
+                        json.dump({
+                            'title': title,
+                            'sequence': sequence,
+                            'created_at': datetime.now().isoformat(timespec='seconds'),
+                            'image_count_before': image_count,
+                            'image_count_after': new_image_count,
+                            'hero_slot_before': hero_idx,
+                            'archived_frame_slots': archived_frame_slots,
+                            'archived_video_slots': archived_video_slots,
+                            'manifest_after_fingerprint': manifest_fingerprint(mdata),
+                        }, f, ensure_ascii=False, indent=2)
 
                     affected = [sequence - 1] if any(
                         v.get('slot') == sequence - 1 for v in videos_new_entries) else []
@@ -4560,11 +9125,417 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                                      'image_count': new_image_count,
                                      'affected_video_slots': affected,
                                      'dropped_review_frames': dropped,
-                                     'removed': removed})
+                                     'removed': removed,
+                                     'recovery_snapshot': archive_dir})
                 finally:
                     release_frame_run(project_dir, claim_id)
             except Exception as e:
                 self._send_json({'status': 'error', 'message': str(e)}, status=500)
+
+        elif path == '/api/restore_slot':
+            # 撤销一次「删除整拍」。删除时已在 .deleted_slots/<id>/ 落下完整快照
+            # （删除前的 manifest 与 prompt_block ＋ 所有被物理删除的媒体文件），
+            # 这里做它的逆操作：当前编号整体后移一位、归档文件放回原位、
+            # manifest 与 prompt_block 还原成删除前那一份。
+            #
+            # 为什么是「整单回滚」而不是「把那一格插回去」：删除会给其后每一格
+            # 重新编号，逐格插回等于重新推导每一格的来历；快照里存着整份删除前
+            # manifest，直接还原它才是可靠语义——当初把整份 manifest 存进快照就是
+            # 为了这一步（此前只有写快照的那一半，读回那一半从来没有实现，代价是
+            # 一次误删要靠手写脚本捞回来，见 tools/recover_ice_cave_slot3.py）。
+            try:
+                if not access_ok(self):
+                    self._send_json({'error': '访问码无效或缺失'}, status=401)
+                    return
+                body = self._read_json_body()
+                title = body.get('title', '')
+                snapshot_id = str(body.get('snapshot_id') or '')
+                force = bool(body.get('force'))
+                current_prompt_block = body.get('prompt_block') or ''
+
+                # snapshot_id 直接来自请求体、又要拼进路径：只允许快照目录的固定形状，
+                # 挡掉 ../ 之类的穿越
+                if not re.fullmatch(r'\d{8}_\d{6}_\d+_slot_\d{3}', snapshot_id):
+                    self._send_json({'error': 'snapshot_id 格式不合法'}, status=400)
+                    return
+
+                project_dir = _get_project_dir(title)
+                archive_dir = os.path.join(project_dir, '.deleted_slots', snapshot_id)
+                if not os.path.isdir(archive_dir):
+                    self._send_json({'error': f'找不到恢复快照: {snapshot_id}'}, status=404)
+                    return
+
+                prompt_before_path = os.path.join(archive_dir, 'prompt_block.before.txt')
+                manifest_before_path = os.path.join(archive_dir, 'manifest.before.json')
+                if not os.path.isfile(prompt_before_path):
+                    self._send_json({'error': '快照缺少 prompt_block.before.txt，无法恢复'},
+                                    status=422)
+                    return
+
+                import uuid
+                claim_id = f"restoreslot_{uuid.uuid4().hex}"
+                holder = claim_frame_run(project_dir, claim_id)
+                if holder:
+                    self._send_json({'status': 'error',
+                                     'message': '该创意的帧序列正在生成/修复中，请等它结束后再恢复'},
+                                    status=409)
+                    return
+                try:
+                    with open(prompt_before_path, 'r', encoding='utf-8') as f:
+                        old_prompt_block = f.read()
+                    images_old, videos_old = _parse_prompt_slots(old_prompt_block)
+                    if not images_old:
+                        self._send_json({'error': '快照里的提示词块解析不出图片槽位'}, status=422)
+                        return
+                    image_count_old = max(images_old)
+
+                    state = {}
+                    state_path = os.path.join(archive_dir, 'state.json')
+                    if os.path.isfile(state_path):
+                        with open(state_path, 'r', encoding='utf-8') as f:
+                            state = json.load(f) or {}
+                    if state.get('restored_at'):
+                        self._send_json({'error': '这份快照已经恢复过了'}, status=409)
+                        return
+
+                    removed_meta = {}
+                    removed_path = os.path.join(archive_dir, 'removed.json')
+                    if os.path.isfile(removed_path):
+                        with open(removed_path, 'r', encoding='utf-8') as f:
+                            removed_meta = json.load(f) or {}
+                    sequence = int(state.get('sequence') or removed_meta.get('sequence') or 0)
+                    if sequence < 1:
+                        self._send_json({'error': '快照里没有记录被删除的拍号'}, status=422)
+                        return
+
+                    # 删除之后这单有没有被继续改动过（又生成/重试/上传/再删了别的拍）。
+                    # 对不上仍可恢复，但必须由用户明确确认——恢复会把 manifest 整份
+                    # 还原成删除前那一份，删除之后新产生的记录会随之丢失。
+                    current_manifest = read_manifest(project_dir) or {}
+                    expected_fp = state.get('manifest_after_fingerprint')
+                    actual_fp = manifest_fingerprint(current_manifest)
+                    diverged = bool(expected_fp) and expected_fp != actual_fp
+                    if diverged and not force:
+                        self._send_json({
+                            'status': 'diverged',
+                            'error': ('删除之后这单又被改动过（重新生成/重试/上传等）。'
+                                      '继续恢复会把清单整份还原成删除前那一版，'
+                                      '删除之后新产生的记录会丢失。'),
+                            'snapshot_id': snapshot_id,
+                        }, status=409)
+                        return
+
+                    # 与 /api/delete_slot 同一套换号规则，反过来用
+                    new_image_count = image_count_old - 1
+                    hero_idx = state.get('hero_slot_before')
+                    if hero_idx is None:
+                        hero_idx = next((i for i, item in videos_old.items()
+                                         if 'HERO' in str((item or {}).get('meta', '')).upper()),
+                                        None)
+
+                    def _image_target_old(k):
+                        if k == sequence:
+                            return None
+                        return k - 1 if k > sequence else k
+
+                    def _video_target_old(k):
+                        if hero_idx is not None and k == hero_idx:
+                            return new_image_count if new_image_count >= 1 else None
+                        if k == sequence:
+                            return None
+                        t = k - 1 if k > sequence else k
+                        return t if t <= new_image_count - 1 else None
+
+                    frames_dir = os.path.join(project_dir, 'frames')
+                    videos_dir = os.path.join(project_dir, 'videos')
+                    fx_src_dir = os.path.join(frames_dir, 'fx_src')
+
+                    # 反向换号表：{当前槽位: 应还原到的老槽位}。老号恒 >= 当前号，
+                    # 所以按老号降序处理时目标文件名必然已经腾空，不需要中转文件。
+                    frame_back = {}
+                    for k in range(1, image_count_old + 1):
+                        t = _image_target_old(k)
+                        if t is not None:
+                            frame_back[t] = k
+                    video_back = {}
+                    for k in sorted(set(range(1, image_count_old + 1)) | set(videos_old)):
+                        t = _video_target_old(k)
+                        if t is not None:
+                            video_back[t] = k
+
+                    def _plan_moves(dir_path, name_of, back_map):
+                        """先整体校验再执行：目标位置已被占用就整次拒绝，绝不半途改到
+                        一半、留下一个既不是删除前也不是删除后的状态。
+
+                        占用判断要按"执行到这一步时"的名字集合来算，而不是当前磁盘的
+                        静态快照——按老号降序处理时，前一步已经把 img_003 搬去 img_004，
+                        img_003 这个名字对下一步来说是空的。"""
+                        occupied = set(os.listdir(dir_path)) if os.path.isdir(dir_path) else set()
+                        moves = []
+                        for cur, old in sorted(back_map.items(), key=lambda kv: -kv[1]):
+                            if cur == old:
+                                continue
+                            src_name, dst_name = name_of(cur), name_of(old)
+                            if src_name not in occupied:
+                                continue
+                            if dst_name in occupied:
+                                raise RuntimeError(f'恢复目标位置已被占用: {dst_name}')
+                            occupied.discard(src_name)
+                            occupied.add(dst_name)
+                            moves.append((os.path.join(dir_path, src_name),
+                                          os.path.join(dir_path, dst_name)))
+                        return moves
+
+                    frame_moves = _plan_moves(
+                        frames_dir, lambda n: f'img_{n:03d}.webp', frame_back)
+                    video_moves = _plan_moves(
+                        videos_dir, lambda n: f'vid_{n:03d}.mp4', video_back)
+
+                    fx_moves = []
+                    if os.path.isdir(fx_src_dir):
+                        for cur, old in sorted(frame_back.items(), key=lambda kv: -kv[1]):
+                            if cur == old:
+                                continue
+                            for fname in os.listdir(fx_src_dir):
+                                m = re.match(r'^img_(\d+)_(.*)$', fname)
+                                if not m or int(m.group(1)) != cur:
+                                    continue
+                                fx_moves.append((
+                                    os.path.join(fx_src_dir, fname),
+                                    os.path.join(fx_src_dir, f'img_{old:03d}_{m.group(2)}')))
+
+                    # 恢复前先给「当前状态」也留一份快照：恢复本身不删除任何媒体
+                    # 文件（只重命名 + 把归档文件放回空出来的位置），会被覆盖的只有
+                    # manifest 与提示词块，所以存这两样就够回到恢复前。
+                    restore_stamp = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
+                    restore_point = os.path.join(
+                        project_dir, '.deleted_slots',
+                        f'{restore_stamp}_restorepoint_of_{snapshot_id}')
+                    os.makedirs(restore_point, exist_ok=True)
+                    cur_manifest_path = os.path.join(project_dir, 'manifest.json')
+                    if os.path.isfile(cur_manifest_path):
+                        shutil.copy2(cur_manifest_path,
+                                     os.path.join(restore_point, 'manifest.before.json'))
+                    if current_prompt_block:
+                        with open(os.path.join(restore_point, 'prompt_block.before.txt'),
+                                  'w', encoding='utf-8') as f:
+                            f.write(current_prompt_block)
+
+                    for src, dst in frame_moves + video_moves + fx_moves:
+                        os.replace(src, dst)
+
+                    # 归档的媒体文件放回原位（文件名本身带的就是老槽位号）
+                    restored_files = []
+                    for fname in sorted(os.listdir(archive_dir)):
+                        if re.fullmatch(r'img_\d{3}\.webp', fname):
+                            dst_dir = frames_dir
+                        elif re.fullmatch(r'vid_\d{3}\.mp4', fname):
+                            dst_dir = videos_dir
+                        elif re.match(r'^img_\d{3}_.+', fname):
+                            dst_dir = fx_src_dir
+                        else:
+                            continue
+                        os.makedirs(dst_dir, exist_ok=True)
+                        shutil.copy2(os.path.join(archive_dir, fname),
+                                     os.path.join(dst_dir, fname))
+                        restored_files.append(fname)
+
+                    # manifest 还原成删除前那一份
+                    with manifest_lock(project_dir):
+                        if os.path.isfile(manifest_before_path):
+                            with open(manifest_before_path, 'r', encoding='utf-8') as f:
+                                mdata = json.load(f)
+                        else:
+                            mdata = current_manifest
+                        # 槽位号又换了一轮（这次是反过来后移）：修复快照按帧号存，
+                        # 留着就会把别的帧的旧图退回到这一格（同 /api/delete_slot）
+                        from pipeline_orchestrator import drop_fix_snapshots
+                        drop_fix_snapshots(project_dir, mdata)
+                        write_manifest(project_dir, mdata)
+
+                    # 标记这份快照已消费，避免同一份被恢复两次（第二次的换号前提
+                    # 已经不成立，会把好好的一单推乱）
+                    state.update({
+                        'restored_at': datetime.now().isoformat(timespec='seconds'),
+                        'restored_forced': bool(diverged and force),
+                        'restore_point': restore_point,
+                    })
+                    with open(state_path, 'w', encoding='utf-8') as f:
+                        json.dump(state, f, ensure_ascii=False, indent=2)
+
+                    log('INFO', 'FRAMES',
+                        f'恢复第 {sequence} 拍（快照 {snapshot_id}），'
+                        f'其后整体后移一位；现有图片 {image_count_old} 张'
+                        + ('；已确认覆盖删除之后的改动' if diverged else ''),
+                        title=title)
+                    self._send_json({
+                        'status': 'ok',
+                        'sequence': sequence,
+                        'prompt_block': old_prompt_block,
+                        'prompt_slots': prompt_slots_list(old_prompt_block),
+                        'frames': mdata.get('frames') or [],
+                        'videos': mdata.get('videos') or [],
+                        'image_count': image_count_old,
+                        'restored_files': restored_files,
+                        'forced': bool(diverged and force),
+                        'restore_point': restore_point,
+                    })
+                finally:
+                    release_frame_run(project_dir, claim_id)
+            except Exception as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
+
+        elif path == '/api/project_meta':
+            # 一键补齐一单的中英双版主题与话题标签（结果页标题行的 ✨ 按钮）。
+            #
+            # 正常激发的单子在收尾就带上了 social_title_en/cn（见 background_worker），
+            # 但手动上传的提示词集从来没跑过那条路径：theme 就是个文件名、两行发布标题
+            # 全空，工作台上那一行看着像条没主题的裸项目。这里把同一件事做成按需的、
+            # 可重复调用的一次 aux 调用，并且**以提示词集正文为依据**——只凭文件名推，
+            # 推出来的全是套话。
+            #
+            # 同步返回（单次 aux 调用，秒级），不建后台任务：它没有中间进度可报，
+            # 失败也只是"这次没生成"，不值得占一条任务记录。落库仍由前端走
+            # /api/library/item —— 与封面/删拍同一套回写路径，服务端不碰创意库。
+            try:
+                if not access_ok(self):
+                    self._send_json({'error': '访问码无效或缺失'}, status=401)
+                    return
+                if not rate_ok(_client_ip(self), 'project_meta'):
+                    self._send_json({'error': '请求过于频繁，请稍后再试'}, status=429)
+                    return
+                body = self._read_json_body()
+                config = effective_config(body.get('config'))
+                title = body.get('title', '') or ''
+                theme = body.get('theme', '') or ''
+                prompt_block = body.get('prompt_block', '') or ''
+                creativity = body.get('creativity', '') or ''
+                if not (prompt_block.strip() or title.strip()):
+                    self._send_json({'error': '既没有提示词集也没有标题，无从推断主题与话题'},
+                                    status=400)
+                    return
+
+                from prompt_pipeline import generate_project_meta
+                meta = generate_project_meta(config, title, theme, prompt_block, creativity)
+                # generate_project_meta 吞掉所有异常返回空串；四个都空说明这次调用
+                # 实际失败了，如实报错，别让前端把一串空值当成"生成成功"写回创意库。
+                if not any(meta.values()):
+                    self._send_json({'error': '模型没能返回可用的主题与话题，请稍后重试'},
+                                    status=502)
+                    return
+                self._send_json({'status': 'ok', **meta})
+            except Exception as e:
+                self._send_json({'error': str(e)}, status=500)
+
+        elif path == '/api/project/rename':
+            # 项目改名：本地目录与目录里的文件跟着一起改。
+            #
+            # 只改创意条目里的标题，这一单当场散架——磁盘命名空间取的是
+            # project_key || title（前端 getIdeaSaveTitle / 后端 _get_project_dir），
+            # 改完名再去找帧/视频/封面，找到的是一个空目录：已生成的资产在界面上
+            # "凭空消失"，重新生成还会在新目录里另起一套。所以改名必须由服务端
+            # 一次做完：目录搬迁 + 目录内带名字的文件改名 + json 里写死的路径改写
+            # （见 server_common.rename_project_media），再把任务记录里的旧键换掉。
+            #
+            # 创意条目本身仍由前端落库（/api/library/item，与封面/删拍同一套回写
+            # 路径）：服务端在这条路上不碰创意库，只回一份改名清单让前端改 URL。
+            try:
+                if not access_ok(self):
+                    self._send_json({'error': '访问码无效或缺失'}, status=401)
+                    return
+                body = self._read_json_body()
+                old_key = (body.get('project_key') or '').strip()
+                new_title = (body.get('new_title') or '').strip()
+                if not new_title:
+                    self._send_json({'error': '新项目名不能为空'}, status=400)
+                    return
+                if not old_key:
+                    self._send_json({'error': '缺少 project_key，无从定位要改名的项目'},
+                                    status=400)
+                    return
+
+                # 有作业在跑时不能搬目录：帧/视频 worker 手里攥着旧目录路径，目录被
+                # 搬走之后它写出来的东西会落回一个刚被重建的空旧目录，两边都残缺。
+                #
+                # 但"不能搬目录"不等于"不能改名"。改名被整个挡掉才是用户实际撞到的
+                # 那个 bug：一边看着视频在跑、一边点 ✨ 是最常见的用法，结果主题换了、
+                # 项目名一直不动。这里改成降级成功——目录留在原地，把**旧键**回给前端
+                # 钉进条目当 project_key（磁盘命名空间从此不再跟着标题走，见
+                # getIdeaSaveTitle），标题就能随便改而资产一张都不丢。
+                with ACTIVE_TASKS_LOCK:
+                    busy = [t.get('id') for t in ACTIVE_TASKS.values()
+                            if t.get('status') == 'running'
+                            and old_key in ((t.get('dimensions') or {}).get('project_key'),
+                                            (t.get('result') or {}).get('project_key'))]
+                if busy:
+                    stay = os.path.basename(os.path.normpath(_get_project_dir(old_key)))
+                    log('INFO', 'RENAME',
+                        f'项目改名（目录暂不搬迁，{busy[0]} 还在跑）：{old_key} 保持为命名空间')
+                    self._send_json({'status': 'ok', 'project_key': old_key, 'tasks_updated': [],
+                                     'moved': False, 'reason': 'busy', 'busy': busy,
+                                     'old_dir_name': stay, 'new_dir_name': stay,
+                                     'dir': os.path.join(OUTPUT_ROOT, stay),
+                                     'file_map': {}, 'rewrite_failures': []})
+                    return
+
+                new_key = rekey_project_title(old_key, new_title)
+                try:
+                    moved = rename_project_media(old_key, new_key, new_title)
+                except ValueError as e:
+                    self._send_json({'error': str(e)}, status=409)
+                    return
+
+                # 任务记录：旧键要换（不换的话工作台会把这一单的媒体作业按旧键拆成
+                # 另一行「孤立作业」），记录里写死的旧路径也要跟着换——结果页的
+                # 「跟进 / 查看已完成任务」整页是照着 task.result 渲染的
+                # （app.js loadCompletedTask），只换键不换路径，打开就是满屏 404，
+                # 而且那份带死链的对象会被存成 currentIdea 再写回点子库，把改名时
+                # 刚修好的 URL 覆盖回去。
+                path_pairs = []
+                if moved['moved']:
+                    path_pairs = [(f"outputs/{moved['old_dir_name']}/",
+                                   f"outputs/{moved['new_dir_name']}/"),
+                                  (f"outputs\\{moved['old_dir_name']}\\",
+                                   f"outputs\\{moved['new_dir_name']}\\")]
+                    path_pairs += list((moved.get('file_map') or {}).items())
+                touched = []
+                with ACTIVE_TASKS_LOCK:
+                    for tid, t in ACTIVE_TASKS.items():
+                        hit = False
+                        for holder in (t.get('dimensions'), t.get('result')):
+                            if isinstance(holder, dict) and holder.get('project_key') == old_key:
+                                holder['project_key'] = new_key
+                                hit = True
+                        # result.title 是那次跑的日志，保持原样——工作台显示的标题
+                        # 现在以点子库条目为准（见 server_common.build_projects_index）
+                        if hit:
+                            if path_pairs:
+                                for holder in (t.get('dimensions'), t.get('result')):
+                                    rewrite_media_paths(holder, path_pairs)
+                            touched.append(tid)
+                for tid in touched:
+                    try:
+                        save_task_to_disk(tid)
+                    except Exception as e:
+                        log('WARN', 'RENAME', f'任务 {tid} 的新 project_key 未能落盘：{e}')
+
+                # 创意台账：不改的话，合流索引按 project_key 找不到这一行的台账，
+                # 改完名这条创意的选题/评分/投放状态就从项目行上消失了。
+                try:
+                    ledger_updated = rekey_ledger_project_key(old_key, new_key)
+                except Exception as e:
+                    ledger_updated = 0
+                    log('WARN', 'RENAME', f'台账里的 project_key 未能改写：{e}')
+
+                log('INFO', 'RENAME',
+                    f"项目改名：{old_key} → {new_key}"
+                    + (f"（目录 {moved['old_dir_name']} → {moved['new_dir_name']}）"
+                       if moved['moved'] else f"（{moved['reason'] or '无需搬迁'}）")
+                    + f"，任务 {len(touched)} 条、台账 {ledger_updated} 条跟着改")
+                self._send_json({'status': 'ok', 'project_key': new_key, 'tasks_updated': touched,
+                                 'ledger_updated': ledger_updated, **moved})
+            except Exception as e:
+                self._send_json({'error': str(e)}, status=500)
 
         elif path == '/api/generate_cover':
             try:
@@ -4580,16 +9551,31 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 theme = body.get('theme', '')
                 prompt_block = body.get('prompt_block', '')
                 parent_task_id = body.get('id') or body.get('task_id')
+                # 与 /api/generate_frames 同款分工：project_key 定磁盘命名空间，
+                # title 只进提示词与日志。老客户端不发 project_key 时回落到标题
+                # （_get_project_dir 认得标题派生的那三套历史目录名）。
+                project_key = body.get('project_key') or title
+                concurrent = bool(body.get('concurrent') or body.get('candidate_selection'))
+                count = body.get('count') or body.get('candidate_count') or config.get('candidateConcurrency') or 4
+                try:
+                    count = int(count)
+                except (TypeError, ValueError):
+                    count = 4
+                count = max(1, min(8, count))
 
                 import uuid
                 task_id = f"cover_{uuid.uuid4().hex}"
 
                 cleanup_old_tasks()
-                get_or_create_task(task_id, {"type": "cover", "theme": theme})
+                get_or_create_task(task_id, {"type": "cover", "theme": theme,
+                                             "project_key": project_key or None,
+                                             "concurrent": concurrent,
+                                             "count": count})
 
                 threading.Thread(
                     target=generate_cover_worker,
-                    args=(task_id, config, parent_task_id, title, theme, prompt_block),
+                    args=(task_id, config, parent_task_id, title, theme, prompt_block,
+                          project_key, concurrent, count),
                     daemon=True
                 ).start()
 
@@ -4615,15 +9601,21 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 response_format = body.get('response_format') or 'b64_json'
 
                 final_model = _image_generation_model_for_request(model, size, quality)
-                api_size = gpt_image_pixel_size(size) if final_model == 'gpt-image-2' else size
+                gpt_image = is_gpt_image_model(final_model)
+                api_size = gpt_image_pixel_size(
+                    size, quality, final_model
+                ) if gpt_image else size
 
                 payload = {
                     'model': final_model,
                     'prompt': prompt,
                     'size': api_size,
-                    'quality': quality,
-                    'response_format': response_format
+                    'quality': gpt_image_render_quality(
+                        final_model, body.get('quality') or body.get('image_size')
+                    ) if gpt_image else quality,
                 }
+                if not gpt_image:
+                    payload['response_format'] = response_format
 
                 import uuid
                 task_id = f"img_task_{uuid.uuid4().hex}"
@@ -4698,6 +9690,23 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 if not files:
                     self._send_json({'error': 'At least one image file is required'}, status=400)
                     return
+
+                if is_gpt_image_model(model):
+                    # GPT uses pixel size and rendering quality; Studio's resolution
+                    # and ratio fields are converted before forwarding to the API.
+                    fields['model'] = model
+                    fields['size'] = gpt_image_pixel_size(
+                        fields.get('size') or fields.get('aspect_ratio') or 'auto',
+                        fields.get('image_size') or fields.get('quality'), model,
+                    )
+                    fields['quality'] = gpt_image_render_quality(
+                        model, fields.get('quality') or fields.get('image_size')
+                    )
+                    style = fields.pop('style', '')
+                    if style and style.lower() not in ('none', 'auto', 'default'):
+                        fields['prompt'] = f"{fields.get('prompt', '')}\nDesired visual style: {style}."
+                    for legacy_field in ('image_size', 'aspect_ratio', 'response_format'):
+                        fields.pop(legacy_field, None)
 
                 # Standard OpenAI edits proxy logic (works for Gemini and GPT alike)
                 import uuid
@@ -4780,11 +9789,12 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                     return
                 body = self._read_json_body()
                 model_name = body.get('model') or ''
-                if model_name.startswith('gemini-3.5-flash') and not model_name.endswith('-low'):
-                    body['model'] = 'gemini-3.5-flash-low'
+                body['model'] = resolve_chat_model(model_name)
                 config = effective_config(body.get('config'))
                 if 'config' in body:
                     del body['config']
+                # Claude 不接受自定义采样参数、max_tokens 有上限：与 _chat 同一套整形。
+                shape_chat_payload(body['model'], body)
                 
                 base_url, api_key = resolve_gateway(body.get('model'), config)
                 if sys.stdout:
@@ -4861,28 +9871,59 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                     print(f"[ARK PROXY] POST tasks error: {e}")
                 self._send_json({'error': str(e)}, status=500)
 
+        elif path in ('/api/restart', '/api/service/restart'):
+            try:
+                if not access_ok(self):
+                    self._send_json({'error': '访问码无效或缺失'}, status=401)
+                    return
+                body = self._read_json_body() if int(self.headers.get('Content-Length') or 0) else {}
+                with ACTIVE_TASKS_LOCK:
+                    running = sorted(tid for tid, t in ACTIVE_TASKS.items()
+                                     if isinstance(t, dict) and (t.get('status') == 'running'
+                                                                 or t.get('_cookie_login') is True))
+                running += _beat_pack_busy()
+                # 重启会直接杀掉进程里正在跑的任务：已发出的付费视频提交变成没人接的孤儿，
+                # 界面再点一次又会重新提交。有任务在跑时拒绝，交给自动重载在空闲时完成。
+                if running and not (isinstance(body, dict) and body.get('force') is True):
+                    self._send_json({'status': 'error', 'failure_code': 'TASKS_RUNNING',
+                                     'running_tasks': running,
+                                     'message': f'还有 {len(running)} 个任务在运行，重启会中断它们。'
+                                                '等任务结束后服务会自动重载新代码；确需立即重启请先取消这些任务。'},
+                                    status=409)
+                    return
+                self._send_json({'status': 'ok', 'message': '正在重启服务...'})
+                threading.Thread(target=restart_server_process, daemon=True).start()
+            except Exception as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
+
         else:
             self._send_json({'error': 'Not found'}, status=404)
 
 
-def sync_project_manifest_with_disk(project_dir):
+def sync_project_manifest_with_disk(project_dir, migrate_media=True):
     """按项目目录持锁调用真正的实现。这里整个扫描+改写是一轮跨越目录 I/O 的
     read-modify-write（读旧 manifest → 扫盘对比 → 整体重写 frames/videos 列表），
     与帧渲染 worker 逐帧 write_manifest() 用的是同一把 manifest_lock——否则谁
     用陈旧快照后写谁就会把对方刚落盘的帧整体覆盖掉（帧图片"无故被覆盖或丢失"
-    的成因之一：本函数此前直接 open() 读文件，完全绕过了这把锁）。"""
+    的成因之一：本函数此前直接 open() 读文件，完全绕过了这把锁）。
+    migrate_media=False 仅更新记录，不转换或复制未选中的媒体文件。
+    """
     with manifest_lock(project_dir):
-        return _sync_project_manifest_with_disk_locked(project_dir)
+        return _sync_project_manifest_with_disk_locked(project_dir, migrate_media=migrate_media)
 
 
-def _sync_project_manifest_with_disk_locked(project_dir):
+def _sync_project_manifest_with_disk_locked(project_dir, migrate_media=True):
     """
     Scans the frames/ and videos/ directories in project_dir.
-    1. Converts any *.png in frames/ to *.webp, and deletes the *.png.
+    1. Unless migrate_media=False, converts PNG frames to WebP and deletes the PNG.
     2. Ensures every img_*.webp file in frames/ has a corresponding entry in manifest['frames'].
     3. Ensures every video_*.mp4 file in videos/ (or similar) has a corresponding entry in manifest['videos'].
     4. Removes any entries in manifest['frames'] or manifest['videos'] whose files do not exist on disk.
     """
+    from project_archive import receipt
+    archived = receipt(project_dir)
+    if archived and archived.get('status') in ('prepared', 'archived'):
+        return
     manifest_path = os.path.join(project_dir, 'manifest.json')
     from datetime import datetime
     if not os.path.exists(manifest_path):
@@ -4902,12 +9943,31 @@ def _sync_project_manifest_with_disk_locked(project_dir):
             
     if not isinstance(manifest, dict):
         return
-        
-    if 'frames' not in manifest:
-        manifest['frames'] = []
-    if 'videos' not in manifest:
-        manifest['videos'] = []
-        
+
+    if not isinstance(manifest.get('frames'), list):
+        if isinstance(manifest.get('frames'), dict):
+            manifest['frames'] = [
+                v for k, v in sorted(manifest['frames'].items(), key=lambda x: int(x[0]) if x[0].isdigit() else 0)
+                if isinstance(v, dict)
+            ]
+        else:
+            manifest['frames'] = []
+    else:
+        manifest['frames'] = [f for f in manifest['frames'] if isinstance(f, dict)]
+
+    if not isinstance(manifest.get('videos'), list):
+        if isinstance(manifest.get('videos'), dict):
+            converted_videos = []
+            for k, v in sorted(manifest['videos'].items(), key=lambda x: int(x[0]) if x[0].isdigit() else 0):
+                if isinstance(v, dict):
+                    v.setdefault('slot', int(k) if k.isdigit() else k)
+                    converted_videos.append(v)
+            manifest['videos'] = converted_videos
+        else:
+            manifest['videos'] = []
+    else:
+        manifest['videos'] = [v for v in manifest['videos'] if isinstance(v, dict)]
+
     frames_dir = os.path.join(project_dir, 'frames')
     modified = False
     
@@ -4915,7 +9975,7 @@ def _sync_project_manifest_with_disk_locked(project_dir):
     import io
     
     # 1. Scan frames_dir and convert PNG to WebP
-    if os.path.exists(frames_dir):
+    if migrate_media and os.path.exists(frames_dir):
         for fname in os.listdir(frames_dir):
             if fname.lower().endswith('.png') and fname.lower().startswith('img_'):
                 png_path = os.path.join(frames_dir, fname)
@@ -4930,15 +9990,28 @@ def _sync_project_manifest_with_disk_locked(project_dir):
                 except Exception as e:
                     print(f"[SYNC] Failed to convert orphaned {png_path} to WebP: {e}")
                     
-    # 2. Build map of existing webp files on disk
-    existing_webp_frames = {}
+    # 2. Without migration, retain PNG frames and their existing selection too.
+    preferred_frames = {}
+    if not migrate_media:
+        for frame in manifest['frames']:
+            try:
+                seq = int(frame.get('sequence') or frame.get('slot'))
+                preferred_frames[seq] = os.path.basename(frame.get('file') or '')
+            except (ValueError, TypeError):
+                continue
+    existing_frames = {}
     if os.path.exists(frames_dir):
         for fname in os.listdir(frames_dir):
-            if fname.lower().endswith('.webp') and fname.lower().startswith('img_'):
+            supported = fname.lower().endswith('.webp') or (not migrate_media and fname.lower().endswith('.png'))
+            if supported and fname.lower().startswith('img_') and os.path.isfile(os.path.join(frames_dir, fname)):
                 try:
                     seq_str = fname.split('_')[1].split('.')[0]
                     seq = int(seq_str)
-                    existing_webp_frames[seq] = fname
+                    current = existing_frames.get(seq)
+                    preferred = preferred_frames.get(seq)
+                    if (current is None or fname == preferred
+                            or (current != preferred and fname.lower().endswith('.webp'))):
+                        existing_frames[seq] = fname
                 except Exception:
                     pass
                     
@@ -4969,7 +10042,7 @@ def _sync_project_manifest_with_disk_locked(project_dir):
             if not file_path:
                 modified = True
                 continue
-            if file_path and file_path.lower().endswith('.png'):
+            if migrate_media and file_path and file_path.lower().endswith('.png'):
                 file_path = os.path.splitext(file_path)[0] + '.webp'
                 frame['file'] = file_path
                 frame['url'] = '/' + file_path.lstrip('/')
@@ -4982,7 +10055,7 @@ def _sync_project_manifest_with_disk_locked(project_dir):
             else:
                 modified = True
                 
-    for seq, fname in existing_webp_frames.items():
+    for seq, fname in existing_frames.items():
         if seq not in seen_sequences:
             rel_file_path = os.path.relpath(os.path.join(frames_dir, fname), os.path.dirname(os.path.abspath(__file__))).replace('\\', '/')
             new_frame = {
@@ -4996,7 +10069,7 @@ def _sync_project_manifest_with_disk_locked(project_dir):
                 "aspect_ratio": manifest.get('aspect_ratio') or "9:16",
                 "image_size": manifest.get('image_size') or "2K",
                 "retry_count": 0,
-                "quality_gate": "pending_manual_review"
+                "quality_gate": "retired"
             }
             new_frames.append(new_frame)
             modified = True
@@ -5012,7 +10085,7 @@ def _sync_project_manifest_with_disk_locked(project_dir):
                 pass
 
     rebuilt_frames = []
-    for seq, fname in sorted(existing_webp_frames.items()):
+    for seq, fname in sorted(existing_frames.items()):
         frame_path = os.path.join(frames_dir, fname)
         frame = manifest_frames_by_seq.get(seq, {}).copy()
         frame['slot'] = frame.get('slot') or seq
@@ -5025,7 +10098,26 @@ def _sync_project_manifest_with_disk_locked(project_dir):
         frame.setdefault("aspect_ratio", manifest.get('aspect_ratio') or "9:16")
         frame.setdefault("image_size", manifest.get('image_size') or "2K")
         frame.setdefault("retry_count", 0)
-        frame.setdefault("quality_gate", "pending_manual_review")
+        frame.setdefault("quality_gate", "retired")
+
+        # 候选池同步与补齐（含 gpt-image-2 及所有历史生成帧，全量扫描盘与元数据）
+        if migrate_media:
+            try:
+                from candidate_selection_pipeline import sync_frame_candidates_pool
+                loaded_cands, chosen_c_idx, _ = sync_frame_candidates_pool(
+                    frames_dir, seq,
+                    current_frame=frame,
+                    target_path=frame_path,
+                    auto_archive_current=False
+                )
+                if loaded_cands:
+                    if frame.get('candidates') != loaded_cands or frame.get('chosen_candidate_index') != chosen_c_idx:
+                        frame['candidates'] = loaded_cands
+                        frame['chosen_candidate_index'] = chosen_c_idx
+                        modified = True
+            except Exception as cand_sync_e:
+                pass
+
         rebuilt_frames.append(frame)
     if rebuilt_frames:
         new_frames = rebuilt_frames
@@ -5084,6 +10176,17 @@ def _sync_project_manifest_with_disk_locked(project_dir):
             if slot:
                 seen_slots.add(slot)
         else:
+            # 无文件不等于无任务：失败、排队中或已提交待确认的记录是重试/
+            # 回收画布结果的凭据。启动迁移和 GET /api/get_manifest 都会走到这里，
+            # 不能因尚未下载 MP4 就清掉 last_attempt，导致下一轮重复提交扣点。
+            # 已成功但被用户删掉文件的旧条目仍按原有逻辑移除。
+            attempt = video.get('last_attempt') or {}
+            if (video.get('status') in ('failed', 'pending', 'running', 'queued', 'cancelled')
+                    or (isinstance(attempt, dict) and attempt.get('submission_pending'))):
+                new_videos.append(video)
+                if slot:
+                    seen_slots.add(slot)
+                continue
             vpath = video.get('file')
             if not vpath:
                 continue
@@ -5172,6 +10275,11 @@ def run():
         pass
     run_migrations()
     load_tasks_from_disk()
+    # 孤儿任务文件的清理只在这里跑一次，且只在 load_tasks_from_disk 真的成功之后
+    # （prune_orphan_task_files 自己也会复核 TASKS_LOADED_FROM_DISK）。它以前挂在
+    # save_tasks_to_disk 里、每次落盘都扫一遍全目录，那正是两次任务历史被清空的
+    # 事故路径。
+    prune_orphan_task_files()
     bootstrap_fx_runtime()
     # sys.stdout is None under pythonw (no console); guard prints so the server
     # also runs cleanly headless, while still logging when launched with python.exe.
@@ -5182,16 +10290,27 @@ def run():
         # 启动时显式列出缺失文件，便于第一时间发现。清单是 server_common 里
         # SKILL_CONTRACT_FILES（合成真正会读的全部 8 个文件），此前这里只查了
         # 其中 2 个，另外 6 个缺失时全程无声。
-        _skill = skill_contract_report()
-        print(f"Skill contract source: {_skill['dir']} (来源: {_skill['source']})")
-        if _skill['missing']:
-            print(f"[WARN] 技能契约文件缺失 {len(_skill['missing'])}/{_skill['total']} 个，"
-                  f"提示词合成将降级运行（形态矩阵/提示词模板/一致性协议按空契约处理）：")
-            for rel in _skill['missing']:
-                print(f"[WARN]   缺失: {os.path.join(_skill['dir'], rel)}")
-            print('[WARN] 修复：在 server_config.json 里加一行 "skillDir": "技能包目录的本地路径"'
-                  "（支持 ~ 与相对路径，改完不用重启，下一次激发/合成即生效），"
-                  "或设环境变量 SKILL_DIR（优先级更高），或直接把契约文件补进上面这个目录。")
+        _active_profile = active_skill_profile()
+        for _skill in skill_contract_reports():
+            _mark = '←当前' if _skill['profile'] == _active_profile else '      '
+            print(f"Skill contract [{_skill['profile']}]{_mark} {_skill['label']}: "
+                  f"{_skill['dir']} (来源: {_skill['source']}, "
+                  f"契约 {_skill['total'] - len(_skill['missing'])}/{_skill['total']})")
+            if _skill['missing']:
+                print(f"[WARN] [{_skill['profile']}] 技能契约文件缺失 "
+                      f"{len(_skill['missing'])}/{_skill['total']} 个，该 profile 下的"
+                      f"激发/合成将降级运行（形态矩阵/提示词模板/一致性协议按空契约处理）：")
+                for rel in _skill['missing']:
+                    print(f"[WARN]   缺失: {os.path.join(_skill['dir'], rel)}")
+                print(f'[WARN] 修复：在 server_config.json 里写 "skillProfiles": '
+                      f'{{"{_skill["profile"]}": "技能包目录的本地路径"}}'
+                      "（支持 ~ 与相对路径，改完不用重启，下一次激发/合成即生效），"
+                      f"或设环境变量 {SKILL_PROFILES[_skill['profile']]['env']}（优先级更高），"
+                      "或直接把契约文件补进上面这个目录。")
+        print(f"Skill profile: {_active_profile}"
+              f"（videoModel={SERVER_CONFIG.get('videoModel') or '未设置'}，"
+              f"skillProfile={SERVER_CONFIG.get('skillProfile') or 'auto'}）")
+    global HTTPD_INSTANCE
     server_address = ('', PORT)
     try:
         httpd = DualStackHTTPServer(server_address, SparkRequestHandler)
@@ -5200,9 +10319,11 @@ def run():
         if sys.stdout:
             print(f"IPv6 双栈监听失败（{e}），回退到 IPv4 监听...")
         httpd = IPv4HTTPServer(server_address, SparkRequestHandler)
+    HTTPD_INSTANCE = httpd
+    _start_auto_reload_watcher()
     try:
         httpd.serve_forever()
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, OSError):
         pass
     if sys.stdout:
         print("Stopping server...")

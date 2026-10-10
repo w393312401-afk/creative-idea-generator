@@ -5,7 +5,8 @@
 - 插帧中间产物目录（项目根下 frames/videos 以外的子目录）不进画廊；
 - 删除接口的安全边界：越界路径、非媒体文件、目录一律拒绝；
 - 项目内媒体删空后整个项目目录被清理，否则上报 affected_project_dirs
-  让调用方重同步 manifest。
+  让调用方重同步 manifest；
+- 项目目录能反查回点子库条目（画廊「激发项目」入口的数据来源）。
 """
 import os
 import time
@@ -15,7 +16,9 @@ import pytest
 from server_common import (
     scan_gallery,
     gallery_delete_files,
+    resolve_gallery_media_path,
     gallery_collect_references,
+    make_idea_project_key,
     _safe_project_name,
     _legacy_ascii_project_name,
 )
@@ -136,6 +139,34 @@ class TestGalleryDelete:
         assert res['affected_project_dirs'] == [] and res['removed_project_dirs'] == []
         assert os.path.isdir(os.path.join(media_tree, 'outputs', 'covers'))
 
+    @pytest.mark.parametrize('artifact', ['.state.json', 'input.mp4', 'work/edited.mp4'])
+    def test_last_gallery_media_keeps_independent_edit_artifacts(self, tmp_path, artifact):
+        project = tmp_path / 'outputs' / '精剪项目'
+        source = project / 'merged.mp4'
+        edit_artifact = project / 'codex_edits' / ('a' * 32) / artifact
+        _touch(str(source))
+        _touch(str(edit_artifact), content=b'preserve this edit')
+
+        res = gallery_delete_files(['outputs/精剪项目/merged.mp4'], base_dir=str(tmp_path))
+
+        assert res['deleted'] == ['outputs/精剪项目/merged.mp4']
+        assert res['failed'] == []
+        assert not source.exists()
+        assert edit_artifact.read_bytes() == b'preserve this edit'
+        assert res['affected_project_dirs'] == [str(project)]
+        assert res['removed_project_dirs'] == []
+
+    def test_empty_edit_root_does_not_keep_empty_project(self, tmp_path):
+        project = tmp_path / 'outputs' / '精剪项目'
+        _touch(str(project / 'merged.mp4'))
+        (project / 'codex_edits').mkdir()
+
+        res = gallery_delete_files(['outputs/精剪项目/merged.mp4'], base_dir=str(tmp_path))
+
+        assert res['failed'] == []
+        assert res['removed_project_dirs'] == [str(project)]
+        assert not project.exists()
+
     def test_rejects_unsafe_and_non_media_paths(self, media_tree):
         _touch(os.path.join(media_tree, 'secret.webp'), mtime=1)
         res = gallery_delete_files([
@@ -156,6 +187,35 @@ class TestGalleryDelete:
         res = gallery_delete_files(
             ['/outputs\\covers\\cover_a.webp'], base_dir=media_tree)
         assert res['deleted'] == ['outputs/covers/cover_a.webp']
+
+
+class TestRevealPathResolution:
+    """「定位本地文件」按钮的路径解析（/api/reveal_file 的落地边界）。
+    它会把结果交给系统文件管理器打开，所以越界路径必须在这一步就断掉。"""
+
+    def test_accepts_url_form_with_cache_bust(self, media_tree):
+        abs_p = resolve_gallery_media_path(
+            '/outputs/%E6%A0%91%E5%B1%8B%E9%A1%B9%E7%9B%AE/%E6%A0%91%E5%B1%8B_2x.mp4?v=1712',
+            base_dir=media_tree)
+        assert abs_p == os.path.join(media_tree, 'outputs', '树屋项目', '树屋_2x.mp4')
+
+    def test_accepts_plain_relative_path(self, media_tree):
+        abs_p = resolve_gallery_media_path('outputs/树屋项目/videos/vid_001.mp4', base_dir=media_tree)
+        assert abs_p == os.path.join(media_tree, 'outputs', '树屋项目', 'videos', 'vid_001.mp4')
+
+    @pytest.mark.parametrize('bad', [
+        '../secret.webp',                 # 相对越界
+        'outputs/../secret.webp',         # 归一化后越界
+        'outputs/树屋项目/manifest.json',  # 非媒体白名单
+        'outputs/树屋项目/frames',         # 目录
+        'outputs/covers/ghost.webp',      # 不存在
+        '',                               # 空
+        None,                             # 非字符串
+    ])
+    def test_rejects_unsafe_targets(self, media_tree, bad):
+        _touch(os.path.join(media_tree, 'secret.webp'), mtime=1)
+        with pytest.raises(ValueError):
+            resolve_gallery_media_path(bad, base_dir=media_tree)
 
 
 class TestGalleryReferences:
@@ -226,3 +286,78 @@ class TestGalleryReferences:
         data = scan_gallery(base_dir=media_tree)
         assert 'orphan' not in _group(data, '树屋项目')
         assert 'in_use' not in _group(data, 'covers')['items'][0]
+
+
+class TestGalleryProjectOwners:
+    """项目目录 → 点子库条目的反查（画廊「激发项目」直达入口的数据来源）。"""
+
+    def test_owner_covers_project_key_title_and_paths(self):
+        lib = [{
+            'id': '1785381906330',
+            'title': '树屋项目',
+            'project_key': make_idea_project_key('1785381906330', '树屋项目'),
+            'frameRun': {'frames': [{'url': '/outputs/别名目录/frames/img_001.webp'}]},
+        }]
+        refs = gallery_collect_references(library_items=lib, tasks=[])
+        owners = refs['project_owners']
+        expected = {'idea_id': '1785381906330', 'idea_title': '树屋项目'}
+
+        # 每次合成独占的媒体命名空间（run_<task_id>_<标题>）才是真实目录名
+        assert owners[_safe_project_name(lib[0]['project_key'])] == expected
+        # 早期没有 project_key 的记录仍按标题的历代命名方案反查
+        assert owners[_safe_project_name('树屋项目')] == expected
+        # frameRun 里的文件路径直接给出目录名
+        assert owners['别名目录'] == expected
+        # project_key 派生的目录名同样算"被引用"，不会被误标孤儿
+        assert _safe_project_name(lib[0]['project_key']) in refs['project_names']
+
+    def test_owner_needs_an_id_and_first_record_wins(self):
+        refs = gallery_collect_references(library_items=[
+            {'title': '树屋项目', 'covers': []},                    # 无 id：认不出是哪条创意
+            {'id': 'new', 'title': '灯塔改造'},                     # 点子库按新→旧排列
+            {'id': 'old', 'title': '灯塔改造'},                     # 同名旧记录不覆盖新的
+        ], tasks=[])
+        owners = refs['project_owners']
+        assert _safe_project_name('树屋项目') not in owners
+        assert owners[_safe_project_name('灯塔改造')]['idea_id'] == 'new'
+
+    def test_tasks_never_claim_ownership(self):
+        refs = gallery_collect_references(
+            library_items=[],
+            tasks=[{'dimensions': {'theme': '飞机残骸小屋'}, 'result': {'title': '灯塔改造'}}])
+        # 任务只贡献引用（不标孤儿），但前端没有可载入的点子库记录
+        assert _safe_project_name('飞机残骸小屋') in refs['project_names']
+        assert refs['project_owners'] == {}
+
+    def test_scan_annotates_owner_on_project_group(self, media_tree):
+        refs = gallery_collect_references(
+            library_items=[{'id': 'idea-1', 'title': '树屋项目'}], tasks=[])
+        data = scan_gallery(base_dir=media_tree, refs=refs)
+        proj = _group(data, '树屋项目')
+        assert (proj['idea_id'], proj['idea_title']) == ('idea-1', '树屋项目')
+        # 封面池/图像工坊不是项目，永远不带归属字段
+        assert 'idea_id' not in _group(data, 'covers')
+
+    def test_renamed_project_group_carries_the_current_project_name(self, media_tree):
+        """改过名的项目：目录名停在旧名字，组上必须带着**现在**的项目名。
+
+        画廊分组标题就是照着这个字段显示的（js/gallery.js：g.idea_title || g.title）。
+        没有它，改过名的项目在画廊里挂的是导入时的临时目录名（run_import_xxx_粘贴的
+        文本 之类），用户认不出那是哪一单——磁盘目录未必跟着标题走：改名时有作业在
+        跑就不搬目录，早期改的名压根没搬过。
+        """
+        refs = gallery_collect_references(
+            library_items=[{'id': 'idea-1', 'title': '林间树屋隐居小屋',
+                            'project_key': '树屋项目'}],
+            tasks=[])
+        data = scan_gallery(base_dir=media_tree, refs=refs)
+        proj = _group(data, '树屋项目')
+
+        assert proj['title'] == '树屋项目'                 # 目录名照旧（删除要用它）
+        assert proj['idea_title'] == '林间树屋隐居小屋'     # 组标题要显示的名字
+        assert proj['orphan'] is False
+
+    def test_scan_without_owner_leaves_group_unannotated(self, media_tree):
+        data = scan_gallery(base_dir=media_tree,
+                            refs={'cover_paths': set(), 'project_names': set()})
+        assert 'idea_id' not in _group(data, '树屋项目')

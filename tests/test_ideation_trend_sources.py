@@ -14,6 +14,27 @@ from unittest.mock import patch
 
 import prompt_pipeline as pp
 
+# 一份合格的「内外双重完工」工序清单，本文件多处复用。
+# 2026-07-28 起 dual 门禁按骨架自己的账收紧（外部 >=4 条且落实 >=3 个外部族、其中必须
+# 有一条外部设备/平台；过门后 >=6 条；整单 >=11 条），旧样例那种「外部 2 条 + 内部 2 条」
+# 的 7~11 条清单不再合格——它把骨架点名的 17 个状态压进 6 个施工拍，每拍近 3 个变化，
+# 而每拍的 IMAGE 是从上一帧续写的，一拍改多处画面必飘。见 _DUAL_MIN_OUTLINE_ENTRIES。
+DUAL_OK_OUTLINE = [
+    '立柱搭建外部框架',          # 0  大结构就位
+    '封装外墙木饰面',            # 1  围护/外立面
+    '安装双开谷仓门',            # 2  门扇
+    '铺设门前碎石车道',          # 3  外部平台
+    '挂装太阳能板与风管',        # 4  外部设备
+    '完成外部入口门面',          # 5  外部小完工（mini-payoff）
+    '推镜穿过门口进入原始室内',  # 6  过门
+    '清空室内积渣',              # 7  清运
+    '铺设防潮基层',              # 8
+    '架设墙顶龙骨',              # 9
+    '填充墙顶保温',              # 10
+    '封装内衬面板',              # 11
+    '点亮灯光,人物入住',         # 12 reward
+]
+
 
 class TestParseTrendUrls(unittest.TestCase):
     def test_empty_and_non_dict(self):
@@ -230,8 +251,43 @@ class TestRunIdeateReturnShape(unittest.TestCase):
 
         self.assertEqual([idea['title'] for idea in result['ideas']], ['真正的新创意'])
 
+    def test_ledger_remix_uses_seed_and_skips_unrelated_trends(self):
+        captured = {}
+
+        def fake_chat(config, system_prompt, user_prompt, **kwargs):
+            captured['system'] = system_prompt
+            return json.dumps([{
+                'title': '谷仓黄铜隐居屋·雨林版',
+                'dna': 'grain-silo / rainforest-refuge / rain-chain-wall',
+                # 通用骨架门禁（outline_skeleton_violations）对所有骨架生效，
+                # 这里的清单必须是结构合法的（≥4 条、末条是 reward 揭示），
+                # 否则这张卡会被当成硬失败丢掉，本用例要断言的 remix 行为就无从验证。
+                'beat_outline': ['清空锈蚀内壁', '焊补穿孔钢板', '封装内衬木饰面',
+                                 '铺装成品木地板', '点亮雨链墙,人物入住'],
+            }], ensure_ascii=False)
+
+        seed = {
+            'topic_dna': 'grain-silo / refuge / brass',
+            'one_line': '谷仓黄铜隐居屋',
+            'creative_seed': {'carrier': 'grain silo', 'twist_zh': '黄铜机械夹层'},
+        }
+        with patch.object(pp, 'read_ledger', return_value=[seed]), \
+             patch.object(pp, 'fetch_trend_snippet') as fetch_trend, \
+             patch.object(pp, 'fetch_custom_url_snippet') as fetch_urls, \
+             patch.object(pp, '_chat', side_effect=fake_chat):
+            result = pp.run_ideate({}, count=1, remix_seed=seed)
+
+        self.assertEqual(result['ideas'][0]['title'], '谷仓黄铜隐居屋·雨林版')
+        self.assertEqual(result['trend_refs'], [])
+        fetch_trend.assert_not_called()
+        fetch_urls.assert_not_called()
+        self.assertIn('REMIX SEED (PRIMARY CREATIVE SOURCE)', captured['system'])
+        self.assertIn('谷仓黄铜隐居屋', captured['system'])
+        self.assertIn('ONLY exception', captured['system'])
+
     def test_llm_failure_falls_back_with_new_fields(self):
-        with patch.object(pp, 'fetch_trend_snippet', return_value='· 趋势要点'), \
+        with patch.object(pp, 'read_ledger', return_value=[]), \
+             patch.object(pp, 'fetch_trend_snippet', return_value='· 趋势要点'), \
              patch.object(pp, 'fetch_custom_url_snippet', return_value=''), \
              patch.object(pp, '_chat', side_effect=RuntimeError('down')):
             result = pp.run_ideate({}, count=3)
@@ -240,11 +296,16 @@ class TestRunIdeateReturnShape(unittest.TestCase):
             self.assertIn('recommended_beats', idea)
             self.assertTrue(5 <= idea['recommended_beats'] <= 15)
             self.assertIn('trend_ref', idea)
+            self.assertIn(idea['pacing_skeleton'],
+                          ('linear_milestone', 'dual_payoff', 'nested_space_payoff'))
             # 兜底列表也要带逐拍工序简介(卡片上的「工序预览」),长度 = 推荐拍数 + 1
             # (末条是 reward 揭示拍),否则 LLM 全挂时卡片会退化成没有工序的空壳
             self.assertEqual(len(idea['beat_outline']), idea['recommended_beats'] + 1)
-            self.assertTrue(all(isinstance(s, str) and s.strip() for s in idea['beat_outline']))
-            self.assertTrue(all(len(s) <= 16 for s in idea['beat_outline']))
+            # P1-C: normalize 后每条是 {op, text} dict
+            self.assertTrue(all(
+                isinstance(s, dict) and isinstance(s.get('text'), str) and s['text'].strip()
+                for s in idea['beat_outline']))
+            self.assertTrue(all(len(s['text']) <= 16 for s in idea['beat_outline']))
         # 兜底路径也要把已拿到的联网参考带回前端
         self.assertEqual(result['trend_refs'][0]['source'], 'web_search')
 
@@ -265,7 +326,8 @@ class TestRunIdeateReturnShape(unittest.TestCase):
                 "beat_outline": ["1", "2", "3", "4", "5", "6"]
             }])
 
-        with patch.object(pp, 'fetch_trend_snippet', return_value=''), \
+        with patch.object(pp, 'read_ledger', return_value=[]), \
+             patch.object(pp, 'fetch_trend_snippet', return_value=''), \
              patch.object(pp, 'fetch_custom_url_snippet', return_value=''), \
              patch.object(pp, 'load_reference_file', return_value=''), \
              patch.object(pp, '_chat', side_effect=fake_chat):
@@ -280,6 +342,110 @@ class TestRunIdeateReturnShape(unittest.TestCase):
         # 逐拍工序简介的产出契约
         self.assertIn('"beat_outline"', system)
         self.assertIn('recommended_beats + 1', system)
+
+    def test_selected_pacing_skeletons_are_prompted_and_missing_ids_are_balanced(self):
+        """GUI 默认同时启用新旧两套；模型漏写归属时后端也要轮询补齐，
+        避免四张卡又全部退回原单线节拍。"""
+        captured = {}
+        payload = json.dumps([
+            {'title': 'A', 'dna': 'a / refuge / x', 'beat_outline': [
+                '立柱搭建外部框架', '封装外墙木饰面', '铺装成品木地板',
+                '布置床铺与软装', '点亮灯光,人物入住',
+            ]},
+            {'title': 'B', 'dna': 'b / refuge / x', 'beat_outline': list(DUAL_OK_OUTLINE)},
+        ], ensure_ascii=False)
+
+        def fake_chat(config, system_prompt, user_prompt, **kwargs):
+            captured['system'] = system_prompt
+            return payload
+
+        with patch.object(pp, 'read_ledger', return_value=[]), \
+             patch.object(pp, 'fetch_trend_snippet', return_value=''), \
+             patch.object(pp, 'fetch_custom_url_snippet', return_value=''), \
+             patch.object(pp, '_chat', side_effect=fake_chat):
+            result = pp.run_ideate({}, count=2,
+                                   pacing_skeleton_ids=['linear_milestone', 'dual_payoff'])
+
+        self.assertIn('PACING SKELETON REFERENCES', captured['system'])
+        self.assertIn('linear_milestone', captured['system'])
+        self.assertIn('dual_payoff', captured['system'])
+        self.assertIn('visible, continuous doorway-crossing video', captured['system'])
+        self.assertEqual([idea['pacing_skeleton'] for idea in result['ideas']],
+                         ['linear_milestone', 'dual_payoff'])
+
+    def test_single_selected_pacing_skeleton_rejects_unselected_model_value(self):
+        payload = json.dumps([{
+            'title': 'T', 'dna': 't / refuge / x',
+            'pacing_skeleton': 'linear_milestone',
+            'beat_outline': [
+                *DUAL_OK_OUTLINE,
+            ],
+        }], ensure_ascii=False)
+        with patch.object(pp, 'read_ledger', return_value=[]), \
+             patch.object(pp, 'fetch_trend_snippet', return_value=''), \
+             patch.object(pp, 'fetch_custom_url_snippet', return_value=''), \
+             patch.object(pp, '_chat', return_value=payload):
+            result = pp.run_ideate({}, count=1, pacing_skeleton_ids=['dual_payoff'])
+        self.assertEqual(result['ideas'][0]['pacing_skeleton'], 'dual_payoff')
+
+    def test_dual_payoff_deterministically_requires_a_visible_crossing_video(self):
+        brief = {
+            'mode': 'Threshold',
+            'threshold_variant': 'coaxial',
+            'threshold_elevated': True,
+        }
+        out = pp.apply_pacing_skeleton_to_brief(brief, 'dual_payoff')
+        self.assertEqual(out['mode'], 'Threshold')
+        self.assertEqual(out['threshold_variant'], 'coaxial')
+        self.assertTrue(out['threshold_elevated'])
+        self.assertTrue(out['require_visible_threshold_video'])
+
+        accidental_cut = {'mode': 'Threshold', 'threshold_variant': 'hard_cut'}
+        fixed = pp.apply_pacing_skeleton_to_brief(accidental_cut, 'dual_payoff')
+        self.assertEqual(fixed['threshold_variant'], 'coaxial')
+        self.assertTrue(fixed['require_visible_threshold_video'])
+
+        # 单线骨架不动过门几何；只额外落两个说明性字段（骨架名 + 载体是否开拍后才运到）
+        old = {'mode': 'Standard', 'threshold_variant': 'coaxial'}
+        linear = pp.apply_pacing_skeleton_to_brief(old.copy(), 'linear_milestone')
+        self.assertEqual(linear['mode'], 'Standard')
+        self.assertEqual(linear['threshold_variant'], 'coaxial')
+        self.assertEqual(linear['pacing_skeleton'], 'linear_milestone')
+        self.assertFalse(pp.carrier_arrives_on_camera(linear))
+
+    def test_dual_payoff_label_cannot_pass_with_a_linear_outline(self):
+        """长度、过门位置、外部族、内部层族全都合格，只是外部幕从来没有"完工"过——
+        这样的清单挂 dual_payoff 的牌子仍然是在骗人，必须被 mini-payoff 那条拦下。"""
+        idea = {
+            'pacing_skeleton': 'dual_payoff',
+            'beat_outline': [
+                *DUAL_OK_OUTLINE[:5],
+                '打磨外墙石缝接口',      # 本该是外部小完工,却没有任何完工语义
+                *DUAL_OK_OUTLINE[6:],
+            ],
+        }
+        errors = pp.pacing_skeleton_outline_violations(idea)
+        self.assertTrue(errors)
+        self.assertTrue(any('completed exterior mini-payoff' in err for err in errors))
+
+    def test_dual_payoff_rejects_hard_cut_even_when_other_structure_is_valid(self):
+        idea = {
+            'pacing_skeleton': 'dual_payoff',
+            'beat_outline': [
+                *DUAL_OK_OUTLINE[:6], '硬切原始室内', *DUAL_OK_OUTLINE[7:],
+            ],
+        }
+        errors = pp.pacing_skeleton_outline_violations(idea)
+        self.assertTrue(any('forbids a hard cut' in err for err in errors))
+
+    def test_dual_payoff_outline_passes_only_with_both_arcs_and_layered_rebuild(self):
+        idea = {
+            'pacing_skeleton': 'dual_payoff',
+            'beat_outline': [
+                *DUAL_OK_OUTLINE,
+            ],
+        }
+        self.assertEqual(pp.pacing_skeleton_outline_violations(idea), [])
 
     def test_selected_theme_still_locks_one_carrier_for_the_whole_batch(self):
         """GUI 已选定基础主题时仍然锁死同一个载体——这条不受「同批载体互不重复」影响,
@@ -331,26 +497,158 @@ class TestBeatOutlineDelivery(unittest.TestCase):
         """数组里混进 null/数字/空白项要被清掉,数字要转成字符串,顺序不能变。"""
         payload = json.dumps([{
             'title': 'T', 'dna': 'a / b / c',
-            'beat_outline': ['  清运积渣  ', None, '', 5, '点亮灯带,人物入住'],
+            'beat_outline': ['  清运积渣  ', None, '', 5, '架设墙顶龙骨',
+                             '铺装成品地板', '点亮灯带,人物入住'],
         }], ensure_ascii=False)
         result, _ = self._run(lambda *a, **k: payload)
-        self.assertEqual(result['ideas'][0]['beat_outline'],
-                         ['清运积渣', '5', '点亮灯带,人物入住'])
+        # P1-C: normalize 后每条是 {op: None, text} dict（旧字符串形态 op 为 None）
+        self.assertEqual(result['ideas'][0]['beat_outline'], [
+            {'op': None, 'text': '清运积渣'},
+            {'op': None, 'text': '5'},
+            {'op': None, 'text': '架设墙顶龙骨'},
+            {'op': None, 'text': '铺装成品地板'},
+            {'op': None, 'text': '点亮灯带,人物入住'},
+        ])
+        # 拍数一律由清单长度派生,模型申报的数字不再有话语权(见 §1.3)
+        self.assertEqual(result['ideas'][0]['recommended_beats'], 4)
+
+    def test_invalid_rich_entry_is_downgraded_without_losing_the_card(self):
+        payload = json.dumps([{
+            'title': '富字段降级测试', 'dna': 'steel-cabin / refuge / warm-light',
+            'beat_outline': [
+                {'op': 'clearing', 'text': '清空锈屑与碎渣',
+                 'en': 'loose rust flakes and broken debris are shoveled into steel bins',
+                 'mat': ['rust flakes', 'broken debris']},
+                {'op': 'repair', 'text': '焊补穿孔钢板',
+                 'en': '焊补钢板', 'mat': ['steel plate']},
+                {'op': 'flooring', 'text': '铺好毛毡与松木地板',
+                 'en': 'grey wool felt underlay laid edge to edge, oiled pine planks nailed over it',
+                 'mat': ['wool felt underlay', 'oiled pine planks']},
+                {'op': 'reward', 'text': '点亮暖灯完成人物入住',
+                 'en': 'warm brass wall lamps illuminate the finished cabin as its occupant settles in',
+                 'mat': ['brass wall lamps', 'finished cabin']},
+            ],
+        }], ensure_ascii=False)
+        with patch.object(pp, '_OUTLINE_RICH_GATE_ENFORCING', True):
+            result, mock_chat = self._run(lambda *a, **k: payload)
+        idea = result['ideas'][0]
+        self.assertEqual(mock_chat.call_count, 1)
+        self.assertEqual(idea['beat_outline'][1],
+                         {'op': 'repair', 'text': '焊补穿孔钢板'})
+        self.assertEqual(idea['beat_outline'][2]['mat'],
+                         ['wool felt underlay', 'oiled pine planks'])
+        self.assertFalse(idea['outline_enriched'])
+
+    RICH_OUTLINE = [
+        {'op': 'clearing', 'text': '清空舱内碎屑与旧板',
+         'en': 'loose debris and broken wall panels shoveled out of the steel cabin',
+         'mat': ['broken wall panels'], 'zone': 'cabin floor', 'scope': 'large'},
+        {'op': 'rough-in', 'text': '铺设防潮膜与电路',
+         'en': 'a black vapour barrier membrane stapled up with copper conduit runs clipped over it',
+         'mat': ['vapour barrier membrane', 'copper conduit'],
+         'zone': 'cabin floor', 'scope': 'default',
+         'trace': 'staple lines along the membrane edges'},
+        {'op': 'flooring', 'text': '铺好毛毡与松木地板',
+         'en': 'grey wool felt underlay laid edge to edge, oiled pine planks nailed over it',
+         'mat': ['wool felt underlay', 'oiled pine planks'],
+         'zone': 'cabin floor', 'scope': 'large',
+         'trace': 'pine plank seams running lengthwise'},
+        {'op': 'reward', 'text': '点亮暖灯完成入住',
+         'en': 'warm brass wall lamps illuminate the finished cabin as its occupant settles in',
+         'mat': ['brass wall lamps'], 'zone': 'sleeping nook', 'scope': 'large',
+         'trace': 'a pool of lamplight across the finished planks'},
+    ]
+    ZONE_MAP = ['cabin floor', 'walls & ceiling', 'sleeping nook']
+
+    def _rich_payload(self, mutate=None, zone_map=None):
+        outline = [dict(e) for e in self.RICH_OUTLINE]
+        if mutate:
+            mutate(outline)
+        return json.dumps([{
+            'title': '富字段卡', 'dna': 'steel-cabin / refuge / warm-light',
+            'zone_map': self.ZONE_MAP if zone_map is None else zone_map,
+            'beat_outline': outline,
+        }], ensure_ascii=False)
+
+    def test_a_fully_enriched_card_keeps_every_field(self):
+        result, _ = self._run(lambda *a, **k: self._rich_payload())
+        idea = result['ideas'][0]
+        self.assertTrue(idea['outline_enriched'])
+        self.assertEqual(idea['beat_outline'][2]['zone'], 'cabin floor')
+        self.assertEqual(idea['beat_outline'][2]['scope'], 'large')
+        self.assertEqual(idea['beat_outline'][2]['trace'],
+                         'pine plank seams running lengthwise')
+
+    def test_a_zone_outside_the_zone_map_drops_only_the_property_pack(self):
+        """事实源 en/mat 已经合格，不该被一个写错的 zone 连累掉——两包各自降级。"""
+        def mutate(outline):
+            outline[2]['zone'] = 'engine bay'
+        result, _ = self._run(lambda *a, **k: self._rich_payload(mutate))
+        entry = result['ideas'][0]['beat_outline'][2]
+        self.assertEqual(entry['mat'], ['wool felt underlay', 'oiled pine planks'])
+        self.assertNotIn('zone', entry)
+        self.assertNotIn('scope', entry)
+        self.assertNotIn('trace', entry)
+        self.assertFalse(result['ideas'][0]['outline_enriched'])
+
+    def test_all_large_coverage_is_rejected(self):
+        """每拍都是「整屋完工」= 没有进度感。"""
+        def mutate(outline):
+            outline[1]['scope'] = 'large'
+        result, _ = self._run(lambda *a, **k: self._rich_payload(mutate))
+        outline = result['ideas'][0]['beat_outline']
+        self.assertTrue(all('scope' not in e for e in outline))
+        # 事实源仍在，卡片照常交付
+        self.assertEqual(len(outline), 4)
+        self.assertTrue(all(e.get('en') for e in outline))
+
+    def test_a_repeated_trace_is_rejected(self):
+        def mutate(outline):
+            outline[2]['trace'] = outline[1]['trace']
+        result, _ = self._run(lambda *a, **k: self._rich_payload(mutate))
+        self.assertNotIn('trace', result['ideas'][0]['beat_outline'][2])
+        self.assertIn('trace', result['ideas'][0]['beat_outline'][1])
+
+    def test_zone_jitter_beyond_the_budget_is_rejected(self):
+        """每拍换一个区 = 镜头反复横跳，观众读不出进度。"""
+        def mutate(outline):
+            # 4 条清单只允许 ⌈4/3⌉ = 2 次换区，这里换了 3 次
+            outline[1]['zone'] = 'walls & ceiling'
+            outline[2]['zone'] = 'sleeping nook'
+            outline[3]['zone'] = 'cabin floor'
+        result, _ = self._run(lambda *a, **k: self._rich_payload(mutate))
+        zones = [e.get('zone') for e in result['ideas'][0]['beat_outline']]
+        self.assertIn(None, zones)
+        self.assertFalse(result['ideas'][0]['outline_enriched'])
+
+    def test_the_gate_never_burns_the_batch_over_rich_fields(self):
+        """富字段不合格一律就地降级，绝不重跑一次 150s 的激发。"""
+        def mutate(outline):
+            outline[2]['zone'] = 'engine bay'
+            outline[1]['en'] = '铺设防潮膜'
+        result, mock_chat = self._run(lambda *a, **k: self._rich_payload(mutate))
+        self.assertEqual(mock_chat.call_count, 1)
+        self.assertEqual(len(result['ideas'][0]['beat_outline']), 4)
 
     def test_outline_returned_as_one_string_is_split_into_beats(self):
         payload = json.dumps([{
             'title': 'T', 'dna': 'a / b / c',
-            'beat_outline': '清运积渣\n架设龙骨\n点亮灯带,人物入住',
+            'beat_outline': '清运积渣\n架设龙骨\n铺装地板\n点亮灯带,人物入住',
         }], ensure_ascii=False)
         result, _ = self._run(lambda *a, **k: payload)
-        self.assertEqual(result['ideas'][0]['beat_outline'],
-                         ['清运积渣', '架设龙骨', '点亮灯带,人物入住'])
+        # P1-C: 单字符串拆分后也变成 {op: None, text} dict 列表
+        self.assertEqual(result['ideas'][0]['beat_outline'], [
+            {'op': None, 'text': '清运积渣'},
+            {'op': None, 'text': '架设龙骨'},
+            {'op': None, 'text': '铺装地板'},
+            {'op': None, 'text': '点亮灯带,人物入住'},
+        ])
 
     def test_batch_with_no_outline_at_all_is_retried(self):
         """整批一条 beat_outline 都没有 = 模型整个忽略了这个字段,重试后用合规的那批。"""
         good = json.dumps([{
             'title': '带简介', 'dna': 'a / b / c',
-            'beat_outline': ['清运积渣', '点亮灯带,人物入住'],
+            'beat_outline': ['清运积渣', '架设墙顶龙骨', '铺装成品地板', '点亮灯带,人物入住'],
         }], ensure_ascii=False)
         responses = ['[{"title": "无简介", "dna": "x / y / z"}]', good]
         result, mock_chat = self._run(lambda *a, **k: responses.pop(0))
@@ -360,12 +658,13 @@ class TestBeatOutlineDelivery(unittest.TestCase):
     def test_partial_outlines_are_kept_without_burning_a_retry(self):
         """只是个别条目没写:为一条重跑整批不划算,照收即可(前端对这类卡片退回「载入维度」)。"""
         payload = json.dumps([
-            {'title': '有', 'dna': 'a / b / c', 'beat_outline': ['清运积渣', '点亮灯带']},
+            {'title': '有', 'dna': 'a / b / c',
+             'beat_outline': ['清运积渣', '架设墙顶龙骨', '铺装成品地板', '点亮灯带,人物入住']},
             {'title': '无', 'dna': 'x / y / z'},
         ], ensure_ascii=False)
         result, mock_chat = self._run(lambda *a, **k: payload)
         self.assertEqual(mock_chat.call_count, 1)
-        self.assertEqual([len(i['beat_outline']) for i in result['ideas']], [2, 0])
+        self.assertEqual([len(i['beat_outline']) for i in result['ideas']], [4, 0])
 
     def test_persistently_missing_outline_still_returns_ideas(self):
         """模型三次都不写:宁可给没有节拍简介的卡片,也不能把整批灵感丢掉(退回静态兜底)。"""
@@ -374,6 +673,207 @@ class TestBeatOutlineDelivery(unittest.TestCase):
         self.assertEqual(mock_chat.call_count, 3)
         self.assertEqual(result['ideas'][0]['title'], '无简介')
         self.assertEqual(result['ideas'][0]['beat_outline'], [])
+
+
+class TestDualPayoffCrossingDetection(unittest.TestCase):
+    """过门拍的识别口径。原来只要一拍里同时出现「进入」和「室内」就算一次过门，
+    于是室内工序段里正常的「搬入家具进入室内布置」被算成第二次过门，整批合格的
+    卡片一起被否掉——server.log 里刷屏的 "exactly one" 多数是这么来的。"""
+
+    def _errs(self, outline):
+        return pp.pacing_skeleton_outline_violations(
+            {'pacing_skeleton': 'dual_payoff', 'beat_outline': outline})
+
+    def test_ordinary_interior_beat_is_not_counted_as_a_second_crossing(self):
+        outline = [
+            '清理谷仓外墙藤蔓', '加固石砌墙体与梁架', '安装双开谷仓门',
+            '铺装门前碎石车道', '点亮外墙壁灯完成门面', '推镜穿过谷仓门进入原始仓内',
+            '清空仓内朽木与粪土', '浇筑并找平室内地坪', '铺设防潮层与电路管线',
+            '架设木龙骨与保温棉', '封装内衬板与饰面', '搬入家具进入室内布置',
+            '点亮吊灯,人物入住',
+        ]
+        self.assertEqual(self._errs(outline), [])
+
+    def test_crossing_without_door_or_camera_cue_still_counts_when_raw_state_named(self):
+        outline = [
+            '清理石屋周边灌木与碎石', '修补外墙石缝与拱券', '安装实木入户门与五金',
+            '铺设入口石板平台', '点亮门廊灯完成外立面', '进入未修的屋内查看',
+            '清运屋内塌落瓦砾', '找平夯实室内地基', '铺设防潮膜与管线',
+            '架设木龙骨隔墙', '封装松木内衬板', '布置床铺与软装',
+            '炉火点亮,人物入住',
+        ]
+        self.assertEqual(self._errs(outline), [])
+
+    def test_missing_and_duplicated_crossings_are_reported_distinguishably(self):
+        # 两份样例都要够长，否则先撞上长度下界、看不到过门计数的判定（见 DUAL_OK_OUTLINE）
+        linear = ['清空洞内碎冰与积雪', '凿平起居区冰面地坪', '锚固钢制支撑框架',
+                  '喷涂洞壁隔热封闭层', '铺设防潮膜与电路管线', '铺设架空木龙骨地台',
+                  '填充羊毛保温层', '封装内衬松木板', '铺装成品木地板',
+                  '布置床铺与软装', '点亮灯带,人物入住']
+        self.assertIn('found 0', self._errs(linear)[0])
+
+        twice = ['清理外墙藤蔓', '加固砖砌山墙', '安装谷仓木门框',
+                 '铺设门前碎石车道', '完成外部入口门面', '推镜过门进入原始仓内',
+                 '清空仓内朽木', '再次过门进入原始阁楼', '铺设防潮基层',
+                 '架设墙顶龙骨', '封装内衬面板', '布置床铺软装', '点亮灯光入住']
+        self.assertIn('found 2', self._errs(twice)[0])
+
+    def test_interior_vocabulary_is_shared_by_detection_and_verification(self):
+        """用 仓内 认出过门拍，就不能反过来判它"没落进室内"——两处词表必须是同一份。"""
+        # 清单要够长才走得到落点判定这一步，否则先被长度下界挡回、这条断言会变成空转
+        outline = ['清理外墙藤蔓', '加固砖砌山墙', '安装谷仓木门框',
+                   '铺设门前碎石车道', '点亮壁灯完成外立面', '推镜过门进入原始仓内',
+                   '清空仓内朽木', '铺设防潮基层', '架设墙顶龙骨',
+                   '填充墙顶保温', '封装内衬面板', '布置床铺软装', '点亮灯光入住']
+        self.assertEqual(self._errs(outline), [])
+
+
+class TestPacingGateDoesNotDiscardPassingCards(unittest.TestCase):
+    """节拍验收从「整批连坐」改成「按张处理」。
+
+    旧行为：四张里一张没过 → 整批丢掉重来，三次 150s 调用烧完还是掉进静态兜底，
+    而静态兜底又要过台账去重，用久了只剩一两条甚至零条，用户看到的就是「换一批
+    灵感」转几分钟然后一句「暂无灵感推荐」。
+    """
+
+    GOOD_OUTLINE = list(DUAL_OK_OUTLINE)
+    LINEAR_OUTLINE = [
+        '清空洞内碎冰与积雪', '凿平起居区冰面地坪', '锚固钢制支撑框架',
+        '喷涂洞壁隔热封闭层', '铺设架空木龙骨地台', '填充羊毛保温层',
+        '铺装成品木地板', '布置床铺与软装', '点亮灯带,人物入住',
+    ]
+
+    def setUp(self):
+        self._tmp_dir = tempfile.mkdtemp()
+        self._patches = [
+            patch.object(pp, 'SEARCH_SNIPPET_CACHE_PATH',
+                         os.path.join(self._tmp_dir, 'search_snippet_cache.json')),
+            patch.object(pp, 'TREND_REFS_PATH', os.path.join(self._tmp_dir, 'trend_refs.json')),
+        ]
+        for p in self._patches:
+            p.start()
+
+    def tearDown(self):
+        for p in self._patches:
+            p.stop()
+        shutil.rmtree(self._tmp_dir, ignore_errors=True)
+
+    def _payload(self):
+        return json.dumps([
+            {'title': '合格卡', 'dna': 'a / refuge / x',
+             'pacing_skeleton': 'dual_payoff', 'beat_outline': self.GOOD_OUTLINE},
+            {'title': '写成单线的卡', 'dna': 'b / refuge / y',
+             'pacing_skeleton': 'dual_payoff', 'beat_outline': self.LINEAR_OUTLINE},
+        ], ensure_ascii=False)
+
+    def _run(self, pacing_ids):
+        with patch.object(pp, 'read_ledger', return_value=[]), \
+             patch.object(pp, 'fetch_trend_snippet', return_value=''), \
+             patch.object(pp, 'fetch_custom_url_snippet', return_value=''), \
+             patch.object(pp, '_chat', return_value=self._payload()) as mock_chat:
+            return pp.run_ideate({}, count=2, pacing_skeleton_ids=pacing_ids), mock_chat
+
+    def test_failing_card_is_downgraded_not_dropped_when_linear_is_selected(self):
+        result, mock_chat = self._run(['linear_milestone', 'dual_payoff'])
+        self.assertEqual([i['title'] for i in result['ideas']], ['合格卡', '写成单线的卡'])
+        # 标签必须诚实：内容是单线清单，就不能继续挂 dual_payoff 的牌子
+        self.assertEqual([i['pacing_skeleton'] for i in result['ideas']],
+                         ['dual_payoff', 'linear_milestone'])
+        # 降级卡不再计入「凑够 count」：它兑现的是单线，而用户勾的是 dual/nested。
+        # 剩下的尝试要先拿去争取一张真正的 dual 卡，补不到才用降级卡填缺口
+        # （本用例的模型每次只会回同一批，于是三次跑满、最终仍交付这两张）。
+        self.assertEqual(mock_chat.call_count, 3)
+
+    def test_short_batch_spends_the_remaining_attempts_topping_up_to_count(self):
+        """用户在 GUI 选的生成数是硬要求：本轮少收了卡就用掉剩下的尝试补齐。
+
+        旧行为是「有一张过关 + 本轮有失败」就直接收工，于是选 5 张只回来 1~2 张
+        （只勾 dual/nested 时更是一张不剩，掉进静态兜底）。现在按缺口继续要卡，
+        上限仍是原来的 3 次调用。
+        """
+        result, mock_chat = self._run(['dual_payoff'])
+        # 三次都只给得出同一张合格卡（补的那两次全被去重/门禁拦下）
+        self.assertEqual([i['title'] for i in result['ideas']], ['合格卡'])
+        self.assertEqual(result['ideas'][0]['pacing_skeleton'], 'dual_payoff')
+        self.assertEqual(mock_chat.call_count, 3)
+
+    def test_whole_batch_failing_delivers_the_downgraded_card_after_using_up_retries(self):
+        payload = json.dumps([{
+            'title': '写成单线的卡', 'dna': 'b / refuge / y',
+            'pacing_skeleton': 'dual_payoff', 'beat_outline': self.LINEAR_OUTLINE,
+        }], ensure_ascii=False)
+        with patch.object(pp, 'read_ledger', return_value=[]), \
+             patch.object(pp, 'fetch_trend_snippet', return_value=''), \
+             patch.object(pp, 'fetch_custom_url_snippet', return_value=''), \
+             patch.object(pp, '_chat', return_value=payload) as mock_chat:
+            result = pp.run_ideate({}, count=1,
+                                   pacing_skeleton_ids=['linear_milestone', 'dual_payoff'])
+        # 降级卡不算凑够 count：先把剩下两次尝试用掉去争取一张真正的 dual 卡，
+        # 都没争取到才拿它填缺口——标签仍然诚实，只是没兑现用户勾的那个骨架。
+        self.assertEqual(mock_chat.call_count, 3)
+        self.assertEqual([i['title'] for i in result['ideas']], ['写成单线的卡'])
+        self.assertEqual(result['ideas'][0]['pacing_skeleton'], 'linear_milestone')
+
+    def test_nested_only_batch_falls_back_to_honest_nested_topics_not_a_downgrade(self):
+        """双空间卡永不降级（见 _NO_DOWNGRADE_SKELETONS）。
+
+        降级成 linear_milestone 之后标签确实不骗人了，但交付的是完全另一种片子——
+        用户勾的第二毛坯空间那一幕压根不存在，现象就是「勾了双空间，出来的全是单线」。
+        这个骨架有自己的静态兜底选题池（都是人工运输载体 + 双舱清单），走那条路
+        交付的仍是真正的双空间卡，比改个名字的单线卡更接近用户勾的东西。"""
+        payload = json.dumps([
+            {'title': '单线卡一', 'dna': 'p / refuge / x',
+             'pacing_skeleton': 'nested_space_payoff', 'beat_outline': self.LINEAR_OUTLINE},
+            {'title': '单线卡二', 'dna': 'q / refuge / y',
+             'pacing_skeleton': 'nested_space_payoff',
+             'beat_outline': list(self.LINEAR_OUTLINE[:-1]) + ['通电亮灯,人物入住']},
+        ], ensure_ascii=False)
+        with patch.object(pp, 'read_ledger', return_value=[]), \
+             patch.object(pp, 'fetch_trend_snippet', return_value=''), \
+             patch.object(pp, 'fetch_custom_url_snippet', return_value=''), \
+             patch.object(pp, '_chat', return_value=payload):
+            result = pp.run_ideate({}, count=2,
+                                   pacing_skeleton_ids=['nested_space_payoff'])
+        # 那两张写成单线的卡一张都不许交付
+        self.assertNotIn('单线卡一', [i['title'] for i in result['ideas']])
+        self.assertNotIn('单线卡二', [i['title'] for i in result['ideas']])
+        # 静态兜底按池子整批交付（不截到 count，和其它兜底路径一致）
+        self.assertGreaterEqual(len(result['ideas']), 2)
+        for idea in result['ideas']:
+            self.assertEqual(idea['pacing_skeleton'], 'nested_space_payoff')
+            self.assertEqual(pp.pacing_skeleton_outline_violations(idea), [])
+
+    GENERIC_BURNED = [
+        {'topic_dna': 'glacier-ice-cave / refuge-den / self-material-window'},
+        {'topic_dna': 'retired-submarine / micro-home / porthole-lighting'},
+        {'topic_dna': 'missile-silo / burrow-dwelling / roof-hatch'},
+    ]
+
+    def test_exhausted_fallback_raises_instead_of_returning_an_empty_batch(self):
+        """兜底池被台账认领干净时，以前静静返回空数组，前端只显示「暂无灵感推荐」,
+        分不清是模型挂了还是兜底用完了。现在必须报出可执行的原因。
+
+        用单线选择来测：nested 的埋地池按设计「用光了也照原样再发一遍」（见
+        run_ideate 里的 `or nested_pool`），那条路永远不会空手。"""
+        with patch.object(pp, 'read_ledger', return_value=list(self.GENERIC_BURNED)), \
+             patch.object(pp, 'fetch_trend_snippet', return_value=''), \
+             patch.object(pp, 'fetch_custom_url_snippet', return_value=''), \
+             patch.object(pp, '_chat', side_effect=RuntimeError('proxy down')):
+            with self.assertRaises(RuntimeError) as ctx:
+                pp.run_ideate({}, count=3, pacing_skeleton_ids=['linear_milestone'])
+        self.assertIn('没有产出任何新卡片', str(ctx.exception))
+
+    def test_burned_generic_pool_does_not_take_the_buried_topics_down_with_it(self):
+        """两个兜底池各自独立：通用三条（冰洞/潜艇/导弹井）被用光时，埋地选题
+        照样要发得出来——它是「双空间重置兑现」唯一的兜底来源。"""
+        with patch.object(pp, 'read_ledger', return_value=list(self.GENERIC_BURNED)), \
+             patch.object(pp, 'fetch_trend_snippet', return_value=''), \
+             patch.object(pp, 'fetch_custom_url_snippet', return_value=''), \
+             patch.object(pp, '_chat', side_effect=RuntimeError('proxy down')):
+            result = pp.run_ideate({}, count=3)
+        titles = [i['title'] for i in result['ideas']]
+        self.assertTrue(titles, '通用池用光不该把埋地兜底一起带走')
+        self.assertTrue(all(i['pacing_skeleton'] == 'nested_space_payoff' for i in result['ideas']))
 
 
 if __name__ == '__main__':

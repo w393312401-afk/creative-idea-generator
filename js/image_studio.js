@@ -7,13 +7,55 @@
    ========================================================================== */
 
 let imgStudioCurrentTab = 't2i';
+let imgStudioMobileView = 'create'; // 'create' | 'result'
 let imgStudioSelectedT2iRatio = '16:9';
 let imgStudioSelectedT2iQuality = '2K';
 let imgStudioSelectedI2iRatio = 'auto';
 let imgStudioSelectedI2iQuality = '1K';
 let imgStudioUploadedFiles = []; // Array of { name, file, base64 }
 let imgStudioHistory = []; // Array of { id, type, prompt, model, ratio, quality, timestamp, image }
+let imgStudioReferenceRetryTaskId = null;
+let imgStudioReferenceRetryVersion = 0;
 let imgStudioTaskList = []; // Array of { id, type, prompt, model, ratio, quality, status, error, image, timestamp, controller, extraData }
+
+function imgStudioMediaAttrs(url) {
+    return typeof MediaPreview !== 'undefined' ? MediaPreview.attrs(url) : `src="${url}"`;
+}
+
+// Mobile Subview Switch (P4: 创作 / 结果 互斥切换)
+window.switchImageStudioMobileView = function (view) {
+    imgStudioMobileView = view;
+    const grid = document.querySelector('#panel-image-studio .imgstudio-grid');
+    if (grid) {
+        grid.setAttribute('data-mobile-view', view);
+        grid.scrollTop = 0;
+    }
+    const createBtn = document.getElementById('imgstudio-mobtab-create');
+    const resultBtn = document.getElementById('imgstudio-mobtab-result');
+    if (createBtn) createBtn.classList.toggle('active', view === 'create');
+    if (resultBtn) resultBtn.classList.toggle('active', view === 'result');
+};
+
+function initImageStudioMobileView() {
+    const mql = window.matchMedia('(max-width: 768px)');
+    const syncView = (e) => {
+        const grid = document.querySelector('#panel-image-studio .imgstudio-grid');
+        if (!grid) return;
+        if (e.matches) {
+            grid.setAttribute('data-mobile-view', imgStudioMobileView);
+        } else {
+            grid.removeAttribute('data-mobile-view');
+        }
+    };
+    if (mql.matches) {
+        switchImageStudioMobileView(imgStudioMobileView);
+    }
+    if (typeof mql.addEventListener === 'function') {
+        mql.addEventListener('change', syncView);
+    } else if (typeof mql.addListener === 'function') {
+        mql.addListener(syncView);
+    }
+}
 
 // Curated Creative Prompts for Random Generator
 const IMGSTUDIO_CREATIVE_PROMPTS = [
@@ -65,8 +107,71 @@ function switchImageStudioTab(tabId) {
     document.getElementById(`imgstudio-pane-${tabId}`).classList.add('active');
 }
 
+function syncImageStudioQualityDescriptions(tabId) {
+    const select = document.getElementById(`${tabId}-model`);
+    if (!select) return;
+    const unavailable = !isApiImageModelAvailable(select.value);
+    const baseModel = select.value === 'gpt-image-2.5' && !unavailable;
+    const variant = unavailable ? null : /^gpt-image-2\.5-(sunburst|flare)(-\d{4}-\d{2}-\d{2})?$/.exec(select.value);
+    const modelDescription = unavailable || baseModel || Boolean(variant);
+    const descriptions = {
+        '1K': '标准尺寸',
+        '2K': '最长边最高 2048px',
+        '4K': '最长边最高 3840px（实验尺寸）',
+    };
+    document.querySelectorAll(`#${tabId}-quality-selector .quality-card`).forEach(card => {
+        const description = card.querySelector('.quality-desc');
+        if (!description) return;
+        if (!Object.prototype.hasOwnProperty.call(description.dataset, 'originalText')) {
+            description.dataset.originalText = description.textContent;
+            description.dataset.originalHidden = description.hidden ? '1' : '0';
+        }
+        description.textContent = unavailable ? '当前网关不可用'
+            : baseModel ? '尺寸由网关自适应'
+                : variant ? descriptions[card.getAttribute('data-quality')] : description.dataset.originalText;
+        description.hidden = modelDescription ? false : description.dataset.originalHidden === '1';
+        description.dataset.variantSizeDescription = modelDescription ? '1' : '0';
+        const qualityHint = card.querySelector('.quality-hint');
+        if (qualityHint) {
+            if (!Object.prototype.hasOwnProperty.call(qualityHint.dataset, 'originalHidden')) {
+                qualityHint.dataset.originalHidden = qualityHint.hidden ? '1' : '0';
+            }
+            qualityHint.hidden = modelDescription || qualityHint.dataset.originalHidden === '1';
+        }
+    });
+    const hint = document.getElementById(`${tabId}-model-quality-hint`);
+    if (hint) {
+        hint.hidden = !modelDescription;
+        hint.textContent = unavailable ? unavailableApiImageModelMessage(select.value)
+            : baseModel ? 'GPT Image 2.5：输出尺寸由当前网关自适应。'
+                : variant ? `${variant[1] === 'sunburst' ? 'Sunburst：请求最高画质' : 'Flare：请求自动画质'}；实际画质和尺寸以网关返回为准，4K 请求为实验支持。` : '';
+    }
+}
+
+function syncImageStudioModelAvailability() {
+    for (const tabId of ['t2i', 'i2i']) {
+        const select = document.getElementById(`${tabId}-model`);
+        if (!select) continue;
+        Array.from(select.options).forEach(applyApiImageModelOptionAvailability);
+        syncImageStudioQualityDescriptions(tabId);
+    }
+}
+
+function initImageStudioModelQualityDescriptions() {
+    for (const tabId of ['t2i', 'i2i']) {
+        const select = document.getElementById(`${tabId}-model`);
+        if (!select) continue;
+        if (!select.dataset.qualityDescriptionsBound) {
+            select.dataset.qualityDescriptionsBound = '1';
+            select.addEventListener('change', () => syncImageStudioQualityDescriptions(tabId));
+        }
+    }
+    syncImageStudioModelAvailability();
+}
+
 // Selection Handlers for Custom Grids (Ratio, Quality, Styles)
 function initImageStudioSelectors() {
+    initImageStudioModelQualityDescriptions();
     const t2iRatioCards = document.querySelectorAll('#t2i-ratio-selector .ratio-card');
     t2iRatioCards.forEach(card => {
         card.addEventListener('click', () => {
@@ -162,6 +267,11 @@ function imgStudioSetRandomPrompt(options = {}) {
 function initImageStudioFileUploader() {
     const dragArea = document.getElementById('i2i-drag-area');
     const fileInput = document.getElementById('i2i-file-input');
+    const retryInput = document.getElementById('imgstudio-retry-file-input');
+    if (retryInput) {
+        retryInput.addEventListener('change', e => imgStudioRetryWithReferenceFiles(imgStudioReferenceRetryTaskId, e.target.files));
+        retryInput.addEventListener('cancel', () => { imgStudioReferenceRetryTaskId = null; ++imgStudioReferenceRetryVersion; });
+    }
 
     dragArea.addEventListener('click', () => {
         fileInput.click();
@@ -190,6 +300,71 @@ function initImageStudioFileUploader() {
     dragArea.addEventListener('drop', (e) => {
         imgStudioHandleFiles(e.dataTransfer.files);
     }, false);
+}
+
+function imgStudioReferenceFilesReady(files) {
+    return Array.isArray(files) && files.length > 0 && files.every(file =>
+        typeof file.base64 === 'string' && /^data:image\/[^;,]+;base64,.+/.test(file.base64));
+}
+
+function imgStudioTaskNeedsReferences(task) {
+    return task.type === 'i2i' && ['failed', 'cancelled'].includes(task.status)
+        && (task.referenceRequired || !imgStudioReferenceFilesReady(task.extraData?.files));
+}
+
+function imgStudioReadReferenceFile(file) {
+    return new Promise((resolve, reject) => {
+        if (!file?.type?.startsWith('image/')) return reject(new Error(`文件 ${file?.name || ''} 不是图片，请重新选择。`));
+        if (file.size > 10 * 1024 * 1024) return reject(new Error(`图片 ${file.name} 超过 10MB，请换一张。`));
+        const reader = new FileReader();
+        reader.onload = e => {
+            const item = { name: file.name, base64: e.target.result };
+            if (!imgStudioReferenceFilesReady([item])) return reject(new Error(`无法读取图片 ${file.name}，请重新选择。`));
+            resolve(item);
+        };
+        reader.onerror = () => reject(new Error(`无法读取图片 ${file.name}，请重新选择。`));
+        reader.readAsDataURL(file);
+    });
+}
+
+function chooseImageStudioRetryReferences(taskId) {
+    const task = imgStudioTaskList.find(item => item.id === taskId);
+    const input = document.getElementById('imgstudio-retry-file-input');
+    if (!task || task.status === 'pending' || task._referenceRetryPending || !input) return;
+    imgStudioReferenceRetryTaskId = taskId;
+    ++imgStudioReferenceRetryVersion;
+    input.value = '';
+    input.click();
+}
+
+async function imgStudioRetryWithReferenceFiles(taskId, files) {
+    const task = imgStudioTaskList.find(item => item.id === taskId);
+    if (!task || task.status === 'pending' || task._referenceRetryPending || !files?.length) return;
+    const version = imgStudioReferenceRetryVersion;
+    task._referenceRetryPending = true;
+    imgStudioRenderTaskListUI();
+    try {
+        // No partial replacement: all chosen references must be readable before resubmission.
+        const references = await Promise.all(Array.from(files, imgStudioReadReferenceFile));
+        if (version !== imgStudioReferenceRetryVersion || !imgStudioTaskList.includes(task) || task.status === 'pending') return;
+        task.extraData = { ...(task.extraData || {}), files: references };
+        delete task.extraData.fileNames;
+        task.filesStripped = false;
+        task.referenceRequired = false;
+        retryImageStudioTask(taskId);
+        switchImageStudioMobileView('result');
+    } catch (error) {
+        if (version === imgStudioReferenceRetryVersion && imgStudioTaskList.includes(task)) {
+            task.referenceRequired = true;
+            task.error = error.message;
+            imgStudioSaveTaskList();
+            showToast(error.message, 'warning');
+        }
+    } finally {
+        delete task._referenceRetryPending;
+        if (version === imgStudioReferenceRetryVersion) imgStudioReferenceRetryTaskId = null;
+        imgStudioRenderTaskListUI();
+    }
 }
 
 function imgStudioHandleFiles(files) {
@@ -264,17 +439,28 @@ function imgStudioTriggerGeneration() {
         const prompt = document.getElementById('t2i-prompt').value.trim();
         const model = document.getElementById('t2i-model').value;
 
+        if (!isApiImageModelAvailable(model)) {
+            showToast(unavailableApiImageModelMessage(model), 'error');
+            return;
+        }
+
         if (!prompt) {
             showToast('请输入创意提示词再开始生成', 'error');
             return;
         }
 
         imgStudioAddTask('t2i', prompt, model, imgStudioSelectedT2iRatio, imgStudioSelectedT2iQuality, null);
+        switchImageStudioMobileView('result');
         showToast('文生图任务已加入生成队列', 'success');
     } else {
         const prompt = document.getElementById('i2i-prompt').value.trim();
         const model = document.getElementById('i2i-model').value;
         const style = document.getElementById('i2i-style').value;
+
+        if (!isApiImageModelAvailable(model)) {
+            showToast(unavailableApiImageModelMessage(model), 'error');
+            return;
+        }
 
         if (imgStudioUploadedFiles.length === 0) {
             showToast('请至少上传一张参考图片再开始图生图', 'error');
@@ -285,11 +471,16 @@ function imgStudioTriggerGeneration() {
             return;
         }
 
+        if (!imgStudioReferenceFilesReady(imgStudioUploadedFiles)) {
+            showToast('参考图还在读取，请稍候再生成。', 'warning');
+            return;
+        }
         const filesData = imgStudioUploadedFiles.map(f => ({ name: f.name, base64: f.base64 }));
         const extraData = { style: style, files: filesData };
         const finalRatio = imgStudioSelectedI2iRatio === 'auto' ? 'Auto' : imgStudioSelectedI2iRatio;
 
         imgStudioAddTask('i2i', prompt, model, finalRatio, imgStudioSelectedI2iQuality, extraData);
+        switchImageStudioMobileView('result');
         showToast('图生图修改任务已加入生成队列', 'success');
     }
 }
@@ -347,7 +538,7 @@ function imgStudioSaveTaskList() {
     // 序列化时剥离参考图 base64：几张参考图就能把 5MB 的 localStorage 配额打爆，
     // 之前配额溢出是静默的，整个任务队列的持久化会就此失效
     const serialize = () => imgStudioTaskList.map(task => {
-        const { controller, extraData, ...serializable } = task;
+        const { controller, extraData, _referenceRetryPending, ...serializable } = task;
         if (extraData) {
             const { files, ...restExtra } = extraData;
             serializable.extraData = restExtra;
@@ -413,14 +604,40 @@ function imgStudioLatestPendingTask() {
 
 function imgStudioFeedActionsHTML(task) {
     if (task.status === 'pending') {
-        return `<button type="button" class="task-btn-icon danger-hover" title="取消任务" onclick="cancelImageStudioTask('${task.id}')">✕</button>`;
+        return `<button type="button" class="task-btn-icon feed-action-text danger-hover" onclick="cancelImageStudioTask('${task.id}')">取消</button>`;
     }
+    const needsReferences = imgStudioTaskNeedsReferences(task);
+    const retryAction = needsReferences ? 'chooseImageStudioRetryReferences' : 'retryImageStudioTask';
+    const retryText = task._referenceRetryPending ? '正在读取…' : needsReferences ? '补图后重试' : '重试';
     const retryBtn = (task.status === 'failed' || task.status === 'cancelled')
-        ? `<button type="button" class="task-btn-icon" title="重试任务" onclick="retryImageStudioTask('${task.id}')">🔄</button>` : '';
-    return `${retryBtn}<button type="button" class="task-btn-icon danger-hover" title="删除记录" onclick="deleteImageStudioTask('${task.id}')">✕</button>`;
+        ? `<button type="button" class="task-btn-icon feed-action-text" ${task._referenceRetryPending ? 'disabled' : ''} onclick="${retryAction}('${task.id}')">${retryText}</button>` : '';
+    return `${retryBtn}<button type="button" class="task-btn-icon danger-hover" title="删除这条生成记录" aria-label="删除这条生成记录" onclick="deleteImageStudioTask('${task.id}')">✕</button>`;
 }
 
-const IMGSTUDIO_STATUS_TEXT = { pending: '渲染中', completed: '已完成', failed: '失败', cancelled: '已取消' };
+const IMGSTUDIO_STATUS_TEXT = { pending: '生成中', completed: '已完成', failed: '生成失败', cancelled: '已取消', needs_reference: '待补图' };
+
+function imgStudioTaskDisplayModel(task) {
+    return task.submittedModel || task.model || '';
+}
+
+function imgStudioTaskSummary(task) {
+    if (task._referenceRetryPending) return '正在读取补充的参考图，读完后会自动重试。';
+    if (imgStudioTaskNeedsReferences(task)) return '参考图未保留。点击“补图后重试”，继续使用这条任务的原有设置。';
+    if (task.status === 'completed') return '图片已生成，可预览或下载。';
+    if (task.status === 'cancelled') return '生成已取消，可以重试。';
+    if (task.status === 'pending') {
+        if (!task.backendTaskId) return '正在提交生成请求…';
+        const stage = task.lastStage || '';
+        if (/落盘|保存|下载/.test(stage)) return '图片已生成，正在保存…';
+        if (/重试/.test(stage)) return '生成遇到问题，正在重试…';
+        if (/排队|等待/.test(stage)) return '请求已提交，等待生成…';
+        return '正在生成图片…';
+    }
+    const error = String(task.error || '本次未能生成图片').replace(/\s+/g, ' ').trim();
+    if (/API.?key|凭证|登录|额度|余额|401|403|unauthorized/i.test(error)) return '请检查配置中心的模型登录或额度，然后重试。';
+    if (/网络|连接|失联|超时|timeout|fetch|network/i.test(error)) return '连接暂时中断，请检查服务后重试。';
+    return `${error.length > 100 ? error.slice(0, 100) + '…' : error}。可重试，具体原因见“生成过程”。`;
+}
 
 function imgStudioBuildFeedEntry(task) {
     const node = document.createElement('div');
@@ -429,7 +646,7 @@ function imgStudioBuildFeedEntry(task) {
     node.innerHTML = `
         <div class="feed-entry-head">
             <span class="task-badge-type">${task.type === 't2i' ? '文生图' : '图生图'}</span>
-            <span class="feed-model" translate="no">${escapeHtml((task.model || '').replace('-image', ''))}</span>
+            <span class="feed-model" translate="no">${escapeHtml(imgStudioTaskDisplayModel(task))}</span>
             <span class="feed-meta">${escapeHtml(task.ratio || '')} · ${escapeHtml(task.quality || '')}</span>
             <span class="feed-head-right">
                 <span class="feed-status-chip"></span>
@@ -437,27 +654,41 @@ function imgStudioBuildFeedEntry(task) {
             </span>
         </div>
         <div class="feed-entry-prompt" title="${escapeHtml(task.prompt)}">${escapeHtml(task.prompt)}</div>
-        <div class="feed-stage-lines"></div>
+        <p class="feed-current-status" role="status"></p>
+        <details class="feed-process"><summary>生成过程</summary><div class="feed-stage-lines"></div><p class="feed-error-details" hidden></p></details>
         <div class="feed-entry-result" style="display:none;"></div>
     `;
     return node;
 }
 
 function imgStudioUpdateFeedEntry(node, task) {
+    const modelLabel = node.querySelector('.feed-model');
+    if (modelLabel) modelLabel.textContent = imgStudioTaskDisplayModel(task);
     // 状态胶囊 + 操作按钮：仅在状态变化时重建
-    if (node.dataset.status !== task.status) {
-        node.dataset.status = task.status;
-        node.className = `feed-entry st-${task.status}`;
+    const visualStatus = imgStudioTaskNeedsReferences(task) ? 'needs_reference' : task.status;
+    const statusSignature = `${visualStatus}:${!!task._referenceRetryPending}`;
+    if (node.dataset.status !== statusSignature) {
+        node.dataset.status = statusSignature;
+        node.className = `feed-entry st-${visualStatus}`;
         const chip = node.querySelector('.feed-status-chip');
         if (chip) {
-            chip.className = `feed-status-chip task-status-badge ${task.status}`;
+            chip.className = `feed-status-chip task-status-badge ${visualStatus}`;
             chip.innerHTML = task.status === 'pending'
                 ? `${IMGSTUDIO_STATUS_TEXT.pending} <span class="feed-elapsed">(${imgStudioTaskElapsedText(task)})</span>`
-                : `${IMGSTUDIO_STATUS_TEXT[task.status] || task.status} · ${imgStudioTaskElapsedText(task)}`;
-            if (task.status === 'failed') chip.title = task.error || '';
+                : `${IMGSTUDIO_STATUS_TEXT[visualStatus] || visualStatus} · ${imgStudioTaskElapsedText(task)}`;
+            chip.title = '';
         }
         const actions = node.querySelector('.feed-actions');
         if (actions) actions.innerHTML = imgStudioFeedActionsHTML(task);
+    }
+
+    const summary = node.querySelector('.feed-current-status');
+    const summaryText = imgStudioTaskSummary(task);
+    if (summary && summary.textContent !== summaryText) summary.textContent = summaryText;
+    const failureDetails = node.querySelector('.feed-error-details');
+    if (failureDetails) {
+        failureDetails.hidden = !task.error;
+        failureDetails.textContent = task.error || '';
     }
 
     // 阶段行：只追加新行；被截断或重试重置过的整块重建
@@ -484,7 +715,7 @@ function imgStudioUpdateFeedEntry(node, task) {
         const box = node.querySelector('.feed-entry-result');
         if (box) {
             box.style.display = 'flex';
-            box.innerHTML = `<img src="${task.image}" alt="生成结果" onclick="viewImageStudioTaskItem('${task.id}')" title="点击在渲染室大屏查看">`;
+            box.innerHTML = `<img ${imgStudioMediaAttrs(task.image)} alt="生成结果" onclick="viewImageStudioTaskItem('${task.id}')" title="点击在渲染室大屏查看">`;
         }
     }
 }
@@ -505,7 +736,7 @@ function imgStudioSyncFeedTicker(activeCount) {
                 const t = imgStudioLatestPendingTask();
                 const st = sk.querySelector('.loader-status-text');
                 if (t && st) {
-                    const stageText = (t.stages && t.stages.length) ? t.stages[t.stages.length - 1].text : '渲染中';
+                    const stageText = imgStudioTaskSummary(t);
                     st.textContent = `${stageText} · ${imgStudioTaskElapsedText(t)}`;
                 }
             }
@@ -547,9 +778,17 @@ function imgStudioRenderTaskListUI() {
 
     if (activeCountSpan) activeCountSpan.textContent = activeCount;
     if (totalCountSpan) totalCountSpan.textContent = totalCount;
+    const clearCompletedButton = document.getElementById('clear-completed-tasks-btn');
+    if (clearCompletedButton) clearCompletedButton.disabled = !imgStudioTaskList.some(task => task.status === 'completed');
     if (section) section.style.display = totalCount > 0 ? 'block' : 'none';
     const liveDot = document.getElementById('feed-live-dot');
     if (liveDot) liveDot.classList.toggle('active', activeCount > 0);
+
+    const mobileBadge = document.getElementById('imgstudio-mobile-active-badge');
+    if (mobileBadge) {
+        mobileBadge.textContent = activeCount;
+        mobileBadge.style.display = activeCount > 0 ? 'inline-block' : 'none';
+    }
 
     if (!container) return;
 
@@ -581,6 +820,11 @@ function imgStudioRenderTaskListUI() {
 }
 
 function imgStudioAddTask(type, prompt, model, ratio, quality, extraData) {
+    model = normalizeApiImageModel(model);
+    if (!isApiImageModelAvailable(model)) {
+        showToast(unavailableApiImageModelMessage(model), 'error');
+        return null;
+    }
     const id = 'task_' + Date.now() + '_' + Math.floor(Math.random() * 1000);
     const task = {
         id, type, prompt, model, ratio, quality,
@@ -688,8 +932,9 @@ async function imgStudioPollTaskStatus(task) {
                         currentTask.controller = null;
                         imgStudioPushStage(currentTask, `✅ 渲染完成，已存入历史画廊（总用时 ${imgStudioTaskElapsedText(currentTask)}）`);
 
-                        imgStudioSaveToHistory(currentTask.type, currentTask.prompt, currentTask.model, currentTask.ratio, currentTask.quality, imgDataUrl);
-                        imgStudioDisplaySpotlight(imgDataUrl, currentTask.prompt, currentTask.model, currentTask.ratio, currentTask.quality);
+                        const completedModel = imgStudioTaskDisplayModel(currentTask);
+                        imgStudioSaveToHistory(currentTask.type, currentTask.prompt, completedModel, currentTask.ratio, currentTask.quality, imgDataUrl);
+                        imgStudioDisplaySpotlight(imgDataUrl, currentTask.prompt, completedModel, currentTask.ratio, currentTask.quality);
                         showToast('图像渲染成功！已存入历史画廊', 'success');
                     } else {
                         currentTask.status = 'failed';
@@ -728,15 +973,39 @@ async function imgStudioPollTaskStatus(task) {
 }
 
 async function imgStudioRunTaskFetch(task) {
+    const requestModel = normalizeApiImageModel(task.model);
+    if (!isApiImageModelAvailable(requestModel)) {
+        task.status = 'failed';
+        task.error = unavailableApiImageModelMessage(requestModel);
+        task.finishedAt = Date.now();
+        showToast(task.error, 'error');
+        imgStudioSaveTaskList();
+        imgStudioRenderTaskListUI();
+        return;
+    }
+    if (task.type === 'i2i' && !imgStudioReferenceFilesReady(task.extraData?.files)) {
+        task.status = 'failed';
+        task.referenceRequired = true;
+        task.error = '参考图尚未准备好，请补图后重试。';
+        task.finishedAt = Date.now();
+        imgStudioSaveTaskList();
+        imgStudioRenderTaskListUI();
+        return;
+    }
     const controller = new AbortController();
     task.controller = controller;
+    task.submittedModel = requestModel;
+    if (requestModel !== task.model) {
+        imgStudioPushStage(task, `使用 ${requestModel} 提交（原任务型号：${task.model}）`);
+    }
+    imgStudioRenderTaskListUI();
 
     try {
         let response;
         if (task.type === 't2i') {
             const body = {
                 prompt: task.prompt,
-                model: task.model,
+                model: requestModel,
                 size: task.ratio,
                 quality: task.quality,
                 image_size: task.quality,
@@ -753,7 +1022,7 @@ async function imgStudioRunTaskFetch(task) {
         } else {
             const formData = new FormData();
             formData.append('prompt', task.prompt);
-            formData.append('model', task.model);
+            formData.append('model', requestModel);
             formData.append('response_format', 'b64_json');
 
             if (task.ratio && task.ratio !== 'auto') {
@@ -769,6 +1038,10 @@ async function imgStudioRunTaskFetch(task) {
                 task.extraData.files.forEach((f, idx) => {
                     const mime = f.base64.split(';')[0].split(':')[1] || 'image/png';
                     const blob = imgStudioBase64ToBlob(f.base64, mime);
+                    if (!blob) {
+                        task.referenceRequired = true;
+                        throw new Error('参考图无法读取，请补图后重试。');
+                    }
                     if (blob) {
                         const file = new File([blob], f.name, { type: mime });
                         const fieldName = idx === 0 ? 'image' : 'image[]';
@@ -856,18 +1129,13 @@ function deleteImageStudioTask(taskId) {
 function retryImageStudioTask(taskId) {
     const task = imgStudioTaskList.find(t => t.id === taskId);
     if (!task || task.status === 'pending') return;
+    if (!isApiImageModelAvailable(task.model)) {
+        showToast(unavailableApiImageModelMessage(task.model), 'error');
+        return;
+    }
 
-    // 页面刷新后参考图 base64 不再持久化（防爆 localStorage 配额）：
-    // 没有参考图的 i2i 重试会静默变成"无参考图生图"，必须拦下
-    const hasFiles = task.extraData && task.extraData.files && task.extraData.files.length > 0;
-    if (task.type === 'i2i' && !hasFiles) {
-        task.status = 'failed';
-        task.finishedAt = Date.now();
-        task.error = '参考图已失效（页面刷新后不保留），请重新上传后再生成';
-        imgStudioPushStage(task, '❌ 参考图已失效（页面刷新后不保留），无法重试');
-        imgStudioSaveTaskList();
-        imgStudioRenderTaskListUI();
-        showToast('参考图已失效，请重新上传后再生成', 'warning');
+    if (task.type === 'i2i' && (task.referenceRequired || !imgStudioReferenceFilesReady(task.extraData?.files))) {
+        chooseImageStudioRetryReferences(taskId);
         return;
     }
 
@@ -891,15 +1159,14 @@ function retryImageStudioTask(taskId) {
 }
 
 function clearCompletedImageStudioTasks() {
-    const activeTasks = imgStudioTaskList.filter(t => t.status === 'pending');
-    const hasCompleted = imgStudioTaskList.length > activeTasks.length;
-    if (hasCompleted) {
-        imgStudioTaskList = activeTasks;
+    const count = imgStudioTaskList.filter(task => task.status === 'completed').length;
+    if (count) {
+        imgStudioTaskList = imgStudioTaskList.filter(task => task.status !== 'completed');
         imgStudioSaveTaskList();
         imgStudioRenderTaskListUI();
-        showToast('已清除已完成和已失效的任务记录', 'success');
+        showToast(`已清除 ${count} 条成功记录，图片仍在历史画廊。`, 'success');
     } else {
-        showToast('没有可清除的记录', 'success');
+        showToast('没有已完成的记录可清除。', 'success');
     }
 }
 
@@ -921,10 +1188,11 @@ function clearAllImageStudioTasks() {
 window.cancelImageStudioTask = cancelImageStudioTask;
 window.deleteImageStudioTask = deleteImageStudioTask;
 window.retryImageStudioTask = retryImageStudioTask;
+window.chooseImageStudioRetryReferences = chooseImageStudioRetryReferences;
 window.viewImageStudioTaskItem = function (taskId) {
     const task = imgStudioTaskList.find(t => t.id === taskId);
     if (task && task.status === 'completed' && task.image) {
-        imgStudioDisplaySpotlight(task.image, task.prompt, task.model, task.ratio, task.quality);
+        imgStudioDisplaySpotlight(task.image, task.prompt, imgStudioTaskDisplayModel(task), task.ratio, task.quality);
         showToast('已在渲染室展示该图片', 'success');
     }
 };
@@ -934,14 +1202,17 @@ function imgStudioDisplaySpotlight(imgDataUrl, prompt, model, ratio, quality) {
     document.getElementById('spotlight-placeholder').style.display = 'none';
     document.getElementById('spotlight-image-wrapper').style.display = 'flex';
 
-    document.getElementById('spotlight-img').src = imgDataUrl;
-    document.getElementById('spotlight-info-model').textContent = model.replace('-image', '');
+    const spotlightImg = document.getElementById('spotlight-img');
+    if (typeof MediaPreview !== 'undefined') MediaPreview.setSource(spotlightImg, imgDataUrl);
+    else spotlightImg.src = imgDataUrl;
+    document.getElementById('spotlight-info-model').textContent = model;
     document.getElementById('spotlight-info-prompt').textContent = prompt;
 
     imgStudioSetupSpotlightActions(imgDataUrl, prompt, model, ratio, quality);
 }
 
 function imgStudioResetSpotlightUI() {
+    if (typeof MediaPreview !== 'undefined') MediaPreview.setSource(document.getElementById('spotlight-img'), '');
     document.getElementById('spotlight-skeleton').style.display = 'none';
     document.getElementById('spotlight-image-wrapper').style.display = 'none';
     document.getElementById('spotlight-placeholder').style.display = 'flex';
@@ -951,7 +1222,7 @@ function imgStudioCaptionFor(item) {
     return `
         <strong>提示词:</strong> ${item.prompt}<br>
         <span style="font-size:0.75rem; color: #94a3b8; display:block; margin-top:0.4rem">
-            模型: ${item.model} | 比例: ${item.ratio} | 画质: ${item.quality}
+            模型: ${imgStudioTaskDisplayModel(item)} | 比例: ${item.ratio} | 画质: ${item.quality}
         </span>
     `;
 }
@@ -959,7 +1230,7 @@ function imgStudioCaptionFor(item) {
 function imgStudioSetupSpotlightActions(imgDataUrl, prompt, model, ratio, quality) {
     document.getElementById('spotlight-zoom-btn').onclick = () => {
         const spotlightImg = document.getElementById('spotlight-img');
-        const currentSrc = spotlightImg ? spotlightImg.src : imgDataUrl;
+        const currentSrc = (spotlightImg && (spotlightImg.getAttribute('data-media-preview-src') || spotlightImg.src)) || imgDataUrl;
 
         const clickedIndex = imgStudioHistory.findIndex(item => item.image === currentSrc);
         if (clickedIndex === -1) {
@@ -982,7 +1253,7 @@ function imgStudioSetupSpotlightActions(imgDataUrl, prompt, model, ratio, qualit
     };
 
     document.getElementById('spotlight-reuse-btn').onclick = () => {
-        imgStudioReusePrompt(prompt, ratio, quality);
+        imgStudioReusePrompt(prompt, ratio, quality, model);
     };
 
     document.getElementById('spotlight-to-i2i-btn').onclick = () => {
@@ -1041,7 +1312,34 @@ async function imgStudioCopyImageToClipboard(dataUrl) {
     }
 }
 
-function imgStudioReusePrompt(prompt, ratio, quality) {
+function imgStudioRestoreModelSelection(tabId, model) {
+    model = normalizeApiImageModel(model);
+    const select = document.getElementById(`${tabId}-model`);
+    if (!select || !model) return;
+    let message = '';
+    if (!isApiImageModelAvailable(model)) {
+        if (isApiImageModelAvailable('gpt-image-2.5')) {
+            message = `${model} 当前网关不可用，已在创作面板选择 gpt-image-2.5。`;
+            model = 'gpt-image-2.5';
+        } else {
+            message = unavailableApiImageModelMessage(model);
+        }
+    }
+    const known = Array.from(select.options).some(option => option.value === model);
+    const variant = /^gpt-image-2\.5-(sunburst|flare)(-\d{4}-\d{2}-\d{2})?$/.exec(model);
+    if (!known && variant) {
+        const option = document.createElement('option');
+        option.value = model;
+        option.textContent = `${model}（${variant[1] === 'sunburst' ? '最强 / 高精度' : '快速'}）`;
+        applyApiImageModelOptionAvailability(option);
+        select.appendChild(option);
+    }
+    if (known || variant) select.value = model;
+    return message;
+}
+
+function imgStudioReusePrompt(prompt, ratio, quality, model) {
+    const modelMessage = imgStudioRestoreModelSelection(imgStudioCurrentTab, model);
     if (imgStudioCurrentTab === 't2i') {
         document.getElementById('t2i-prompt').value = prompt;
         const ratioCard = document.querySelector(`#t2i-ratio-selector .ratio-card[data-ratio="${ratio}"]`);
@@ -1053,17 +1351,21 @@ function imgStudioReusePrompt(prompt, ratio, quality) {
         document.getElementById('i2i-prompt').value = prompt;
     }
 
-    showToast('创意提示词已填回配置面板', 'success');
+    syncImageStudioQualityDescriptions(imgStudioCurrentTab);
+    showToast(modelMessage || '创意提示词已填回配置面板', modelMessage ? 'warning' : 'success');
+    switchImageStudioMobileView('create');
 }
 
 function imgStudioSendToImageToImage(dataUrl, filename) {
     switchImageStudioTab('i2i');
+    switchImageStudioMobileView('create');
 
     fetch(dataUrl)
         .then(res => res.blob())
-        .then(blob => {
-            const file = new File([blob], filename, { type: "image/png" });
-            imgStudioUploadedFiles = [{ name: filename, file: file, base64: dataUrl }];
+        .then(async blob => {
+            const file = new File([blob], filename, { type: blob.type || 'image/png' });
+            const reference = await imgStudioReadReferenceFile(file);
+            imgStudioUploadedFiles = [{ ...reference, file }];
             imgStudioRenderUploadPreviews();
             showToast('图片已送往图生图作为参考画布！', 'success');
         })
@@ -1144,6 +1446,12 @@ async function imgStudioLoadHistory() {
         } catch (e) {}
     }
 
+    // Count-only pages do not need one remote HEAD request per saved image.
+    if (typeof MediaPreview !== 'undefined' && MediaPreview.countsOnly()) {
+        imgStudioRenderHistoryGrid();
+        return;
+    }
+
     // Filter out history items whose images no longer exist on the server (non-data URLs only)
     const filteredHistory = [];
     let needCleanSave = false;
@@ -1178,8 +1486,12 @@ function imgStudioRenderHistoryGrid() {
     imgStudioHistory.forEach(item => {
         const card = document.createElement('div');
         card.className = 'history-card';
+        card.onclick = (e) => {
+            if (e.target.closest('button')) return;
+            imgStudioDisplaySpotlight(item.image, item.prompt, item.model, item.ratio, item.quality);
+        };
         card.innerHTML = `
-            <img src="${item.image}" alt="History Item" loading="lazy">
+            <img ${imgStudioMediaAttrs(item.image)} alt="History Item" loading="lazy">
             <div class="history-card-overlay">
                 <button class="history-card-btn" title="查看" onclick="viewImageStudioHistoryItem('${item.id}', 'zoom')">🔍</button>
                 <button class="history-card-btn" title="下载" onclick="viewImageStudioHistoryItem('${item.id}', 'download')">📥</button>
@@ -1205,7 +1517,7 @@ window.viewImageStudioHistoryItem = function (id, action) {
     } else if (action === 'download') {
         imgStudioDownloadImage(item.image, `spark_${item.id}.png`);
     } else if (action === 'reuse') {
-        imgStudioReusePrompt(item.prompt, item.ratio, item.quality);
+        imgStudioReusePrompt(item.prompt, item.ratio, item.quality, item.model);
     } else if (action === 'to-i2i') {
         imgStudioSendToImageToImage(item.image, `ref_${item.id}.png`);
     }
@@ -1236,6 +1548,7 @@ document.addEventListener('DOMContentLoaded', () => {
     imgStudioLoadTaskList();
     initImageStudioSelectors();
     initImageStudioFileUploader();
+    initImageStudioMobileView();
 
     const clearCompletedTasksBtn = document.getElementById('clear-completed-tasks-btn');
     if (clearCompletedTasksBtn) clearCompletedTasksBtn.addEventListener('click', clearCompletedImageStudioTasks);

@@ -3,18 +3,20 @@ import os
 import shutil
 import tempfile
 import unittest
+from types import SimpleNamespace
 
 from unittest.mock import patch
 
 from video_generator import (
     rewrite_prompt_for_two_card_ui,
     load_slot_frames,
-    load_drift_break_slots,
     plan_video_slots,
     _ManifestWriter,
     _video_info,
     _BatchBridge,
     _merge_skip_missing,
+    _normalize_merge_speed,
+    _merge_filter,
     merge_project_videos,
     PartialMergeBlocked,
     _select_pool_account,
@@ -25,6 +27,21 @@ from video_generator import (
 )
 
 from datetime import datetime, timedelta
+
+
+def _merge_probe_fixture(cmd, captured, output_duration):
+    """Silent 8 s / 30 fps clips, with an independently specified export duration."""
+    if '-select_streams' in cmd and cmd[cmd.index('-select_streams') + 1].startswith('a'):
+        stdout = json.dumps({'streams': []}) if 'json' in cmd else ''
+    else:
+        duration = output_duration if cmd[-1] == captured.get('output_path') else 8.0
+        stdout = json.dumps({
+            'streams': [{'codec_type': 'video', 'width': 1080, 'height': 1920,
+                         'r_frame_rate': '30/1', 'avg_frame_rate': '30/1',
+                         'duration': str(duration)}],
+            'format': {'duration': str(duration)},
+        })
+    return SimpleNamespace(returncode=0, stderr='', stdout=stdout)
 
 
 class TestPromptRewrite(unittest.TestCase):
@@ -166,6 +183,17 @@ class TestPlanVideoSlots(_TmpDirCase):
                                   gate_level='off')
         self.assertEqual([p['action'] for p in plans], ['generate'] * 3)
 
+    def test_frame_continuity_failed_blocks_both_adjacent_videos(self):
+        frames = self._make_frames(4)
+        quality = {3: 'frame_continuity_failed'}
+        plans = plan_video_slots(self.VIDEOS, frames, quality, self.videos_dir,
+                                 gate_level='standard')
+        self.assertEqual([p['action'] for p in plans], ['generate', 'blocked', 'blocked'])
+        self.assertIn('场景连续性检查失败', plans[1]['reason'])
+        off_plans = plan_video_slots(self.VIDEOS, frames, quality, self.videos_dir,
+                                     gate_level='off')
+        self.assertEqual([p['action'] for p in off_plans], ['generate', 'blocked', 'blocked'])
+
     def test_override_flagged_bypasses_sequence_review_block(self):
         """2026-07-23：前端"确认风险，强制生成"必须真正让后端放行——此前 UI 弹窗确认
         了也没用，plan_video_slots 仍按 quality_gate 硬拦，等于白问用户一遍。"""
@@ -206,15 +234,25 @@ class TestPlanVideoSlots(_TmpDirCase):
         self.assertEqual([p['action'] for p in plans], ['generate'] * 3)
         self.assertIn('被人工标记存在问题', plans[1]['warning'])
 
-    def test_stale_lineage_blocks_standard_warns_lenient(self):
+    def test_stale_lineage_blocks_unless_gate_off(self):
+        """2026-07-30：血统过期从"standard 拦 / lenient 警告"改成"除 off 档一律拦"。
+
+        它和其它门禁不同类——一致性审查的判定有主观成分（宽松档放行是合理档位），
+        血统过期是确定性事实：上游帧被单独换过，这一对锚点帧确实来自两条不同的 i2i
+        链。lenient 档那条警告会和其它十几条混在一起滚过去，实际等于没拦（2026-07-27
+        ice_cave slot3 事故就是这么走到成片的）。要放行走 override_flagged 或 off 档。
+        """
         frames = self._make_frames(4)
         stale = {3}
+        for level in ('standard', 'lenient'):
+            plans = plan_video_slots(self.VIDEOS, frames, {}, self.videos_dir,
+                                      gate_level=level, stale_slots=stale)
+            self.assertEqual([p['action'] for p in plans],
+                             ['generate', 'blocked', 'blocked'], level)
+            self.assertIn('血统过期', plans[1]['reason'])
+        # off = 整体停用质检，与其它门禁一致地不做事后拦截
         plans = plan_video_slots(self.VIDEOS, frames, {}, self.videos_dir,
-                                  gate_level='standard', stale_slots=stale)
-        self.assertEqual([p['action'] for p in plans], ['generate', 'blocked', 'blocked'])
-        self.assertIn('血统过期', plans[1]['reason'])
-        plans = plan_video_slots(self.VIDEOS, frames, {}, self.videos_dir,
-                                  gate_level='lenient', stale_slots=stale)
+                                  gate_level='off', stale_slots=stale)
         self.assertEqual([p['action'] for p in plans], ['generate'] * 3)
         self.assertIn('旧 i2i 链', plans[1]['warning'])
         self.assertNotIn('warning', plans[0])
@@ -232,70 +270,15 @@ class TestPlanVideoSlots(_TmpDirCase):
         self.assertIn('旧 i2i 链', plans[1]['warning'])
         self.assertNotIn('warning', plans[0])
 
-    def test_chain_drift_break_blocks_standard_warns_lenient(self):
-        """链回望 FAIL 段（manifest.chain_drift passed=False）覆盖的槽位：standard 拦、
-        lenient 警告放行、off 放行。2026-07-15 盐湖贝壳单 anchor=6/tail=9 FAIL 被无视，
-        vid_006 在室外/室内两张无关帧之间自由变形——此门即为该事故补的。"""
+    def test_unreviewed_anchor_is_warned_about_not_blocked(self):
+        """渲染期不再产生任何判定，帧默认停在 pending_manual_review。这不是坏帧，
+        不该拦；但花视频额度那一刻必须把"这张没人看过"说出来。"""
         frames = self._make_frames(4)
-        drift = {2, 3}  # 模拟 anchor=2 / tail=4 的 FAIL 段
-        plans = plan_video_slots(self.VIDEOS, frames, {}, self.videos_dir,
-                                  gate_level='standard', drift_slots=drift)
-        self.assertEqual([p['action'] for p in plans], ['generate', 'blocked', 'blocked'])
-        self.assertIn('空间断裂', plans[1]['reason'])
-        plans = plan_video_slots(self.VIDEOS, frames, {}, self.videos_dir,
-                                  gate_level='lenient', drift_slots=drift)
+        quality = {s: 'pending_manual_review' for s in (1, 2, 3, 4)}
+        plans = plan_video_slots(self.VIDEOS, frames, quality, self.videos_dir,
+                                  gate_level='standard')
         self.assertEqual([p['action'] for p in plans], ['generate'] * 3)
-        self.assertIn('空间断裂', plans[1]['warning'])
-        self.assertNotIn('warning', plans[0])
-        plans = plan_video_slots(self.VIDEOS, frames, {}, self.videos_dir,
-                                  gate_level='off', drift_slots=drift)
-        self.assertEqual([p['action'] for p in plans], ['generate'] * 3)
-
-    def test_override_flagged_bypasses_chain_drift_block(self):
-        """2026-07-24 修复：链回望空间断裂（chain_drift）此前不受 override_flagged
-        影响——实录案例：用户确认风险后 sequence_review_flagged 帧对应的视频被放行
-        了，但同一批里被链回望标记为 FAIL 段的槽位（4-12）仍然全部 blocked，锚点帧
-        从未被提交生成/上传到视频后端，用户的"确认风险"只对一部分槽位生效。"""
-        frames = self._make_frames(4)
-        drift = {2, 3}
-        plans = plan_video_slots(self.VIDEOS, frames, {}, self.videos_dir,
-                                  gate_level='standard', drift_slots=drift, override_flagged=True)
-        self.assertEqual([p['action'] for p in plans], ['generate'] * 3)
-        self.assertIn('空间断裂', plans[1]['warning'])
-        self.assertNotIn('warning', plans[0])
-
-    def test_stale_and_drift_warnings_are_both_kept_on_lenient(self):
-        frames = self._make_frames(4)
-        plans = plan_video_slots(self.VIDEOS, frames, {}, self.videos_dir,
-                                  gate_level='lenient', stale_slots={2}, drift_slots={2})
-        w = plans[1]['warning']
-        self.assertIn('旧 i2i 链', w)
-        self.assertIn('空间断裂', w)
-
-
-class TestLoadDriftBreakSlots(unittest.TestCase):
-    """manifest.chain_drift FAIL 段 → 受影响视频槽位（anchor..tail-1）。"""
-
-    def test_failed_entry_covers_anchor_to_tail_minus_one(self):
-        manifest = {'chain_drift': [
-            {'family_anchor': 1, 'mid': 3, 'tail': 4, 'passed': True, 'reason': 'PASS'},
-            {'family_anchor': 6, 'mid': 8, 'tail': 9, 'passed': False, 'reason': 'FAIL: 断裂'},
-        ]}
-        # 2026-07-15 实案：anchor=6/tail=9 FAIL → vid 6/7/8 都可能横跨断裂
-        self.assertEqual(load_drift_break_slots(manifest), {6, 7, 8})
-
-    def test_passed_and_malformed_entries_are_ignored(self):
-        manifest = {'chain_drift': [
-            {'family_anchor': 1, 'tail': 4, 'passed': True},
-            {'family_anchor': 'x', 'tail': 9, 'passed': False},
-            {'tail': 9, 'passed': False},
-            'not a dict',
-        ]}
-        self.assertEqual(load_drift_break_slots(manifest), set())
-
-    def test_missing_chain_drift_key_or_empty_manifest(self):
-        self.assertEqual(load_drift_break_slots({}), set())
-        self.assertEqual(load_drift_break_slots(None), set())
+        self.assertIn('未经过一致性审查', plans[0]['warning'])
 
 
 class TestLoadSlotFrames(_TmpDirCase):
@@ -363,6 +346,18 @@ class TestStaleLineage(_TmpDirCase):
         self.assertEqual(manifest['videos'], [])
         self.assertTrue(all('stale_lineage' not in f for f in manifest['frames']))
 
+    def test_reused_frames_keep_delivered_videos(self):
+        """整轮都复用磁盘现成帧（frames_changed=False）时，视频清单与合并视频不能被清空。"""
+        from frame_generator import update_manifest_stale_status
+        manifest = dict(self._manifest(3), merged_video='x', videos=[{'slot': 1, 'status': 'success'}])
+        update_manifest_stale_status(manifest, self.tmp, frames_changed=False)
+        update_manifest_stale_status(manifest, self.tmp, regenerated_sequences=None,
+                                     finalize=True, frames_changed=False)
+        self.assertEqual(manifest['merged_video'], 'x')
+        self.assertEqual(manifest['videos'], [{'slot': 1, 'status': 'success'}])
+        update_manifest_stale_status(manifest, self.tmp, finalize=True, frames_changed=True)
+        self.assertEqual(manifest['videos'], [])
+
 
 class TestManifestWriter(_TmpDirCase):
     def test_incremental_merge_keeps_other_slots_and_orders(self):
@@ -405,7 +400,8 @@ class TestVideoInfo(unittest.TestCase):
         self.assertEqual(info['status'], 'failed')
         self.assertEqual(info['error'], 'boom')
         self.assertEqual(info['slot'], 2)
-        self.assertEqual(info['sequence'], 1)
+        # sequence 跟 slot 走，不再是批内序号（plan['seq'] 这里是 1）
+        self.assertEqual(info['sequence'], 2)
 
     def test_success_info_has_relative_url(self):
         info = _video_info(self.PLAN, 'veo', status='success')
@@ -453,6 +449,78 @@ class TestVideoProgressEvents(unittest.TestCase):
         self.assertEqual(error[1]['message'], 'boom')
         self.assertEqual(records[0]['slot'], 7)
 
+    def test_explicit_override_keeps_anchor_mismatch_with_warning(self):
+        records = []
+        events = []
+
+        class Writer:
+            def record(self, info):
+                records.append(info)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            generated = os.path.join(tmp, 'generated.mp4')
+            destination = os.path.join(tmp, 'vid_008.mp4')
+            with open(generated, 'wb') as f:
+                f.write(b'video')
+            plan = {
+                'slot': 8, 'seq': 1, 'prompt': 'p', 'dest_path': destination,
+                'start_frame': os.path.join(tmp, 'img_008.webp'),
+                'end_frame': os.path.join(tmp, 'img_009.webp'),
+            }
+            bridge = _BatchBridge(
+                pending=[{'plan': plan}], total=1, video_model='omni',
+                writer=Writer(),
+                on_progress=lambda stage, payload: events.append((stage, payload)),
+                allow_anchor_mismatch=True,
+            )
+            with patch('video_generator.verify_video_anchors',
+                       return_value=(False, 'first=26.0, last=32.6')):
+                result = bridge(0, 'video_done', {'video_url': generated})
+
+            self.assertIsNone(result)
+            self.assertTrue(os.path.exists(destination))
+            self.assertEqual(records[0]['status'], 'success')
+            self.assertTrue(records[0]['anchor_mismatch_overridden'])
+            self.assertTrue(any(stage == 'video_warning' for stage, _ in events))
+
+    def test_anchor_rejection_adapts_prompt_before_retry(self):
+        records = []
+        events = []
+
+        class Writer:
+            def record(self, info):
+                records.append(info)
+
+        class Req:
+            prompt = 'Build the cabinets evenly.'
+
+        with tempfile.TemporaryDirectory() as tmp:
+            generated = os.path.join(tmp, 'generated.mp4')
+            destination = os.path.join(tmp, 'vid_011.mp4')
+            with open(generated, 'wb') as f:
+                f.write(b'video')
+            req = Req()
+            plan = {
+                'slot': 11, 'seq': 1, 'prompt': req.prompt, 'dest_path': destination,
+                'start_frame': os.path.join(tmp, 'img_011.webp'),
+                'end_frame': os.path.join(tmp, 'img_012.webp'),
+            }
+            bridge = _BatchBridge(
+                pending=[{'plan': plan, 'req': req}], total=1, video_model='omni',
+                writer=Writer(),
+                on_progress=lambda stage, payload: events.append((stage, payload)),
+            )
+            with patch('video_generator.verify_video_anchors',
+                       return_value=(False, 'first=4.3, last=27.3')):
+                result = bridge(0, 'video_done', {'video_url': generated})
+
+            self.assertEqual(result, 'rejected')
+            self.assertIn('ANCHOR_RETRY_ADAPTATION:', req.prompt)
+            self.assertIn('last-frame geometry', req.prompt)
+            self.assertEqual(bridge.stats['anchor_rejections'], 1)
+            self.assertEqual(bridge.stats['adaptive_retries'], 1)
+            self.assertTrue(any(stage == 'video_retry_adapted' for stage, _ in events))
+
 
 class TestMergeSkipMissing(unittest.TestCase):
     """2026-07-22 改版：强制合并不再用起始锚点帧定格+「缺失」标注填充缺口，改成直接
@@ -471,20 +539,21 @@ class TestMergeSkipMissing(unittest.TestCase):
             os.path.join(self.rel_project_dir, 'videos', 'vid_001.mp4'))
         with open(self.good_video, 'wb') as f:
             f.write(b'fake')
+        # These cases exercise slot selection, not motion-based retiming.
+        retime = patch('video_generator.retime_clips_for_merge',
+                       side_effect=lambda files, tmp, metas=None: (list(files), []))
+        retime.start()
+        self.addCleanup(retime.stop)
 
     def tearDown(self):
         os.chdir(self.orig_cwd)
         shutil.rmtree(self.base, ignore_errors=True)
 
-    def _fake_run(self, captured):
+    def _fake_run(self, captured, output_duration=2.0):
         def fake_run(cmd, cwd=None, **kwargs):
             captured.setdefault('calls', []).append(cmd)
             if cmd[0] == 'ffprobe':
-                class Probe:
-                    returncode = 0
-                    stderr = ''
-                    stdout = '5.0'
-                return Probe()
+                return _merge_probe_fixture(cmd, captured, output_duration)
             # 主合并调用：复刻真实 ffmpeg 行为——相对路径参数按子进程 cwd 解析，
             # 目标目录不存在就报错，不会自动创建目录
             out_arg = cmd[-1]
@@ -497,6 +566,8 @@ class TestMergeSkipMissing(unittest.TestCase):
                 return Fail()
             with open(resolved, 'wb') as f:
                 f.write(b'fake-mp4')
+            captured['output_path'] = out_arg
+            captured['inputs'] = [cmd[i + 1] for i, value in enumerate(cmd) if value == '-i']
             class Ok:
                 returncode = 0
                 stderr = ''
@@ -518,14 +589,80 @@ class TestMergeSkipMissing(unittest.TestCase):
         ffmpeg_cmd = next(c for c in captured['calls'] if c[0] == 'ffmpeg')
         self.assertTrue(os.path.isabs(ffmpeg_cmd[-1]),
                         f"ffmpeg output arg must be absolute: {ffmpeg_cmd[-1]}")
+        self.assertEqual(captured['inputs'], [self.good_video])
+        self.assertEqual(result['duration_seconds'], 2.0)
         # 跳过模式不应再生成任何占位/字幕相关的临时文件
         self.assertFalse(any('_ph_' in c for call in captured['calls'] for c in call))
+
+    def test_applies_selected_1_5x_speed(self):
+        captured = {}
+        with patch('video_generator.subprocess.run',
+                   side_effect=self._fake_run(captured, output_duration=16 / 3)):
+            result = _merge_skip_missing(
+                self.rel_project_dir, {'title': 'Test Project'},
+                expected_slots=[1, 2], good={1: self.good_video},
+                missing=[2], mismatched=[], speed=1.5)
+
+        ffmpeg_cmd = next(c for c in captured['calls'] if c[0] == 'ffmpeg')
+        filter_value = ffmpeg_cmd[ffmpeg_cmd.index('-filter_complex') + 1]
+        self.assertIn('setpts=(PTS-STARTPTS)*0.6666666667', filter_value)
+        self.assertTrue(ffmpeg_cmd[-1].endswith('_partial_1_5x.mp4'))
+        self.assertEqual(result['speed'], 1.5)
+        self.assertEqual(result['duration_seconds'], 5.33)
+
+    def test_merge_speed_validation_and_filters(self):
+        self.assertEqual(_normalize_merge_speed('1'), 1.0)
+        self.assertEqual(_normalize_merge_speed(1.5), 1.5)
+        self.assertEqual(_normalize_merge_speed(2), 2.0)
+        self.assertEqual(_normalize_merge_speed('3'), 3.0)
+        self.assertEqual(_normalize_merge_speed('4'), 4.0)
+        self.assertEqual(_merge_filter(3.0, True),
+                         '[0:v]setpts=0.3333333333*PTS[v];[0:a]atempo=2,atempo=1.5[a]')
+        self.assertEqual(_merge_filter(4.0, True),
+                         '[0:v]setpts=0.25*PTS[v];[0:a]atempo=2,atempo=2[a]')
+        self.assertEqual(_merge_filter(4.0, False),
+                         '[0:v]setpts=0.25*PTS[v]')
+        self.assertEqual(_merge_filter(1.0, True),
+                         '[0:v]setpts=1*PTS[v];[0:a]atempo=1[a]')
+        with self.assertRaises(ValueError):
+            _normalize_merge_speed(5)
 
     def test_no_good_slots_returns_none(self):
         result = _merge_skip_missing(
             self.rel_project_dir, {'title': 'Test Project'},
             expected_slots=[1, 2], good={}, missing=[1, 2], mismatched=[])
         self.assertIsNone(result)
+
+    def test_merge_project_videos_raises_partial_merge_blocked(self):
+        """当视频片段不全且 allow_partial=False 时，必须拦截并抛出 PartialMergeBlocked。"""
+        manifest = {
+            'title': 'Partial Video Test',
+            'frames': [
+                {'slot': 1, 'sequence': 1, 'file': 'frames/img_001.webp'},
+                {'slot': 2, 'sequence': 2, 'file': 'frames/img_002.webp'},
+                {'slot': 3, 'sequence': 3, 'file': 'frames/img_003.webp'},
+            ],
+            'videos': [
+                {'slot': 1, 'status': 'success', 'file': 'videos/vid_001.mp4'},
+                # slot 2 is missing / failed
+            ]
+        }
+        with open(os.path.join(self.rel_project_dir, 'manifest.json'), 'w', encoding='utf-8') as f:
+            json.dump(manifest, f)
+
+        # 默认 allow_partial=False 抛出异常
+        with self.assertRaises(PartialMergeBlocked) as ctx:
+            merge_project_videos(self.rel_project_dir, allow_partial=False)
+        self.assertIn(2, ctx.exception.missing)
+
+        # allow_partial=True 时跳过缺失槽位合并
+        captured = {}
+        with patch('video_generator.subprocess.run', side_effect=self._fake_run(captured)):
+            result = merge_project_videos(self.rel_project_dir, allow_partial=True)
+            self.assertIsNotNone(result)
+            self.assertTrue(result.get('partial'))
+            self.assertEqual(result.get('skipped_slots'), [2])
+            self.assertEqual(captured['inputs'], [self.good_video])
 
 
 class TestMergeManualUploadTrust(unittest.TestCase):
@@ -541,6 +678,10 @@ class TestMergeManualUploadTrust(unittest.TestCase):
         self.frames_dir = os.path.join(self.tmp, 'frames')
         os.makedirs(self.videos_dir)
         os.makedirs(self.frames_dir)
+        retime = patch('video_generator.retime_clips_for_merge',
+                       side_effect=lambda files, tmp, metas=None: (list(files), []))
+        retime.start()
+        self.addCleanup(retime.stop)
 
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
@@ -561,22 +702,17 @@ class TestMergeManualUploadTrust(unittest.TestCase):
         with open(os.path.join(self.tmp, 'manifest.json'), 'w', encoding='utf-8') as f:
             json.dump(manifest, f)
 
-    def _fake_run_factory(self, captured):
+    def _fake_run_factory(self, captured, output_duration=2.0):
         def fake_run(cmd, cwd=None, **kwargs):
             captured.setdefault('calls', []).append(cmd)
             if cmd[0] == 'ffprobe':
-                class Probe:
-                    returncode = 0
-                    stderr = ''
-                    stdout = '5.0'
-                return Probe()
-            i_idx = cmd.index('-i')
-            with open(cmd[i_idx + 1], 'r', encoding='utf-8') as f:
-                captured['concat_list'] = f.read()
+                return _merge_probe_fixture(cmd, captured, output_duration)
+            captured['inputs'] = [cmd[i + 1] for i, value in enumerate(cmd) if value == '-i']
             out_path = cmd[-1]
             os.makedirs(os.path.dirname(out_path) or '.', exist_ok=True)
             with open(out_path, 'wb') as f:
                 f.write(b'fake-merged-mp4')
+            captured['output_path'] = out_path
 
             class Ok:
                 returncode = 0
@@ -599,20 +735,38 @@ class TestMergeManualUploadTrust(unittest.TestCase):
 
         self.assertIsNotNone(result)
         self.assertEqual(result['status'], 'success')
-        concat_lines = [l for l in captured['concat_list'].splitlines() if l.strip()]
-        self.assertEqual(len(concat_lines), 1)
+        self.assertEqual(captured['inputs'], [os.path.join(self.videos_dir, 'vid_001.mp4')])
+
+    def test_explicit_generated_override_bypasses_merge_recheck(self):
+        self._touch(os.path.join(self.videos_dir, 'vid_001.mp4'))
+        self._write_manifest(2, [
+            {'slot': 1, 'status': 'success', 'file': 'videos/vid_001.mp4',
+             'start_anchor_slot': 1, 'model': 'omni',
+             'anchor_mismatch_overridden': True},
+        ])
+        captured = {}
+        with patch('video_generator.verify_video_anchors', return_value=(False, 'forced mismatch')), \
+             patch('video_generator.subprocess.run', side_effect=self._fake_run_factory(captured)):
+            result = merge_project_videos(self.tmp)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result['status'], 'success')
+        self.assertEqual(captured['inputs'], [os.path.join(self.videos_dir, 'vid_001.mp4')])
 
     def test_auto_generated_slot_still_blocked_on_anchor_mismatch(self):
-        """对照组：非手动上传的槽位没有被这次修复连带放松——安全网仍然有效。"""
+        """非手动上传的槽位锚点不符时留警告日志，仍按合并容错策略并入成片。"""
         self._touch(os.path.join(self.videos_dir, 'vid_001.mp4'))
         self._write_manifest(2, [
             {'slot': 1, 'status': 'success', 'file': 'videos/vid_001.mp4',
              'start_anchor_slot': 1, 'model': 'i2v'},
         ])
-        with patch('video_generator.verify_video_anchors', return_value=(False, 'real mismatch')):
-            with self.assertRaises(PartialMergeBlocked) as ctx:
-                merge_project_videos(self.tmp)
-        self.assertIn(1, ctx.exception.mismatched)
+        captured = {}
+        with patch('video_generator.verify_video_anchors', return_value=(False, 'real mismatch')), \
+             patch('video_generator.subprocess.run', side_effect=self._fake_run_factory(captured)):
+            result = merge_project_videos(self.tmp)
+        self.assertIsNotNone(result)
+        self.assertEqual(result['status'], 'success')
+        self.assertEqual(captured['inputs'], [os.path.join(self.videos_dir, 'vid_001.mp4')])
 
     def test_manual_upload_hero_clip_bypasses_anchor_mismatch(self):
         self._touch(os.path.join(self.videos_dir, 'vid_001.mp4'))
@@ -625,18 +779,20 @@ class TestMergeManualUploadTrust(unittest.TestCase):
         captured = {}
         # 只让"英雄片段"这一路锚点判定为不匹配，验证正片槽位（非手动上传）走的仍是
         # 真实校验结果、没有被这次修复连带放松。
-        def fake_verify(video_path, start_frame_path, end_frame_path, strict=False):
+        def fake_verify(video_path, start_frame_path, end_frame_path, strict=False, config=None):
             if 'vid_002' in video_path:
                 return False, 'forced mismatch'
             return True, 'ok'
         with patch('video_generator.verify_video_anchors', side_effect=fake_verify), \
-             patch('video_generator.subprocess.run', side_effect=self._fake_run_factory(captured)):
+             patch('video_generator.subprocess.run',
+                   side_effect=self._fake_run_factory(captured, output_duration=4.0)):
             result = merge_project_videos(self.tmp)
 
         self.assertIsNotNone(result)
         self.assertEqual(result['status'], 'success')
-        concat_lines = [l for l in captured['concat_list'].splitlines() if l.strip()]
-        self.assertEqual(len(concat_lines), 2, "手动上传的英雄片段应该照样拼进成片")
+        self.assertEqual(captured['inputs'], [os.path.join(self.videos_dir, f'vid_{slot:03d}.mp4')
+                                              for slot in (1, 2)],
+                         "手动上传的英雄片段应该照样拼进成片")
 
 
 class _FakeAccountPool:
@@ -651,7 +807,7 @@ class _FakeAccountPool:
     def list_accounts(self):
         return self._accounts
 
-    def pick_account(self, min_credit=1):
+    def pick_account(self, min_credit=1, *args, **kwargs):
         self.pick_calls.append(min_credit)
         return self._chosen
 
@@ -784,7 +940,7 @@ class TestAccountRotationRing(unittest.TestCase):
 
 
 class TestPlanGenerationLegs(unittest.TestCase):
-    """切腿：每 switch_interval 个请求换一个号，全程同一个 IP（换 IP 已全局关停）。"""
+    """整条视频序列沿用可用账号，额度耗尽由服务换号。"""
 
     def _items(self, n):
         return [{'plan': {'slot': i}} for i in range(n)]
@@ -797,14 +953,15 @@ class TestPlanGenerationLegs(unittest.TestCase):
             self.assertEqual(len(legs[0]['items']), 12)
             self.assertIsNone(legs[0]['user_id'])
 
-    def test_switches_account_every_interval(self):
+    def test_available_pool_does_not_split_healthy_session(self):
         legs = plan_generation_legs(self._items(12), ['a', 'b', 'c'], 5)
-        self.assertEqual([len(l['items']) for l in legs], [5, 5, 2])
-        self.assertEqual([l['user_id'] for l in legs], ['a', 'b', 'c'])
+        self.assertEqual([len(l['items']) for l in legs], [12])
+        self.assertEqual([l['user_id'] for l in legs], [None])
 
-    def test_account_ring_wraps_around(self):
+    def test_old_interval_does_not_restore_previous_accounts(self):
         legs = plan_generation_legs(self._items(20), ['a', 'b'], 5)
-        self.assertEqual([l['user_id'] for l in legs], ['a', 'b', 'a', 'b'])
+        self.assertEqual([l['user_id'] for l in legs], [None])
+        self.assertEqual(legs[0]['items'], self._items(20))
 
     def test_never_emits_rotate_ip(self):
         """换 IP 已关停：腿计划里不该再出现任何换 IP 指示。"""
@@ -851,6 +1008,258 @@ class TestNextUnusedAccount(unittest.TestCase):
     def test_returns_none_when_everything_used(self):
         pool = _FakeAccountPool(chosen={'user_id': 'a'})
         self.assertIsNone(_next_unused_account({}, pool, ['a'], {'a'}))
+
+
+class TestContinueVideoSequenceManualAndExistingSlots(unittest.TestCase):
+    """测试继续生成视频序列时对手动上传、手动换位和已有视频槽位的识别与保留。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.videos_dir = os.path.join(self.tmp, 'videos')
+        self.frames_dir = os.path.join(self.tmp, 'frames')
+        os.makedirs(self.videos_dir)
+        os.makedirs(self.frames_dir)
+        self.VIDEOS = {
+            1: 'move from IMAGE 1 to IMAGE 2',
+            2: 'move from IMAGE 2 to IMAGE 3',
+            3: 'move from IMAGE 3 to IMAGE 4',
+        }
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _touch(self, path, content=b'fake-video-content'):
+        with open(path, 'wb') as f:
+            f.write(content)
+        return path
+
+    def _make_frames(self, n):
+        frames = {}
+        for i in range(1, n + 1):
+            p = os.path.join(self.frames_dir, f'img_{i:03d}.webp')
+            self._touch(p, b'frame')
+            frames[i] = p
+        return frames
+
+    def test_manual_upload_is_reused_without_anchor_verification(self):
+        """手动上传的视频即使锚点校验不符也不得被删除或重新生成。"""
+        frames = self._make_frames(4)
+        dest = self._touch(os.path.join(self.videos_dir, 'vid_002.mp4'))
+        existing_videos = [
+            {'slot': 2, 'source': 'manual_upload', 'model': 'manual_upload', 'status': 'success'}
+        ]
+        verify_called = []
+        def fake_verify(*args, **kwargs):
+            verify_called.append(args)
+            return False, 'anchor mismatch'
+
+        plans = plan_video_slots(
+            self.VIDEOS, frames, {}, self.videos_dir,
+            verify_fn=fake_verify,
+            existing_videos=existing_videos
+        )
+        self.assertEqual(plans[1]['action'], 'reuse')
+        self.assertFalse(plans[1]['delete_existing'])
+        # 槽位 2 不应调用 verify_fn（直接信任手动上传）
+        self.assertEqual(len(verify_called), 0)
+
+    def test_manual_swap_is_reused_without_anchor_verification(self):
+        """手动换位的视频即使首尾帧不匹配新槽位锚点也必须保留复用。"""
+        frames = self._make_frames(4)
+        self._touch(os.path.join(self.videos_dir, 'vid_002.mp4'))
+        existing_videos = [
+            {'slot': 2, 'source': 'manual_swap', 'swapped_from_slot': 1, 'status': 'success'}
+        ]
+        plans = plan_video_slots(
+            self.VIDEOS, frames, {}, self.videos_dir,
+            verify_fn=lambda *a, **k: (False, 'mismatch'),
+            existing_videos=existing_videos
+        )
+        self.assertEqual(plans[1]['action'], 'reuse')
+        self.assertFalse(plans[1]['delete_existing'])
+
+    def test_existing_success_video_reused_if_anchors_not_stale(self):
+        """已成功生成的视频在锚点帧未重渲（无 stale_slots）时应直接复用。"""
+        frames = self._make_frames(4)
+        self._touch(os.path.join(self.videos_dir, 'vid_001.mp4'))
+        existing_videos = [
+            {'slot': 1, 'status': 'success', 'model': 'Veo 3.1 - Lite'}
+        ]
+        plans = plan_video_slots(
+            self.VIDEOS, frames, {}, self.videos_dir,
+            verify_fn=lambda *a, **k: (False, 'minor drift'),
+            stale_slots=set(),
+            existing_videos=existing_videos
+        )
+        self.assertEqual(plans[0]['action'], 'reuse')
+        self.assertFalse(plans[0]['delete_existing'])
+
+    def test_existing_success_video_checks_anchors_if_stale(self):
+        """若关联锚点帧重新渲染过（在 stale_slots 中），则必须核对锚点并拦截/重新生成。"""
+        frames = self._make_frames(4)
+        self._touch(os.path.join(self.videos_dir, 'vid_001.mp4'))
+        existing_videos = [
+            {'slot': 1, 'status': 'success', 'model': 'Veo 3.1 - Lite'}
+        ]
+        # 标准门禁下，血统过期被拦截，且旧文件被标记删除
+        plans = plan_video_slots(
+            self.VIDEOS, frames, {}, self.videos_dir,
+            verify_fn=lambda *a, **k: (False, 'stale mismatch'),
+            stale_slots={2},  # slot 1 结束帧是 frame 2，已过期
+            existing_videos=existing_videos
+        )
+        self.assertEqual(plans[0]['action'], 'blocked')
+        self.assertTrue(plans[0]['delete_existing'])
+
+        # 用户确认风险强制放行时，转入重新生成
+        override_plans = plan_video_slots(
+            self.VIDEOS, frames, {}, self.videos_dir,
+            verify_fn=lambda *a, **k: (False, 'stale mismatch'),
+            stale_slots={2},
+            override_flagged=True,
+            existing_videos=existing_videos
+        )
+        self.assertEqual(override_plans[0]['action'], 'generate')
+        self.assertTrue(override_plans[0]['delete_existing'])
+
+    def test_explicit_retry_deletes_even_manual_upload(self):
+        """用户显式重试指定槽位时，应允许重新生成覆盖。"""
+        frames = self._make_frames(4)
+        self._touch(os.path.join(self.videos_dir, 'vid_002.mp4'))
+        existing_videos = [
+            {'slot': 2, 'source': 'manual_upload', 'status': 'success'}
+        ]
+        plans = plan_video_slots(
+            self.VIDEOS, frames, {}, self.videos_dir,
+            target_slots=['2'],
+            existing_videos=existing_videos
+        )
+        self.assertEqual(len(plans), 1)
+        self.assertEqual(plans[0]['slot'], 2)
+        self.assertEqual(plans[0]['action'], 'generate')
+        self.assertTrue(plans[0]['delete_existing'])
+
+
+
+class TestDeclaredAnchorExtractionAndPlanning(unittest.TestCase):
+    """测试从视频提示词中智能提取首尾锚点声明，并在槽位规划中正确绑定。"""
+
+    def test_extract_various_declared_anchors(self):
+        from video_generator import extract_declared_frame_anchors
+
+        # 1. 显式双帧描述（Shot B 进场工序）
+        p1 = (
+            "Use the provided first frame and last frame as exact composition anchors. "
+            "Use IMAGE 7 as the actual first-frame image and IMAGE 8 as the actual last-frame image; "
+            "every visible action must interpolate between those two frame images without inventing a third layout."
+        )
+        self.assertEqual(extract_declared_frame_anchors(p1, 6, 7), (7, 8))
+
+        # 2. 箭头格式
+        p2 = "视频 6 [BRIDGE TRANSITION] (Image 7 -> Image 8): worker enters chamber..."
+        self.assertEqual(extract_declared_frame_anchors(p2, 6, 7), (7, 8))
+
+        # 3. 中文格式
+        p3 = "使用图片 7 作为起始帧，图片 8 作为结束帧进行平滑过渡。"
+        self.assertEqual(extract_declared_frame_anchors(p3, 6, 7), (7, 8))
+
+        # 4. 英雄单帧展示
+        p4 = "Use the provided reference image (IMAGE 11) as the sole starting-frame anchor for this clip."
+        self.assertEqual(extract_declared_frame_anchors(p4, 11, None), (11, None))
+
+        # 5. 无显式声明（回退到默认）
+        p5 = "worker paints the floor continuously."
+        self.assertEqual(extract_declared_frame_anchors(p5, 3, 4), (3, 4))
+
+    def _eleven_frames(self, tmp):
+        frames_dir = os.path.join(tmp, 'frames')
+        os.makedirs(frames_dir, exist_ok=True)
+        frames = {}
+        for i in range(1, 12):
+            p = os.path.join(frames_dir, f'img_{i:03d}.webp')
+            with open(p, 'wb') as f:
+                f.write(b'frame')
+            frames[i] = p
+        return frames
+
+    _SHIFTED_SLOTS = {
+        5: {
+            'body': 'starting from the close-up shot of IMAGE 5... reveal ladder (IMAGE 6)',
+            'meta': 'CUT - SHOT A TRANSITION',
+        },
+        6: {
+            # 组稿阶段整段编号滑了一格：视频 6 本该是 IMAGE 6 -> IMAGE 7
+            'body': (
+                'Use the provided first frame and last frame as exact composition anchors. '
+                'Use IMAGE 7 as the actual first-frame image and IMAGE 8 as the actual last-frame image; '
+                'worker climbs down ladder and fastens oak timber panels matching IMAGE 8.'
+            ),
+            'meta': 'SHOT B INTERIOR ENTRY',
+        },
+    }
+
+    def test_slot_contract_wins_over_declared_anchors(self):
+        """正文声明的编号不影响选帧与生成：严格按槽位契约取帧直接生成，不因提示词编号差异拦截。"""
+        tmp = tempfile.mkdtemp()
+        try:
+            videos_dir = os.path.join(tmp, 'videos')
+            os.makedirs(videos_dir)
+            frames = self._eleven_frames(tmp)
+
+            plans = plan_video_slots(dict(self._SHIFTED_SLOTS), frames, {}, videos_dir)
+
+            # slot 5：按契约取 5->6 生成
+            self.assertEqual(plans[0]['slot'], 5)
+            self.assertEqual(plans[0]['start_anchor_slot'], 5)
+            self.assertEqual(plans[0]['end_anchor_slot'], 6)
+            self.assertEqual(plans[0]['action'], 'generate')
+
+            # slot 6：提示词写 7->8，槽位契约 6->7。严格按契约取 frames[6] -> frames[7] 直接生成，不拦截
+            self.assertEqual(plans[1]['slot'], 6)
+            self.assertEqual(plans[1]['start_anchor_slot'], 6)
+            self.assertEqual(plans[1]['end_anchor_slot'], 7)
+            self.assertEqual(plans[1]['start_frame'], frames[6])
+            self.assertEqual(plans[1]['end_frame'], frames[7])
+            self.assertEqual(plans[1]['action'], 'generate')
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_declared_mismatch_override_generates_by_contract(self):
+        """提示词编号被平滑重写为两卡位 IMAGE 1 / IMAGE 2，并按契约生成。"""
+        tmp = tempfile.mkdtemp()
+        try:
+            videos_dir = os.path.join(tmp, 'videos')
+            os.makedirs(videos_dir)
+            frames = self._eleven_frames(tmp)
+
+            plans = plan_video_slots(dict(self._SHIFTED_SLOTS), frames, {}, videos_dir)
+            slot6 = plans[1]
+            self.assertEqual(slot6['action'], 'generate')
+            self.assertEqual(slot6['start_frame'], frames[6])
+            self.assertEqual(slot6['end_frame'], frames[7])
+            # 文案改写按声明的编号做，别在提示词里留下裸的 IMAGE 7 / IMAGE 8
+            self.assertIn('IMAGE 1', slot6['prompt'])
+            self.assertIn('IMAGE 2', slot6['prompt'])
+            self.assertNotIn('IMAGE 7', slot6['prompt'])
+            self.assertNotIn('IMAGE 8', slot6['prompt'])
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_video_info_records_end_anchor_and_slot_sequence(self):
+        """manifest 条目必须带 end_anchor_slot，且 sequence 用 slot 而不是批内序号。"""
+        from video_generator import _video_info
+        plan = {
+            'slot': 7, 'seq': 1, 'prompt': 'x', 'dest_path': os.path.join(os.sep, 'tmp', 'v.mp4'),
+            'start_anchor_slot': 7, 'end_anchor_slot': 8, 'meta': '',
+        }
+        info = _video_info(plan, 'Veo 3.1', status='failed', error='boom')
+        self.assertEqual(info['slot'], 7)
+        self.assertEqual(info['sequence'], 7)          # 不是批内序号 1
+        self.assertEqual(info['start_anchor_slot'], 7)
+        self.assertEqual(info['end_anchor_slot'], 8)
+
+        hero = dict(plan, slot=11, end_anchor_slot=None, meta='HERO REVEAL')
+        self.assertIsNone(_video_info(hero, 'Veo 3.1', status='failed')['end_anchor_slot'])
 
 
 if __name__ == '__main__':

@@ -13,9 +13,14 @@ numpy>=1.24
 
 # HTTP 客户端：/api/generate_image_with_vlm 的上游调用使用 requests，
 # 其余出站请求走标准库 urllib
-requests>=2.31
+# SOCKS5 出口验证需要 PySocks；只安装 requests 会在换 IP 时抛 InvalidSchema。
+requests[socks]>=2.31
+# Flow2API 视频流式调用与可取消下载。
+httpx>=0.27,<1
 
 # Google FX UI 自动化：通过 AdsPower 提供的 CDP 地址连接已安装浏览器。
 playwright>=1.45
 pydantic>=2.7,<3
 python-dotenv>=1.0
+# 导入 Clash/Mihomo 机场配置（仅本地读取，不访问订阅地址）。
+PyYAML>=6.0,<7

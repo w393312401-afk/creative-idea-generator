@@ -17,6 +17,33 @@ function _setAccessHeader(init, code) {
     return init;
 }
 
+// 在本机文件管理器（macOS Finder / Windows 资源管理器 / Linux 文件管理器）里
+// 选中某个 outputs/ 下的媒体文件。传相对路径或播放地址都行（带 ?v= 版本号也行，
+// 服务端会剥掉）。打开的是**跑服务端那台机器**的桌面，因此远程访问时服务端会
+// 回 403，这里照原样把它的中文说明弹给用户，而不是含糊的"失败"。
+async function revealLocalFile(pathOrUrl, label) {
+    if (!pathOrUrl) {
+        showToast('没有可定位的本地文件', 'error');
+        return false;
+    }
+    try {
+        const res = await fetch('/api/reveal_file', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ path: pathOrUrl }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok || (data && data.status !== 'ok')) {
+            throw new Error((data && data.message) || ('HTTP ' + res.status));
+        }
+        showToast(`已在文件管理器中定位${label ? `「${label}」` : ''}`, 'success');
+        return true;
+    } catch (e) {
+        showToast(`定位本地文件失败：${e.message}`, 'error');
+        return false;
+    }
+}
+
 function copyText(text) {
     if (navigator.clipboard && window.isSecureContext) {
         return navigator.clipboard.writeText(text);
@@ -98,6 +125,13 @@ function customPrompt(message, defaultValue = '') {
             close();
             resolve(val);
         });
+
+        modal.addEventListener('click', (e) => {
+            if (e.target === modal) {
+                close();
+                resolve(null);
+            }
+        });
         
         input.addEventListener('keydown', (e) => {
             if (e.key === 'Enter') {
@@ -172,6 +206,10 @@ function customTextarea({ title = '输入内容', message = '', defaultValue = '
         modal.querySelector('.confirm-btn').addEventListener('click', () => finish('confirm'));
         if (extraBtn) extraBtn.addEventListener('click', () => finish('extra'));
 
+        modal.addEventListener('click', (e) => {
+            if (e.target === modal) finish(null);
+        });
+
         // Enter 在多行输入里是换行，提交要按 Ctrl/Cmd+Enter
         input.addEventListener('keydown', (e) => {
             if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
@@ -184,7 +222,7 @@ function customTextarea({ title = '输入内容', message = '', defaultValue = '
     });
 }
 
-function customConfirm(message) {
+function customConfirm(message, confirmLabel = '确定', cancelLabel = '取消') {
     return new Promise((resolve) => {
         const modal = document.createElement('div');
         modal.className = 'modal active';
@@ -192,7 +230,7 @@ function customConfirm(message) {
         modal.style.zIndex = '1100';
         
         modal.innerHTML = `
-            <div class="modal-content glass-panel" style="max-width: 400px; border-color: var(--neon-purple);">
+            <div class="modal-content glass-panel" style="max-width: 420px; border-color: var(--neon-purple);">
                 <div class="modal-header">
                     <h3>操作确认</h3>
                     <button class="close-btn">&times;</button>
@@ -201,8 +239,8 @@ function customConfirm(message) {
                     <p style="font-size: 13.5px; line-height: 1.5; color: var(--text-secondary);">${message}</p>
                 </div>
                 <div class="modal-footer">
-                    <button class="action-btn text-btn secondary cancel-btn">取消</button>
-                    <button class="action-btn text-btn primary confirm-btn" style="background: var(--neon-purple); border-color: rgba(157,78,221,0.4); color: #fff; font-weight:600;">确定</button>
+                    <button class="action-btn text-btn secondary cancel-btn">${cancelLabel}</button>
+                    <button class="action-btn text-btn primary confirm-btn" style="background: var(--neon-purple); border-color: rgba(157,78,221,0.4); color: #fff; font-weight:600;">${confirmLabel}</button>
                 </div>
             </div>
         `;
@@ -228,6 +266,13 @@ function customConfirm(message) {
             close();
             resolve(true);
         });
+
+        modal.addEventListener('click', (e) => {
+            if (e.target === modal) {
+                close();
+                resolve(false);
+            }
+        });
         
         modal.addEventListener('keydown', (e) => {
             if (e.key === 'Enter') {
@@ -243,7 +288,10 @@ function customConfirm(message) {
 
 // duration：可选停留毫秒数，默认 3 秒。少数"配置层面出了问题、需要人真的读完
 // 一句话才能修"的提示（如技能契约缺失）3 秒不够看完。
-function showToast(message, type = 'success', duration = 3000) {
+// action：可选的行动按钮 { label, onClick }。用于"刚做完、可能想马上反悔"的
+// 操作（目前是删除整拍后的「撤销」）——把出口放在结果通知上，比让人事后去菜单里
+// 找一个恢复入口更贴近当时的心理状态。点过一次即隐藏，避免重复触发。
+function showToast(message, type = 'success', duration = 3000, action = null) {
     const container = document.getElementById('toast-container');
     if (!container) return;
     const toast = document.createElement('div');
@@ -259,10 +307,26 @@ function showToast(message, type = 'success', duration = 3000) {
     msgEl.textContent = message;
     toast.append(iconEl, ' ', msgEl);
 
+    let timer = null;
+    if (action && action.label && typeof action.onClick === 'function') {
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'toast-action';
+        btn.textContent = action.label;
+        btn.addEventListener('click', () => {
+            btn.disabled = true;
+            if (timer) clearTimeout(timer);
+            toast.classList.add('hiding');
+            setTimeout(() => toast.remove(), 200);
+            action.onClick();
+        });
+        toast.appendChild(btn);
+    }
+
     container.appendChild(toast);
 
     // Use CSS class for exit (avoids JS writing style.opacity/transform → forced layout)
-    setTimeout(() => {
+    timer = setTimeout(() => {
         toast.classList.add('hiding');
         setTimeout(() => toast.remove(), 200);
     }, Number.isFinite(+duration) && +duration > 0 ? +duration : 3000);
@@ -305,12 +369,29 @@ function handleManualInterventionEvent(type, data) {
             `处理完成后脚本会自动继续（最长等待 ${maxWaitMin} 分钟）`
         );
         showToast(`需要人工处理：${codeLabel}，脚本已暂停等待`, 'warning');
+        if (typeof NotificationCenter !== 'undefined') {
+            NotificationCenter.notify({
+                type: 'action_required',
+                title: `需要人工处理：${codeLabel}`,
+                message: `Google Flow 触发安全/登录拦截，请切到 AdsPower 处理`
+            });
+        }
     } else if (type === 'manual_intervention_cleared') {
         hideManualInterventionBanner();
         showToast('人工处理已完成，自动继续生成', 'success');
+        if (typeof NotificationCenter !== 'undefined') {
+            NotificationCenter.onWindowActivated();
+        }
     } else if (type === 'manual_intervention_timeout') {
         hideManualInterventionBanner();
         showToast(`等待人工处理超时（${codeLabel}），相关任务已标记失败`, 'error');
+        if (typeof NotificationCenter !== 'undefined') {
+            NotificationCenter.notify({
+                type: 'error',
+                title: `人工处理超时（${codeLabel}）`,
+                message: '任务已标记失败'
+            });
+        }
     }
 }
 
@@ -321,6 +402,24 @@ function handleManualInterventionEvent(type, data) {
  * Null-safe by design: a missing DOM node or malformed info must never be able
  * to crash a stream-consumer loop.
  */
+// 管线条刷新按帧合批。上面那句"代价与这里的 DOM 写入同量级"是错的：
+// updatePipelineBar 会走 computePipelineState → resolvePromptSlots，后者每次都
+// 重建全部槽位对象（旧条目还要逐行正则解析整段 prompt_block），再对 4 枚芯片
+// 各做一次 querySelector + 4 次 classList.toggle。而 setProgressBar 挂在 compose
+// 的 text_chunk 上——也就是**每个流式 token 跑一遍**。生成期间这条路径能把主线程
+// 吃满，点击/切页/滚动全部被推到它后面排队，这正是"UI 交互延迟高"的主因。
+// 进度条本身的三个写入很便宜，保持同步（数字要跟手）；重的那部分一帧一次。
+let _pipelineBarPending = false;
+function schedulePipelineBarUpdate() {
+    if (_pipelineBarPending) return;
+    if (typeof updatePipelineBar !== 'function') return;
+    _pipelineBarPending = true;
+    requestAnimationFrame(() => {
+        _pipelineBarPending = false;
+        updatePipelineBar();
+    });
+}
+
 function setProgressBar(prefix, info) {
     if (!prefix) return;
     const label = document.getElementById(`${prefix}-progress-label`);
@@ -331,10 +430,8 @@ function setProgressBar(prefix, info) {
     if (percentEl) percentEl.textContent = `${Math.round(pct)}%`;
     if (fill) fill.style.width = `${pct}%`;
 
-    // 帧/视频每推进一格，管线条上的「3/16」也跟着走一格（app.js 提供；
-    // 生成流程里这个函数调用得很频繁，updatePipelineBar 本身是纯读 + 改几个
-    // class/文本，代价与这里已有的 DOM 写入同量级）。
-    if (typeof updatePipelineBar === 'function') updatePipelineBar();
+    // 帧/视频每推进一格，管线条上的「3/16」也跟着走一格（app.js 提供）。
+    schedulePipelineBarUpdate();
 }
 
 function mapEnglishCarrierToValue(carrier) {
@@ -388,3 +485,14 @@ function getIdeaSaveTitle(idea) {
     return idea.project_key || idea.title || '';
 }
 
+// 挂帧的三种角色各有各的读法，标错一个用户就会照着一张不该照的图挑毛病（2026-08-31 复盘）：
+//   envelope    过门梯那几格挂的是硬切两侧的包络端点——原片硬切过门，根本没拍过门槛帧；
+//   establishing 同空间最近的一张全景——本拍原片全程特写时的退档，机位构图能对，
+//                但它不是本拍的时刻，施工进度对不得；
+//   benchmark   原片这一拍的真实交付帧，逐像素对标。
+function refFrameRoleLabel(roles, seq) {
+    const role = roles && (roles[seq] || roles[String(seq)]);
+    if (role === 'envelope') return '[包络端点 · 原片未拍摄此镜]';
+    if (role === 'establishing') return '[同空间全景参考 · 非本拍时刻]';
+    return '[参考对标基准]';
+}

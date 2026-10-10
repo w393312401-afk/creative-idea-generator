@@ -28,7 +28,7 @@
             const entered = window.prompt('需要访问码才能使用本服务，请输入：', '');
             if (entered) {
                 ACCESS_CODE = entered.trim();
-                localStorage.setItem('spark_access_code', ACCESS_CODE);
+                try { localStorage.setItem('spark_access_code', ACCESS_CODE); } catch (_) {}
                 _setAccessHeader(init, ACCESS_CODE);
                 resp = await _origFetch(input, init);
             }
@@ -42,6 +42,12 @@
 async function initServerMode() {
     try {
         const m = await fetch('/api/mode').then(r => r.json());
+        if (m && m.video_config && typeof applyServerVideoConfig === 'function') {
+            applyServerVideoConfig(m.video_config);
+        }
+        if (m && m.image_gateway_models && typeof syncImageGatewayModelAvailability === 'function') {
+            syncImageGatewayModelAvailability(m.image_gateway_models);
+        }
         if (m && m.server_managed) {
             // Keep the settings button (gear button) permanently visible as requested by the user
             // const btn = document.getElementById('open-settings-btn');
@@ -50,26 +56,230 @@ async function initServerMode() {
                 const entered = window.prompt('需要访问码才能使用本服务，请输入：', '');
                 if (entered) {
                     ACCESS_CODE = entered.trim();
-                    localStorage.setItem('spark_access_code', ACCESS_CODE);
+                    try { localStorage.setItem('spark_access_code', ACCESS_CODE); } catch (_) {}
                 }
             }
         }
+        // 「视频模型名 → 提示词链路」的规则表由服务端下发，前端只按表匹配显示
+        // （见 js/config.js resolveAutoSkillProfile）。在前端硬编码一份 omni 判断，
+        // 就是给同一件事留了第二个会漂移的真相源。拿到后重刷一次链路选择器：
+        // initServerMode 是异步的，首帧渲染时 auto 的徽标还没有规则可用。
+        if (m && Array.isArray(m.skill_profile_rules)) {
+            window.SKILL_PROFILE_RULES = m.skill_profile_rules;
+        }
+        if (m && m.skill_profile_default) {
+            window.SKILL_PROFILE_DEFAULT = m.skill_profile_default;
+        }
+        if (typeof syncIdeationSkillProfilePicker === 'function') {
+            syncIdeationSkillProfilePicker();
+        }
+        // 质量门禁总表（server_common.GATE_SETTINGS）：配置中心的开关面板照它渲染。
+        // 与 skill_profile_rules 同一个约定——表在服务端，前端只渲染不复制。
+        if (m && Array.isArray(m.gate_settings)) {
+            window.GATE_SETTINGS_SPEC = m.gate_settings;
+            if (typeof renderGateSettingsPanel === 'function') renderGateSettingsPanel();
+        }
+        // 服务代码已过期：这个进程仍在跑旧代码，磁盘上已经有更新的核心文件没生效——
+        // 常见于"改完代码就直接复跑同一个任务，忘了先重启服务"。不区分改动是否与
+        // 本次任务相关：宁可偶尔提示一次不必要的重启，也不要让"修复已经落盘但没生效"
+        // 悄悄发生而没人知道（见 server_common.code_staleness_report）。
+        if (m && m.runtime_version && m.runtime_version.stale) {
+            const rv = m.runtime_version;
+            const files = Array.isArray(rv.stale_files) ? rv.stale_files : [];
+            const preview = files.slice(0, 5).join('、') + (files.length > 5 ? ` 等 ${files.length} 个文件` : '');
+            showToast(
+                `⚠️ 服务代码已过期：${preview || '核心文件'}在本次服务启动后被修改过，`
+                + `当前进程仍在用旧代码运行。请重启后端服务后再生成，否则可能拿到"看似已修复、实际未生效"的结果。`,
+                'error', 15000, {
+                    label: '一键重启服务',
+                    onClick: async () => {
+                        showToast('正在重启后端服务，请稍候...', 'info', 6000);
+                        try {
+                            const resp = await fetch('/api/restart', {
+                                method: 'POST',
+                                headers: {
+                                    'Content-Type': 'application/json',
+                                    'X-Access-Code': ACCESS_CODE || ''
+                                }
+                            });
+                            if (resp.status === 409) {
+                                const data = await resp.json().catch(() => ({}));
+                                showToast(data.message || '还有任务在运行，暂不能重启服务。', 'warning', 8000);
+                                return;
+                            }
+                        } catch (_) {}
+                        // 轮询等待新进程启动就绪
+                        let restarted = false;
+                        for (let i = 0; i < 25; i++) {
+                            await new Promise(r => setTimeout(r, 600));
+                            try {
+                                const check = await fetch('/api/mode', {
+                                    headers: { 'X-Access-Code': ACCESS_CODE || '' }
+                                });
+                                if (check.ok) {
+                                    const data = await check.json();
+                                    if (data && data.runtime_version && !data.runtime_version.stale) {
+                                        restarted = true;
+                                        break;
+                                    }
+                                }
+                            } catch (_) {}
+                        }
+                        if (restarted) {
+                            showToast('✓ 后端服务已成功重启并载入最新代码！', 'success', 3000);
+                            setTimeout(() => window.location.reload(), 800);
+                        } else {
+                            showToast('未能确认服务重启状态，请手动刷新页面重试。', 'warning', 5000);
+                        }
+                    }
+                });
+        }
         // 技能契约缺失只劣化生成质量、不影响接口可用性，过去仅写进启动日志——
         // 从浏览器用的人看不到那个终端，等于没有告知。这里提示一次。
-        const sc = m && m.skill_contract;
-        if (sc && Array.isArray(sc.missing) && sc.missing.length > 0) {
-            console.warn('skill contract missing', sc.dir, sc.source, sc.missing);
-            showToast(
-                `⚠️ 技能契约缺失 ${sc.missing.length}/${sc.total} 个文件，生成质量将降级。`
-                + `当前技能包目录：${sc.dir}。`
-                + `请在 server_config.json 里把 skillDir 指向技能包所在目录（改完不用重启）`,
-                'error', 10000);
+        // 两个 profile（base / omni）都要查：只查当前激活的那个，等于把"另一个包
+        // 没装好"留到用户切视频模型的那一刻才炸。缺失的那个是不是当前激活的，
+        // 决定文案是"生成质量正在降级"还是"切过去就会降级"。
+        const reports = (m && Array.isArray(m.skill_contracts) && m.skill_contracts.length)
+            ? m.skill_contracts
+            : (m && m.skill_contract ? [m.skill_contract] : []);
+        for (const sc of reports) {
+            if (!sc) continue;
+            const isActive = !m.skill_profile || sc.profile === m.skill_profile || !sc.profile;
+            const who = `${sc.label || sc.profile || ''}${isActive ? '，当前正在用' : '，切到该模型时才会用'}`;
+
+            if (Array.isArray(sc.missing) && sc.missing.length) {
+                console.warn('skill contract missing', sc.profile, sc.dir, sc.source, sc.missing);
+                showToast(
+                    `⚠️ 技能契约缺失 ${sc.missing.length}/${sc.total} 个文件`
+                    + `（${who}）${isActive ? '，生成质量将降级' : ''}。`
+                    + `技能包目录：${sc.dir}。`
+                    + `请在 server_config.json 的 skillProfiles 里把 "${sc.profile || 'base'}" 指向技能包所在目录（改完不用重启）`,
+                    isActive ? 'error' : 'warning', 10000);
+            }
+
+            // 文件齐全 ≠ 契约有效。注册表把「SKILL.md 里写的契约」钉到「真正在跑的
+            // Python 门禁」上，它缺失或版本对不上，意味着这个包与运行时脱节——照跑
+            // 会按错误的契约集合审计，外观上却和一次正常生成一模一样。
+            if (sc.registry_status && sc.registry_status !== 'ok') {
+                console.warn('skill contract registry', sc.profile, sc.registry_status,
+                    sc.contract_version, '->', sc.registry_expected, sc.dir);
+                const detail = {
+                    missing: `技能包里没有 ${'references/contract-registry.json'}——无法核对契约与门禁是否一致`,
+                    unreadable: '契约注册表无法解析（JSON 损坏）',
+                    version_mismatch: `契约版本 ${sc.contract_version} 与运行时期望的 ${sc.registry_expected} 不一致`,
+                }[sc.registry_status] || `契约注册表状态异常：${sc.registry_status}`;
+                showToast(
+                    `⚠️ 技能契约注册表异常（${who}）。${detail}。`
+                    + `技能包可能与当前代码版本脱节，生成结果仍会产出但审计口径未必正确。`
+                    + `技能包目录：${sc.dir}`,
+                    isActive ? 'error' : 'warning', 10000);
+            }
+
+            // 仓库内置包是与运行时代码同版本的那一份；走到 env/config/default/autodetect
+            // 说明正在用一份来源不受版本控制的包，漂移只是时间问题。只提示当前激活的，
+            // 免得两个 profile 各弹一条把真正的问题淹掉。
+            if (isActive && sc.source && sc.source !== 'vendored') {
+                console.warn('skill package is not the vendored copy', sc.profile, sc.source, sc.dir);
+                showToast(
+                    `ℹ️ 正在使用非仓库内置的技能包（${who}，来源 ${sc.source}）。`
+                    + `仓库内置那份才与当前代码同步版本化；外部目录更新不及时会让契约与门禁悄悄分叉。`
+                    + `技能包目录：${sc.dir}`,
+                    'warning', 8000);
+            }
+        }
+
+        // 渲染版本信息（顶部徽标与配置中心系统面板）
+        if (m && m.runtime_version) {
+            renderAppVersion(m.runtime_version);
         }
     } catch (e) {
         console.warn('mode check failed', e);
     }
 }
 document.addEventListener('DOMContentLoaded', initServerMode);
+
+function formatAppVersion(rv) {
+    if (!rv) return null;
+    const policy = rv.policy_version || '';
+    const match = policy.match(/(v\d+)/);
+    const shortPolicy = match ? match[1] : (policy ? policy.slice(0, 10) : '');
+    const commit = rv.git_commit_short || (rv.git_commit ? rv.git_commit.slice(0, 7) : '');
+    const dirty = rv.git_dirty ? '*' : '';
+
+    let label = '';
+    if (shortPolicy && commit) {
+        label = `${shortPolicy} · ${commit}${dirty}`;
+    } else if (shortPolicy) {
+        label = `${shortPolicy}${dirty}`;
+    } else if (commit) {
+        label = `${commit}${dirty}`;
+    } else {
+        label = 'v1.0';
+    }
+    return {
+        label,
+        shortPolicy,
+        commit: commit ? `${commit}${dirty}` : '',
+        policy,
+        stale: Boolean(rv.stale),
+        staleFiles: Array.isArray(rv.stale_files) ? rv.stale_files : [],
+        startTime: rv.service_start_time ? new Date(rv.service_start_time * 1000).toLocaleString('zh-CN', { hour12: false }) : '',
+        dirty: Boolean(rv.git_dirty),
+    };
+}
+
+function renderAppVersion(rv) {
+    const info = formatAppVersion(rv);
+    if (!info) return;
+
+    // 1. 顶部 Header 版本胶囊徽标
+    const badge = document.getElementById('spark-version-badge');
+    if (badge) {
+        badge.textContent = info.label;
+        badge.style.display = 'inline-flex';
+        badge.classList.toggle('stale', info.stale);
+
+        const tooltipLines = [
+            `SPARK 运行时版本信息:`,
+            `• 策略版本 (Policy): ${info.policy || '默认'}`,
+            info.commit ? `• Git 提交: ${info.commit} (${info.dirty ? '有未提交修改 dirty' : '干净 clean'})` : null,
+            info.startTime ? `• 服务启动时间: ${info.startTime}` : null,
+            info.stale ? `• 代码状态: ⚠️ 已过期 (存在磁盘改动，需重启)` : `• 代码状态: ✓ 最新 (与磁盘代码一致)`,
+            `点击打开配置中心「系统」查看详情`
+        ].filter(Boolean).join('\n');
+        badge.title = tooltipLines;
+
+        if (!badge.dataset.bound) {
+            badge.dataset.bound = '1';
+            badge.addEventListener('click', () => {
+                const openSettings = document.getElementById('open-settings-btn');
+                if (openSettings) openSettings.click();
+                if (typeof switchSettingsSection === 'function') {
+                    switchSettingsSection('system');
+                }
+            });
+        }
+    }
+
+    // 2. 配置中心「系统」面板详细卡片
+    const polEl = document.getElementById('sys-policy-version');
+    if (polEl) polEl.textContent = info.policy || '无';
+    const commitEl = document.getElementById('sys-git-commit');
+    if (commitEl) commitEl.textContent = info.commit ? `${info.commit} (${info.dirty ? '未提交修改 dirty' : '干净 clean'})` : '未知 (未检测到 Git 仓库)';
+    const timeEl = document.getElementById('sys-start-time');
+    if (timeEl) timeEl.textContent = info.startTime || '未知';
+    const staleEl = document.getElementById('sys-staleness-status');
+    if (staleEl) {
+        if (info.stale) {
+            const files = info.staleFiles.length ? ` (${info.staleFiles.slice(0, 3).join('、')}${info.staleFiles.length > 3 ? ' 等' : ''})` : '';
+            staleEl.textContent = `⚠️ 代码已过期，待重启生效${files}`;
+            staleEl.style.color = '#ef4444';
+        } else {
+            staleEl.textContent = '✓ 最新 (当前进程与磁盘代码一致)';
+            staleEl.style.color = '#10b981';
+        }
+    }
+}
 
 // Safe Clipboard Copy Helper with HTTP LAN Fallback
 // Function copyText moved to modular JS file
@@ -82,7 +292,7 @@ document.addEventListener('DOMContentLoaded', initServerMode);
 
 
 // Initialize Elements
-document.addEventListener('DOMContentLoaded', () => {
+document.addEventListener('DOMContentLoaded', async () => {
     // ── Minimal debounce utility (avoids lodash dep) ──
     window._debounce = function(fn, delay) {
         let t;
@@ -93,31 +303,24 @@ document.addEventListener('DOMContentLoaded', () => {
     };
 
     loadConfig();
-    loadLibrary();
-    loadCustomPresets();
-    initSliders();
-    initSelectors();
-    loadSelectionState();
-    loadCurrentIdeaState();
     initCanvas();
     checkApiStatus();
     setupEventListeners();
     setupDragAndDrop();
     initDebugLimitControls();
-    resumeActiveTaskIfExists();
-    resumeActiveBackgroundTasksIfExists();
+    initAutoVideoControl();
+    initCoverBurnControl();
+    initMergeSpeedControl();
     startGlobalTasksBadgePolling();
-    loadIdeationCards();
-    initBeatOutlineModal();
     updateDrawerTopOffset();
     window.addEventListener('resize', window._debounce(updateDrawerTopOffset, 150));
-    const refreshBtn = document.getElementById('ideate-refresh-btn');
-    if (refreshBtn) {
-        refreshBtn.addEventListener('click', () => {
-            loadIdeationCards(true);
-        });
-    }
     initLocalServiceLogs();
+    // 任务登记按项目归属恢复；库与当前项目尚未读完时接流会丢掉后台任务。
+    await loadLibrary();
+    await loadCurrentIdeaState();
+    syncAutoVideoToggleFromIdea(currentIdea);
+    resumeActiveTaskIfExists();
+    resumeActiveBackgroundTasksIfExists();
 });
 
 // Function saveSelectionState moved to modular JS file
@@ -172,39 +375,25 @@ const PRESETS = {
 
 // Function renderParsedPrompts moved to modular JS file
 
-// 页脚 LLM 芯片组收回折叠态（仅窄屏有意义；桌面端 picker-collapsed 不生效，
-// 调了也不会有视觉变化）。config.js 选完模型后回调这里，见 syncIdeationLlmPicker。
-function collapseIdeationPickerOnMobile() {
-    if (!window.matchMedia || !window.matchMedia('(max-width: 768px)').matches) return;
-    const picker = document.getElementById('ideation-model-picker');
-    if (picker) picker.classList.add('picker-collapsed');
-    const toggle = document.getElementById('ideation-llm-toggle');
-    if (toggle) {
-        toggle.setAttribute('aria-expanded', 'false');
-        toggle.title = '展开模型选择';
-    }
-}
-
 // Top-level workspace switch: exclusive single-panel view (config / results / image studio),
 // used at every screen size. 'left'/'right' are accepted as aliases of 'config'/'results' for
 // backward compatibility with any inline handlers still spelled the old way.
 function switchMainTab(tabName) {
-    const aliases = { left: 'config', right: 'results' };
-    const tab = aliases[tabName] || tabName;
+    const aliases = { left: 'results', config: 'results', right: 'results' };
+    const requestedTab = aliases[tabName] || tabName;
+    const tab = ['results', 'image', 'projects', 'gallery'].includes(requestedTab) ? requestedTab : 'projects';
 
     const panels = {
-        config: document.querySelector('.panel-left'),
         results: document.querySelector('.panel-right'),
         image: document.getElementById('panel-image-studio'),
+        projects: document.getElementById('panel-projects'),
         gallery: document.getElementById('panel-gallery'),
-        ledger: document.getElementById('panel-ledger'),
     };
     const buttons = {
-        config: document.getElementById('main-tab-config'),
         results: document.getElementById('main-tab-results'),
         image: document.getElementById('main-tab-image'),
+        projects: document.getElementById('main-tab-projects'),
         gallery: document.getElementById('main-tab-gallery'),
-        ledger: document.getElementById('main-tab-ledger'),
     };
 
     Object.keys(panels).forEach((key) => {
@@ -212,19 +401,16 @@ function switchMainTab(tabName) {
         if (buttons[key]) buttons[key].classList.toggle('active', key === tab);
     });
 
-    // 图像工坊现与"创意工坊"同级挂在顶部 app-switcher 里，两者共享同一高亮态：
-    // 切到 image 时把"创意工坊"熄灭，切回其余任一子标签时把它点亮。
-    const workshopSwitcher = document.getElementById('switcher-workshop-btn');
-    if (workshopSwitcher) workshopSwitcher.classList.toggle('active', tab !== 'image');
-
     // 画廊首次进入时才扫描本地文件（js/gallery.js 提供；懒加载避免拖慢启动）
     if (tab === 'gallery' && typeof galleryTabEntered === 'function') {
         galleryTabEntered();
     }
-    // 创意台账：每次进入都重新拉取（体量小、纯 JSON 读取，代价远低于画廊的文件系统扫描），
-    // 这样"存入备选"后立刻切回台账页也能看到最新数据，无需手动点刷新
-    if (tab === 'ledger' && typeof ledgerTabEntered === 'function') {
-        ledgerTabEntered();
+    // 项目工作台：进入时拉一次并开始轮询，离开时立刻停表。轮询节奏由
+    // js/projects.js 按"有没有项目在跑"自己决定（4s / 30s），离开页面还接着
+    // 空转就是旧任务抽屉那种恒定 2.5s 全量轮询的老毛病。
+    if (typeof projectsTabEntered === 'function') {
+        if (tab === 'projects') projectsTabEntered();
+        else if (typeof projectsTabLeft === 'function') projectsTabLeft();
     }
 }
 
@@ -234,7 +420,7 @@ const RESULT_TAB_IDS = ['overview', 'prompts'];
 
 function switchTab(tabId) {
     if (!RESULT_TAB_IDS.includes(tabId)) tabId = 'overview';
-    localStorage.setItem('spark_active_tab', tabId);
+    try { localStorage.setItem('spark_active_tab', tabId); } catch (_) {}
     document.querySelectorAll('.result-tabs-bar .tab-btn').forEach(btn => {
         if (btn.dataset.tab === tabId) {
             btn.classList.add('active');
@@ -252,40 +438,12 @@ function switchTab(tabId) {
     });
 }
 
-function showDeleteConfirm(card, ideaId) {
-    document.querySelectorAll('.delete-confirm-overlay').forEach(overlay => overlay.remove());
-    
-    const overlay = document.createElement('div');
-    overlay.className = 'delete-confirm-overlay';
-    overlay.innerHTML = `
-        <span class="delete-confirm-text">确定删除此点子？</span>
-        <button class="delete-confirm-btn yes">删除</button>
-        <button class="delete-confirm-btn no">取消</button>
-    `;
-    
-    overlay.querySelector('.yes').addEventListener('click', (e) => {
-        e.stopPropagation();
-        deleteFromLibrary(ideaId);
-    });
-    
-    overlay.querySelector('.no').addEventListener('click', (e) => {
-        e.stopPropagation();
-        overlay.remove();
-    });
-    
-    overlay.addEventListener('click', (e) => {
-        e.stopPropagation();
-    });
-    
-    card.appendChild(overlay);
-}
-
 function updateFavoriteButtonState() {
     const saveBtn = document.getElementById('save-idea-btn');
     const saveBtnText = document.getElementById('save-idea-btn-text');
     if (!saveBtn || !currentIdea) return;
     
-    const isSaved = savedIdeas.some(item => item.title === currentIdea.title);
+    const isSaved = libraryEntries().some(item => item.title === currentIdea.title);
     if (isSaved) {
         saveBtn.classList.add('favorited');
         if (saveBtnText) saveBtnText.textContent = '已收藏点子';
@@ -295,25 +453,51 @@ function updateFavoriteButtonState() {
     }
 }
 
-let _scrollPending = false;
-function appendLiveTerminal(chunk) {
+// 实况终端的写入必须按帧合批，不能按 chunk 直写。compose 是流式的，
+// text_chunk 事件在一次激发里能来几千到上万条（LLM 逐 token 推），每条都
+// createTextNode + insertBefore 的话：① 主线程在整个生成期间被 DOM 写入占满，
+// 点按钮/切标签/滚动全部排在后面，就是"交互延迟高"的直接来源；② 文本节点
+// 只增不减，跑到后半程终端里挂着几万个节点，之后每次滚动都要重新布局这一大坨。
+// 现在：chunk 先进字符串缓冲，一帧最多落一次 DOM；同时把终端内容裁到
+// LIVE_TERMINAL_MAX_CHARS，只留最近的一段（往上翻的是完整日志 dock 的活，
+// 这里本来就只是"看着它在动"）。
+const LIVE_TERMINAL_MAX_CHARS = 20000;
+let _terminalBuffer = '';
+let _terminalFlushPending = false;
+let _terminalText = '';
+
+function flushLiveTerminal() {
+    _terminalFlushPending = false;
     const body = document.getElementById('live-terminal-body');
-    if (!body) return;
-    const cursor = body.querySelector('.terminal-cursor');
-    if (cursor) {
-        const textNode = document.createTextNode(chunk);
-        body.insertBefore(textNode, cursor);
-    } else {
-        body.textContent += chunk;
+    if (!body) { _terminalBuffer = ''; return; }
+    if (_terminalBuffer) {
+        _terminalText += _terminalBuffer;
+        _terminalBuffer = '';
+        if (_terminalText.length > LIVE_TERMINAL_MAX_CHARS) {
+            // 从行首截断，别把一行劈成半截
+            const cut = _terminalText.length - LIVE_TERMINAL_MAX_CHARS;
+            const nl = _terminalText.indexOf('\n', cut);
+            _terminalText = _terminalText.slice(nl >= 0 ? nl + 1 : cut);
+        }
+        const cursor = body.querySelector('.terminal-cursor');
+        body.textContent = _terminalText;
+        if (cursor) body.appendChild(cursor);
     }
-    // Throttle auto-scroll with rAF to avoid forced layout on every chunk
-    if (!_scrollPending) {
-        _scrollPending = true;
-        requestAnimationFrame(() => {
-            body.scrollTop = body.scrollHeight;
-            _scrollPending = false;
-        });
+    body.scrollTop = body.scrollHeight;
+}
+
+function appendLiveTerminal(chunk) {
+    if (!chunk) return;
+    _terminalBuffer += chunk;
+    if (!_terminalFlushPending) {
+        _terminalFlushPending = true;
+        requestAnimationFrame(flushLiveTerminal);
     }
+}
+
+function resetLiveTerminal() {
+    _terminalBuffer = '';
+    _terminalText = '';
 }
 
 function startLoadingTimer(startTimeOverride = null) {
@@ -330,7 +514,8 @@ function startLoadingTimer(startTimeOverride = null) {
     const terminalBody = document.getElementById('live-terminal-body');
     if (terminalBody) {
         terminalBody.innerHTML = '<span class="terminal-cursor"></span>';
-        appendLiveTerminal("[SYSTEM] Initializing creative idea engine...\n[SYSTEM] Loading restoration-prompt-composer contract...\n");
+        resetLiveTerminal();
+        appendLiveTerminal("[SYSTEM] Initializing creative idea engine...\n[SYSTEM] Loading skill contract...\n");
     }
 
     clearLiveBeatsPanel();
@@ -477,28 +662,24 @@ function handleComposeProgressExtras(prog) {
 // Load saved ideas library from API or localStorage fallback
 async function loadLibrary() {
     try {
-        const response = await fetch('/api/library');
+        const response = await fetch('/api/library/index');
         if (response.ok) {
-            savedIdeas = await response.json();
-            console.log("Successfully loaded library from local server file.");
+            const data = await response.json();
+            if (!data || !Array.isArray(data.items)) throw new Error('创意库索引格式有误');
+            savedIdeaIndex = data.items.map(item => ({ ...item, _librarySummary: true }));
+            const ids = new Set(savedIdeaIndex.map(item => String(item.id)));
+            savedIdeas = savedIdeas.filter(item => !item._librarySummary && ids.has(String(item.id)));
+            console.log("Successfully loaded library index from local server file.");
             // 2026-07-12 整库清零事故防线：服务器返回“合法空库”但本地备份非空时，
             // 大概率是服务器文件被状态错乱的客户端清掉了（或刚发生过回滚）——采用
             // 本地备份并提示，绝不能让空结果静默吞掉最后一份幸存副本。不自动回写
             // 服务器：用户下一次正常保存动作会自然把恢复的库写回去。
-            if (Array.isArray(savedIdeas) && savedIdeas.length === 0) {
-                const stored = localStorage.getItem('spark_library');
-                if (stored) {
-                    try {
-                        const backup = JSON.parse(stored);
-                        if (Array.isArray(backup) && backup.length > 0) {
-                            savedIdeas = backup;
-                            console.warn(`Server library is empty but localStorage backup has ${backup.length} ideas — using the backup.`);
-                            if (typeof showToast === 'function') {
-                                showToast(`服务器创意库为空，已从本地备份恢复 ${backup.length} 条创意（保存任意改动即回写服务器）`, 'error');
-                            }
-                        }
-                    } catch (err) {
-                        console.error("Failed to parse localStorage library backup", err);
+            if (savedIdeaIndex.length === 0) {
+                const backup = readLibraryBackup();
+                if (backup.length > 0) {
+                    savedIdeas = backup;
+                    if (typeof showToast === 'function') {
+                        showToast(`服务器创意库为空，已从本地备份恢复 ${backup.length} 条创意（保存任意改动即回写服务器）`, 'error');
                     }
                 }
             }
@@ -507,41 +688,180 @@ async function loadLibrary() {
         }
     } catch (e) {
         console.warn("Failed to load library from server, falling back to localStorage", e);
-        const stored = localStorage.getItem('spark_library');
-        if (stored) {
-            try {
-                savedIdeas = JSON.parse(stored);
-            } catch (err) {
-                console.error("Failed to parse localStorage library", err);
-            }
-        }
+        savedIdeas = readLibraryBackup();
     }
-    renderLibrary();
+    if (typeof refreshProjects === 'function') refreshProjects({ assets: false });
 }
 
-// Save library to both API (server file) and localStorage (browser backup)
-async function saveLibrary() {
-    // 1. Always write to localStorage as a fallback backup
-    localStorage.setItem('spark_library', JSON.stringify(savedIdeas));
-    
-    // 2. Attempt saving to server file database
+const libraryItemRequests = new Map();
+
+function libraryEntries() {
+    const entries = new Map(savedIdeaIndex.map(item => [String(item.id), item]));
+    savedIdeas.forEach(item => { if (item && !item._librarySummary) entries.set(String(item.id), item); });
+    return [...entries.values()];
+}
+
+function readLibraryBackup() {
     try {
-        const response = await fetch('/api/library', {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json'
-            },
-            body: JSON.stringify(savedIdeas)
-        });
-        if (!response.ok) {
-            throw new Error(`Server returned HTTP ${response.status}`);
-        }
-        console.log("Successfully persisted library to local server file.");
+        const items = JSON.parse(localStorage.getItem('spark_library') || '[]');
+        return Array.isArray(items) ? items.filter(item => item && !item._librarySummary) : [];
     } catch (e) {
-        console.warn("Failed to persist library to server, backed up in localStorage only", e);
+        console.warn('[library] 本地正文备份读取失败', e);
+        return [];
     }
-    
-    renderLibrary();
+}
+
+// Merge hydrated records into the existing complete-record backup. Unopened records survive.
+function writeLibraryMirror({ deletedIds = [] } = {}) {
+    try {
+        const removed = new Set(deletedIds.map(String));
+        const records = new Map(readLibraryBackup().map(item => [String(item.id), item]));
+        savedIdeas.forEach(item => { if (item && !item._librarySummary) records.set(String(item.id), item); });
+        removed.forEach(id => records.delete(id));
+        localStorage.setItem('spark_library', JSON.stringify([...records.values()]));
+    } catch (e) {
+        console.warn('[library] localStorage 镜像写入失败（不影响服务器写入）', e);
+    }
+}
+
+function cacheLibraryIdea(idea) {
+    if (!idea || idea._librarySummary || idea.id === undefined || idea.id === null) return null;
+    const index = savedIdeas.findIndex(item => String(item.id) === String(idea.id));
+    if (index === -1) savedIdeas.push(idea);
+    else savedIdeas[index] = idea;
+    return idea;
+}
+
+// Concurrent project opening/recovery shares a single item request. A failed read only uses
+// complete cached bodies; directory metadata can never become an editable task owner.
+async function ensureLibraryIdea(id, { refresh = false } = {}) {
+    if (id === undefined || id === null || id === '') return null;
+    const key = String(id);
+    if (libraryItemRequests.has(key)) return libraryItemRequests.get(key);
+    const cached = savedIdeas.find(item => !item._librarySummary && String(item.id) === key);
+    if (cached && !refresh) return cached;
+    const request = (async () => {
+        try {
+            const response = await fetch(`/api/library/item?id=${encodeURIComponent(key)}`);
+            if (response.status === 404) return null;
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+            const idea = await response.json();
+            if (!idea || String(idea.id) !== key || idea._librarySummary) throw new Error('创意正文格式有误');
+            cacheLibraryIdea(idea);
+            writeLibraryMirror();
+            return idea;
+        } catch (error) {
+            const backup = cached || readLibraryBackup().find(item => String(item.id) === key);
+            if (backup) return cacheLibraryIdea(backup);
+            console.warn('[library] 创意正文读取失败', error);
+            return null;
+        }
+    })();
+    libraryItemRequests.set(key, request);
+    try { return await request; }
+    finally { if (libraryItemRequests.get(key) === request) libraryItemRequests.delete(key); }
+}
+
+function forgetLibraryIdeas(ids) {
+    const removed = new Set(ids.map(String));
+    savedIdeas = savedIdeas.filter(item => !removed.has(String(item.id)));
+    savedIdeaIndex = savedIdeaIndex.filter(item => !removed.has(String(item.id)));
+    writeLibraryMirror({ deletedIds: ids });
+}
+
+function rememberLibraryArchive(entry) {
+    if (!entry || !entry.id) return;
+    savedIdeaIndex = savedIdeaIndex.filter(item => String(item.id) !== String(entry.id));
+    savedIdeaIndex.push({ ...entry, _librarySummary: true });
+    const complete = savedIdeas.find(item => String(item.id) === String(entry.id))
+        || readLibraryBackup().find(item => String(item.id) === String(entry.id));
+    if (complete) {
+        Object.assign(complete, entry);
+        delete complete.frameRun;
+        complete.covers = [];
+        delete complete.activeCoverUrl;
+        delete complete.coverRoles;
+        delete complete.collage_url;
+        cacheLibraryIdea(complete);
+    }
+    writeLibraryMirror();
+}
+
+/* ==========================================================================
+   创意库写入路径
+   --------------------------------------------------------------------------
+   历史上这里是 saveLibrary()：「整表覆盖」——客户端持有完整数组、整份 POST 回
+   /api/library。代价是每次改动都要上传全库（实测单条创意 164KB），而且服务端
+   为了防住这个动作本身挂了三道闸门（空库拒写 / 槽位不自洽 / 未声明缩量 409），
+   用户日常撞到的就是那句"保存失败，请刷新页面后重试"。
+
+   2026-07-31（P1/P4）整表写入已彻底移除，全部改走 /api/library/item 与
+   /api/library/item/delete：一次只碰一条记录，服务端只写它自己的正文文件 +
+   索引行。因此：
+     · 不会碰到别的记录，"整库清零 / 未声明缩量"在结构上不可能发生；
+     · 删掉库里最后一条也不会被 409（老路径会撞上"空列表覆盖非空库"防护）；
+     · 调用方不必再声明"这次缩量是我有意为之"。
+   见 docs/plans/project_workbench_refactor_plan.md
+   ========================================================================== */
+
+// 单条写入服务端。返回 true/false 表示服务端是否接受。
+async function persistIdeaItem(idea) {
+    if (!idea || idea.id === undefined || idea.id === null || idea.id === '') {
+        console.warn('[library] 缺少 id，无法单条写入', idea);
+        return false;
+    }
+    if (idea._librarySummary || savedIdeaIndex.includes(idea)) {
+        console.warn('[library] 拒绝把索引摘要写成创意正文');
+        if (typeof showToast === 'function') showToast('请先打开项目，载入完整创意后再保存。', 'error');
+        return false;
+    }
+    cacheLibraryIdea(idea);
+    writeLibraryMirror();
+    try {
+        const res = await fetch('/api/library/item', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ item: idea }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok || data.status !== 'success') {
+            throw new Error(data.message || `HTTP ${res.status}`);
+        }
+        return true;
+    } catch (e) {
+        console.warn('[library] 单条写入失败', e);
+        if (typeof showToast === 'function') {
+            showToast(`收藏只存到了浏览器本地（服务器写入失败：${e.message}）`, 'error');
+        }
+        return false;
+    }
+}
+
+// 单条删除。服务端顺带清掉这条创意生成的图片/视频文件，所以不必再单独打一次
+// /api/library/delete_item。
+async function deleteIdeaItem(idea) {
+    try {
+        const res = await fetch('/api/library/item/delete', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                id: idea.id,
+                title: getIdeaSaveTitle(idea),
+                covers: idea.covers || [],
+            }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok || data.status !== 'ok') {
+            throw new Error(data.message || `HTTP ${res.status}`);
+        }
+        return true;
+    } catch (e) {
+        console.error('[library] 单条删除失败', e);
+        if (typeof showToast === 'function') {
+            showToast(`删除失败：${e.message}`, 'error');
+        }
+        return false;
+    }
 }
 
 // Check API status via the server-side ping (the server reaches the local proxy
@@ -549,7 +869,8 @@ async function saveLibrary() {
 async function checkApiStatus() {
     const badge = document.getElementById('api-status-badge');
     badge.className = 'status-badge checking';
-    badge.querySelector('.status-text').textContent = '检测 API 连接中...';
+    badge.querySelector('.status-text').textContent = '检测模型接口…';
+    badge.title = '检测文本模型接口；图片与视频任务的状态请查看项目进度';
 
     try {
         const res = await fetch('/api/ping', {
@@ -561,155 +882,23 @@ async function checkApiStatus() {
 
         if (res.ok && data.online) {
             badge.className = 'status-badge online';
-            badge.querySelector('.status-text').textContent = `本地 ${config.model} 在线`;
+            badge.querySelector('.status-text').textContent = '模型接口在线';
+            badge.title = `文本模型：${config.model}`;
             return true;
         } else {
             throw new Error(data.message || `HTTP Error ${res.status}`);
         }
     } catch (e) {
         badge.className = 'status-badge offline';
-        badge.querySelector('.status-text').textContent = 'API 连接断开';
+        badge.querySelector('.status-text').textContent = '模型接口未连接';
+        badge.title = '文本模型接口暂不可用；这不代表正在生成的图片或视频已停止';
         console.error("API check failed:", e);
         return false;
     }
 }
 
-// Interactive Sliders Initialization
-function initSliders() {
-    const complexity = document.getElementById('slider-complexity');
-    const budget = document.getElementById('slider-budget');
-    const ratio = document.getElementById('slider-ratio');
-    const creativity = document.getElementById('slider-creativity');
-    const beats = document.getElementById('slider-beats');
-    const beatCountMode = document.getElementById('beat-count-mode');
-
-    const complexityLabels = { 1: '轻量级改造', 2: '中等重工', 3: '硬核结构性改建' };
-    const budgetLabels = { 1: '平民精简版', 2: '轻奢设计师级', 3: '顶奢艺术级定制' };
-    // 注意：这些标签文字会作为 Creativity Scale 原样送进 LLM（generateIdea 直接取
-    // val-creativity 的 textContent）——措辞必须保持写实取向，绝不能出现「科幻」类
-    // 引导词（旧文案「脑洞大开 (极致科幻)」曾把整条产出带偏成科幻题材）。
-    const creativityLabels = { 1: '常规务实', 2: '突破常规', 3: '脑洞大开 (写实奇观)' };
-
-    // 反差强度/节拍数轨道上色到当前值，让拖动时能直接看到进度而不是只有上方的静态文字
-    const updateFill = (input) => {
-        const min = Number(input.min) || 0;
-        const max = Number(input.max) || 100;
-        const pct = max > min ? ((Number(input.value) - min) / (max - min)) * 100 : 0;
-        input.style.setProperty('--fill-pct', `${pct}%`);
-    };
-
-    // 复杂度/预算/脑洞大开度只有 3 档，拖滑块去精确命中某一档很别扭，改成点选式分段按钮。
-    // 底层 <input type=range> 保留（视觉隐藏）：config.js / prompt_pipeline.js 里大量代码
-    // 按 id 直接读写它的 .value，分段按钮只是换了一层交互，不改数据模型。
-    const fillSegmentLabels = (targetId, labels) => {
-        const group = document.querySelector(`.segmented-control[data-target="${targetId}"]`);
-        if (!group) return;
-        group.querySelectorAll('.segment-btn').forEach((btn) => {
-            btn.textContent = labels[btn.dataset.value] || btn.dataset.value;
-        });
-    };
-    fillSegmentLabels('slider-complexity', complexityLabels);
-    fillSegmentLabels('slider-budget', budgetLabels);
-    fillSegmentLabels('slider-creativity', creativityLabels);
-
-    const syncSegments = (input) => {
-        const group = document.querySelector(`.segmented-control[data-target="${input.id}"]`);
-        if (!group) return;
-        group.querySelectorAll('.segment-btn').forEach((btn) => {
-            const isActive = btn.dataset.value === String(input.value);
-            btn.classList.toggle('active', isActive);
-            btn.setAttribute('aria-pressed', String(isActive));
-        });
-    };
-
-    document.querySelectorAll('.segmented-control').forEach((group) => {
-        const input = document.getElementById(group.dataset.target);
-        if (!input) return;
-        group.querySelectorAll('.segment-btn').forEach((btn) => {
-            btn.addEventListener('click', () => {
-                input.value = btn.dataset.value;
-                // 'input' 驱动即时的标签/摘要更新；'change' 是 saveSelectionState() 落盘到
-                // localStorage 唯一挂钩的事件——原生滑块靠"松手"触发它，这里补发使其等效。
-                input.dispatchEvent(new Event('input'));
-                input.dispatchEvent(new Event('change'));
-            });
-        });
-    });
-
-    // 反差强度/节拍数两侧的 −/+：不想拖也能单步精调
-    document.querySelectorAll('.slider-step-btn').forEach((btn) => {
-        btn.addEventListener('click', () => {
-            const input = document.getElementById(btn.dataset.target);
-            if (!input) return;
-            const step = Number(input.step) || 1;
-            const min = Number(input.min);
-            const max = Number(input.max);
-            const next = Number(input.value) + Number(btn.dataset.step) * step;
-            input.value = Math.min(max, Math.max(min, next));
-            input.dispatchEvent(new Event('input'));
-            input.dispatchEvent(new Event('change'));
-        });
-    });
-
-    complexity.addEventListener('input', (e) => {
-        document.getElementById('val-complexity').textContent = complexityLabels[e.target.value];
-        syncSegments(e.target);
-    });
-    budget.addEventListener('input', (e) => {
-        document.getElementById('val-budget').textContent = budgetLabels[e.target.value];
-        syncSegments(e.target);
-    });
-    ratio.addEventListener('input', (e) => {
-        const val = e.target.value;
-        document.getElementById('val-ratio').textContent = `反差强度: ${val}%`;
-        updateFill(e.target);
-    });
-    creativity.addEventListener('input', (e) => {
-        document.getElementById('val-creativity').textContent = creativityLabels[e.target.value];
-        syncSegments(e.target);
-    });
-    beats.addEventListener('input', (e) => {
-        document.getElementById('val-beats').textContent = `${e.target.value} 拍`;
-        updateFill(e.target);
-    });
-    const syncBeatModeLabel = () => {
-        const adaptive = !beatCountMode || beatCountMode.value !== 'fixed';
-        const label = document.getElementById('beat-count-label');
-        if (label) label.textContent = adaptive ? '最多施工节拍数 (Milestone Cap)' : '固定施工节拍数 (Beat Count)';
-        updateConfigSummary();
-    };
-    if (beatCountMode) {
-        beatCountMode.addEventListener('input', syncBeatModeLabel);
-        beatCountMode.addEventListener('change', syncBeatModeLabel);
-    }
-
-    // Fire initial displays
-    complexity.dispatchEvent(new Event('input'));
-    budget.dispatchEvent(new Event('input'));
-    ratio.dispatchEvent(new Event('input'));
-    creativity.dispatchEvent(new Event('input'));
-    beats.dispatchEvent(new Event('input'));
-    syncBeatModeLabel();
-}
-
-// Theme & Anchor Selection Handling
-function initSelectors() {
-    // 基础场景主题选择器已从 GUI 移除（灵感改由联网参考案例库驱动，见
-    // js/trend_refs.js）；#theme-selector 不复存在，这里不再绑定它的监听。
-
-    // Anchor Selector (Multi-select) — section removed from the GUI; guard kept since
-    // #anchor-selector no longer exists (anchors are now left for the composer to pick).
-    const anchorFlex = document.getElementById('anchor-selector');
-    if (anchorFlex) {
-        anchorFlex.addEventListener('click', (e) => {
-            const btn = e.target.closest('.anchor-node');
-            if (!btn) return;
-
-            btn.classList.toggle('active');
-        });
-    }
-}
-
+// 维度滑块（复杂度/预算/反差/尺度/拍数）的初始化随「激发维度」页一起下线：
+// 那五个 #slider-* 已不在 index.html 里，函数本身也早已无人调用。
 // Interactive Particle Background (Canvas)
 function initCanvas() {
     const canvas = document.getElementById('particle-canvas');
@@ -823,67 +1012,35 @@ async function updateCacheSizeInfo() {
     }
 }
 
-// --- Persistent panel (tasks/library) helpers -----------------------------
-// Both drawers stay open once opened (no auto-close on outside click) so they
-// can be used as a reference alongside the rest of the workspace; the header
-// toggle button doubles as the "收起" (collapse) control, its label swapping
-// to make that discoverable.
-const DRAWER_TOGGLE_LABELS = {
-    'toggle-tasks-btn': '任务列表',
-    'toggle-library-btn': '点子库',
-};
-
-function setDrawerToggleOpenState(btnId, isOpen) {
-    const btn = document.getElementById(btnId);
-    if (!btn) return;
-    const label = DRAWER_TOGGLE_LABELS[btnId] || '';
-    const labelSpan = btn.querySelector('span:not(.task-badge)');
-    btn.classList.toggle('panel-open', isOpen);
-    btn.title = isOpen ? `收起${label}` : label;
-    if (labelSpan) labelSpan.textContent = isOpen ? '收起' : label;
+// Fetch and update log size info in settings modal
+async function updateLogsSizeInfo() {
+    const logsInfoSpan = document.getElementById('logs-size-info');
+    if (!logsInfoSpan) return;
+    logsInfoSpan.textContent = '计算中...';
+    try {
+        const resp = await fetch('/api/logs-info');
+        if (resp.ok) {
+            const data = await resp.json();
+            const total = data.total_size || 0;
+            // 日志按 8MB×3 封顶，KB 在这个量级读起来太长，超过 1MB 就换单位
+            const size = total >= 1024 * 1024
+                ? `${(total / 1024 / 1024).toFixed(2)} MB`
+                : `${(total / 1024).toFixed(2)} KB`;
+            logsInfoSpan.textContent = `${size} (${data.file_count || 0}个文件)`;
+        } else {
+            logsInfoSpan.textContent = '获取失败';
+        }
+    } catch (e) {
+        logsInfoSpan.textContent = '获取失败';
+    }
 }
 
-function openLibraryDrawer() {
-    const libraryDrawer = document.getElementById('library-drawer');
-    if (!libraryDrawer) return;
-    closeTasksDrawer();
-    // 日志 dock 也停靠右侧，三者互斥（见 api_client.js setLogDockOpen）
-    if (typeof window.collapseLogDock === 'function') window.collapseLogDock();
-    libraryDrawer.classList.add('active');
-    setDrawerToggleOpenState('toggle-library-btn', true);
-    renderLibrary();
-}
+// 「任务列表」「点子库」两个右侧抽屉及其开合函数已于 2026-07-31（P4）删除，
+// 内容合并进「📁 项目」主标签页（js/projects.js）。右侧现在只剩日志 dock 一个
+// 停靠物，不再需要三者互斥的那套协调逻辑。
 
-function closeLibraryDrawer() {
-    const libraryDrawer = document.getElementById('library-drawer');
-    if (!libraryDrawer) return;
-    libraryDrawer.classList.remove('active');
-    setDrawerToggleOpenState('toggle-library-btn', false);
-}
-
-function openTasksDrawer() {
-    const tasksDrawer = document.getElementById('tasks-drawer');
-    if (!tasksDrawer) return;
-    closeLibraryDrawer();
-    if (typeof window.collapseLogDock === 'function') window.collapseLogDock();
-    tasksDrawer.classList.add('active');
-    setDrawerToggleOpenState('toggle-tasks-btn', true);
-    renderTasks();
-    startTasksPolling();
-}
-
-function closeTasksDrawer() {
-    const tasksDrawer = document.getElementById('tasks-drawer');
-    if (!tasksDrawer) return;
-    tasksDrawer.classList.remove('active');
-    setDrawerToggleOpenState('toggle-tasks-btn', false);
-    stopTasksPolling();
-}
-
-// The persistent drawers are position:fixed siblings of .app-container, so a plain
-// `top: 0` box would paint over the header (and its own collapse button) rather than
-// under it. Anchor the drawer below the real header+tab-bar height instead of a
-// hardcoded pixel value, since that height differs across breakpoints.
+// 日志 dock 是 position:fixed 的，`top: 0` 会盖住 header（含它自己的收起按钮）。
+// 这里按真实的 header+标签栏高度锚定它，而不是写死像素——那个高度随断点变化。
 function updateDrawerTopOffset() {
     const anchor = document.querySelector('.mobile-nav-tabs') || document.querySelector('.app-header');
     if (!anchor) return;
@@ -900,16 +1057,39 @@ function setupEventListeners() {
     const closeSettings = document.getElementById('settings-modal').querySelector('.close-btn');
     const settingsModal = document.getElementById('settings-modal');
     
+    // 配置中心的分区导航 + 改动即存的委托绑定（见 js/config.js）
+    if (typeof initSettingsCenter === 'function') initSettingsCenter();
+
     openSettings.addEventListener('click', () => {
         settingsModal.classList.add('active');
+        // 回到上次停留的分区；进「生成号池」时顺带重读池子
+        if (typeof switchSettingsSection === 'function') {
+            switchSettingsSection(localStorage.getItem('spark_settings_section') || 'backend');
+        }
         updateCacheSizeInfo();
+        updateLogsSizeInfo();
     });
     closeSettings.addEventListener('click', () => settingsModal.classList.remove('active'));
+    settingsModal.addEventListener('click', (e) => {
+        if (e.target === settingsModal) settingsModal.classList.remove('active');
+    });
+
+    // 点击半透明空白背景区域关闭弹窗（全局支持所有 .modal 容器）
+    document.addEventListener('click', (e) => {
+        if (e.target && e.target.classList && e.target.classList.contains('modal') && e.target.classList.contains('active')) {
+            const closeBtn = e.target.querySelector('.close-btn') || e.target.querySelector('.cancel-btn');
+            if (closeBtn) {
+                closeBtn.click();
+            } else {
+                e.target.classList.remove('active');
+            }
+        }
+    });
     
     // （API Key 输入框与可见性切换按钮已随死配置一并移除：托管模式密钥在服务端）
 
     document.getElementById('save-settings-btn').addEventListener('click', () => {
-        saveConfig();
+        // 每项改动已独立保存；完成只关闭面板，不重复写入或提前宣告成功。
         settingsModal.classList.remove('active');
     });
     
@@ -938,6 +1118,37 @@ function setupEventListeners() {
             } finally {
                 clearCacheBtn.disabled = false;
                 clearCacheBtn.textContent = '🧹 清理系统缓存';
+            }
+        });
+    }
+
+    // Clear logs button handler
+    const clearLogsBtn = document.getElementById('clear-logs-btn');
+    if (clearLogsBtn) {
+        clearLogsBtn.addEventListener('click', async () => {
+            if (!confirm('确定要清理运行日志吗？server.log 及其轮转备份会被清空，历史日志无法恢复。\n\n服务不会中断，日志会继续写入。')) {
+                return;
+            }
+            try {
+                clearLogsBtn.disabled = true;
+                clearLogsBtn.textContent = '清理中...';
+                const resp = await fetch('/api/clear-logs', { method: 'POST' });
+                const data = await resp.json();
+                if (data.status === 'success') {
+                    const freed = data.freed_bytes || 0;
+                    const size = freed >= 1024 * 1024
+                        ? `${(freed / 1024 / 1024).toFixed(2)} MB`
+                        : `${(freed / 1024).toFixed(2)} KB`;
+                    showToast(`运行日志清理成功，释放 ${size}`, 'success');
+                    updateLogsSizeInfo();
+                } else {
+                    showToast('清理失败: ' + data.message, 'error');
+                }
+            } catch (err) {
+                showToast('请求出错: ' + err.message, 'error');
+            } finally {
+                clearLogsBtn.disabled = false;
+                clearLogsBtn.textContent = '🧹 清理运行日志';
             }
         });
     }
@@ -987,68 +1198,17 @@ function setupEventListeners() {
         });
     }
 
-    // Library Drawer
-    const openLibrary = document.getElementById('toggle-library-btn');
-    const closeLibrary = document.getElementById('close-library-btn');
-    const libraryDrawer = document.getElementById('library-drawer');
-    const tasksDrawer = document.getElementById('tasks-drawer');
-
-    openLibrary.addEventListener('click', () => {
-        if (libraryDrawer.classList.contains('active')) {
-            closeLibraryDrawer();
-        } else {
-            openLibraryDrawer();
-        }
-    });
-    closeLibrary.addEventListener('click', closeLibraryDrawer);
-
-    // Tasks Drawer
-    const openTasks = document.getElementById('toggle-tasks-btn');
-    const closeTasks = document.getElementById('close-tasks-btn');
-
-    if (openTasks && closeTasks && tasksDrawer) {
-        openTasks.addEventListener('click', () => {
-            if (tasksDrawer.classList.contains('active')) {
-                closeTasksDrawer();
-            } else {
-                openTasksDrawer();
-            }
-        });
-        closeTasks.addEventListener('click', closeTasksDrawer);
+    // 项目工作台入口。原先 header 上有「项目」按钮，现已并入工作区标签栏（#main-tab-projects，
+    // 点它由 inline onclick 切到项目页）。运行中角标挂在这个标签里：点角标直接落到"运行中"筛选，
+    // 那正是用户点角标时想看的东西；点标签本身则保持当前筛选不动。
+    const taskBadge = document.getElementById('active-task-count');
+    if (taskBadge && typeof openProjectsWorkbench === 'function') {
+        taskBadge.addEventListener('click', () => openProjectsWorkbench('running'));
     }
 
-    // Tasks Drawer filter inputs and clear buttons
-    const tasksSearchInput = document.getElementById('tasks-search');
-    const tasksStatusSelect = document.getElementById('tasks-filter-status');
-    const tasksTypeSelect = document.getElementById('tasks-filter-type');
-    const clearCompletedBtn = document.getElementById('clear-completed-btn');
-    const clearFailedBtn = document.getElementById('clear-failed-btn');
-
-    if (tasksSearchInput) {
-        // Debounce: avoid firing a network fetch on every single keystroke
-        const debouncedSearch = _debounce((e) => {
-            tasksSearchQuery = e.target.value;
-            renderTasks();
-        }, 300);
-        tasksSearchInput.addEventListener('input', debouncedSearch);
-    }
-    if (tasksStatusSelect) {
-        tasksStatusSelect.addEventListener('change', (e) => {
-            tasksFilterStatus = e.target.value;
-            renderTasks();
-        });
-    }
-    if (tasksTypeSelect) {
-        tasksTypeSelect.addEventListener('change', (e) => {
-            tasksFilterType = e.target.value;
-            renderTasks();
-        });
-    }
-    if (clearCompletedBtn) {
-        clearCompletedBtn.addEventListener('click', () => clearTasks('completed'));
-    }
-    if (clearFailedBtn) {
-        clearFailedBtn.addEventListener('click', () => clearTasks('failed_cancelled'));
+    const clearAllBtn = document.getElementById('projects-clear-all-btn');
+    if (clearAllBtn) {
+        clearAllBtn.addEventListener('click', () => clearTasks('all'));
     }
 
     // View Active Generation Progress
@@ -1076,9 +1236,9 @@ function setupEventListeners() {
         manualInterventionDismissBtn.addEventListener('click', () => hideManualInterventionBanner());
     }
 
-    // Generation Action
-    document.getElementById('generate-btn').addEventListener('click', () => generateIdea());
-    document.getElementById('retry-btn').addEventListener('click', () => retryGeneration());
+    // Generation Action —— 「激发」主按钮随「激发维度」页下线，只剩结果页的重试按钮。
+    const retryBtn = document.getElementById('retry-btn');
+    if (retryBtn) retryBtn.addEventListener('click', () => retryGeneration());
 
     // Cancel Generation Actions
     const cancelGenBtn = document.getElementById('cancel-generate-btn');
@@ -1126,17 +1286,7 @@ function setupEventListeners() {
     const cancelVideosBtn = document.getElementById('cancel-videos-btn');
     if (cancelVideosBtn) {
         cancelVideosBtn.addEventListener('click', () => {
-            // 见 cancel-frames-btn 的同款说明。
-            const rec = currentIdea && getIdeaTaskRecord(currentIdea.id, 'videos');
-            if (rec && rec.taskId) {
-                fetch('/api/compose-cancel', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ task_id: rec.taskId })
-                }).catch(e => console.error("Failed to cancel videos task on server:", e));
-            }
-            if (rec && rec.controller) rec.controller.abort();
-            showToast(rec && rec.taskId ? "已发送取消请求，视频序列生成即将停止" : "已取消视频序列生成", "info");
+            if (currentIdea) cancelVideoOperation(currentIdea);
         });
     }
 
@@ -1152,6 +1302,26 @@ function setupEventListeners() {
             if (file && Number.isFinite(slot)) {
                 uploadVideoToSlot(slot, file);
             }
+        });
+    }
+
+    // 手动上传图片覆盖帧槽位：同上的共用隐藏 <input type=file>，由各帧卡片的
+    // 「上传」按钮触发。多选时走与"拖多张图进来"同一条路径（uploadFramesFromDrop：
+    // 按文件名顺序从目标帧起依次填、超出槽位的丢弃并告知），不另起一套语义。
+    const frameUploadInput = document.getElementById('frame-upload-input');
+    if (frameUploadInput) {
+        frameUploadInput.addEventListener('change', (e) => {
+            const files = Array.from((e.target && e.target.files) || []);
+            const seq = parseInt(frameUploadInput.dataset.seq, 10);
+            frameUploadInput.value = '';
+            if (!files.length || !Number.isFinite(seq)) return;
+            // accept="image/*" 只是筛选器，部分系统的文件对话框允许绕过它选任意文件
+            const images = files.filter(isImageFileLike);
+            if (!images.length) {
+                showToast(`「${files[0].name}」不是图片文件，帧槽位只接受图片`, 'error');
+                return;
+            }
+            uploadFramesFromDrop(seq, images);
         });
     }
 
@@ -1173,37 +1343,9 @@ function setupEventListeners() {
     });
 
     // Preset Selection
-    document.querySelectorAll('.preset-btn').forEach(btn => {
-        btn.addEventListener('click', (e) => {
-            const preset = e.currentTarget.dataset.preset;
-            if (preset) {
-                applyPreset(preset);
-            }
-        });
-    });
-
-    // Save state on slider input/change
-    // rAF-gate the heavy updateConfigSummary (many DOM reads) so it runs
-    // at most once per animation frame during rapid drag gestures
-    let _configSummaryPending = false;
-    const rafConfigSummary = () => {
-        if (!_configSummaryPending) {
-            _configSummaryPending = true;
-            requestAnimationFrame(() => {
-                updateConfigSummary();
-                _configSummaryPending = false;
-            });
-        }
-    };
-    ['slider-complexity', 'slider-budget', 'slider-ratio', 'slider-creativity', 'slider-beats', 'beat-count-mode'].forEach(id => {
-        const el = document.getElementById(id);
-        if (el) {
-            el.addEventListener('input', rafConfigSummary);
-            el.addEventListener('change', saveSelectionState);
-        }
-    });
-
-    // （旧 #theme-selector 点击存档监听已随主题选择器一起移除）
+    // （预设按钮与维度滑块的监听已随「激发维度」页一起移除：.preset-btn 与
+    //   #slider-* 都不在 index.html 里了，applyPreset / updateConfigSummary /
+    //   saveSelectionState 三个宿主函数也已从 js/config.js 删除。）
 
     // Tab buttons switching
     document.querySelectorAll('.result-tabs-bar .tab-btn').forEach(btn => {
@@ -1215,15 +1357,20 @@ function setupEventListeners() {
     // 管线条与 section 弹层：必须排在下面那批按钮监听之前绑定，管线条用的是
     // 捕获阶段拦截，绑定先后本身不影响，但放这里读起来跟 tab 一组更顺。
     initPipelineBar();
+    initResultLeftColumnToggle();
+    initMergedVideoSettingsButton();
     initSectionPops();
 
     // Idea Interaction Buttons
-    document.getElementById('save-idea-btn').addEventListener('click', saveCurrentIdea);
-    document.getElementById('export-idea-btn').addEventListener('click', exportIdeaMarkdown);
-    document.getElementById('copy-prompt-btn').addEventListener('click', copyPromptToClipboard);
-    document.getElementById('copy-prompt-btn-all').addEventListener('click', copyPromptToClipboard);
-    document.getElementById('copy-tiktok-meta-btn').addEventListener('click', copyTikTokMetaToClipboard);
-    document.getElementById('copy-tiktok-meta-cn-btn').addEventListener('click', copyTikTokMetaCnToClipboard);
+    document.getElementById('save-idea-btn')?.addEventListener('click', saveCurrentIdea);
+    document.getElementById('export-idea-btn')?.addEventListener('click', exportIdeaMarkdown);
+    document.getElementById('copy-prompt-btn')?.addEventListener('click', copyPromptToClipboard);
+    // 提示词页的手动编辑（✏️ 手动编辑 / ➕ 添加一拍 / 保存 / 取消），见 js/prompt_editor.js
+    if (typeof initPromptEditor === 'function') initPromptEditor();
+    document.getElementById('copy-prompt-btn-all')?.addEventListener('click', copyPromptToClipboard);
+    document.getElementById('copy-tiktok-meta-btn')?.addEventListener('click', copyTikTokMetaToClipboard);
+    document.getElementById('copy-tiktok-meta-cn-btn')?.addEventListener('click', copyTikTokMetaCnToClipboard);
+    document.getElementById('gen-project-meta-btn')?.addEventListener('click', generateProjectMetaForCurrentIdea);
     // 手机端标题区折叠开关：折叠态只留一行英文主标题（话题串与中文标题行藏起来），
     // 让封面/帧序列能上首屏。class 常驻 DOM，桌面端的 CSS 不理会它，所以按钮本身
     // 也只在 ≤768px 显示。
@@ -1237,22 +1384,61 @@ function setupEventListeners() {
             ideaMetaToggle.title = collapsed ? '展开完整标题与话题' : '收起标题与话题';
         });
     }
-    // 手机端页脚 LLM 模型选择器的折叠开关：折叠态只留「LLM 模型 · 使用中 xxx」一行，
-    // 展开才铺开全部芯片。桌面端 CSS 不理会 picker-collapsed，按钮本身也不显示。
-    const llmToggle = document.getElementById('ideation-llm-toggle');
-    if (llmToggle) {
-        llmToggle.addEventListener('click', () => {
-            const picker = document.getElementById('ideation-model-picker');
-            if (!picker) return;
-            const collapsed = picker.classList.toggle('picker-collapsed');
-            llmToggle.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
-            llmToggle.title = collapsed ? '展开模型选择' : '收起模型选择';
+    // （页脚 LLM 模型选择器的折叠开关已移除：#ideation-llm-toggle / #ideation-model-picker
+    //   随「激发维度」页一起下线。模型切换现在只在配置中心，见 syncSettingsLlmModelPicker。）
+    document.getElementById('make-cover-btn').addEventListener('click', () => generateCover());
+    const makeCoverConcBtn = document.getElementById('generate-cover-concurrent-btn');
+    if (makeCoverConcBtn) {
+        makeCoverConcBtn.addEventListener('click', () => {
+            markCandidateSelectionMode(true);
+            generateCover({ concurrent: true });
         });
     }
-    document.getElementById('make-cover-btn').addEventListener('click', () => generateCover());
+    const coverPlaceholder = document.getElementById('cover-image-placeholder');
+    if (coverPlaceholder) {
+        coverPlaceholder.style.cursor = 'pointer';
+        coverPlaceholder.addEventListener('click', () => generateCover());
+    }
     document.getElementById('generate-frames-btn').addEventListener('click', () => generateFrames());
+    const genSelBtn = document.getElementById('generate-frames-selection-btn');
+    if (genSelBtn) genSelBtn.addEventListener('click', () => generateFramesSelection());
+    const pipeSelBtn = document.getElementById('pipeline-frames-selection-btn');
+    if (pipeSelBtn) pipeSelBtn.addEventListener('click', () => generateFramesSelection());
+    const candCloseBtn = document.getElementById('candidate-selection-close-btn');
+    if (candCloseBtn) {
+        candCloseBtn.addEventListener('click', () => {
+            if (typeof closeCandidateSelectionModal === 'function') closeCandidateSelectionModal();
+            else {
+                const modal = document.getElementById('candidate-selection-modal');
+                if (modal) { modal.classList.remove('active'); modal.style.display = 'none'; }
+            }
+        });
+    }
+    const candModal = document.getElementById('candidate-selection-modal');
+    if (candModal) {
+        candModal.addEventListener('click', (e) => {
+            if (e.target === candModal) {
+                if (typeof closeCandidateSelectionModal === 'function') closeCandidateSelectionModal();
+            }
+        });
+    }
     document.getElementById('run-sequence-review-btn').addEventListener('click', () => runSequenceReview());
+    const fullReviewBtn = document.getElementById('run-full-sequence-review-btn');
+    if (fullReviewBtn) {
+        fullReviewBtn.addEventListener('click', async () => {
+            // 全量重审要烧掉整套调用，先说清代价再跑
+            const ok = await customConfirm(
+                '全量重审会把每一拍与跨帧层整个重跑一遍，不复用任何既有结论——'
+                + '十几帧的单子通常是几分钟、几十次模型调用。<br><br>'
+                + '日常修完帧之后用「🔍 一致性审查」就够：它只重审帧图变过的那几拍。');
+            if (ok) runSequenceReview('full');
+        });
+    }
+    const deletedSlotsBtn = document.getElementById('deleted-slots-btn');
+    if (deletedSlotsBtn) deletedSlotsBtn.addEventListener('click', () => openDeletedSlotsPanel());
     document.getElementById('generate-videos-btn').addEventListener('click', () => generateVideos());
+    const genVideoChainBtn = document.getElementById('generate-video-chain-btn');
+    if (genVideoChainBtn) genVideoChainBtn.addEventListener('click', () => generateVideoChain());
     document.getElementById('merge-videos-btn').addEventListener('click', () => mergeVideos());
     const copyHookBtn = document.getElementById('copy-hook-btn');
     if (copyHookBtn) {
@@ -1270,292 +1456,104 @@ function setupEventListeners() {
     }
 
     // Library search & filters
-    const libSearch = document.getElementById('library-search');
-    const libFilterTime = document.getElementById('library-filter-time');
-    let searchTimeout = null;
-    if (libSearch) {
-        libSearch.addEventListener('input', () => {
-            clearTimeout(searchTimeout);
-            searchTimeout = setTimeout(renderLibrary, 200);
-        });
-    }
-    if (libFilterTime) libFilterTime.addEventListener('change', renderLibrary);
-
-    // Library Drawer buttons
-    document.getElementById('export-all-btn').addEventListener('click', exportAllLibrary);
+    // 点子库的搜索/排序已由项目工作台的 chips + 搜索框接管（js/projects.js）
+    const exportBtn = document.getElementById('export-all-btn');
+    if (exportBtn) exportBtn.addEventListener('click', exportAllLibrary);
     
     const importBtn = document.getElementById('import-btn');
     const importFile = document.getElementById('import-file');
     importBtn.addEventListener('click', () => importFile.click());
     importFile.addEventListener('change', importLibrary);
+
+    // 同一排工具条上的「📥 上传提示词集」：导入一份外部提示词集 = 新建一个项目
+    // （格式不合槽位契约时自动补全），见 js/prompt_import.js
+    if (typeof initPromptImport === 'function') initPromptImport();
 }
 
-// --- Tasks Drawer Functions & Polling ---
-let tasksPollTimeout = null;
-let currentPollInterval = 2500;
-let tasksSearchQuery = '';
-let tasksFilterStatus = '';
-let tasksFilterType = '';
-
-// 图片/视频生成类任务一律不进激发任务列表（2026-07-12 用户要求）：帧序列、
-// 分步渲染、视频、封面的全过程都在各自模块内直播（含取消/重试入口），
-// 激发任务列表只保留创意激发（compose / auto_run）任务
-const MEDIA_TASK_TYPES = new Set(['frames', 'staged_render', 'videos', 'cover']);
-const isIdeationTask = (t) => !MEDIA_TASK_TYPES.has((t.dimensions && t.dimensions.type) || 'idea');
-
-function formatTaskDuration(totalSeconds) {
-    const seconds = Number(totalSeconds);
-    if (!Number.isFinite(seconds) || seconds < 0) return '';
-    if (seconds < 60) return `${seconds.toFixed(seconds < 10 ? 1 : 0)} 秒`;
-    const wholeSeconds = Math.round(seconds);
-    const minutes = Math.floor(wholeSeconds / 60);
-    const remainder = wholeSeconds % 60;
-    if (minutes < 60) return `${minutes} 分 ${remainder} 秒`;
-    const hours = Math.floor(minutes / 60);
-    return `${hours} 小时 ${minutes % 60} 分`;
-}
-
-function taskModelOptions(selectedModel) {
-    const selected = selectedModel || config.model || DEFAULT_CONFIG.model;
-    return LLM_MODEL_PICKER_FAMILIES.map(family => {
-        const models = (LLM_MODEL_GROUPS[family.key] || []).slice();
-        if (!models.some(model => model.value === selected)
-            && !Object.values(LLM_MODEL_GROUPS).flat().some(model => model.value === selected)
-            && family.key === 'gpt') {
-            models.push({ value: selected, label: `${selected}（历史模型）` });
-        }
-        const options = models.map(model => `
-            <option value="${escapeHtml(model.value)}"${model.value === selected ? ' selected' : ''}>${escapeHtml(model.label)}</option>
-        `).join('');
-        return `<optgroup label="${escapeHtml(family.label)}">${options}</optgroup>`;
-    }).join('');
-}
-
-async function renderTasks() {
-    const tasksListContainer = document.getElementById('tasks-list');
-    if (!tasksListContainer) return;
-
-    try {
-        const response = await fetch('/api/tasks');
-        if (!response.ok) throw new Error(`HTTP ${response.status}`);
-        const resData = await response.json();
-        const tasks = (Array.isArray(resData) ? resData : (resData.tasks || []))
-            .filter(isIdeationTask);
-
-        // Update badge count
-        updateTasksBadge(tasks);
-        
-        // Local filtering
-        let filteredTasks = tasks.filter(task => {
-            // 任务名优先用灵感卡片选题名（task_label），回退基础场景主题
-            const theme = task.dimensions ? (task.dimensions.task_label || task.dimensions.theme || '未命名主题') : '未命名主题';
-            // 完成任务以实际解析出的 VIDEO 数为准。beats_count 是规划阶段的
-            // 施工拍数参数，流水线还可能追加 reward/HERO，直接展示它会少算。
-            const actualBeats = Number(task.result && task.result.video_count);
-            const beats = Number.isFinite(actualBeats) && actualBeats > 0
-                ? ` (${actualBeats} 镜)`
-                : ((task.dimensions && task.dimensions.beats_count)
-                    ? ` (${task.dimensions.beat_count_mode === 'fixed' ? '' : '最多 '}${task.dimensions.beats_count} 镜)` : '');
-            const taskTitle = `${theme}${beats}`;
-
-            if (tasksSearchQuery) {
-                const q = tasksSearchQuery.toLowerCase();
-                if (!taskTitle.toLowerCase().includes(q) && !String(task.id).includes(q)) {
-                    return false;
-                }
-            }
-            if (tasksFilterStatus) {
-                if (task.status !== tasksFilterStatus) return false;
-            }
-            if (tasksFilterType) {
-                const resolvedType = (task.dimensions && task.dimensions.type) || 'idea';
-                if (resolvedType !== tasksFilterType) return false;
-            }
-            return true;
-        });
-        
-        let html = '';
-        if (filteredTasks.length === 0) {
-            html = `<div class="tasks-empty">暂无符合筛选条件的任务</div>`;
-        }
-        // (loop body is skipped naturally when there are no filtered tasks)
-        filteredTasks.forEach(task => {
-            // frames_/videos_/cover_ 前缀的任务 ID 不是时间戳，直接 parseInt 会显示 Invalid Date
-            const idMs = parseInt(task.id, 10);
-            const dateStr = Number.isFinite(idMs) && String(idMs) === String(task.id)
-                ? new Date(idMs).toLocaleString()
-                : (task.last_active ? new Date(task.last_active * 1000).toLocaleString() : '—');
-            // 任务名优先用灵感卡片选题名（task_label），回退基础场景主题
-            const theme = task.dimensions ? (task.dimensions.task_label || task.dimensions.theme || '未命名主题') : '未命名主题';
-            const actualBeats = Number(task.result && task.result.video_count);
-            const beats = Number.isFinite(actualBeats) && actualBeats > 0
-                ? ` (${actualBeats} 镜)`
-                : ((task.dimensions && task.dimensions.beats_count)
-                    ? ` (${task.dimensions.beat_count_mode === 'fixed' ? '' : '最多 '}${task.dimensions.beats_count} 镜)` : '');
-            const taskTitle = `${theme}${beats}`;
-
-            let statusLabel = '';
-            let statusClass = '';
-            let footerButtons = '';
-            let progressHtml = '';
-            let errorHtml = '';
-            let tokenInfoHtml = '';
-            let taskDetailsHtml = '';
-            
-            if (task.status === 'running') {
-                statusLabel = '运行中';
-                statusClass = 'running';
-
-                // Reuse the same ProgressModel the main loading view drives itself with, so the
-                // drawer's mini progress bar tracks the real backend stages (outline/batch/audit/
-                // repair, or the frames/videos/cover equivalents) instead of a stale, hand-rolled
-                // stage list that no longer matches what the backend actually emits.
-                const taskType = window.ProgressModel ? ProgressModel.inferTaskType(task.dimensions) : 'compose';
-                const progressInfo = window.ProgressModel
-                    ? ProgressModel.progressFromEvents(task.events || [], taskType, null)
-                    : null;
-                const progressPercent = progressInfo ? progressInfo.percent : 0;
-                const currentStage = (progressInfo && progressInfo.label) || '准备中...';
-
-                progressHtml = `
-                    <div class="task-progress-container">
-                        <div class="task-progress-text">
-                            <span>${escapeHtml(currentStage)}</span>
-                            <span>${progressPercent}%</span>
-                        </div>
-                        <div class="task-progress-bar">
-                            <div class="task-progress-fill" style="width: ${progressPercent}%;"></div>
-                        </div>
-                    </div>
-                `;
-                
-                footerButtons = `
-                    <button class="task-action-btn view" onclick="viewTask('${task.id}', ${JSON.stringify(task.dimensions).replace(/"/g, '&quot;')})">查看</button>
-                    <button class="task-action-btn cancel" onclick="cancelTask('${task.id}', event)">取消</button>
-                `;
-            } else if (task.status === 'completed') {
-                statusLabel = '已完成';
-                statusClass = 'completed';
-                const timings = task.result && task.result.timings;
-                const durationText = formatTaskDuration(timings && timings.total_duration_seconds);
-                const usedModel = (task.result && task.result.model) || config.model || DEFAULT_CONFIG.model;
-                taskDetailsHtml = `
-                    <div class="task-completed-details">
-                        <div class="task-duration-info">
-                            <span>激发总时间</span>
-                            <strong>${escapeHtml(durationText || '暂无记录')}</strong>
-                        </div>
-                        <label class="task-rerun-model">
-                            <span>换模型再跑</span>
-                            <select class="task-rerun-model-select" aria-label="选择重新激发使用的模型">
-                                ${taskModelOptions(usedModel)}
-                            </select>
-                        </label>
-                    </div>
-                `;
-                if (task.result && task.result.token_usage) {
-                    const usage = task.result.token_usage;
-                    tokenInfoHtml = `
-                        <div class="task-token-info" style="font-size: 11px; color: var(--text-secondary, #94a3b8); margin-top: 8px; font-family: var(--font-mono, monospace);">
-                            Tokens: ${usage.total_tokens} (I:${usage.prompt_tokens} O:${usage.completion_tokens}) | Calls: ${usage.api_calls}
-                        </div>
-                    `;
-                }
-                footerButtons = `
-                    <button class="task-action-btn view" onclick="loadCompletedTask('${task.id}')">查看</button>
-                    <button class="task-action-btn retry" onclick="rerunCompletedTask('${task.id}', ${JSON.stringify(task.dimensions).replace(/"/g, '&quot;')}, event)">再跑一遍</button>
-                    <button class="task-action-btn delete" onclick="deleteTask('${task.id}', event)">删除</button>
-                `;
-            } else if (task.status === 'failed') {
-                statusLabel = '已失败';
-                statusClass = 'failed';
-                const errorMsg = task.error || '未知错误';
-                errorHtml = `<div class="task-error-text">❌ 错误: ${escapeHtml(errorMsg)}</div>`;
-                footerButtons = `
-                    <button class="task-action-btn retry" onclick="retryTask('${task.id}', ${JSON.stringify(task.dimensions).replace(/"/g, '&quot;')}, event)">重试</button>
-                    <button class="task-action-btn delete" onclick="deleteTask('${task.id}', event)">删除</button>
-                `;
-            } else if (task.status === 'cancelled') {
-                statusLabel = '已取消';
-                statusClass = 'cancelled';
-                const errorMsg = task.error || '用户已取消';
-                errorHtml = `<div class="task-error-text" style="color: var(--text-secondary, #94a3b8);">⚪ ${escapeHtml(errorMsg)}</div>`;
-                footerButtons = `
-                    <button class="task-action-btn delete" onclick="deleteTask('${task.id}', event)">删除</button>
-                `;
-            }
-            
-            html += `
-                <div class="task-card" data-task-id="${task.id}">
-                    <div class="task-card-header">
-                        <div>
-                            <div class="task-card-title">${escapeHtml(taskTitle)}</div>
-                            <div class="task-card-date">${escapeHtml(dateStr)}</div>
-                        </div>
-                        <span class="task-status-badge ${statusClass}">${escapeHtml(statusLabel)}</span>
-                    </div>
-                    ${taskDetailsHtml}
-                    ${tokenInfoHtml}
-                    ${progressHtml}
-                    ${errorHtml}
-                    <div class="task-card-footer">
-                        ${footerButtons}
-                    </div>
-                </div>
-            `;
-        });
-        
-        // Skip the DOM teardown when the rendered output is byte-identical to the last poll.
-        // `html` reflects only visible state (status, bucketed progress %, stage text, buttons) —
-        // not the raw growing events array — so identical html means an identical view. This turns
-        // most 2.5s poll ticks into a no-op and stops the drawer from snapping to the top and
-        // dropping hover/focus while a task runs. When it does change, scroll position is preserved.
-        if (html === _lastTasksRenderHtml) return;
-        _lastTasksRenderHtml = html;
-        const _prevScroll = tasksListContainer.scrollTop;
-        tasksListContainer.innerHTML = html;
-        tasksListContainer.scrollTop = _prevScroll;
-    } catch (e) {
-        console.error("Failed to render tasks list:", e);
-        _lastTasksRenderHtml = null; // force a real re-render on the next successful poll
-        tasksListContainer.innerHTML = `<div class="tasks-empty" style="color: #f87171;">加载任务列表失败: ${escapeHtml(e.message)}</div>`;
-    }
-}
-
-// Function startTasksPolling moved to modular JS file
-
-// Function stopTasksPolling moved to modular JS file
-
-// Function updateTasksBadge moved to modular JS file
-
-// Last rendered tasks-list markup; used to skip no-op re-renders (see renderTasks).
-let _lastTasksRenderHtml = null;
+// --- 任务状态：只剩 header 角标这一路 -------------------------------------
+// renderTasks / 抽屉筛选状态 / _lastTasksRenderHtml / taskModelOptions /
+// formatTaskDuration 已于 2026-07-31（P4）随「激发任务列表」抽屉一并删除，
+// 任务的展示与操作全部由「📁 项目」主标签页承担（js/projects.js）。
+// 这里只保留两样别处还在用的东西：
+const IDEATION_TASK_TYPES = new Set(['idea', 'spark', 'spark_seed', 'spark_followup', 'compose', 'stepped', 'stepped_advance']);
+const isIdeationTask = (t) => !!t && IDEATION_TASK_TYPES.has((t.dimensions && t.dimensions.type) || 'idea');
 
 let globalBadgeTimeout = null;
+let globalBadgePolling = null;
 
 async function startGlobalTasksBadgePolling() {
-    if (globalBadgeTimeout) clearTimeout(globalBadgeTimeout);
-    
+    if (globalBadgePolling) globalBadgePolling.stop();
+    const state = { request: null, epoch: 0, stopped: false };
+    globalBadgePolling = state;
+    const clearPollTimer = () => {
+        if (globalBadgeTimeout) clearTimeout(globalBadgeTimeout);
+        globalBadgeTimeout = null;
+    };
+    const cancelRequest = () => {
+        state.epoch++;
+        const request = state.request;
+        state.request = null;
+        if (request) {
+            clearTimeout(request.deadline);
+            request.controller.abort();
+        }
+    };
+    const schedule = hasRunning => {
+        clearPollTimer();
+        if (!state.stopped && !document.hidden) {
+            globalBadgeTimeout = setTimeout(poll, hasRunning ? 5000 : 30000);
+        }
+    };
     const poll = async () => {
+        clearPollTimer();
+        if (state.stopped || document.hidden || state.request) return;
+        const request = { controller: new AbortController(), epoch: state.epoch, deadline: null };
+        state.request = request;
+        const isCurrent = () => !state.stopped && !document.hidden &&
+            state.request === request && state.epoch === request.epoch;
+        request.deadline = setTimeout(() => {
+            if (state.request !== request) return;
+            cancelRequest();
+            schedule(false);
+        }, 15000);
         let hasRunning = false;
         try {
-            const response = await fetch('/api/tasks');
-            if (response.ok) {
-                const resData = await response.json();
+            const response = await fetch('/api/tasks/summary', { cache: 'no-store', signal: request.controller.signal });
+            if (!isCurrent()) return;
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+            const resData = await response.json();
+            if (isCurrent()) {
                 // 与 renderTasks 同口径：图片/视频生成类任务不计入任务列表角标
-                const tasks = (Array.isArray(resData) ? resData : (resData.tasks || []))
-                    .filter(isIdeationTask);
-                updateTasksBadge(tasks);
-                hasRunning = tasks.some(t => t.status === 'running');
+                const allTasks = Array.isArray(resData.tasks) ? resData.tasks : [];
+                window.dispatchEvent(new CustomEvent('spark:tasks-updated', { detail: { tasks: allTasks } }));
+                const tasks = allTasks.filter(isIdeationTask);
+                const counts = resData.counts || {};
+                updateTasksBadge(tasks, counts.ideation_running);
+                hasRunning = Number.isInteger(counts.running) ? counts.running > 0
+                    : allTasks.some(t => t.status === 'running');
             }
         } catch (e) {
-            console.warn("Background badge poll failed:", e);
+            if (isCurrent() && e.name !== 'AbortError') console.warn("Background badge poll failed:", e);
+        } finally {
+            clearTimeout(request.deadline);
+            if (state.request === request) {
+                state.request = null;
+                schedule(hasRunning);
+            }
         }
-        
-        const nextInterval = hasRunning ? 5000 : 30000;
-        globalBadgeTimeout = setTimeout(poll, nextInterval);
     };
-    
+    const onVisibilityChange = () => {
+        clearPollTimer();
+        if (document.hidden) cancelRequest();
+        else poll();
+    };
+    state.stop = () => {
+        state.stopped = true;
+        clearPollTimer();
+        cancelRequest();
+        document.removeEventListener('visibilitychange', onVisibilityChange);
+    };
+    document.addEventListener('visibilitychange', onVisibilityChange);
     poll();
 }
 
@@ -1579,8 +1577,10 @@ async function viewTask(taskId, dimensions) {
     generationState.status = 'composing';
     updateActiveGenerationBanner();
 
-    localStorage.setItem('spark_active_task_id', taskId);
-    localStorage.setItem('spark_active_task_dimensions', JSON.stringify(dimensions));
+    try {
+        localStorage.setItem('spark_active_task_id', taskId);
+        localStorage.setItem('spark_active_task_dimensions', JSON.stringify(dimensions));
+    } catch (_) {}
 
     // 跟进任务时同样在 loading 视图展示选题名
     const viewTopicEl = document.getElementById('loading-topic-name');
@@ -1633,6 +1633,9 @@ async function loadCompletedTask(taskId) {
                 project_key: data.project_key || null
             };
             
+            if (libraryEntries().some(item => String(item.id) === String(result.id))) {
+                await ensureLibraryIdea(result.id);
+            }
             currentIdea = result;
             saveCurrentIdeaState();
             generationState.status = 'idle';
@@ -1680,7 +1683,7 @@ async function cancelTask(taskId, event) {
                 currentGenerationController.abort();
                 currentGenerationController = null;
             }
-            setTimeout(renderTasks, 500);
+            setTimeout(() => { if (typeof refreshProjects === 'function') refreshProjects({ assets: false }); }, 500);
         } else {
             showToast("取消任务失败", "error");
         }
@@ -1729,7 +1732,7 @@ async function deleteTask(taskId, event) {
                 }
             }
             
-            renderTasks();
+            if (typeof refreshProjects === 'function') refreshProjects();
         } else {
             showToast("删除任务记录失败", "error");
         }
@@ -1742,8 +1745,7 @@ async function deleteTask(taskId, event) {
 async function retryTask(taskId, dimensions, event) {
     if (event) event.stopPropagation();
 
-    closeTasksDrawer();
-
+    switchMainTab('results');
     showToast("正在重新提交该生成任务...", "info");
 
     try {
@@ -1762,16 +1764,17 @@ async function retryTask(taskId, dimensions, event) {
 
 async function rerunCompletedTask(taskId, dimensions, event) {
     if (event) event.stopPropagation();
-    const card = document.querySelector(`.task-card[data-task-id="${CSS.escape(String(taskId))}"]`);
-    const modelSelect = card && card.querySelector('.task-rerun-model-select');
-    const selectedModel = (modelSelect && modelSelect.value) || config.model || DEFAULT_CONFIG.model;
+    // 模型选择器现在长在项目工作台的详情栏里（原先是任务抽屉的成功卡，
+    // 抽屉已随 P4 删除）。取不到就退回当前全局模型。
+    const modelSelect = document.getElementById('projects-rerun-model');
+    const selectedModel = normalizeLlmModel((modelSelect && modelSelect.value) || config.model || DEFAULT_CONFIG.model);
 
-    // 卡片内的模型选择同时成为后续激发的全局模型，保证在线检测、页脚当前模型提示
+    // 这里的模型选择同时成为后续激发的全局模型，保证在线检测、页脚当前模型提示
     // 和本次请求使用同一条网关；新任务不复用旧 id，保留原成功结果供对比。
     config.model = selectedModel;
-    localStorage.setItem('spark_config', JSON.stringify(config));
+    try { localStorage.setItem('spark_config', JSON.stringify(config)); } catch (_) {}
     if (typeof syncIdeationLlmPicker === 'function') syncIdeationLlmPicker();
-    closeTasksDrawer();
+    switchMainTab('results');
     showToast(`正在使用 ${selectedModel} 重新激发，原结果已保留...`, 'info');
 
     try {
@@ -1786,11 +1789,32 @@ async function rerunCompletedTask(taskId, dimensions, event) {
 }
 
 async function clearTasks(statusGroup) {
+    let countHint = "";
+    if (typeof projectsRows !== 'undefined' && Array.isArray(projectsRows)) {
+        const n = projectsRows.length;
+        if (statusGroup === "all") {
+            if (n > 0) countHint = `（共检测到 ${n} 个项目）`;
+        } else if (statusGroup === "completed") {
+            const compN = projectsRows.filter(p => (p.task || {}).status === 'completed' || p.state === 'completed').length;
+            if (compN > 0) countHint = `（检测到约 ${compN} 条）`;
+        } else if (statusGroup === "failed_cancelled") {
+            const failN = projectsRows.filter(p => ['failed', 'cancelled'].includes((p.task || {}).status) || p.state === 'failed' || p.has_failed_jobs).length;
+            if (failN > 0) countHint = `（检测到约 ${failN} 条）`;
+        } else if (statusGroup === "no_cover") {
+            const noCovN = projectsRows.filter(p => !p.cover && !(p.assets && p.assets.cover)).length;
+            if (noCovN > 0) countHint = `（检测到约 ${noCovN} 条）`;
+        }
+    }
+
     let msg = "";
-    if (statusGroup === "completed") {
-        msg = "确定要清空所有【已完成】的任务记录吗？";
+    if (statusGroup === "all") {
+        msg = `⚠️ 确定要彻底清空项目工作台的所有项目、任务记录及本地生成文件吗${countHint}？\n（将清除所有点子库项目、任务记录，并彻底删除本地已生成的图片与成片视频）`;
+    } else if (statusGroup === "completed") {
+        msg = `确定要清空所有【已完成】的任务记录吗${countHint}？（仅清理历史记录，不影响已收藏的创意与磁盘素材）`;
     } else if (statusGroup === "failed_cancelled") {
-        msg = "确定要清空所有【已失败】和【已取消】的任务记录吗？";
+        msg = `确定要清空所有【已失败】和【已取消】的任务记录吗${countHint}？`;
+    } else if (statusGroup === "no_cover") {
+        msg = `确定要清空所有【无封面】的项目吗${countHint}？（将同时清除无封面项目的生成任务记录与点子库收藏，包括已收藏但无封面的项目）`;
     }
     
     const confirmed = await customConfirm(msg);
@@ -1804,40 +1828,118 @@ async function clearTasks(statusGroup) {
         });
         if (response.ok) {
             const data = await response.json();
-            showToast(`清空成功，共删除 ${data.count} 条记录`, "success");
-            
-            // If the currently viewed task was deleted, reset the active task ID
-            const activeTaskId = localStorage.getItem('spark_active_task_id');
-            if (activeTaskId) {
-                const listRes = await fetch('/api/tasks');
-                if (listRes.ok) {
-                    const resData = await listRes.json();
-                    const tasks = Array.isArray(resData) ? resData : (resData.tasks || []);
-                    const remains = tasks.some(t => t.id === activeTaskId);
-                    if (!remains) {
-                        localStorage.removeItem('spark_active_task_id');
-                        localStorage.removeItem('spark_active_task_dimensions');
-                        if (currentGenerationController) {
-                            currentGenerationController.abort();
-                            currentGenerationController = null;
-                        }
-                        generationState.status = 'idle';
-                        const placeholderView = document.getElementById('output-placeholder-view');
-                        const loadingView = document.getElementById('output-loading-view');
-                        const contentView = document.getElementById('output-content-view');
-                        if (loadingView) loadingView.classList.remove('active');
-                        if (placeholderView) placeholderView.classList.add('active');
-                        if (contentView) contentView.classList.remove('active');
-                        updateActiveGenerationBanner();
-                        const genBtn = document.getElementById('generate-btn');
-                        if (genBtn) {
-                            genBtn.disabled = false;
-                            genBtn.classList.remove('loading');
+            const libCount = data.deleted_library_count || 0;
+            let toastMsg = `清空成功，共删除 ${data.count} 项`;
+            if (statusGroup === "all") {
+                toastMsg = `彻底清空成功，已清理 ${data.count} 项及本地生成媒体文件`;
+            } else if (libCount > 0) {
+                toastMsg = `清空成功，共删除 ${data.count} 项（含 ${libCount} 个已收藏创意）`;
+            }
+            showToast(toastMsg, "success");
+
+            if (statusGroup === "all") {
+                if (typeof savedIdeas !== 'undefined') {
+                    savedIdeas = [];
+                    savedIdeaIndex = [];
+                    try {
+                        localStorage.setItem('spark_library', '[]');
+                        localStorage.removeItem('spark_library_index');
+                    } catch (e) {
+                        console.warn('[library] localStorage 镜像写入失败', e);
+                    }
+                }
+                if (typeof loadLibrary === 'function') {
+                    try { await loadLibrary(); } catch (e) {}
+                }
+                if (typeof updateFavoriteButtonState === 'function') {
+                    updateFavoriteButtonState();
+                }
+                localStorage.removeItem('spark_active_task_id');
+                localStorage.removeItem('spark_active_task_dimensions');
+                if (currentGenerationController) {
+                    currentGenerationController.abort();
+                    currentGenerationController = null;
+                }
+                generationState.status = 'idle';
+                currentIdea = null;
+
+                const placeholderView = document.getElementById('output-placeholder-view');
+                const loadingView = document.getElementById('output-loading-view');
+                const contentView = document.getElementById('output-content-view');
+                if (loadingView) loadingView.classList.remove('active');
+                if (placeholderView) placeholderView.classList.add('active');
+                if (contentView) contentView.classList.remove('active');
+
+                updateActiveGenerationBanner();
+                const genBtn = document.getElementById('generate-btn');
+                if (genBtn) {
+                    genBtn.disabled = false;
+                    genBtn.classList.remove('loading');
+                }
+                if (typeof projectsSelected !== 'undefined' && projectsSelected.clear) {
+                    projectsSelected.clear();
+                }
+                if (typeof projectsSelectedKey !== 'undefined') {
+                    projectsSelectedKey = null;
+                }
+                const bulkBar = document.getElementById('projects-bulkbar');
+                if (bulkBar) bulkBar.hidden = true;
+                document.getElementById('projects-list')?.classList.remove('has-selection');
+                if (typeof projectsSyncSelectAllBtn === 'function') {
+                    projectsSyncSelectAllBtn();
+                }
+                if (typeof loadGallery === 'function') {
+                    try { loadGallery(); } catch (e) {}
+                }
+            } else {
+                // 同步清理已收藏条目的前端缓存与持久化
+                if (Array.isArray(data.deleted_library_ids) && data.deleted_library_ids.length > 0) {
+                    const deletedSet = new Set(data.deleted_library_ids);
+                    if (typeof savedIdeas !== 'undefined' && Array.isArray(savedIdeas)) {
+                        forgetLibraryIdeas([...deletedSet]);
+                    }
+                    if (typeof updateFavoriteButtonState === 'function') {
+                        updateFavoriteButtonState();
+                    }
+                }
+                
+                // If the currently viewed task was deleted, reset the active task ID
+                const activeTaskId = localStorage.getItem('spark_active_task_id');
+                if (activeTaskId) {
+                    const listRes = await fetch('/api/tasks');
+                    if (listRes.ok) {
+                        const resData = await listRes.json();
+                        const tasks = Array.isArray(resData) ? resData : (resData.tasks || []);
+                        const remains = tasks.some(t => t.id === activeTaskId);
+                        if (!remains) {
+                            localStorage.removeItem('spark_active_task_id');
+                            localStorage.removeItem('spark_active_task_dimensions');
+                            if (currentGenerationController) {
+                                currentGenerationController.abort();
+                                currentGenerationController = null;
+                            }
+                            generationState.status = 'idle';
+                            const currentIdeaSaved = currentIdea && libraryEntries().some(item => item.id === currentIdea.id);
+                            if (!currentIdeaSaved) {
+                                currentIdea = null;
+                                const placeholderView = document.getElementById('output-placeholder-view');
+                                const loadingView = document.getElementById('output-loading-view');
+                                const contentView = document.getElementById('output-content-view');
+                                if (loadingView) loadingView.classList.remove('active');
+                                if (placeholderView) placeholderView.classList.add('active');
+                                if (contentView) contentView.classList.remove('active');
+                            }
+                            updateActiveGenerationBanner();
+                            const genBtn = document.getElementById('generate-btn');
+                            if (genBtn) {
+                                genBtn.disabled = false;
+                                genBtn.classList.remove('loading');
+                            }
                         }
                     }
                 }
             }
-            renderTasks();
+            if (typeof refreshProjects === 'function') refreshProjects();
         } else {
             showToast("清空任务失败", "error");
         }
@@ -1847,9 +1949,7 @@ async function clearTasks(statusGroup) {
     }
 }
 
-window.renderTasks = renderTasks;
-window.startTasksPolling = startTasksPolling;
-window.stopTasksPolling = stopTasksPolling;
+// renderTasks / startTasksPolling / stopTasksPolling 已随任务抽屉删除（P4）
 window.viewTask = viewTask;
 window.loadCompletedTask = loadCompletedTask;
 window.cancelTask = cancelTask;
@@ -1861,10 +1961,10 @@ window.clearTasks = clearTasks;
 
 // Compose the full skill-grade prompt set via the server-side skill shell.
 // The GUI only collects dimensions; the server runs them through the real
-// restoration-prompt-composer contract and relays to the local LLM proxy.
+// gemini-veo-restoration-composer contract and relays to the local LLM proxy.
 // Compose the full skill-grade prompt set via the server-side skill shell.
 // The GUI only collects dimensions; the server runs them through the real
-// restoration-prompt-composer contract and relays to the local LLM proxy.
+// gemini-veo-restoration-composer contract and relays to the local LLM proxy.
 async function generateIdea(retryParams = null) {
     const badge = document.getElementById('api-status-badge');
     if (badge && badge.classList.contains('offline')) {
@@ -1880,12 +1980,11 @@ async function generateIdea(retryParams = null) {
         }
     }
 
-    // 基础场景主题选择器已移除：非重试路径的选题只能来自选中过的灵感卡片（联网参考
-    // 驱动，点卡片或点卡片上的「🔨 节拍简介」都会载入维度）。没载入过就没有可合成的
-    // 主题，在切换视图前先拦下。
-    const loadedIdea = (typeof loadedIdeationCover !== 'undefined' && loadedIdeationCover) ? loadedIdeationCover : null;
-    if (!retryParams && (!loadedIdea || !loadedIdea.input_str)) {
-        showToast('请先点选灵感推荐卡片（或卡片上的「🔨 节拍简介」）选定选题，也可直接在卡片上一键合成', 'error');
+    // 灵感卡片链路已下线，所有入口（项目工作台的重试 / 换模型重跑 / 结果页重试）
+    // 都会带着完整的 dimensions 进来。没有 retryParams 就没有可合成的选题，这里拦下，
+    // 免得后面拿着一份空维度去发请求。
+    if (!retryParams) {
+        showToast('没有可合成的选题：请从「📁 项目」里重试一条任务，或用「📥 上传提示词集」新建。', 'error');
         return;
     }
 
@@ -1914,31 +2013,6 @@ async function generateIdea(retryParams = null) {
         dimensions = retryParams.dimensions;
         currentConf = retryParams.config;
         reuseTaskId = retryParams.taskId ? String(retryParams.taskId) : null;
-    } else {
-        // Collect GUI dimensions — 选题（theme=一键输入串）与任务名都取自已载入的
-        // 灵感卡片；函数入口已保证 loadedIdea.input_str 存在
-        const activeAnchors = Array.from(document.querySelectorAll('#anchor-selector .anchor-node.active'))
-            .map(node => node.textContent.trim());
-
-        dimensions = {
-            theme: loadedIdea.input_str,
-            task_label: loadedIdea.task_label || loadedIdea.input_str,
-            // 与卡片「一键合成」路径对齐：封面与英文标题一并带给后端（有则复用）
-            cover_url: loadedIdea.cover_url || null,
-            english_title: loadedIdea.english_title || null,
-            // 联网参考案例库使用计次：与卡片「一键合成」路径对齐透传，让选中卡片载入维度
-            // 后走主生成按钮的合成同样能在真正借鉴时计次（见 server.py /api/compose）
-            trend_ref: loadedIdea.trend_ref || null,
-            trend_ref_ids: loadedIdea.trend_ref_ids || [],
-            anchors: activeAnchors,
-            complexity: document.getElementById('val-complexity').textContent,
-            budget: document.getElementById('val-budget').textContent,
-            ratio: document.getElementById('val-ratio').textContent,
-            creativity: document.getElementById('val-creativity').textContent,
-            beats_count: parseInt(document.getElementById('slider-beats').value, 10),
-            beat_count_mode: (document.getElementById('beat-count-mode') || {}).value || 'adaptive'
-        };
-        currentConf = { ...config };
     }
 
     // Generate unique taskId (retry reuses the failed record's id so the rerun
@@ -1957,8 +2031,10 @@ async function generateIdea(retryParams = null) {
     setupLoadingSteps('compose');
 
     // Persist active task to localStorage so it survives refresh/close
-    localStorage.setItem('spark_active_task_id', taskId);
-    localStorage.setItem('spark_active_task_dimensions', JSON.stringify(dimensions));
+    try {
+        localStorage.setItem('spark_active_task_id', taskId);
+        localStorage.setItem('spark_active_task_dimensions', JSON.stringify(dimensions));
+    } catch (_) {}
 
     startLoadingTimer();
 
@@ -2033,6 +2109,18 @@ async function streamProgress(taskId, dimensions) {
         progressState = info.state;
         setProgressBar('generation', info);
     };
+    // text_chunk 是逐 token 来的，但它对进度只贡献"还活着"这一个信息，百分比
+    // 在整个流式阶段基本不动。每个 token 都跑一遍 normalizeGenerationProgress
+    // （克隆一次 state）+ 三次 DOM 写入纯属浪费，一帧一次足够。
+    let composeChunkTick = false;
+    const applyComposeChunkProgress = () => {
+        if (composeChunkTick) return;
+        composeChunkTick = true;
+        requestAnimationFrame(() => {
+            composeChunkTick = false;
+            if (isCurrent()) applyComposeProgress('text_chunk', null);
+        });
+    };
     applyComposeProgress('init', null);
 
     try {
@@ -2047,7 +2135,7 @@ async function streamProgress(taskId, dimensions) {
                     applyComposeProgress(type, data);
                 } else if (type === 'text_chunk') {
                     appendLiveTerminal(data);
-                    applyComposeProgress(type, data);
+                    applyComposeChunkProgress();
                 } else if (type === 'reconnecting') {
                     const stageText = document.getElementById('loading-stage-text');
                     if (stageText) stageText.textContent = `与服务的连接中断，正在自动重连（第 ${data.attempt} 次）...`;
@@ -2130,6 +2218,13 @@ async function streamProgress(taskId, dimensions) {
         contentView.classList.add('active');
         
         showToast("提示词集合合成成功！已开始在后台制作封面图。", "success");
+        if (typeof NotificationCenter !== 'undefined') {
+            NotificationCenter.notify({
+                type: 'success',
+                title: '提示词集合合成成功',
+                message: result.english_title || '创意母案与镜头提示词已就绪，已开始制作封面图'
+            });
+        }
         // Background asynchronous cover generation
         generateCover();
 
@@ -2171,6 +2266,13 @@ async function streamProgress(taskId, dimensions) {
                 errMsgEl.textContent = errorMsg;
             }
             showToast(errorMsg, "error");
+            if (typeof NotificationCenter !== 'undefined') {
+                NotificationCenter.notify({
+                    type: 'error',
+                    title: '提示词合成失败',
+                    message: errorMsg
+                });
+            }
         }
     } finally {
         if (isCurrent()) {
@@ -2310,50 +2412,19 @@ async function resumeActiveTaskIfExists() {
 
 /**
  * 把一个已生成的帧渲染进对应槽位卡片。
- * 事件重放/重连会对同一槽位重复触发，所以这里用 on* 赋值（幂等）而不是
- * addEventListener（旧实现每次事件都往同一元素堆叠一套新监听器）。
+ * 事件重放/重连会对同一槽位重复触发——renderSlotCard 是幂等的整格重画，
+ * 且卡片上不绑任何 click（点击走网格级委托，见 js/slot_card.js），
+ * 所以重复调用不会像旧实现那样往同一元素上堆叠监听器。
+ *
+ * 缓存版本已由 applyFrameEventToIdea（数据合并的唯一入口）在本次渲染前递增，
+ * renderSlotCard 内部用 bust=false 直接取到新版本号；两处各自 bust 会让同一
+ * 张新图被拉两次。
  */
 function updateFrameSlotCard(f) {
     if (!f) return;
-    const slot = document.getElementById(`frame-slot-${f.sequence}`);
-    if (!slot) return;
-    slot.className = 'frame-card';
-    slot.style.cursor = 'pointer';
-    slot.title = `打开第 ${f.sequence} 帧`;
-    slot.innerHTML = `
-        <img src="" alt="Frame ${f.sequence}" loading="lazy">
-        <div class="frame-card-actions" style="position: absolute; top: 5px; right: 5px; display: flex; gap: 4px; opacity: 0; transition: opacity 0.2s;">
-            <button class="action-btn text-btn mini-btn retry-frame-btn" data-seq="${f.sequence}" style="background: rgba(0,0,0,0.6); border: 1px solid rgba(255,255,255,0.3); padding: 2px 6px; font-size: 10px;">重试</button>
-        </div>
-        <span>IMG ${String(f.sequence).padStart(3, '0')}</span>
-    `;
-    // 缓存版本已由 applyFrameEventToIdea（数据合并的唯一入口）在本次渲染前递增，
-    // 这里用 bust=false 直接取到新版本号；两处各自 bust 会让同一新图被拉两次。
-    safeSetImageSrc(slot.querySelector('img'), f.url, false);
-
-    slot.onmouseenter = () => {
-        const actions = slot.querySelector('.frame-card-actions');
-        if (actions) actions.style.opacity = '1';
-    };
-    slot.onmouseleave = () => {
-        const actions = slot.querySelector('.frame-card-actions');
-        if (actions) actions.style.opacity = '0';
-    };
-    slot.onclick = (e) => {
-        if (e.target.classList.contains('retry-frame-btn')) return;
-        const validFrames = (currentIdea && currentIdea.frameRun && currentIdea.frameRun.frames) || [];
-        const mediaList = validFrames.map((frame) => ({
-            type: 'image',
-            url: frame.url || frame.file,
-            caption: `<strong>第 ${frame.sequence} 帧 / 共 ${validFrames.length} 帧</strong>`
-        }));
-        const clickedIndex = validFrames.findIndex(frame => frame.sequence === f.sequence);
-        openLightbox(mediaList, clickedIndex >= 0 ? clickedIndex : 0);
-    };
-    slot.querySelector('.retry-frame-btn').addEventListener('click', (e) => {
-        e.stopPropagation();
-        retrySingleFrame(f.sequence);
-    });
+    const busy = typeof isIdeaTaskActive === 'function' && currentIdea
+        ? isIdeaTaskActive(currentIdea.id, 'frames') : false;
+    renderSlotById('image', f.sequence, frameSlotState(f, { seq: f.sequence, busy }));
 }
 
 /* ── 帧序列实时生成动态 ─────────────────────────────────────────────
@@ -2363,19 +2434,36 @@ function updateFrameSlotCard(f) {
    TaskRecord.feedLines 缓冲区（无论用户是否正看着这个创意），只有正停留在
    这个创意页面时才顺带画进 DOM——这样切到另一个创意不会看到串台的动态行，
    切回来时也能从缓冲区完整回放，而不是"谁最后发起任务谁独占这块面板"。 */
-function _framesFeedAppendDom(text, cls, atDate) {
+function _framesFeedAppendDom(text, cls, atDate, key) {
     const lines = document.getElementById('frames-live-feed-lines');
     if (!lines) return;
     const wrap = document.getElementById('frames-live-feed');
     if (wrap && wrap.style.display === 'none') wrap.style.display = 'block';
     const nearBottom = lines.scrollHeight - lines.scrollTop - lines.clientHeight < 60;
-    const d = atDate || new Date();
+    // localStorage 的 JSON 会把 Date 转成字符串；旧缓存也可能保存 Unix 时间戳。
+    // 日志时间无效时只回退这行显示，不能在监听启动前打断整个任务恢复。
+    let d;
+    try {
+        let value = atDate;
+        if (typeof value === 'string' && /^-?\d+(?:\.\d+)?$/.test(value.trim())) value = Number(value);
+        if (typeof value === 'number' && Math.abs(value) >= 1e9 && Math.abs(value) < 1e11) value *= 1000;
+        d = value === undefined || value === null || value === '' ? new Date() : new Date(value);
+    } catch (_) {
+        d = new Date();
+    }
+    if (!Number.isFinite(d.getTime())) d = new Date();
     const p = n => String(n).padStart(2, '0');
-    const line = document.createElement('div');
+    // 带 key 的行是"同一条进度就地改写"（逐拍审查计数条等）：命中最后一行的
+    // 同 key 就原地改，不再一拍灌一行把真正的结论顶出可视区
+    const last = lines.lastElementChild;
+    const line = (key && last && last.dataset.feedKey === key)
+        ? last : document.createElement('div');
+    const isNew = line !== last;
     line.className = 'gen-feed-line' + (cls ? ` ${cls}` : '');
+    if (key) line.dataset.feedKey = key; else delete line.dataset.feedKey;
     const safeText = escapeHtml(String(text).length > 220 ? String(text).slice(0, 220) + '…' : String(text));
     line.innerHTML = `<span class="gen-feed-time">[${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}]</span> ${safeText}`;
-    lines.appendChild(line);
+    if (isNew) lines.appendChild(line);
     while (lines.children.length > 300) lines.removeChild(lines.firstChild);
     if (nearBottom) lines.scrollTop = lines.scrollHeight;
 }
@@ -2401,14 +2489,25 @@ function framesFeedReset(ideaId, introText) {
     if (introText) framesFeedLine(ideaId, introText);
 }
 
-function framesFeedLine(ideaId, text, cls) {
+/**
+ * key：可选。给同一条会不断刷新的进度用（如逐拍审查的 "已完成 N/M 拍"）——
+ * 缓冲区里最后一行是同 key 时就地改写，而不是追加。此前逐拍审查一拍灌一行，
+ * 十几拍下来把真正要读的结论顶出可视区，"干净"那十几行没有一行值得单独占位。
+ */
+function framesFeedLine(ideaId, text, cls, key) {
     const rec = getIdeaTaskRecord(ideaId, 'frames');
     const atDate = new Date();
     if (rec) {
-        rec.feedLines.push({ text, cls, time: atDate });
-        while (rec.feedLines.length > 300) rec.feedLines.shift();
+        const last = rec.feedLines[rec.feedLines.length - 1];
+        if (key && last && last.key === key) {
+            // 就地改写：回放（framesFeedHydrate）时也只会看到最终那一条
+            rec.feedLines[rec.feedLines.length - 1] = { text, cls, time: atDate, key };
+        } else {
+            rec.feedLines.push({ text, cls, time: atDate, key });
+            while (rec.feedLines.length > 300) rec.feedLines.shift();
+        }
     }
-    if (isViewingIdea(ideaId)) _framesFeedAppendDom(text, cls, atDate);
+    if (isViewingIdea(ideaId)) _framesFeedAppendDom(text, cls, atDate, key);
 }
 
 /** 把这个创意缓冲区里已经攒下的动态行整批回放进 DOM——切回它正在生成的页面时调用。 */
@@ -2423,22 +2522,42 @@ function framesFeedHydrate(ideaId) {
     }
     lines.innerHTML = '';
     wrap.style.display = 'block';
-    rec.feedLines.forEach(l => _framesFeedAppendDom(l.text, l.cls, l.time));
+    rec.feedLines.forEach(l => _framesFeedAppendDom(l.text, l.cls, l.time, l.key));
     const dot = document.getElementById('frames-feed-dot');
     if (dot) dot.classList.toggle('active', !!rec.live);
 }
 
-// isIsolatedRetry：单帧/子集重试专用——这类调用只走 generate_frame_sequence
-// 直调路径，从不经过 pipeline_orchestrator 的整套序列一致性审查（那个审查只在
-// target_sequences=None 的整单编排流程里才会跑）。'pending_manual_review' 对
-// 整单流程而言是"审查还没轮到"，但对单帧重试而言这个审查压根不会来——用同一句
-// "将在整套序列渲染完毕后统一进行"会让人误以为还有后续动作（2026-07-20 用户
-// 实测反馈：全自动配置下这句话既不弹窗也等不到审查结果，怀疑是不是卡住了）。
-function framesFeedQualityLine(ideaId, f, isIsolatedRetry) {
+// gate 的来源现在有三条：4选1 候选优选线落 'auto_approved'；生成期链上守卫
+// （chain_guard）检出结构级问题落 'sequence_review_flagged'；手动一致性审查与人工
+// 标记落其余取值。
+//
+// 'pending_manual_review' 有**两个语义完全相反**的来源，必须分开说：
+//   (a) 这帧从没被审过（旧 manifest / 非候选线渲的帧）；
+//   (b) 这帧被审查抓到过、人点了「修复此帧问题」、重渲后复核确认问题已解决，
+//       gate 按设计回落等人最终确认（见 pipeline_orchestrator._reverify_frame_issues）。
+// 只按 (a) 的话术渲染，会把"刚修好的帧"说成"没人看过"，意思正好反了。
+// fix_backup 是 (b) 的可靠标记（_mark_fix_backup 写入，撤销修复时摘掉）。
+//
+// isIsolatedRetry 保留在签名上供调用方传参，两条路径现在文案一致。
+//
+// guardPending（'frame' 事件的 guard_pending 字段）：这一帧落盘后还有一道链上守卫
+// 要审。事件里的 gate 是**守卫跑之前**的读数——4选1 线恒为 auto_approved（那是优选
+// 结论，不是一致性审查结论），其余线是初始态 pending_manual_review。在这种时候打
+// "完成（质检通过）"，就是在守卫开口之前替它答了，而且答的还多半是反的：几十秒后
+// 守卫判废、manifest 落 flag，卡片下次重画突然变红，用户看到的就是"当时说通过、
+// 继续生成时又回头说有问题"。真结论由 chain_guard_beat / chain_guard_anchor 事件
+// 自己来说（见 streamFramesProgress）。
+function framesFeedQualityLine(ideaId, f, isIsolatedRetry, guardPending) {
     if (!f) return;
     const seq = String(f.sequence || 0).padStart(3, '0');
     const gate = f.quality_gate;
     const reason = typeof f.vlm_qa_reason === 'string' ? f.vlm_qa_reason : '';
+    if (guardPending && (gate === 'auto_approved' || gate === 'pending_manual_review')) {
+        // 4选1 的优选理由仍然值得留痕，只是不能算作"质检通过"
+        const pick = gate === 'auto_approved' && reason ? `（${reason}）` : '';
+        framesFeedLine(ideaId, `🖼️ IMG ${seq} 已渲染${pick}，链上守卫审查中…`);
+        return;
+    }
     if (gate === 'auto_approved') {
         if (reason.indexOf('WARN') === 0) {
             framesFeedLine(ideaId, `✅ IMG ${seq} 完成（宽松放行留痕：${reason.replace(/^WARN:?\s*/, '')}）`, 'warn');
@@ -2455,59 +2574,173 @@ function framesFeedQualityLine(ideaId, f, isIsolatedRetry) {
     } else if (gate === 'sequence_reviewed_pass') {
         framesFeedLine(ideaId, `✅ IMG ${seq} 完成（一致性审查通过）`, 'ok');
     } else if (gate === 'pending_manual_review') {
-        if (isIsolatedRetry) {
-            framesFeedLine(ideaId, `✅ IMG ${seq} 完成（单帧重试不会触发整套序列一致性审查，如需要请自行确认画面）`, 'ok');
+        const fixed = f.fix_backup && typeof f.fix_backup === 'object' ? f.fix_backup : null;
+        if (fixed) {
+            const was = typeof fixed.reason === 'string' && fixed.reason ? fixed.reason : '';
+            framesFeedLine(ideaId, `🔧 IMG ${seq} 已修复并复核通过，等你最终确认${was ? `（原问题：${was}）` : ''}`, 'ok');
         } else {
-            framesFeedLine(ideaId, `✅ IMG ${seq} 完成（一致性审查将在整套序列渲染完毕后统一进行）`, 'ok');
+            framesFeedLine(ideaId, `✅ IMG ${seq} 完成（渲染不做审查，如需复核请在帧网格点「一致性审查」）`, 'ok');
         }
     } else {
         framesFeedLine(ideaId, `✅ IMG ${seq} 完成`, 'ok');
     }
 }
 
-async function streamFramesProgress(taskId, ownerIdea, targetSequences) {
+function restoreMediaTaskProgress(rec, kind, ownerIdea, targets, taskMetadata = {}, previousRecord) {
+    const snapshot = taskMetadata.resumeSnapshot || {};
+    const previous = previousRecord && previousRecord.taskId === rec.taskId ? previousRecord : {};
+    const isResuming = !!(taskMetadata.resumeSnapshot || taskMetadata.progress || previous.taskId);
+    for (const key of ['requestId', 'requestBody', 'requestEndpoint', 'cancelRequested', 'meta', 'feedLines']) {
+        if (snapshot[key] !== undefined) rec[key] = snapshot[key];
+        if (previous[key] !== undefined) rec[key] = previous[key];
+    }
+    rec.projectKey = taskMetadata.projectKey || snapshot.projectKey || previous.projectKey
+        || (typeof getIdeaSaveTitle === 'function' ? getIdeaSaveTitle(ownerIdea) : ownerIdea.project_key);
+    rec.ideaId = ownerIdea.id;
+    if (taskMetadata.requestId) rec.requestId = taskMetadata.requestId;
+    const targetKey = kind === 'frames' ? 'targetSequences' : 'targetSlots';
+    const autoVideo = taskMetadata.autoVideo || snapshot.autoVideo || previous.autoVideo;
+    const requested = [...(previous[targetKey] || []), ...(snapshot[targetKey] || []),
+        ...(taskMetadata[targetKey] || []), ...(targets || []),
+        ...(kind === 'videos' && autoVideo ? autoVideo.target_slots || [] : [])];
+    const restoredTargets = Array.from(new Set(requested.map(Number)
+        .filter(slot => Number.isInteger(slot) && slot > 0))).sort((a, b) => a - b);
+    if (restoredTargets.length) rec[targetKey] = restoredTargets;
+    if (autoVideo) rec.autoVideo = autoVideo;
+
+    const server = taskMetadata.progress || {};
+    const states = [snapshot.progressState || {}, previous.progressState || {}, rec.progressState || {}];
+    const slotStatus = {};
+    for (const state of states) {
+        for (const [slot, status] of Object.entries(state.slotStatus || {})) {
+            if (slotStatus[slot] !== 'done') slotStatus[slot] = status;
+        }
+    }
+    const serverSlots = server.slot_status || server.slotStatus || {};
+    // 服务端快照也能记录本任务的新重试；恢复时该状态优先于浏览器旧 done。
+    Object.assign(slotStatus, serverSlots);
+    const run = ownerIdea.frameRun || {};
+    const entries = kind === 'frames' ? run.frames || [] : run.videos || [];
+    const knownCurrent = Math.max(Number(snapshot.current) || 0, Number(previous.current) || 0,
+        ...states.map(state => Number(state.current) || 0));
+    const knownDone = Object.values(slotStatus).filter(status => status === 'done' || status === 'failed').length;
+    let inferredRemaining = Math.max(0, knownCurrent - knownDone);
+    // 旧文件只补足已保存的完成数；一个刚开始的重渲任务也可能在刷新后接回。
+    // 服务端有进度快照时只使用该快照，不凭旧清单猜测本轮已完成槽位。
+    for (const entry of isResuming && !taskMetadata.progress && inferredRemaining ? entries : []) {
+        const slot = Number(kind === 'frames' ? entry.sequence || entry.slot : entry.slot);
+        if (!slot || (restoredTargets.length && !restoredTargets.includes(slot)) || slotStatus[slot]) continue;
+        if (kind === 'frames' ? (entry.file || entry.path || entry.url || entry.image_url)
+            : entry.status === 'success' && !(entry.last_attempt && ['failed', 'cancelled'].includes(entry.last_attempt.status))) {
+            slotStatus[slot] = 'done';
+            inferredRemaining--;
+            if (!inferredRemaining) break;
+        }
+    }
+    const recoveryActive = kind === 'videos' && (server.phase === 'video_recovery'
+        || Object.values(serverSlots).includes('recovering') || states.some(state => state.recoveryActive));
+    const done = Object.values(slotStatus).filter(status => status === 'done' || (!recoveryActive && status === 'failed')).length;
+    rec.total = Math.max(Number(rec.total) || 0, Number(snapshot.total) || 0, Number(previous.total) || 0,
+        restoredTargets.length, Number(server.total) || 0, ...states.map(state => Number(state.total) || 0));
+    rec.current = recoveryActive ? done : Math.max(Number(rec.current) || 0, Number(snapshot.current) || 0,
+        Number(previous.current) || 0, Number(server.current) || 0, done,
+        ...states.map(state => Number(state.current) || 0));
+    const percentFromCount = rec.total ? 5 + Math.min(1, rec.current / rec.total) * (kind === 'frames' ? 90 : 83) : 0;
+    const label = server.label || server.message || previous.meta || snapshot.meta
+        || (previous.progressInfo || {}).label || (snapshot.progressInfo || {}).label
+        || (previous.progressState || {}).label || (snapshot.progressState || {}).label
+        || (rec.current ? `${kind === 'frames' ? '图片' : '视频'}生成 ${rec.current}/${rec.total}` : '');
+    rec.progressState = {
+        ...Object.assign({}, ...states), taskType: kind, total: rec.total, current: rec.current, slotStatus,
+        percent: recoveryActive ? percentFromCount
+            : Math.max(percentFromCount, Number(server.percent) || 0, ...states.map(state => Number(state.percent) || 0)),
+        ...(recoveryActive ? { recoveryActive: true,
+            recoveryPhase: server.recovery_phase || (autoVideo && autoVideo.phase)
+                || states.map(state => state.recoveryPhase).find(Boolean) || 'waiting',
+            recoverySlots: Object.keys(slotStatus).filter(slot => ['recovering', 'queued'].includes(slotStatus[slot])).map(Number)
+        } : {}),
+        phase: server.phase || previous.progressState && previous.progressState.phase
+            || snapshot.progressState && snapshot.progressState.phase || 'pending',
+        label, message: label
+    };
+    if (typeof ProgressModel !== 'undefined') {
+        const phase = rec.progressState.phase;
+        rec.progressInfo = ProgressModel.normalizeGenerationProgress('resume', { message: label }, kind, rec.progressState);
+        rec.progressState = rec.progressInfo.state;
+        rec.progressState.phase = rec.progressInfo.phase = phase;
+        // 进度数值达到 100 仍可能等待新帧；只有任务终态才结束监听。
+        rec.progressInfo.status = 'running';
+    }
+    if (label) rec.meta = label;
+    if (autoVideo && typeof handleAutoVideoHandoff === 'function') handleAutoVideoHandoff(ownerIdea, autoVideo);
+}
+
+async function streamFramesProgress(taskId, ownerIdea, targetSequences, taskMetadata = {}) {
     ownerIdea = ownerIdea || currentIdea;
     if (!ownerIdea) return;
     const ownerId = ownerIdea.id;
     const btn = document.getElementById('generate-frames-btn');
     const progress = document.getElementById('frames-progress');
     const meta = document.getElementById('frames-meta');
-    const grid = document.getElementById('frames-grid');
+    const grid = slotRenderTarget('image');
     if (!btn || !progress || !meta || !grid) return;
 
     // 同一个创意若已有一条帧序列监听在跑（理论上不该发生，generateFrames 已挡住），
     // 让新的接管旧的，避免两个 watcher 同时往同一份 record 里写。
     const existingRec = getIdeaTaskRecord(ownerId, 'frames');
+    if (existingRec && existingRec.taskId === taskId && existingRec.streaming) {
+        restoreMediaTaskProgress(existingRec, 'frames', ownerIdea, targetSequences, taskMetadata, existingRec);
+        saveActiveBackgroundTasksToLocalStorage();
+        return;
+    }
     if (existingRec && existingRec.controller) {
         try { existingRec.controller.abort(); } catch (_) { /* noop */ }
     }
     const controller = new AbortController();
     const rec = beginIdeaTask(ownerId, 'frames', taskId, controller);
+    rec.streaming = true;
+    restoreMediaTaskProgress(rec, 'frames', ownerIdea, targetSequences, taskMetadata, existingRec);
+    const hasRestoredProgress = !!(rec.current || rec.meta || (rec.feedLines || []).length);
+    if (typeof saveActiveBackgroundTasksToLocalStorage === 'function') saveActiveBackgroundTasksToLocalStorage();
+    if (isViewingIdea(ownerId)) syncAutoVideoToggleFromIdea(ownerIdea);
     // 调试模式（仅生成前 N 帧）：标记本次任务的目标槽位范围，renderFramesForIdea
     // 靠这个字段区分"还没轮到（等待中）"和"这次任务压根没请求（正常缺帧）"，
     // 见 retrySingleFrame 里的同款说明与 2026-07-20 的事故复盘。
-    if (targetSequences && targetSequences.length) rec.targetSequences = targetSequences;
-    const isCurrent = () => isIdeaTaskCurrent(ownerId, 'frames', taskId);
+    const isCurrent = () => getIdeaTaskRecord(ownerId, 'frames') === rec;
     const isViewing = () => isViewingIdea(ownerId);
     const setMeta = (text) => { rec.meta = text; if (isViewing()) meta.textContent = text; };
     const titleTag = () => isViewing() ? '' : `「${ownerIdea.title || '创意'}」`;
 
     if (isViewing()) {
         btn.disabled = true;
+        const selBtn = document.getElementById('generate-frames-selection-btn');
+        if (selBtn) selBtn.disabled = true;
         progress.style.display = 'flex';
+        if (typeof setFrameGridButtonsBusy === 'function') setFrameGridButtonsBusy(true);
     }
-    setMeta('连接帧生成事件流...');
+    setMeta(rec.meta || '连接帧生成事件流...');
 
     const applyFramesProgress = (type, data) => {
         if (!window.ProgressModel) return null;
-        const info = ProgressModel.normalizeGenerationProgress(type, data, 'frames', rec.progressState);
+        const total = Math.max(rec.total || 0, (rec.targetSequences || []).length, Number(data && data.total) || 0);
+        const info = ProgressModel.normalizeGenerationProgress(type, data && typeof data === 'object'
+            ? { ...data, total } : data, 'frames', rec.progressState);
         rec.progressState = info.state;
         rec.progressInfo = info;
+        rec.total = Math.max(rec.total || 0, info.total || 0);
+        rec.current = Math.max(rec.current || 0, info.current || 0);
+        if (typeof saveActiveBackgroundTasksToLocalStorage === 'function') saveActiveBackgroundTasksToLocalStorage();
         if (isViewing()) setProgressBar('frames', info);
         return info;
     };
-    applyFramesProgress('queue', { message: '连接帧生成事件流...' });
-    framesFeedReset(ownerId, '🔌 已连接帧生成事件流，等待后台开始…');
+    if (hasRestoredProgress) {
+        if (rec.progressInfo && isViewing()) setProgressBar('frames', rec.progressInfo);
+        if (typeof framesFeedHydrate === 'function') framesFeedHydrate(ownerId);
+        framesFeedSetLive(ownerId, true);
+    } else {
+        applyFramesProgress('queue', { message: '连接帧生成事件流...' });
+        framesFeedReset(ownerId, '🔌 已连接帧生成事件流，等待后台开始…');
+    }
 
     let disconnectedFrames = false;
     try {
@@ -2518,50 +2751,48 @@ async function streamFramesProgress(taskId, ownerIdea, targetSequences) {
                 if (!isCurrent()) return;
                 if (type === 'start') {
                     applyFramesProgress('start', data);
-                    const total = (data && data.total) || 0;
+                    const total = Math.max((data && data.total) || 0, rec.total || 0,
+                        (rec.targetSequences || []).length);
                     rec.total = total;
-                    setMeta(`开始生成共 ${total} 帧序列图...`);
+                    const startMeta = rec.current ? `正在生成帧序列: ${rec.current}/${total}...`
+                        : `开始生成共 ${total} 帧序列图...`;
+                    setMeta(startMeta);
                     framesFeedLine(ownerId, `🚀 开始生成，共 ${total} 帧（首帧文生图，后续逐帧图生图链式推进）`);
 
-                    if (!ownerIdea.frameRun) {
-                        ownerIdea.frameRun = { title: ownerIdea.title, frames: [] };
-                    }
-                    ownerIdea.frameRun.frames = [];
+                    // 编排层会在“首帧验收”和“剩余帧分段渲染”各发一次 start。
+                    // start 只代表内部阶段开始，不代表之前已经完成的帧作废；保留并
+                    // 重画现有 frameRun，确保 IMG 001 一生成就持续留在界面上。
+                    ensureFrameRunForStart(ownerIdea);
                     if (currentIdea && currentIdea.id === ownerId) saveCurrentIdeaState();
                     const existingIdx = savedIdeas.findIndex(item => item.id === ownerId);
                     if (existingIdx !== -1) savedIdeas[existingIdx].frameRun = ownerIdea.frameRun;
 
                     if (isViewing()) {
-                        grid.innerHTML = '';
-                        for (let i = 1; i <= total; i++) {
-                            const placeholderCard = document.createElement('div');
-                            placeholderCard.className = 'frame-card placeholder-frame-card';
-                            placeholderCard.id = `frame-slot-${i}`;
-                            placeholderCard.innerHTML = `
-                                <div class="frame-placeholder-spinner">
-                                    <div class="cover-spinner" style="width:20px; height:20px; margin-bottom:0;"></div>
-                                </div>
-                                <span>第 ${String(i).padStart(3, '0')} 帧 (等待中)</span>
-                            `;
-                            grid.appendChild(placeholderCard);
-                        }
+                        // renderFramesForIdea 按完整 prompt_slots 补齐等待槽位，同时保留
+                        // 已完成卡片；不能在这里 grid.innerHTML=''，否则重复 start 会
+                        // 把首帧重新画回“等待中”。该函数会改 meta，随后恢复阶段文案。
+                        renderFramesForIdea(ownerIdea);
+                        setMeta(startMeta);
                     }
                 } else if (type === 'frame') {
-                    applyFramesProgress('frame', data);
                     const f = data && data.frame;
-                    const cur = (data && data.current) || 0;
-                    const tot = (data && data.total) || 0;
+                    const info = applyFramesProgress('frame', data);
+                    const cur = rec.current || (info && info.current) || 0;
+                    const tot = rec.total || (info && info.total) || 0;
                     if (cur < tot) {
                         setMeta(`正在生成帧序列: ${cur}/${tot} (正在处理第 ${cur + 1} 帧)...`);
                     } else {
                         setMeta(`正在生成帧序列: ${cur}/${tot} (已生成完毕，正在整理)...`);
                     }
-                    framesFeedQualityLine(ownerId, f);
+                    framesFeedQualityLine(ownerId, f, false, data && data.guard_pending);
                     // 先合并数据（applyFrameEventToIdea 内会递增该帧 URL 的缓存版本），
                     // 再渲染卡片，卡片即取到新版本号；两处各自 bust 会造成同一新图被拉两次
                     applyFrameEventToIdea(f, ownerIdea);
                     if (isViewing()) updateFrameSlotCard(f);
                 } else if (type === 'frame_start' || type === 'frame_retry' || type === 'queue' || type === 'frame_qa') {
+                    const seq = data && (data.sequence || data.slot);
+                    if (seq && rec.progressState.slotStatus[seq] === 'done') return;
+                    if (type === 'queue' && rec.current) return;
                     const info = applyFramesProgress(type, data);
                     if (info && info.label) setMeta(info.label);
                     if (type === 'frame_retry') {
@@ -2589,19 +2820,22 @@ async function streamFramesProgress(taskId, ownerIdea, targetSequences) {
                         framesFeedLine(ownerId, `🛑 ${type === 'manual_intervention_detected' ? '需要人工处理' : type === 'manual_intervention_cleared' ? '人工处理已完成，继续生成' : '人工处理等待超时'}：${data.reason}`,
                                        type === 'manual_intervention_cleared' ? undefined : 'warn');
                     }
-                } else if (type === 'anchor_inertia' || type === 'door_clearance' || type === 'raw_state') {
-                    // 换族锚点惯性卡死 / 门框清除兜底 / 过门帧原始度兜底：动态流留痕
-                    // （含自动 t2i 重渲、定向状态修正的播报）
+                } else if (type === 'anchor_inertia') {
+                    // 换族锚点惯性卡死（本地像素 MAD 判据，不是视觉审查）：动态流留痕
                     if (data && data.message) {
-                        const icon = type === 'anchor_inertia' ? '🧲' : type === 'door_clearance' ? '🚪' : '🕸️';
-                        framesFeedLine(ownerId, `${icon} ${data.message}`,
-                                       (type === 'anchor_inertia' || data.passed === false) ? 'warn' : undefined);
+                        framesFeedLine(ownerId, `🧲 ${data.message}`, 'warn');
                     }
                 } else if (type === 'account_switch') {
                     // 这一批换了号池账号（IP 全程不动，换 IP 已全局关停）。
                     // 属于正常轮换，不是告警，所以不标 warn。
                     if (data && data.message) {
                         framesFeedLine(ownerId, `🔀 ${data.message}`);
+                    }
+                } else if (type === 'candidate_generating' || type === 'candidate_batch_ready' || type === 'candidate_evaluating' || type === 'candidate_ai_evaluation') {
+                    if (data && data.message) {
+                        setMeta(data.message);
+                        const isEval = type === 'candidate_ai_evaluation';
+                        framesFeedLine(ownerId, `${isEval ? '🎯' : '🎨'} ${data.message}`, isEval ? 'ok' : undefined);
                     }
                 } else if (type === 'transport_fallback') {
                     // 图生图端点号池无额度、同模型改走 chat 通道续渲：帧能接着渲。
@@ -2610,12 +2844,93 @@ async function streamFramesProgress(taskId, ownerIdea, targetSequences) {
                     if (data && data.message) {
                         framesFeedLine(ownerId, `🔀 ${data.message}`, data.degraded ? 'warn' : undefined);
                     }
-                } else if (type === 'chain_drift_check' || type === 'anchor_recalibrated' || type === 'reanchor') {
-                    // 检查点现实同步/链回望/重锚定：动态流留痕
-                    if (data && data.message) {
-                        framesFeedLine(ownerId, `${type === 'reanchor' ? '⚓' : '🔭'} ${data.message}`,
-                                       (type === 'reanchor' || (type === 'chain_drift_check' && data.passed === false)) ? 'warn' : undefined);
+                } else if (type === 'chain_guard_beat' || type === 'chain_guard_anchor') {
+                    // 链上守卫「生成一张审一张」的逐拍结论。后端一直在推这两个事件，
+                    // 前端从来没接过（事件链没有 else 兜底，就这么静默丢了）——于是
+                    // 整个生成过程中审查一个字都不上屏，判废的帧要等帧网格下次从
+                    // manifest 重画才突然变红。这一段就是把结论接回原地。
+                    const gSeq = (data && data.sequence) || 0;
+                    const gTag = `IMG ${String(gSeq).padStart(3, '0')}`;
+                    const gWhere = type === 'chain_guard_anchor'
+                        ? '首帧锚点审查' : `第 ${(data && data.beat) || 0} 拍审查`;
+                    const gIssues = (data && data.issues) || [];
+                    const gVerdict = data && data.verdict;
+                    if (gVerdict === 'pass') {
+                        framesFeedLine(ownerId, `🛡️ ${gTag} ${gWhere}合格`, 'ok');
+                    } else if (gVerdict === 'flagged') {
+                        const chainCnt = gIssues.filter(i => i && i.severity === 'chain').length;
+                        // 只有 chain 级才停链；cosmetic 按后端设计是"记账不停链"，
+                        // 说清楚区别，免得每条警告都被当成必须停下来处理。
+                        const grade = chainCnt
+                            ? `（其中 ${chainCnt} 处会传染下游）`
+                            : '（仅观感差异，记账不停链）';
+                        framesFeedLine(ownerId, `⚠️ ${gTag} ${gWhere}检出 ${gIssues.length} 处问题${grade}`, 'warn');
+                        gIssues.forEach(i => {
+                            if (i && i.text) framesFeedLine(ownerId, `　· ${i.text}`, 'warn');
+                        });
+                    } else {
+                        framesFeedLine(ownerId, `⚪ ${gTag} ${gWhere}未完成（判定服务没给出结论，这一拍等于没审）`, 'warn');
                     }
+                    // 徽标只跟着 halt 走：后端只在真要停链时才把 gate 写成 flagged
+                    // （cosmetic 违规 manifest 原样不动）。照 verdict 一律涂红会跟
+                    // manifest 打架，下一次重画又被刷回去，等于制造第二种"忽红忽绿"。
+                    if (data && data.halt && typeof applyChainGuardVerdictToIdea === 'function') {
+                        const patched = applyChainGuardVerdictToIdea(ownerIdea, gSeq, gIssues);
+                        if (patched && isViewing()) updateFrameSlotCard(patched);
+                    }
+                } else if (type === 'chain_guard_autofix') {
+                    // autofix 档：守卫检出结构级问题后就地重写提示词 + 重渲这一帧。
+                    // 后面紧跟着的 frame_issue_fix_* / candidate_* 事件都是这次修复产生的。
+                    const a = (data && data.attempt) || 1;
+                    const mx = (data && data.max_attempts) || 1;
+                    setMeta(`第 ${(data && data.beat) || 0} 拍检出结构级问题，正在自动修复（第 ${a}/${mx} 次）...`);
+                    framesFeedLine(ownerId, `${(data && data.message) || '🔧 正在自动修复本帧'}`, 'warn');
+                } else if (type === 'chain_guard_autofix_rolled_back') {
+                    // 这一次自动修复被三联屏门禁退回了（画面已还原）。再修一次是拿同样
+                    // 的输入跑同样的结果，所以后端当场转停链——说清楚"还原了"和"修后
+                    // 那版留了档"，否则用户只会看到一次莫名其妙的停链。
+                    framesFeedLine(ownerId, `${(data && data.message) || '↩️ 自动修复被门禁退回，画面已还原'}`, 'warn');
+                    if (data && data.rejected_fix) {
+                        framesFeedLine(ownerId, '　修后那一版已留档：确认是门禁误判可在帧网格点「采用修后版」', 'warn');
+                    }
+                } else if (type === 'chain_guard_autofix_done') {
+                    framesFeedLine(ownerId, `${(data && data.message) || '✅ 自动修复后复审通过，继续生成'}`, 'ok');
+                } else if (type === 'chain_guard_soft_continue') {
+                    // autofix_soft 档：结构级问题修不好也不停链。这条事件必须显式接住——
+                    // 事件链没有 else 兜底，漏接的话软档下屏幕上一声不响，用户只会在
+                    // 收尾看见一句没头没尾的「N 帧一致性审查未过」。
+                    const sBeat = (data && data.beat) || 0;
+                    const sSeq = (data && data.sequence) || (sBeat + 1);
+                    const sIssues = (data && data.issues) || [];
+                    const sDetail = sIssues.map(i => i && i.text).filter(Boolean).join('；');
+                    framesFeedLine(ownerId, `${(data && data.message) || '⚠️ 结构级问题未修复，软档不停链，继续往下渲'}`, 'warn');
+                    if (sDetail) framesFeedLine(ownerId, `　问题：${sDetail}`, 'warn');
+                    framesFeedLine(ownerId, `　IMG ${String(sSeq).padStart(3, '0')} 已标记为「一致性审查未过」，本单渲完后会在质量风险里汇总，可挑着点「修复此帧问题」`, 'warn');
+                    // 徽标跟着走：后端在软档下照样把这一帧写成 sequence_review_flagged，
+                    // 这里不同步的话卡片要等下次从 manifest 重画才突然变红。
+                    if (typeof applyChainGuardVerdictToIdea === 'function') {
+                        const sPatched = applyChainGuardVerdictToIdea(ownerIdea, sSeq, sIssues);
+                        if (sPatched && isViewing()) updateFrameSlotCard(sPatched);
+                    }
+                } else if (type === 'chain_guard_halt') {
+                    // 链上守卫在生成途中检出结构级问题并主动停链（chainGuardMode=halt）。
+                    // 后端是 break 出循环、任务正常收尾，所以这里不报错——但必须说清楚
+                    // 「这单是停下的，不是渲完的」，否则下面的收尾会照常报"全部完成"。
+                    // beat 为 0 = 首帧锚点审查判废（它没有"上一拍"，说"第 0 拍"是错的）
+                    const beat = (data && data.beat) || 0;
+                    const seq = (data && data.sequence) || (beat + 1);
+                    const issues = (data && data.issues) || [];
+                    const detail = issues.map(i => i && i.text).filter(Boolean).join('；');
+                    const where = beat ? `第 ${beat} 拍` : '首帧锚点审查';
+                    setMeta(`${where}检出结构级问题，生成已暂停在 IMG ${String(seq).padStart(3, '0')}`);
+                    framesFeedLine(ownerId, `🛑 ${(data && data.message) || `${where}检出结构级链式问题，生成已自动暂停`}`, 'err');
+                    if (detail) {
+                        framesFeedLine(ownerId, `　问题：${detail}`, 'warn');
+                    }
+                    if (data && data.autofix_exhausted) {
+                        framesFeedLine(ownerId, '　自动修复已连试数次仍未通过——这一拍多半不是改写提示词能解决的（提示词与上游画面本身矛盾），需要人工看一眼', 'warn');
+                    }
+                    framesFeedLine(ownerId, '　修复这一帧后再点「生成帧序列」即可从断点续渲（已渲好的帧会跳过）', 'warn');
                 } else if (type === 'sequence_review') {
                     setMeta((data && data.message) || '正在对整套序列做一致性审查...');
                     framesFeedLine(ownerId, `🔍 ${(data && data.message) || '正在对整套序列做一致性审查...'}`);
@@ -2625,6 +2940,11 @@ async function streamFramesProgress(taskId, ownerIdea, targetSequences) {
                     } else if (data && data.passed) {
                         framesFeedLine(ownerId, '✅ 整套序列一致性审查通过', 'ok');
                     }
+                } else if (type === 'auto_video_started' || type === 'auto_video_updated' || type === 'auto_video_blocked') {
+                    handleAutoVideoHandoff(ownerIdea, data);
+                    setMeta((data && data.message) || (data && data.status === 'blocked'
+                        ? '自动视频未启动，请检查首尾帧。'
+                        : '首尾帧就绪的片段在后台生成视频，图片继续生成，无需等待视频完成。'));
                 } else if (type === 'reconnecting') {
                     setMeta(`连接中断，正在重连（第 ${data.attempt} 次）...`);
                     framesFeedLine(ownerId, `⚠️ 连接中断，正在重连（第 ${data.attempt} 次）…`, 'warn');
@@ -2655,8 +2975,55 @@ async function streamFramesProgress(taskId, ownerIdea, targetSequences) {
         }
 
         if (watch.result) {
-            await syncFrameRunToLibrary(watch.result, ownerIdea);
-            if (isViewing()) renderFramesForIdea(ownerIdea);
+            handleAutoVideoHandoff(ownerIdea, watch.result.auto_video);
+            let finalManifest = watch.result;
+            let manifestReadState;
+            if (watch.result.auto_video && watch.result.auto_video.task_id) {
+                // 子任务可能已交付片段；读取此刻的清单，并保留读取期间收到的交付事件。
+                if (typeof captureManifestReadState === 'function') manifestReadState = captureManifestReadState(ownerIdea);
+                try {
+                    const latest = await fetch(`/api/get_manifest?title=${encodeURIComponent(getIdeaSaveTitle(ownerIdea))}`, { cache: 'no-store' });
+                    if (latest.ok) finalManifest = await latest.json();
+                } catch (error) { console.warn('同步自动视频最新清单失败', error); }
+                if (!isCurrent()) return;
+                if (finalManifest.auto_video) handleAutoVideoHandoff(ownerIdea, finalManifest.auto_video);
+                finalManifest = mergeAutoVideoFrameResult(Object.assign({}, finalManifest,
+                    { auto_video: ownerIdea.frameRun.auto_video || watch.result.auto_video }), ownerIdea);
+            }
+            await syncFrameRunToLibrary(finalManifest, ownerIdea, manifestReadState);
+            const autoVideoState = watch.result.auto_video && autoVideoHandoffs.get(`${ownerId}:${watch.result.auto_video.task_id}`);
+            if (autoVideoState) {
+                autoVideoState.frameSynced = true;
+                autoVideoState.deliveredVideos.clear();
+                autoVideoState.result = null;
+            }
+            if (isViewing()) {
+                renderFramesForIdea(ownerIdea);
+                if (watch.result.auto_video) renderVideosForIdea(ownerIdea);
+                renderAutoVideoStatus(ownerIdea);
+            }
+            // 链上守卫停链的单子不是渲完的单子：后端 break 出循环后照常收尾返回，
+            // 这里若沿用"全部完成"的话术，用户会拿着一条断在半路的链去生成视频。
+            // 判"停没停"只看 halted_at_sequence：首帧锚点判废时 halted_at_beat 是 0，
+            // 按真值判会把一条停在首帧的链读成"渲完了"，照常报「全部完成」。
+            const haltedBeat = watch.result.halted_at_beat;
+            const haltedSeq = watch.result.halted_at_sequence
+                || (haltedBeat ? haltedBeat + 1 : 0);  // 旧后端只写 beat 时的兜底
+            if (haltedSeq) {
+                const doneCount = (watch.result.frames || []).filter(f => f && f.file).length;
+                const where = haltedBeat ? `第 ${haltedBeat} 拍` : '首帧锚点审查';
+                framesFeedLine(ownerId, `🛑 帧序列已暂停：${where}检出结构级问题（停在 IMG ${String(haltedSeq).padStart(3, '0')}），已渲 ${doneCount} 帧`, 'err');
+                setMeta(`帧序列已暂停在 IMG ${String(haltedSeq).padStart(3, '0')}（${where}，已渲 ${doneCount} 帧）`);
+                showToast(`${titleTag()}帧序列在${where}检出结构级问题已暂停，请修复 IMG ${String(haltedSeq).padStart(3, '0')} 后续渲。`, 'warning');
+                if (typeof NotificationCenter !== 'undefined') {
+                    NotificationCenter.notify({
+                        type: 'warning',
+                        title: '帧序列已暂停',
+                        message: `${where}检出结构级问题，已暂停等待修复 IMG ${String(haltedSeq).padStart(3, '0')}`
+                    });
+                }
+                return;
+            }
             framesFeedLine(ownerId, `🏁 帧序列全部完成，共 ${(watch.result.frames || []).length} 帧`, 'ok');
             const frameRisks = summarizeRunQuality(watch.result);
             if (frameRisks) {
@@ -2665,6 +3032,13 @@ async function streamFramesProgress(taskId, ownerIdea, targetSequences) {
                 showToast(`${titleTag()}帧序列完成，但检测到质量风险，详见帧序列动态流。`, 'warning');
             } else {
                 showToast(`${titleTag()}已成功生成 ${(watch.result.frames || []).length} 帧连续帧序列图。`, "success");
+            }
+            if (typeof NotificationCenter !== 'undefined') {
+                NotificationCenter.notify({
+                    type: 'success',
+                    title: '帧序列生成完成',
+                    message: `${(watch.result.frames || []).length} 帧连续关键帧图已渲染完成！`
+                });
             }
         }
     } catch (e) {
@@ -2678,65 +3052,135 @@ async function streamFramesProgress(taskId, ownerIdea, targetSequences) {
             setMeta(`帧序列生成失败: ${e.message}`);
             framesFeedLine(ownerId, `❌ 帧序列生成失败：${e.message}`, 'err');
             showToast(`${titleTag()}帧序列生成失败: ${e.message}`, "error");
+            if (typeof NotificationCenter !== 'undefined') {
+                NotificationCenter.notify({
+                    type: 'error',
+                    title: '帧序列生成失败',
+                    message: e.message || '生图任务发生异常中断'
+                });
+            }
         }
 
-        if (isViewing()) renderFramesForIdea(ownerIdea);
+        // 失败/取消前可能已交付部分图片和后台视频；终态不能只重画旧缓存。
+        const previousAuto = ownerIdea.frameRun && ownerIdea.frameRun.auto_video;
+        if (typeof reloadManifestIntoIdea === 'function') await reloadManifestIntoIdea(ownerIdea);
+        if (!isCurrent()) return;
+        const manifestAuto = ownerIdea.frameRun && ownerIdea.frameRun.auto_video;
+        if (previousAuto && previousAuto.task_id
+            && ['completed', 'completed_with_warnings', 'cancelled', 'partial_failed', 'blocked', 'skipped'].includes(previousAuto.status)
+            && manifestAuto && previousAuto.task_id === manifestAuto.task_id) {
+            ownerIdea.frameRun.auto_video = previousAuto;
+            handleAutoVideoHandoff(ownerIdea, manifestAuto);
+        } else if (manifestAuto && !manifestAuto.task_id && ['waiting', 'started'].includes(manifestAuto.status)) {
+            handleAutoVideoHandoff(ownerIdea, { ...manifestAuto,
+                status: e.name === 'AbortError' ? 'cancelled' : 'blocked',
+                message: e.name === 'AbortError' ? '图片生成已取消，自动视频未启动' : `图片生成已停止：${e.message}` });
+        }
+        if (isViewing()) {
+            renderFramesForIdea(ownerIdea);
+            renderVideosForIdea(ownerIdea);
+        }
     } finally {
         if (isCurrent()) {
+            rec.streaming = false;
+            if (typeof saveActiveBackgroundTasksToLocalStorage === 'function') saveActiveBackgroundTasksToLocalStorage();
             if (isViewing()) framesFeedSetLive(ownerId, false);
             // 失联分支保留任务登记：下次刷新页面 resumeActiveBackgroundTasksIfExists
             // 才有机会重新接上这条任务的事件流，而不是让它在客户端彻底失踪。
             if (!disconnectedFrames) {
                 endIdeaTask(ownerId, 'frames');
+                // 忙态画在跨创意共用的网格 DOM 上，按当前正看着的创意现算一遍
+                if (typeof refreshSlotGridBusy === 'function') refreshSlotGridBusy('image');
                 if (isViewing()) {
                     progress.style.display = 'none';
                     btn.disabled = false;
+                    const selBtn = document.getElementById('generate-frames-selection-btn');
+                    if (selBtn) selBtn.disabled = false;
+                    // 必须在 endIdeaTask 之后再重渲一次：renderFramesForIdea 的
+                    // isFramePending 读的就是这条任务登记，catch/成功分支里那次重渲
+                    // 发生在登记还在的时候，没轮到的槽位会继续画成「等待中」并一直
+                    // 转圈——用户点了取消、后台 4 秒后就停了，界面却满屏 spinner，
+                    // 看起来像"取消了任务还在跑"（2026-07-28 实机截图）。清掉登记后
+                    // 这些槽位落到「未生成/已失效」态，并重新带上生成/上传出口。
+                    renderFramesForIdea(ownerIdea);
+                    syncAutoVideoToggleFromIdea(ownerIdea);
+                    renderAutoVideoStatus(ownerIdea);
                 }
             }
         }
     }
 }
 
-async function streamVideosProgress(taskId, ownerIdea, targetSlots) {
+async function streamVideosProgress(taskId, ownerIdea, targetSlots, taskMetadata = {}) {
     ownerIdea = ownerIdea || currentIdea;
     if (!ownerIdea) return;
     const ownerId = ownerIdea.id;
     const btn = document.getElementById('generate-videos-btn');
+    const chainBtn = document.getElementById('generate-video-chain-btn');
     const progress = document.getElementById('videos-progress');
     const meta = document.getElementById('videos-meta');
-    const grid = document.getElementById('videos-grid');
+    const grid = slotRenderTarget('video');
     if (!btn || !progress || !meta || !grid) return;
 
     const existingRec = getIdeaTaskRecord(ownerId, 'videos');
+    if (existingRec && existingRec.taskId === taskId && existingRec.streaming) {
+        restoreMediaTaskProgress(existingRec, 'videos', ownerIdea, targetSlots, taskMetadata, existingRec);
+        saveActiveBackgroundTasksToLocalStorage();
+        return;
+    }
     if (existingRec && existingRec.controller) {
         try { existingRec.controller.abort(); } catch (_) { /* noop */ }
     }
     const controller = new AbortController();
     const rec = beginIdeaTask(ownerId, 'videos', taskId, controller);
+    rec.streaming = true;
+    if (existingRec && existingRec.requestId) Object.assign(rec, {
+        requestId: existingRec.requestId, requestBody: existingRec.requestBody,
+        requestEndpoint: existingRec.requestEndpoint, cancelRequested: existingRec.cancelRequested
+    });
+    restoreMediaTaskProgress(rec, 'videos', ownerIdea, targetSlots, taskMetadata, existingRec);
+    const hasRestoredProgress = !!(rec.current || rec.meta);
     // 调试模式（仅生成前 N 段）：标记本次任务的目标槽位范围，renderVideosForIdea
     // 靠这个字段区分"还没轮到（等待中）"和"这次任务压根没请求（正常缺段）"，
     // 同 streamFramesProgress/retrySingleFrame 的同款契约。
-    if (targetSlots && targetSlots.length) rec.targetSlots = targetSlots;
-    const isCurrent = () => isIdeaTaskCurrent(ownerId, 'videos', taskId);
+    saveActiveBackgroundTasksToLocalStorage();
+    const isCurrent = () => getIdeaTaskRecord(ownerId, 'videos') === rec;
     const isViewing = () => isViewingIdea(ownerId);
     const setMeta = (text) => { rec.meta = text; if (isViewing()) meta.textContent = text; };
     const titleTag = () => isViewing() ? '' : `「${ownerIdea.title || '创意'}」`;
 
     if (isViewing()) {
         btn.disabled = true;
+        if (chainBtn) chainBtn.disabled = true;
         progress.style.display = 'flex';
     }
-    setMeta('连接视频生成事件流...');
+    setMeta(rec.meta || '连接视频生成事件流...');
 
     const applyVideoProgress = (eventType, eventData) => {
         if (!window.ProgressModel) return null;
-        const progressInfo = ProgressModel.normalizeGenerationProgress(eventType, eventData, 'videos', rec.progressState);
+        // 渐进任务会按就绪片段广播小批次进度，整单分母始终使用完整目标数。
+        const total = Math.max(rec.total || 0, (rec.targetSlots || []).length,
+            Number(eventData && eventData.total) || 0);
+        const progressData = total && eventData && typeof eventData === 'object'
+            ? { ...eventData, total } : eventData;
+        const previousPercent = Number(rec.progressState && rec.progressState.percent) || 0;
+        const progressInfo = ProgressModel.normalizeGenerationProgress(eventType, progressData, 'videos', rec.progressState);
+        if (eventType === 'start' && !progressInfo.state.recoveryActive && previousPercent > progressInfo.percent) {
+            progressInfo.percent = previousPercent;
+            progressInfo.state.percent = previousPercent;
+        }
         rec.progressState = progressInfo.state;
         rec.progressInfo = progressInfo;
+        rec.total = Math.max(rec.total || 0, progressInfo.total || 0);
+        rec.current = progressInfo.state.recoveryActive ? progressInfo.current : Math.max(rec.current || 0, progressInfo.current || 0);
+        saveActiveBackgroundTasksToLocalStorage();
         if (isViewing()) setProgressBar('videos', progressInfo);
         return progressInfo;
     };
-    applyVideoProgress('queue', { message: '连接视频生成事件流...' });
+    if (hasRestoredProgress) {
+        if (rec.progressInfo && isViewing()) setProgressBar('videos', rec.progressInfo);
+        if (isViewing()) renderVideosForIdea(ownerIdea);
+    } else applyVideoProgress('queue', { message: '连接视频生成事件流...' });
 
     // 失败/取消时把还挂着转圈的槽位统一改画失败卡（仅在正看着这个创意时才有 DOM 可改）
     const failPendingSlots = (message, labelText) => {
@@ -2755,48 +3199,97 @@ async function streamVideosProgress(taskId, ownerIdea, targetSlots) {
             onEvent: (type, data) => {
                 if (!isCurrent()) return;
                 if (type === 'start') {
-                    applyVideoProgress('start', data);
-                    const total = (data && data.total) || 0;
+                    const total = Math.max((data && data.total) || 0, rec.total || 0,
+                        (rec.targetSlots || []).length);
                     const slots = (data && data.slots) || [];
                     rec.total = total;
-                    setMeta(`开始生成共 ${total} 段视频...`);
+                    if (slots.length) rec.targetSlots = Array.from(new Set([...(rec.targetSlots || []), ...slots].map(Number))).sort((a, b) => a - b);
+                    applyVideoProgress('start', { ...data, total });
+                    setMeta(rec.current ? `正在生成视频: ${rec.current}/${total}...` : `开始生成共 ${total} 段视频...`);
                     if (isViewing()) {
-                        grid.innerHTML = '';
+                        const isSubset = targetSlots && targetSlots.length;
                         const slotsToRender = slots.length ? slots : Array.from({ length: total }, (_, i) => i + 1);
+                        if (!isSubset && (!grid.children.length || grid.querySelectorAll('.video-failed-card').length === grid.children.length)) {
+                            clearSlotGrid(grid, 'video');
+                        }
                         slotsToRender.forEach(slotIdx => {
-                            const placeholderCard = document.createElement('div');
-                            placeholderCard.className = 'frame-card placeholder-frame-card';
-                            placeholderCard.id = `video-slot-${slotIdx}`;
-                            grid.appendChild(placeholderCard);
-                            renderVideoSlotPending(slotIdx, '等待中');
+                            if (['done', 'failed', 'stopped'].includes(rec.progressState.slotStatus[slotIdx])) return;
+                            let card = document.getElementById(`video-slot-${slotIdx}`);
+                            if (!card) {
+                                card = document.createElement('div');
+                                card.id = `video-slot-${slotIdx}`;
+                                enableVideoSlotDnd(card, slotIdx);
+                                placeSlotCard(card, 'video', slotIdx);
+                                grid.appendChild(card);
+                            }
+                            renderSlotCard(card, slotPendingState('video', slotIdx, '等待中'));
                         });
                     }
+                } else if (type === 'auto_video_started' || type === 'auto_video_updated' || type === 'auto_video_blocked') {
+                    if (typeof handleAutoVideoHandoff === 'function') handleAutoVideoHandoff(ownerIdea, data);
                 } else if (type === 'video_start') {
-                    applyVideoProgress('video_start', data);
-                    setMeta(`正在生成视频: ${data.current}/${data.total} (正在处理第 ${data.index} 段视频)...`);
+                    if (rec.progressState.slotStatus[data.index] === 'done') return;
+                    const info = applyVideoProgress('video_start', data);
+                    setMeta((info && info.label) || `正在处理 VID ${padSlot(data.index)}...`);
                     if (isViewing()) {
                         const slot = document.getElementById(`video-slot-${data.index}`);
-                        if (slot && slot.classList.contains('placeholder-frame-card')) {
+                        if (slot) {
                             renderVideoSlotPending(data.index, '生成中...');
                         }
                     }
                 } else if (type === 'video_done') {
-                    applyVideoProgress('video_done', data);
-                    setMeta(`正在生成视频: ${data.current}/${data.total}...`);
-                    if (isViewing()) renderVideoSlotDone(data.index, data.video);
+                    const info = applyVideoProgress('video_done', data);
+                    setMeta((info && info.label) || '正在整理视频生成结果...');
+                    if (typeof recordAutoVideoDelivery === 'function' && data && data.video) {
+                        recordAutoVideoDelivery(ownerIdea, taskId,
+                            Object.assign({}, data.video, { slot: Number(data.video.slot) || Number(data.index) }));
+                    }
+                    renderVideoSlotDone(data.index, data.video, ownerIdea);
                 } else if (type === 'video_error') {
-                    applyVideoProgress('video_error', data);
+                    if (rec.progressState.slotStatus[data.index] === 'done') return;
+                    const info = applyVideoProgress('video_error', data);
                     const msg = (data && data.message) || '生成失败';
-                    setMeta(`视频 ${data.index} 生成失败: ${msg}`);
+                    setMeta((info && info.label) || `视频 ${data.index} 生成失败: ${msg}`);
                     if (isViewing()) renderVideoSlotFailed(data.index, msg);
+                } else if (type === 'video_recovery') {
+                    const info = applyVideoProgress(type, data);
+                    setMeta((info && info.label) || (data && data.message) || '正在自动恢复未完成的视频');
+                    if (isViewing()) renderVideosForIdea(ownerIdea);
+                } else if (type === 'video_warning') {
+                    const info = applyVideoProgress(type, data);
+                    setMeta((info && info.label) || (data && data.message) || '正在处理视频生成状态');
+                } else if (type === 'ip_rotating' || type === 'ip_rotated' || type === 'ip_rotation_failed') {
+                    const info = applyVideoProgress(type, data);
+                    const message = (data && data.message) || (info && info.label) || '正在处理出口 IP';
+                    rec.lastIpRotation = { ...data, stage: type };
+                    setMeta((info && info.label) || message);
+                    if (type !== 'ip_rotating' && isViewing()) {
+                        showToast(message, type === 'ip_rotation_failed' ? 'error' : 'info');
+                    }
                 } else if (type === 'video_skipped') {
-                    // 声明式硬切槽位（[CUT]）：不生成片段，按已完成计入进度
+                    // 硬切占位槽（旧单专属，新单的 [CUT] 槽照常生成）：不生成片段，按已完成计入进度
                     applyVideoProgress('video_done', data);
                     setMeta(`视频 ${data.index} 为声明式硬切槽位，已跳过生成`);
                     if (isViewing() && typeof renderVideoSlotSkippedCut === 'function') {
                         renderVideoSlotSkippedCut(data.index, data && data.message);
                     }
+                } else if (type === 'video_optimization_start') {
+                    applyVideoProgress('video_optimization_start', data);
+                    setMeta((data && data.message) || '正在执行视频提示词视觉优化门...');
+                } else if (type === 'video_optimization_slot') {
+                    applyVideoProgress('video_optimization_slot', data);
+                    setMeta((data && data.message) || `正在依据画面差量优化视频 ${data && data.slot} 提示词...`);
+                } else if (type === 'prompt_block_updated') {
+                    if (data && data.prompt_block) {
+                        ownerIdea.prompt_block = data.prompt_block;
+                        if (typeof applyPromptBlockToIdea === 'function') {
+                            applyPromptBlockToIdea(ownerIdea, data.prompt_block, data.prompt_slots, false);
+                        } else {
+                            if (isViewing()) renderPromptDisplay(ownerIdea.prompt_block);
+                        }
+                    }
                 } else if (type === 'queue') {
+                    if (rec.current) return;
                     applyVideoProgress('queue', data);
                     setMeta((data && data.message) || '正在排队等待生成视频...');
                 } else if (type === 'merge_skip') {
@@ -2841,19 +3334,57 @@ async function streamVideosProgress(taskId, ownerIdea, targetSlots) {
         }
 
         if (watch.result) {
-            await syncFrameRunToLibrary(watch.result, ownerIdea);
+            const declaredAuto = watch.result.auto_video;
+            if (declaredAuto && typeof handleAutoVideoHandoff === 'function') handleAutoVideoHandoff(ownerIdea, declaredAuto);
+            if (typeof settleAutoVideoHandoff === 'function') {
+                settleAutoVideoHandoff(ownerIdea, taskId,
+                    watch.result.completion_state === 'partial_failed' ? 'partial_failed'
+                        : watch.result.has_quality_warnings ? 'completed_with_warnings' : 'completed');
+            }
+            if (typeof recordAutoVideoDelivery === 'function') recordAutoVideoDelivery(ownerIdea, taskId, null, watch.result);
+            if (watch.result.prompt_block) {
+                ownerIdea.prompt_block = watch.result.prompt_block;
+                if (typeof applyPromptBlockToIdea === 'function') {
+                    await applyPromptBlockToIdea(ownerIdea, watch.result.prompt_block, watch.result.prompt_slots, false);
+                } else {
+                    if (isViewing()) renderPromptDisplay(ownerIdea.prompt_block);
+                }
+            }
+            const currentAuto = ownerIdea.frameRun && ownerIdea.frameRun.auto_video;
+            const finalResult = currentAuto && currentAuto.task_id === taskId
+                ? { ...watch.result, auto_video: currentAuto } : watch.result;
+            await syncFrameRunToLibrary(finalResult, ownerIdea);
+            if (typeof renderAutoVideoStatus === 'function' && isViewing()) renderAutoVideoStatus(ownerIdea);
             if (isViewing()) renderVideosForIdea(ownerIdea);
+            const lastRun = (watch.result.video_generation_stats || {}).last_run || {};
+            const requested = targetSlots && targetSlots.length ? new Set(targetSlots.map(Number)) : null;
+            const entries = (watch.result.videos || []).filter(v => !requested || requested.has(Number(v.slot)));
+            const attemptedFailed = entries.filter(v => v.last_attempt
+                && (!lastRun.attempt_id || v.last_attempt.id === lastRun.attempt_id)
+                && ['failed', 'cancelled'].includes(v.last_attempt.status)).length;
+            const successful = entries.filter(v => v.status === 'success'
+                && !(v.last_attempt && (!lastRun.attempt_id || v.last_attempt.id === lastRun.attempt_id)
+                    && ['failed', 'cancelled'].includes(v.last_attempt.status))).length;
+            const partial = attemptedFailed > 0 || watch.result.completion_state === 'partial_failed';
             const videoRisks = summarizeRunQuality(watch.result);
-            if (videoRisks) {
-                setMeta(`视频生成完成，但存在质量风险：${videoRisks.join('；')}——建议处理后再合并成片`);
-                showToast(`${titleTag()}视频生成完成，但检测到质量风险，建议合并成片前先处理。`, 'warning');
-            } else {
-                showToast(`${titleTag()}已成功生成 ${(watch.result.videos || []).length} 段连续视频。`, "success");
+            const message = partial
+                ? `视频任务结束：本轮成功 ${successful} 段${attemptedFailed ? `，失败或取消 ${attemptedFailed} 段` : ''}，请检查缺段或合并结果。`
+                : videoRisks ? `视频生成完成，但存在质量风险：${videoRisks.join('；')}`
+                : `已成功生成 ${successful} 段连续视频。`;
+            setMeta(message);
+            showToast(`${titleTag()}${message}`, partial || videoRisks ? 'warning' : 'success');
+            if (typeof NotificationCenter !== 'undefined') {
+                NotificationCenter.notify({ type: partial || videoRisks ? 'warning' : 'success',
+                    title: partial ? '视频任务仍需处理' : '视频序列生成完成', message });
             }
         }
     } catch (e) {
         if (!isCurrent()) return;
         console.error("Failed to generate videos:", e);
+        applyVideoProgress('error', { message: e.name === 'AbortError' ? '视频生成已被用户取消。' : e.message });
+        if (typeof settleAutoVideoHandoff === 'function') {
+            settleAutoVideoHandoff(ownerIdea, taskId, e.name === 'AbortError' ? 'cancelled' : 'partial_failed', e.message);
+        }
 
         if (e.name === 'AbortError') {
             setMeta('视频生成已被用户取消。');
@@ -2864,17 +3395,41 @@ async function streamVideosProgress(taskId, ownerIdea, targetSlots) {
             showToast(`${titleTag()}视频生成失败: ${e.message}`, "error");
             failPendingSlots(e.message || '生成失败', '生成失败');
 
+            const terminalAuto = ownerIdea.frameRun && ownerIdea.frameRun.auto_video;
             await reloadManifestIntoIdea(ownerIdea);
+            const manifestAuto = ownerIdea.frameRun && ownerIdea.frameRun.auto_video;
+            if (terminalAuto && terminalAuto.task_id === taskId && manifestAuto && manifestAuto.task_id === taskId) {
+                ownerIdea.frameRun.auto_video = terminalAuto;
+                handleAutoVideoHandoff(ownerIdea, manifestAuto);
+            }
+            if (typeof settleAutoVideoHandoff === 'function') {
+                settleAutoVideoHandoff(ownerIdea, taskId, 'partial_failed', e.message);
+            }
             if (isViewing() && ownerIdea.frameRun) renderVideosForIdea(ownerIdea);
+            if (typeof NotificationCenter !== 'undefined') {
+                NotificationCenter.notify({
+                    type: 'error',
+                    title: '视频序列生成失败',
+                    message: e.message || '视频渲染任务发生异常中断'
+                });
+            }
         }
     } finally {
         if (isCurrent()) {
+            rec.streaming = false;
+            saveActiveBackgroundTasksToLocalStorage();
             // 失联分支保留任务登记，供下次刷新页面重新接上事件流。
             if (!disconnectedVideos) {
                 endIdeaTask(ownerId, 'videos');
+                if (typeof refreshSlotGridBusy === 'function') refreshSlotGridBusy('video');
                 if (isViewing()) {
                     progress.style.display = 'none';
                     btn.disabled = false;
+                    if (chainBtn) chainBtn.disabled = false;
+                    // 与 streamFramesProgress 同款收尾：必须在 endIdeaTask 之后再重渲
+                    // 一次——上面成功/失败分支那次重渲发生在登记还在的时候，没轮到的
+                    // 槽位会继续画成「等待中」转圈、卡片按钮也停在禁用态。
+                    renderVideosForIdea(ownerIdea);
                 }
             }
         }
@@ -2889,6 +3444,7 @@ async function streamCoverProgress(taskId, ownerIdea) {
     const placeholderEl = document.getElementById('cover-image-placeholder');
     const displayEl = document.getElementById('cover-img-display');
     const makeBtn = document.getElementById('make-cover-btn');
+    const concBtn = document.getElementById('generate-cover-concurrent-btn');
     if (!loadingEl || !placeholderEl || !displayEl || !makeBtn) return;
 
     const isViewing = () => isViewingIdea(ownerId);
@@ -2899,6 +3455,7 @@ async function streamCoverProgress(taskId, ownerIdea) {
         placeholderEl.style.display = 'none';
         displayEl.style.display = 'none';
         makeBtn.disabled = true;
+        if (concBtn) concBtn.disabled = true;
     }
 
     const controller = new AbortController();
@@ -2907,7 +3464,17 @@ async function streamCoverProgress(taskId, ownerIdea) {
 
     let disconnectedCover = false;
     try {
-        const watch = await watchTaskUntilTerminal(taskId, { label: 'cover', signal: controller.signal });
+        const watch = await watchTaskUntilTerminal(taskId, {
+            label: 'cover',
+            signal: controller.signal,
+            onEvent: (type, data) => {
+                if (!isCurrent()) return;
+                if (type === 'cover_generating' && data && data.message) {
+                    const p = loadingEl.querySelector('p');
+                    if (p) p.textContent = data.message;
+                }
+            }
+        });
 
         if (!isCurrent()) return;
 
@@ -2925,17 +3492,32 @@ async function streamCoverProgress(taskId, ownerIdea) {
         }
 
         const data = watch.result;
-        const imageUrl = extractImageUrl(data.content);
         const englishTitle = data.english_title;
-
-        if (!imageUrl) {
-            throw new Error("无法从模型响应中解析出有效的封面图片 URL");
-        }
 
         if (!ownerIdea.covers) {
             ownerIdea.covers = [];
         }
-        ownerIdea.covers.push(imageUrl);
+
+        let newCovers = [];
+        if (Array.isArray(data.covers) && data.covers.length > 0) {
+            newCovers = data.covers;
+        } else if (data.content) {
+            const parsed = extractImageUrl(data.content);
+            if (parsed) newCovers = [parsed];
+        }
+
+        if (newCovers.length === 0) {
+            throw new Error("无法从模型响应中解析出有效的封面图片 URL");
+        }
+
+        const addedUrls = [];
+        newCovers.forEach(url => {
+            if (!ownerIdea.covers.includes(url)) {
+                ownerIdea.covers.push(url);
+                addedUrls.push(url);
+            }
+        });
+
         if (englishTitle) {
             ownerIdea.english_title = englishTitle;
         }
@@ -2963,11 +3545,14 @@ async function streamCoverProgress(taskId, ownerIdea) {
             if (ownerIdea.social_title_cn) {
                 savedIdeas[existingIdx].social_title_cn = ownerIdea.social_title_cn;
             }
-            await saveLibrary();
+            await persistIdeaItem(savedIdeas[existingIdx]);
         }
 
         if (isViewing()) renderCoversForIdea(ownerIdea, ownerIdea.covers.length - 1);
-        showToast(`${titleTag()}封面图制作成功！`, "success");
+        const successMsg = addedUrls.length > 1
+            ? `${titleTag()}成功并发生成 ${addedUrls.length} 张封面图！`
+            : `${titleTag()}封面图制作成功！`;
+        showToast(successMsg, "success");
     } catch (e) {
         if (!isCurrent()) return;
         console.error("Failed to generate cover:", e);
@@ -2986,6 +3571,8 @@ async function streamCoverProgress(taskId, ownerIdea) {
             if (isViewing()) {
                 loadingEl.style.display = 'none';
                 makeBtn.disabled = false;
+                const concBtnCurrent = document.getElementById('generate-cover-concurrent-btn');
+                if (concBtnCurrent) concBtnCurrent.disabled = false;
             }
         }
     }
@@ -3038,156 +3625,213 @@ function setupLoadingSteps() {
 // plain paragraphs, escaping all HTML.
 // Function renderAuditMarkdown moved to modular JS file
 
-// Save currently active idea to Local Storage Library
-function saveCurrentIdea() {
+// Save currently active idea to the library.
+// 走单条写入（/api/library/item）：只写这一条的正文文件 + 索引行，不再把整个
+// 创意库上传一遍，也就不会撞上整表覆盖的那三道闸门。
+async function saveCurrentIdea() {
     if (!currentIdea) return;
-    
+
     // Check if already saved
-    if (savedIdeas.some(item => item.title === currentIdea.title)) {
+    if (libraryEntries().some(item => item.title === currentIdea.title)) {
         showToast("该创意已存在于点子库中", "error");
         return;
     }
-    
-    savedIdeas.unshift({ ...currentIdea });
-    saveLibrary();
+
+    const idea = { ...currentIdea };
+    savedIdeas.unshift(idea);
     updateFavoriteButtonState();
-    showToast("成功保存至点子库！", "success");
-}
+    if (typeof refreshProjects === 'function') refreshProjects({ assets: false });
 
-// Populate Saved Ideas Library Sidebar
-function renderLibrary() {
-    const list = document.getElementById('library-list');
-    if (!list) return;
-    
-    list.innerHTML = '';
-    
-    const query = (document.getElementById('library-search')?.value || '').trim().toLowerCase();
-    const timeSort = document.getElementById('library-filter-time')?.value || 'newest';
-
-    let filtered = [...savedIdeas];
-
-    // Search filter（也覆盖 theme 的模糊匹配——固定场景主题下拉框已移除，见 index.html）
-    if (query) {
-        filtered = filtered.filter(idea =>
-            (idea.title || '').toLowerCase().includes(query) ||
-            (idea.theme || '').toLowerCase().includes(query) ||
-            (idea.prompt_block || '').toLowerCase().includes(query)
-        );
-    }
-
-    // Time sorting
-    if (timeSort === 'oldest') {
-        filtered.reverse();
-    }
-    
-    if (filtered.length === 0) {
-        list.innerHTML = `
-            <div class="library-empty">
-                没有找到匹配的点子。
-            </div>
-        `;
-        return;
-    }
-    
-    filtered.forEach(idea => {
-        const card = document.createElement('div');
-        card.className = 'saved-card';
-        card.setAttribute('data-id', idea.id);
-        
-        let thumbHtml = `<div class="saved-card-thumb-icon">💡</div>`;
-        if (idea.covers && idea.covers.length > 0) {
-            const coverUrl = idea.covers[0];
-            const isSafe = coverUrl.startsWith('http://') || 
-                           coverUrl.startsWith('https://') || 
-                           coverUrl.startsWith('data:image/') ||
-                           coverUrl.startsWith('/') ||
-                           coverUrl.startsWith('outputs/');
-            if (isSafe) {
-                thumbHtml = `<img src="${coverUrl}" alt="Thumbnail" onerror="this.onerror=null; this.outerHTML='<div class=&quot;saved-card-thumb-icon&quot;>💡</div>';">`;
-            }
-        }
-        
-        card.innerHTML = `
-            <div class="saved-card-thumb">
-                ${thumbHtml}
-            </div>
-            <div class="saved-card-info-content">
-                <div class="saved-card-header">
-                    <h4 class="safe-title"></h4>
-                    <span class="saved-card-date">${idea.timestamp ? idea.timestamp.split(' ')[0] : '未知时间'}</span>
-                </div>
-                <div class="saved-card-footer">
-                    <span class="saved-card-theme safe-theme"></span>
-                    <button class="delete-saved-btn" title="删除">
-                        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path><line x1="10" y1="11" x2="10" y2="17"></line><line x1="14" y1="11" x2="14" y2="17"></line></svg>
-                    </button>
-                </div>
-            </div>
-        `;
-        
-        card.querySelector('.safe-title').textContent = idea.title || '未命名创意';
-        card.querySelector('.safe-theme').textContent = idea.theme || '未命名主题';
-        
-        card.addEventListener('click', (e) => {
-            if (e.target.closest('.delete-saved-btn') || e.target.closest('.delete-confirm-overlay')) {
-                e.stopPropagation();
-                showDeleteConfirm(card, idea.id);
-                return;
-            }
-            loadSavedIdea(idea);
-        });
-        
-        list.appendChild(card);
-    });
+    const ok = await persistIdeaItem(idea);
+    if (ok) showToast("成功保存至点子库！", "success");
 }
 
 async function deleteFromLibrary(id) {
-    const idea = savedIdeas.find(item => item.id === id);
+    const idea = libraryEntries().find(item => item.id === id);
+    if (!idea) return;
 
-    if (idea && idea.title) {
-        try {
-            await fetch('/api/library/delete_item', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ title: getIdeaSaveTitle(idea), covers: idea.covers || [] })
-            });
-        } catch (e) {
-            console.error("Delete idea output files request failed:", e);
-        }
-    }
+    const ok = await deleteIdeaItem(idea);
+    if (!ok) return;   // 服务端没删成功就别动本地状态，否则两边会不一致
 
-    savedIdeas = savedIdeas.filter(item => item.id !== id);
-    saveLibrary();
+    forgetLibraryIdeas([id]);
+    if (typeof refreshProjects === 'function') refreshProjects({ assets: false });
     showToast("已从点子库删除，生成的图片/视频文件已一并清理", "success");
     updateFavoriteButtonState();
+    if (typeof refreshProjects === 'function') refreshProjects();
 }
 
-function loadSavedIdea(idea) {
+function loadSavedIdea(idea, options = {}) {
+    if (idea && idea._librarySummary) {
+        return ensureLibraryIdea(idea.id).then(complete => {
+            if (!complete) {
+                showToast('项目正文暂时无法读取，请稍后重试。', 'error');
+                return false;
+            }
+            return loadSavedIdea(complete, options);
+        });
+    }
+    if (idea && idea.archived) {
+        if (typeof openArchivedProject === 'function') openArchivedProject(idea.project_key);
+        return;
+    }
     currentIdea = idea;
+    syncCandidateModeToggleFromIdea(currentIdea);
     saveCurrentIdeaState();
     renderIdea(idea);
-    
+
     document.getElementById('output-placeholder-view').classList.remove('active');
     document.getElementById('output-loading-view').classList.remove('active');
-    
+
     const errorView = document.getElementById('output-error-view');
     if (errorView) errorView.style.display = 'none';
-    
+
     document.getElementById('output-content-view').classList.add('active');
-    
+
     switchTab('overview');
-    showToast("已载入收藏的创意", "success");
+    showToast(options.toast || "已载入收藏的创意", "success");
     updateActiveGenerationBanner();
+    return true;
+}
+
+/* ==========================================================================
+   台账 / 画廊 / 项目工作台 →「激发项目」直达入口
+
+   2026-07-31（P3）之前这里是三套标题模糊匹配：把一句话选题、场景主题、任务
+   task_label、Topic DNA 各归一化一遍互相撞。撞不上就"找不到"，撞错了就打开
+   另一条创意——因为那时候根本没有主键：project_key 要等合成跑完才生成。
+
+   现在 project_key 从**任务创建那一刻**就定下（server_common.ensure_task_project_key），
+   并且写进任务 dimensions、点子库条目、台账行三处，所以这里是一次直查。
+   标题匹配只作为历史数据（没有 project_key 的老记录）的回落分支保留。
+   ========================================================================== */
+
+function sparkNormKey(v) {
+    return String(v == null ? '' : v).replace(/\s+/g, ' ').trim().toLowerCase();
+}
+
+// 画廊传上来的是**目录名**，它是 _safe_project_name(project_key) 的结果：
+// '__' 会被折成 '_'，且截断到 60 字符。所以目录名与 project_key 不能直接相等
+// 比较，这里做同样的归一化再比。
+function sparkProjectDirKey(v) {
+    return String(v == null ? '' : v).replace(/_+/g, '_').trim().toLowerCase();
+}
+
+function sparkProjectKeyMatches(a, b) {
+    if (!a || !b) return false;
+    if (String(a) === String(b)) return true;
+    const ka = sparkProjectDirKey(a);
+    const kb = sparkProjectDirKey(b);
+    if (!ka || !kb) return false;
+    // 截断：短的那个是长的那个的前缀就算命中
+    return ka === kb || ka.startsWith(kb) || kb.startsWith(ka);
+}
+
+// 点子库里找这条创意的记录。project_key 优先（硬主键），其余是老记录的回落。
+// savedIdeas 按新→旧排列，find 天然取最近一次合成。
+function findSavedIdeaForSpark({ ideaId = null, seed = '', title = '', projectKey = '' } = {}) {
+    const entries = libraryEntries();
+    if (!entries.length) return null;
+    if (ideaId) {
+        const byId = entries.find(i => String(i.id) === String(ideaId));
+        if (byId) return byId;
+    }
+    if (projectKey) {
+        const byKey = entries.find(i => sparkProjectKeyMatches(i.project_key, projectKey));
+        if (byKey) return byKey;
+    }
+    // ── 以下仅供没有 project_key 的历史记录回落 ──
+    const seedKey = sparkNormKey(seed);
+    const titleKey = sparkNormKey(title);
+    return (seedKey && entries.find(i => sparkNormKey(i.theme) === seedKey))
+        || (titleKey && entries.find(i => sparkNormKey(i.title) === titleKey
+                                          || sparkNormKey(i.theme) === titleKey))
+        || null;
+}
+
+// 任务侧兜底（这条创意还没收藏，或收藏前就想回看）。
+async function findCompletedTaskForSpark({ dna = '', seed = '', title = '', projectKey = '' } = {}) {
+    let tasks = [];
+    try {
+        const res = await fetch('/api/tasks');
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        tasks = Array.isArray(data) ? data : (data.tasks || []);
+    } catch (e) {
+        console.warn('Failed to load tasks while resolving spark project', e);
+        return null;
+    }
+    // 只认创意激发任务：帧/分步渲染/视频/封面这些子任务现在也带着同一个
+    // project_key（P3），误配上去 loadCompletedTask 会载入一份没有提示词的空壳结果
+    const done = tasks.filter(t => t && t.status === 'completed' && t.result && isIdeationTask(t));
+    const dims = t => t.dimensions || {};
+
+    if (projectKey) {
+        // 主键直查：任务创建时就写进 dimensions 了
+        const byKey = done.find(t => sparkProjectKeyMatches(dims(t).project_key, projectKey)
+                                  || sparkProjectKeyMatches((t.result || {}).project_key, projectKey));
+        if (byKey) return byKey;
+        // 老任务没有 project_key：目录名以 run_<task_id>_ 开头，拿它做前缀匹配
+        // 比反解目录名更稳（task_id 自身可能带下划线，反解会切错）
+        const byPrefix = done.find(t => {
+            const safeId = String(t.id || '').replace(/[^a-zA-Z0-9_-]+/g, '_').replace(/^_+|_+$/g, '');
+            return safeId && projectKey.startsWith(`run_${safeId}_`);
+        });
+        if (byPrefix) return byPrefix;
+    }
+    // ── 以下仅供没有 project_key 的历史记录回落 ──
+    const dnaKey = sparkNormKey(dna);
+    const seedKey = sparkNormKey(seed);
+    const titleKey = sparkNormKey(title);
+    return (dnaKey && done.find(t => sparkNormKey((dims(t).ledger_candidate || {}).dna
+                                                  || dims(t).topic_dna) === dnaKey))
+        || (seedKey && done.find(t => sparkNormKey(dims(t).theme) === seedKey))
+        || (titleKey && done.find(t => sparkNormKey(dims(t).task_label) === titleKey
+                                    || sparkNormKey(dims(t).theme) === titleKey))
+        || null;
+}
+
+// 打开一条创意对应的激发项目，落到「激发结果」工作区。找不到时给出明确提示
+// 并返回 false（调用方不需要自己再报错）。
+async function openSparkProject({ ideaId = null, dna = '', seed = '', title = '', projectKey = '', label = '' } = {}) {
+    const name = label || title || '该创意';
+    const idea = findSavedIdeaForSpark({ ideaId, seed, title, projectKey });
+    if (idea) {
+        switchMainTab('results');
+        return await loadSavedIdea(idea, { toast: `已打开激发项目「${idea.title || name}」` });
+    }
+    const task = await findCompletedTaskForSpark({ dna, seed, title, projectKey });
+    if (task) {
+        switchMainTab('results');
+        await loadCompletedTask(task.id);
+        return true;
+    }
+    showToast(`没找到「${name}」对应的激发项目——它可能还没合成成功，或历史记录已被清理`, 'error');
+    return false;
 }
 
 // Export Library to JSON
-function exportAllLibrary() {
-    if (savedIdeas.length === 0) {
+async function exportAllLibrary() {
+    if (libraryEntries().length === 0) {
         showToast("库中暂无点子可供导出", "error");
         return;
     }
     
-    const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(savedIdeas, null, 2));
+    let items;
+    try {
+        const response = await fetch('/api/library');
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        items = await response.json();
+        if (!Array.isArray(items) || items.some(item => !item || item._librarySummary)) throw new Error('创意库正文格式有误');
+    } catch (error) {
+        const cache = new Map(readLibraryBackup().map(item => [String(item.id), item]));
+        savedIdeas.forEach(item => { if (!item._librarySummary) cache.set(String(item.id), item); });
+        items = libraryEntries().map(item => cache.get(String(item.id)));
+        if (items.some(item => !item)) {
+            showToast('导出失败：服务暂时不可用，本地未缓存全部创意正文。', 'error');
+            return;
+        }
+    }
+    const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(items, null, 2));
     const downloadAnchor = document.createElement('a');
     downloadAnchor.setAttribute("href", dataStr);
     downloadAnchor.setAttribute("download", `spark_creative_library_${Date.now()}.json`);
@@ -3202,25 +3846,33 @@ function importLibrary(e) {
     if (!file) return;
     
     const reader = new FileReader();
-    reader.onload = function(evt) {
+    reader.onload = async function(evt) {
         try {
             const imported = JSON.parse(evt.target.result);
-            if (Array.isArray(imported)) {
-                // Merge without duplicates based on title
-                const existingTitles = new Set(savedIdeas.map(item => item.title));
-                let count = 0;
-                imported.forEach(item => {
-                    if (item.title && !existingTitles.has(item.title)) {
-                        if (!item.id) item.id = Date.now().toString() + Math.random();
-                        savedIdeas.push(item);
-                        count++;
-                    }
-                });
-                saveLibrary();
-                showToast(`成功导入 ${count} 个新创意点子！`, "success");
-            } else {
-                throw new Error("Invalid file structure");
+            if (!Array.isArray(imported)) throw new Error("Invalid file structure");
+
+            // Merge without duplicates based on title
+            const existingTitles = new Set(libraryEntries().map(item => item.title));
+            const fresh = [];
+            imported.forEach(item => {
+                if (item.title && !existingTitles.has(item.title)) {
+                    if (!item.id) item.id = Date.now().toString() + Math.random();
+                    existingTitles.add(item.title);
+                    savedIdeas.push(item);
+                    fresh.push(item);
+                }
+            });
+            if (typeof refreshProjects === 'function') refreshProjects({ assets: false });
+            // 逐条写入而不是整表回写：导入 50 条时老写法要把「原有全库 + 50 条新
+            // 记录」整份上传一遍，而且中途失败就是全有或全无。
+            let saved = 0;
+            for (const item of fresh) {
+                if (await persistIdeaItem(item)) saved++;
             }
+            showToast(saved === fresh.length
+                ? `成功导入 ${saved} 个新创意点子！`
+                : `导入 ${fresh.length} 条，其中 ${saved} 条已存到服务器（其余仅存在浏览器本地）`,
+                saved === fresh.length ? "success" : "error");
         } catch (err) {
             showToast("导入失败，文件格式有误", "error");
             console.error(err);
@@ -3307,8 +3959,187 @@ function copyTikTokMetaCnToClipboard() {
     });
 }
 
+/* ──────────────────────────────────────────────────────────────────────────
+   一键生成中英双版主题和 tags（结果页标题行的 ✨）
+
+   正常激发的单子在收尾就带上了这些字段（server.background_worker 调
+   generate_social_titles）。手动上传的提示词集走的是另一条路：js/prompt_import.js
+   直接建条目，theme 只能填成标题（往往就是个文件名）、两行发布标题留空——工作台
+   那一行于是既没主题也没话题。这里补的就是这一步，且刻意以**提示词集正文**为依据
+   送给模型（见 prompt_pipeline.generate_project_meta），而不是只递一个标题过去。
+
+   已有值不静默覆盖：这两行是要粘进发布框的文案，用户可能已经手改过。
+
+   项目名跟着新主题一起改，本地目录与目录里的文件也跟着改（见 renameIdeaToTheme）：
+   磁盘命名空间取的是 project_key || title（getIdeaSaveTitle），只改条目里的标题、
+   不动磁盘，下一次按新名字去找帧/视频/封面只会找到一个空目录——已生成的资产在界面
+   上凭空消失。目录搬迁与目录内 json 的路径改写全在服务端一次做完
+   （/api/project/rename），这里只负责把回来的改名清单套到创意条目的 URL 上。
+   ────────────────────────────────────────────────────────────────────────── */
+
+// 项目目录换名之后，条目里那些指向旧目录的 URL 全都失效。服务端回的
+// old_dir_name/new_dir_name/file_map 就是全部改动，照着替换即可。
+// 只走媒体字段：提示词/审核报告是正文，正文里碰巧出现同名字符串也不该被改。
+const IDEA_MEDIA_URL_FIELDS = ['covers', 'activeCoverUrl', 'coverRoles', 'collage_url',
+                               'cover_url', 'frameRun'];
+
+function rewriteIdeaMediaUrls(idea, plan) {
+    const pairs = [[`outputs/${plan.old_dir_name}/`, `outputs/${plan.new_dir_name}/`]]
+        .concat(Object.entries(plan.file_map || {}));
+    const swap = (s) => pairs.reduce((acc, [a, b]) => (a && a !== b ? acc.split(a).join(b) : acc), s);
+    const walk = (node) => {
+        if (typeof node === 'string') return swap(node);
+        if (Array.isArray(node)) return node.map(walk);
+        if (node && typeof node === 'object') {
+            Object.keys(node).forEach(k => { node[k] = walk(node[k]); });
+        }
+        return node;
+    };
+    IDEA_MEDIA_URL_FIELDS.forEach(f => { if (idea[f] != null) idea[f] = walk(idea[f]); });
+}
+
+/**
+ * 把项目名同步成新主题，并让服务端把本地目录/文件一起改掉。
+ *
+ * 目录搬不搬 ≠ 名字改不改：这一单还有帧/视频作业在跑时目录不能搬（worker 攥着
+ * 旧目录路径），但名字照改——服务端会把旧键回给我们钉进 project_key，磁盘命名
+ * 空间从此不再跟着标题走，资产一张都不丢（见 server.py /api/project/rename）。
+ *
+ * 返回 {renamed, from, to, reason, plan}——reason 是没改名的原因，调用方要如实
+ * 报给用户，不能让"名字没变"看起来像什么都没发生。
+ */
+async function renameIdeaToTheme(idea, newTitle) {
+    const from = idea.title || '';
+    const to = String(newTitle || '').trim();
+    if (!to || to === from) return { renamed: false, from, to, reason: '' };
+    if (libraryEntries().some(it => it.id !== idea.id && it.title === to)) {
+        return { renamed: false, from, to, reason: `点子库里已有同名创意「${to}」` };
+    }
+
+    let plan;
+    try {
+        // getIdeaSaveTitle 给的就是当前的磁盘命名空间键（没有 project_key 的老创意
+        // 用的是标题本身），服务端按它定位要搬的目录
+        plan = await slotPostJson('/api/project/rename', {
+            project_key: getIdeaSaveTitle(idea),
+            new_title: to,
+        });
+    } catch (e) {
+        // 目录没搬成就绝不能改名：改了名字，界面就再也找不到旧目录里的资产了
+        return { renamed: false, from, to, reason: `本地目录改名失败：${e.message}` };
+    }
+
+    idea.title = to;
+    // 无论目录搬没搬，回来的这个键都要钉进条目里当磁盘命名空间：
+    //   · 搬了 —— 它是新目录名对应的新键；
+    //   · 没搬（还有作业在跑 / 这一单还没生成过任何媒体）—— 它就是旧键，
+    //     钉住它，标题才敢改：老条目原本没有 project_key、拿标题当命名空间，
+    //     改完名再去找帧/视频/封面就只剩一个空目录（见 getIdeaSaveTitle）。
+    idea.project_key = plan.project_key;
+    if (plan.moved) rewriteIdeaMediaUrls(idea, plan);
+    return { renamed: true, from, to, reason: '', plan };
+}
+
+async function generateProjectMetaForCurrentIdea() {
+    if (!currentIdea) {
+        showToast('先打开一个项目再生成主题和 tags。', 'error');
+        return;
+    }
+    const promptBlock = currentIdea.prompt_block || '';
+    if (!promptBlock.trim() && !(currentIdea.title || '').trim()) {
+        showToast('这一单既没有提示词集也没有标题，无从推断主题与话题。', 'error');
+        return;
+    }
+
+    const meta = getIdeaTikTokMeta(currentIdea);
+    const hasExisting = !!(currentIdea.social_title_en || currentIdea.social_title_cn);
+    if (hasExisting) {
+        const ok = await customConfirm(
+            '这一单已经有主题和 tags 了，重新生成会<b>覆盖</b>现有的两行发布文案：'
+            + `<ul style="margin:8px 0 0 18px; line-height:1.7;">
+                 <li>英文：${escapeHtml(meta.english || '（空）')}</li>
+                 <li>中文：${escapeHtml(meta.chinese || '（空）')}</li>
+                 <li>项目名也会同步改成新主题（当前「${escapeHtml(currentIdea.title || '')}」）</li>
+               </ul>`);
+        if (!ok) return;
+    }
+
+    const btn = document.getElementById('gen-project-meta-btn');
+    if (btn) btn.disabled = true;
+    // 生成期间换单/关页都可能发生：认准发起时的这条创意，回来只写它
+    const ownerId = currentIdea.id;
+    const ownerIdea = currentIdea;
+    showToast('正在按提示词集推荐主题和 tags…', 'info');
+    try {
+        const data = await slotPostJson('/api/project_meta', {
+            config: config,
+            title: ownerIdea.title || '',
+            theme: ownerIdea.theme || '',
+            creativity: ownerIdea.creativity || '',
+            prompt_block: promptBlock,
+        });
+
+        // 四个字段各自可能为空（模型漏给），空的不覆盖已有值
+        if (data.theme_cn) ownerIdea.theme = data.theme_cn;
+        if (data.theme_en) ownerIdea.theme_en = data.theme_en;
+        if (data.tiktok) ownerIdea.social_title_en = data.tiktok;
+        if (data.cn) ownerIdea.social_title_cn = data.cn;
+        const rename = await renameIdeaToTheme(ownerIdea, data.theme_cn);
+
+        if (currentIdea && currentIdea.id === ownerId) {
+            saveCurrentIdeaState();
+            renderIdeaTitles(ownerIdea);
+            const tagThemeEl = document.getElementById('tag-theme');
+            if (tagThemeEl) tagThemeEl.textContent = ownerIdea.theme || '';
+        }
+
+        const existingIdx = savedIdeas.findIndex(item => item.id === ownerId);
+        if (existingIdx !== -1) {
+            // 改名会连带重写 covers/collage_url/frameRun 里的 URL（目录换名了），
+            // 所以这里整条覆盖，而不是只挑那几个文本字段
+            Object.assign(savedIdeas[existingIdx], ownerIdea);
+            await persistIdeaItem(savedIdeas[existingIdx]);
+        } else if (rename.renamed) {
+            // 磁盘那边已经按新名字改完了，条目却不在点子库里：不落库的话，下次打开
+            // 看到的还是旧名字（以及可能已经失效的旧 URL）。如实报出来。
+            showToast(`项目名已改成「${rename.to}」，但这一单不在点子库里，改名没能存下来——`
+                      + '先收藏这一单再点一次 ✨。', 'warning', 8000);
+        }
+        if (typeof refreshProjects === 'function') refreshProjects({ assets: false });
+
+        const plan = rename.plan || {};
+        const movedNote = plan.moved
+            ? `，本地目录改成 outputs/${plan.new_dir_name}`
+            // 有作业在跑时目录不搬（worker 攥着旧路径），命名空间钉在旧键上。
+            // 名字确实改了，但目录名对不上，说清楚免得用户以为改了个寂寞。
+            : (plan.reason === 'busy'
+                ? `（还有作业在跑，本地目录暂不搬迁，仍是 outputs/${plan.old_dir_name}）` : '');
+        showToast(rename.renamed
+            ? `主题和 tags 已生成，项目名同步改成「${rename.to}」${movedNote}`
+            : `主题和 tags 已生成：${ownerIdea.theme || ''}`, 'success');
+        // 改名被挡住时必须说清楚，否则用户只会看到"主题变了、名字没变"
+        if (!rename.renamed && rename.reason) {
+            showToast(`项目名保持「${rename.from}」未改：${rename.reason}`, 'warning', 7000);
+        }
+        // 目录搬了但目录里某些 json 没改写成：那些文件里还留着旧路径，如实报出来
+        const failures = (rename.plan && rename.plan.rewrite_failures) || [];
+        if (failures.length) {
+            showToast(`本地目录已改名，但 ${failures.length} 个 json 里的旧路径没能改写：`
+                + failures[0], 'warning', 8000);
+        }
+    } catch (e) {
+        console.error('Failed to generate project meta:', e);
+        showToast(`生成主题和 tags 失败：${e.message}`, 'error');
+    } finally {
+        if (btn) btn.disabled = false;
+    }
+}
+
 function copyPromptToClipboard() {
-    const text = (currentIdea && currentIdea.prompt_block) || document.getElementById('idea-prompt-block').textContent;
+    const blockEl = document.getElementById('idea-prompt-block');
+    const text = (currentIdea && currentIdea.prompt_block)
+        || (blockEl && blockEl.dataset && blockEl.dataset.rawText)
+        || (blockEl ? blockEl.textContent : '');
     copyText(text).then(() => {
         showToast("提示词集已复制到剪贴板！", "success");
     }).catch(err => {
@@ -3340,10 +4171,12 @@ function initDebugLimitControls() {
         countEl.disabled = !enabledEl.checked;
 
         const persist = () => {
-            localStorage.setItem(storageKey, JSON.stringify({
-                enabled: enabledEl.checked,
-                count: Math.max(1, parseInt(countEl.value, 10) || 3)
-            }));
+            try {
+                localStorage.setItem(storageKey, JSON.stringify({
+                    enabled: enabledEl.checked,
+                    count: Math.max(1, parseInt(countEl.value, 10) || 3)
+                }));
+            } catch (_) {}
         };
 
         enabledEl.addEventListener('change', () => {
@@ -3374,23 +4207,435 @@ function computeDebugTargets(kind, idea, slotType) {
     return slots.slice(0, n);
 }
 
+function autoVideoStorageKey(idea) {
+    const identity = idea && (idea.id || idea.project_key || idea.title);
+    return identity ? `spark_auto_generate_videos:${identity}` : null;
+}
+
+function isAutoGenerateVideosEnabled(idea) {
+    if (!idea) return false;
+    const key = autoVideoStorageKey(idea);
+    try {
+        const stored = key && localStorage.getItem(key);
+        if (stored === 'true' || stored === 'false') return stored === 'true';
+    } catch (_) {}
+    if (idea.auto_generate_videos === true) return true;
+    if (idea.auto_generate_videos === false && idea.auto_generate_videos_preference_explicit === true) return false;
+    const manifestValue = idea.frameRun && idea.frameRun.auto_generate_videos;
+    return manifestValue === false && idea.frameRun.auto_generate_videos_preference_explicit === true ? false : true;
+}
+
+// 自动任务、手动生成和失败槽位重试共享同一套首尾帧识别规则。
+function videoConfigForIdea(baseConfig, idea) {
+    return isAutoGenerateVideosEnabled(idea) || (idea && idea.frameRun && idea.frameRun.video_frame_pairing === 'auto')
+        ? Object.assign({}, baseConfig, { videoFramePairing: 'auto' }) : baseConfig;
+}
+
+function autoVideoPairingText(handoff, limit = 0) {
+    const pairs = handoff && Array.isArray(handoff.frame_pairs) ? handoff.frame_pairs : [];
+    const ready = new Set(autoVideoSlots(handoff, 'ready_slots'));
+    const readyPairs = limit && ready.size ? pairs.filter(pair => ready.has(Number(pair.slot))) : [];
+    const displayed = limit ? (readyPairs.length ? readyPairs.slice(-limit) : pairs.slice(0, limit)) : pairs;
+    const text = displayed.map(pair => {
+        const vid = `VID ${String(pair.slot).padStart(3, '0')}`;
+        const start = `IMG ${String(pair.start_anchor_slot).padStart(3, '0')}`;
+        const end = pair.end_anchor_slot == null ? '' : ` → IMG ${String(pair.end_anchor_slot).padStart(3, '0')}`;
+        return `${vid}：${start}${end}`;
+    }).join('；');
+    return text + (limit && pairs.length > displayed.length ? `；…共 ${pairs.length} 段` : '');
+}
+
+function autoVideoSlots(handoff, key) {
+    return handoff && Array.isArray(handoff[key])
+        ? Array.from(new Set(handoff[key].map(Number).filter(slot => Number.isInteger(slot) && slot > 0))).sort((a, b) => a - b)
+        : [];
+}
+
+function autoVideoSchedulingText(handoff) {
+    if (!handoff) return '';
+    const targets = autoVideoSlots(handoff, 'target_slots');
+    const queued = autoVideoSlots(handoff, 'queued_slots');
+    const pending = autoVideoSlots(handoff, 'pending_slots');
+    if (!Array.isArray(handoff.queued_slots) && !Array.isArray(handoff.pending_slots)) return '';
+    return `已调度 ${queued.length}${targets.length ? `/${targets.length}` : ''} 段${pending.length ? `，${pending.length} 段等待首尾帧` : ''}`;
+}
+
+function renderAutoVideoStatus(idea, handoff) {
+    const status = document.getElementById('frames-auto-video-status');
+    if (!status) return;
+    handoff = handoff || (idea && idea.frameRun && idea.frameRun.auto_video);
+    const enabled = isAutoGenerateVideosEnabled(idea);
+    status.hidden = !enabled && !handoff;
+    status.dataset.status = handoff && handoff.status || '';
+    const pairing = autoVideoPairingText(handoff, 4);
+    status.title = autoVideoPairingText(handoff);
+    const schedule = autoVideoSchedulingText(handoff);
+    if (handoff && handoff.status === 'started') {
+        const imagesRunning = idea && isIdeaTaskActive(idea.id, 'frames');
+        const recovering = ['querying', 'waiting', 'retrying'].includes(handoff.phase);
+        const label = recovering ? handoff.message || (handoff.phase === 'querying' ? '正在自动核对原视频'
+            : handoff.phase === 'retrying' ? '正在自动补跑未完成片段' : '等待自动恢复后继续生成') : '视频在后台生成';
+        status.textContent = `${label}${imagesRunning ? '，图片继续生成' : ''}${schedule ? ` · ${schedule}` : ''}${pairing ? ` · 首尾帧：${pairing}` : ''}`;
+    } else if (handoff && handoff.status === 'completed') {
+        status.textContent = `自动视频已完成${pairing ? ` · 首尾帧：${pairing}` : ''}`;
+    } else if (handoff && handoff.status === 'completed_with_warnings') {
+        status.textContent = `自动视频已完成，请查看提示${handoff.message ? `：${handoff.message}` : ''}${pairing ? ` · 首尾帧：${pairing}` : ''}`;
+    } else if (handoff && handoff.status === 'cancelled') {
+        status.textContent = `自动视频已取消${handoff.message ? `：${handoff.message}` : ''}`;
+    } else if (handoff && handoff.status === 'partial_failed') {
+        status.textContent = `自动视频部分完成，请检查未成功的片段${handoff.message ? `：${handoff.message}` : ''}`;
+    } else if (handoff && ['blocked', 'skipped'].includes(handoff.status)) {
+        status.textContent = `${handoff.status === 'blocked' ? '自动视频未启动' : '自动视频已跳过'}：${handoff.message || '请检查图片与视频提示词'}${pairing ? ` · 首尾帧：${pairing}` : ''}`;
+    } else if (handoff && handoff.status === 'waiting') {
+        status.textContent = `等待首尾帧就绪，随后立即生成对应视频${schedule ? ` · ${schedule}` : ''}`;
+    } else {
+        status.textContent = '每段首尾帧就绪后立即后台生成视频；图片持续生成，无需等待视频完成。';
+    }
+}
+
+function syncAutoVideoToggleFromIdea(idea) {
+    // 浏览器内显式拨过的偏好用于下一单；其他情况下用服务端清单恢复项目设置。
+    const manifestValue = idea && idea.frameRun && idea.frameRun.auto_generate_videos;
+    let hasLocalPreference = false;
+    try {
+        const key = autoVideoStorageKey(idea);
+        const stored = key && localStorage.getItem(key);
+        hasLocalPreference = stored === 'true' || stored === 'false';
+        if (hasLocalPreference && idea) {
+            idea.auto_generate_videos = stored === 'true';
+            idea.auto_generate_videos_preference_explicit = true;
+        }
+    } catch (_) {}
+    const manifestExplicit = idea && idea.frameRun && idea.frameRun.auto_generate_videos_preference_explicit === true;
+    if (idea && typeof manifestValue === 'boolean' && !hasLocalPreference
+        && idea.auto_generate_videos_preference_explicit !== true) {
+        idea.auto_generate_videos = manifestValue === true || !manifestExplicit;
+        if (manifestExplicit) idea.auto_generate_videos_preference_explicit = true;
+    }
+    const toggle = document.getElementById('frames-auto-video-toggle');
+    if (toggle) {
+        toggle.checked = isAutoGenerateVideosEnabled(idea);
+        toggle.disabled = !idea || isIdeaTaskActive(idea.id, 'frames');
+    }
+    renderAutoVideoStatus(idea);
+}
+
+function initAutoVideoControl() {
+    const toggle = document.getElementById('frames-auto-video-toggle');
+    if (!toggle) return;
+    syncAutoVideoToggleFromIdea(currentIdea);
+    toggle.addEventListener('change', () => {
+        const idea = currentIdea;
+        if (!idea) { toggle.checked = false; return; }
+        idea.auto_generate_videos = toggle.checked;
+        idea.auto_generate_videos_preference_explicit = true;
+        const key = autoVideoStorageKey(idea);
+        try { if (key) localStorage.setItem(key, String(toggle.checked)); } catch (_) {}
+        if (typeof saveCurrentIdeaState === 'function') saveCurrentIdeaState();
+        const saved = savedIdeas.find(item => item.id === idea.id);
+        if (saved) {
+            saved.auto_generate_videos = toggle.checked;
+            saved.auto_generate_videos_preference_explicit = true;
+            persistIdeaItem(saved);
+        }
+        renderAutoVideoStatus(idea);
+    });
+}
+
+function applyAutoVideoRequestOptions(body, ownerIdea) {
+    ownerIdea.auto_generate_videos = isAutoGenerateVideosEnabled(ownerIdea);
+    body.auto_generate_videos = ownerIdea.auto_generate_videos;
+    let explicitPreference = ownerIdea.auto_generate_videos_preference_explicit === true
+        || !!(ownerIdea.frameRun && ownerIdea.frameRun.auto_generate_videos_preference_explicit === true);
+    try {
+        const stored = localStorage.getItem(autoVideoStorageKey(ownerIdea));
+        explicitPreference = explicitPreference || stored === 'true' || stored === 'false';
+    } catch (_) {}
+    ownerIdea.auto_generate_videos_preference_explicit = explicitPreference;
+    body.auto_generate_videos_preference_explicit = explicitPreference;
+    if (!body.auto_generate_videos) return;
+    body.config = videoConfigForIdea(body.config, ownerIdea);
+    body.merge_speed = typeof getMergeSpeed === 'function' ? getMergeSpeed() : 4;
+    const slots = computeDebugTargets('videos', ownerIdea, 'video');
+    if (slots) body.video_target_slots = slots;
+    if (isViewingIdea(ownerIdea.id) && typeof saveCurrentIdeaState === 'function') saveCurrentIdeaState();
+}
+
+// SSE 会重放事件，帧 result 也会再次带回同一接续信息；每个子任务只接一次。
+const autoVideoHandoffs = new Map();
+
+function handleAutoVideoHandoff(ownerIdea, handoff) {
+    if (!ownerIdea || !handoff) return;
+    if (!ownerIdea.frameRun) ownerIdea.frameRun = { frames: [] };
+    const previous = ownerIdea.frameRun.auto_video;
+    const sameScope = !previous || !previous.request_id || !handoff.request_id
+        || previous.request_id === handoff.request_id;
+    if (previous && sameScope && (!previous.task_id || !handoff.task_id || previous.task_id === handoff.task_id)) {
+        const incoming = handoff;
+        handoff = { ...previous, ...incoming };
+        if (previous.task_id && !incoming.task_id) handoff.task_id = previous.task_id;
+        for (const field of ['target_slots', 'ready_slots', 'queued_slots']) {
+            if (Array.isArray(previous[field]) || Array.isArray(incoming[field])) {
+                handoff[field] = Array.from(new Set([...autoVideoSlots(previous, field), ...autoVideoSlots(incoming, field)])).sort((a, b) => a - b);
+            }
+        }
+        if (Array.isArray(handoff.pending_slots)) {
+            const queued = new Set(autoVideoSlots(handoff, 'queued_slots'));
+            handoff.pending_slots = autoVideoSlots(handoff, 'pending_slots').filter(slot => !queued.has(slot));
+        }
+        const terminal = ['completed', 'completed_with_warnings', 'cancelled', 'partial_failed', 'blocked', 'skipped'];
+        const previousTerminal = terminal.includes(previous.status)
+            && (!['blocked', 'skipped'].includes(previous.status) || previous.task_id);
+        if (previousTerminal && !terminal.includes(incoming.status)) {
+            handoff.status = previous.status;
+            handoff.message = previous.message;
+        }
+    }
+    ownerIdea.frameRun.auto_video = handoff;
+    if (typeof ownerIdea.auto_generate_videos !== 'boolean') ownerIdea.auto_generate_videos = true;
+    if (isViewingIdea(ownerIdea.id)) renderAutoVideoStatus(ownerIdea, handoff);
+    const frameTask = getIdeaTaskRecord(ownerIdea.id, 'frames');
+    if (frameTask) frameTask.autoVideo = handoff;
+    const key = `${ownerIdea.id}:${handoff.task_id || (frameTask && frameTask.taskId) || handoff.request_id || handoff.status}`;
+    let state = autoVideoHandoffs.get(key);
+    if (!state) {
+        state = { deliveredVideos: new Map(), attached: false };
+        autoVideoHandoffs.set(key, state);
+    }
+    const signature = JSON.stringify(handoff);
+    if (state.signature !== signature) {
+        state.signature = signature;
+        const pairing = autoVideoPairingText(handoff);
+        if (pairing && state.pairing !== pairing) {
+            state.pairing = pairing;
+            framesFeedLine(ownerIdea.id, `🔗 已识别首尾帧：${pairing}`, 'ok', `auto-video-pairs:${key}`);
+        }
+        const schedule = autoVideoSchedulingText(handoff);
+        const message = handoff.status === 'started'
+            ? `🎬 ${handoff.message || schedule || '首尾帧已就绪，立即生成对应视频'}`
+            : handoff.status === 'waiting' ? `🖼️ ${handoff.message || '等待首尾帧就绪，随后立即生成对应视频'}`
+            : handoff.status === 'completed' ? '🏁 自动视频已完成'
+            : handoff.status === 'completed_with_warnings' ? `⚠️ ${handoff.message || '自动视频已完成，请查看提示'}`
+            : handoff.status === 'cancelled' ? `⏹ ${handoff.message || '自动视频已取消'}`
+            : handoff.status === 'partial_failed' ? `⚠️ ${handoff.message || '自动视频部分完成，请检查未成功的片段'}`
+            : `⚠️ ${handoff.message || '自动视频未启动，请检查图片与视频提示词'}`;
+        framesFeedLine(ownerIdea.id, message, ['started', 'completed'].includes(handoff.status) ? 'ok'
+            : handoff.status === 'waiting' ? undefined : 'warn', `auto-video-status:${key}`);
+        if (handoff.status === 'blocked' && isViewingIdea(ownerIdea.id)) {
+            showToast(handoff.message || '自动视频未启动，请检查图片与视频提示词', 'warning');
+        }
+    }
+    const existing = getIdeaTaskRecord(ownerIdea.id, 'videos');
+    if (existing && existing.taskId === handoff.task_id) {
+        const targets = autoVideoSlots(handoff, 'target_slots');
+        if (targets.length) {
+            existing.targetSlots = targets;
+            existing.total = Math.max(existing.total || 0, targets.length);
+        }
+        existing.autoVideo = handoff;
+        if (typeof saveActiveBackgroundTasksToLocalStorage === 'function') saveActiveBackgroundTasksToLocalStorage();
+    }
+    if (handoff.status !== 'started' || !handoff.task_id) return;
+    if (existing) {
+        if (existing.taskId !== handoff.task_id) return;
+        if (existing.streaming !== false) { state.attached = true; return; }
+    } else if (state.attached) {
+        return;
+    }
+    state.attached = true;
+    const stream = streamVideosProgress(handoff.task_id, ownerIdea, handoff.target_slots,
+        { requestId: handoff.request_id, autoVideo: handoff, resumeSnapshot: existing || undefined });
+    if (stream && typeof stream.catch === 'function') {
+        stream.catch(error => console.warn('连接自动视频事件流失败', error));
+    }
+}
+
+function recordAutoVideoDelivery(ownerIdea, taskId, video, result) {
+    const state = autoVideoHandoffs.get(`${ownerIdea.id}:${taskId}`);
+    if (!state || state.frameSynced) return;
+    if (video) state.deliveredVideos.set(Number(video.slot), video);
+    if (result) state.result = result;
+}
+
+// 只有视频子任务自己的终态才能结束自动视频状态，图片父任务结束时仍保持 started。
+function settleAutoVideoHandoff(ownerIdea, taskId, status, message) {
+    const handoff = ownerIdea && ownerIdea.frameRun && ownerIdea.frameRun.auto_video;
+    if (!handoff || handoff.task_id !== taskId) return;
+    const terminal = ['completed', 'completed_with_warnings', 'cancelled', 'partial_failed', 'blocked', 'skipped'];
+    handleAutoVideoHandoff(ownerIdea, terminal.includes(handoff.status) && status !== 'cancelled' ? handoff
+        : { ...handoff, status, ...(message ? { message } : {}) });
+    if (typeof saveActiveBackgroundTasksToLocalStorage === 'function') saveActiveBackgroundTasksToLocalStorage();
+    if (isViewingIdea(ownerIdea.id) && typeof saveCurrentIdeaState === 'function') saveCurrentIdeaState();
+}
+
+// 帧 result 是接续视频启动时的快照，不能抹掉子任务已交付的视频。
+function mergeAutoVideoFrameResult(manifest, ownerIdea) {
+    const handoff = manifest && manifest.auto_video;
+    const state = handoff && autoVideoHandoffs.get(`${ownerIdea.id}:${handoff.task_id}`);
+    if (!state || state.frameSynced) return manifest;
+    if (state.result) return Object.assign({}, manifest, state.result, { auto_video: handoff });
+    const videos = new Map((manifest.videos || []).map(video => [Number(video.slot), video]));
+    state.deliveredVideos.forEach((video, slot) => videos.set(slot, video));
+    return Object.assign({}, manifest, { videos: Array.from(videos.values()).sort((a, b) => Number(a.slot) - Number(b.slot)) });
+}
+
+function hasIdeaCover(idea) {
+    if (!idea) return false;
+    if (Array.isArray(idea.covers) && idea.covers.length > 0) return true;
+    if (idea.activeCoverUrl) return true;
+    if (typeof coverRoleUrl === 'function' && coverRoleUrl(idea, 'frame1')) return true;
+    if (idea.cover || idea.cover_image) return true;
+    const run = idea.frameRun || {};
+    if (Array.isArray(run.frames) && run.frames.some(f => f && (f.url || f.image_url || f.file || f.path))) return true;
+    if (Array.isArray(idea.frames) && idea.frames.some(f => f && (f.url || f.image_url || f.file || f.path || (typeof f === 'string' && f.trim())))) return true;
+    if (Array.isArray(idea.images) && idea.images.some(img => img && (typeof img === 'string' && img.trim()))) return true;
+    return false;
+}
+
+function isSkipCoverReferenceEnabled(idea) {
+    const toggle = document.getElementById('frames-skip-cover-toggle');
+    if (toggle) {
+        return toggle.checked;
+    }
+    const roles = (idea && idea.coverRoles) || {};
+    if (roles['frame1'] === 'none') return true;
+    if (typeof config !== 'undefined' && (config.skipCoverReference || config.allowTextOnlyAnchor)) return true;
+    return false;
+}
+
 // Generate the complete IMAGE prompt chain as ordered still frames.
 function withCoverReference(baseConfig, idea) {
-    const covers = (idea && idea.covers) || [];
-    const chosen = (idea && idea.activeCoverUrl) || covers[covers.length - 1];
-    if (!chosen) return baseConfig;
-    return Object.assign({}, baseConfig, { coverReferencePath: chosen });
+    if (!idea || isSkipCoverReferenceEnabled(idea)) {
+        return Object.assign({}, baseConfig, {
+            coverReferencePath: 'none',
+            skipCoverReference: true,
+            allowTextOnlyAnchor: true
+        });
+    }
+    const chosen = (typeof coverRoleUrl === 'function') ? coverRoleUrl(idea, 'frame1') : null;
+    if (chosen) {
+        return Object.assign({}, baseConfig, {
+            coverReferencePath: chosen,
+            skipCoverReference: false,
+            allowTextOnlyAnchor: false
+        });
+    }
+    // 未勾选跳过封面时，若前端内存 idea 暂未装载完整封面 URL，
+    // 不应强行锁定为 'none'，应允许后端从项目目录/manifest 回落解析封面参考图
+    return Object.assign({}, baseConfig, {
+        coverReferencePath: null,
+        skipCoverReference: false,
+        allowTextOnlyAnchor: false
+    });
+}
+
+function isCandidateSelectionMode() {
+    const toggle = document.getElementById('pipeline-selection-checkbox');
+    return toggle ? toggle.checked : false;
+}
+
+/**
+ * 「4选1 模式」的当前值是不是用户自己设定过的（拨过开关，或点过 4选1 入口）。
+ *
+ * 开关只活在这个浏览器里：刷新页面、换浏览器、换设备之后 localStorage 是空的，
+ * 此时 isCandidateSelectionMode() 返回的 false 只是页面默认值，不是用户的意思。
+ * 把它当成「用户明确要求标准模式」发给服务端，会压过项目自己记着的
+ * candidate_selection，一单 4选1 的活就悄悄降级成单图直出（每帧渲完不做 AI
+ * 鉴别直接下一帧）。服务端据这面旗子决定要不要拿 manifest 兜底，
+ * 见 server_common.resolve_candidate_selection_mode。
+ */
+function candidateSelectionModeIsExplicit() {
+    try {
+        return localStorage.getItem('pipeline_candidate_selection_mode') !== null;
+    } catch (e) {
+        return false;
+    }
+}
+
+/**
+ * 打开/恢复一个项目时，让「4选1 模式」开关跟着这一单走。
+ *
+ * 旧行为是反过来的：拿开关的当前值去写 idea.generation_mode。开关只活在浏览器
+ * 里，刷新之后是关的，于是一打开项目就把这单「我是 4选1」的记忆抹掉，之后的
+ * 续跑/单帧重试全部退回标准模式（每帧渲完不做 AI 鉴别直接下一帧）。模式是项目
+ * 的属性，不是浏览器的属性，所以这里只回填、不覆盖。
+ *
+ * 有意不写 localStorage：那份是「用户的全局默认」，不该被打开某个项目改写。
+ * 开关因此可能与 generation_mode_explicit 不同步，服务端会拿 manifest 兜底得出
+ * 同样的结论（server_common.resolve_candidate_selection_mode）。
+ */
+function syncCandidateModeToggleFromIdea(idea) {
+    if (!idea) return;
+    const mode = typeof idea.generation_mode === 'string' ? idea.generation_mode.trim() : '';
+    if (mode !== 'candidate_selection' && mode !== 'standard') {
+        // 这一单没记过模式（老项目、刚导入的提示词集）：沿用当前开关并写回去
+        if (typeof isCandidateSelectionMode === 'function') {
+            idea.generation_mode = isCandidateSelectionMode() ? 'candidate_selection' : 'standard';
+        }
+        return;
+    }
+    const on = (mode === 'candidate_selection');
+    const toggle = document.getElementById('pipeline-selection-checkbox');
+    if (toggle) toggle.checked = on;
+    const toggleLabel = document.getElementById('pipeline-selection-mode-toggle');
+    if (toggleLabel) toggleLabel.classList.toggle('is-active', on);
+    if (typeof config !== 'undefined' && config) {
+        config.candidateSelectionMode = on;
+        config.candidateSelection = on;
+        config.generation_mode = mode;
+    }
+    if (typeof updatePipelineBar === 'function') updatePipelineBar();
+}
+
+/** 把 4选1 模式记成用户的显式选择：开关、localStorage、config 三处一起对齐。
+    「🎯 4选1 智能生成」这类直接入口用它——点了就是表过态，刷新后不该丢。 */
+function markCandidateSelectionMode(enabled) {
+    const on = !!enabled;
+    const toggle = document.getElementById('pipeline-selection-checkbox');
+    if (toggle) toggle.checked = on;
+    const toggleLabel = document.getElementById('pipeline-selection-mode-toggle');
+    if (toggleLabel) toggleLabel.classList.toggle('is-active', on);
+    try {
+        localStorage.setItem('pipeline_candidate_selection_mode', on ? 'true' : 'false');
+    } catch (e) {}
+    if (typeof config !== 'undefined' && config) {
+        config.candidateSelectionMode = on;
+        config.candidateSelection = on;
+        config.generation_mode = on ? 'candidate_selection' : 'standard';
+        try {
+            localStorage.setItem('spark_config', JSON.stringify(config));
+        } catch (e) {}
+    }
+    if (typeof updatePipelineBar === 'function') updatePipelineBar();
 }
 
 async function generateFrames() {
+    if (isCandidateSelectionMode()) {
+        return generateFramesSelection();
+    }
     if (!currentIdea || !currentIdea.prompt_block) {
         showToast("请先激发一个创意点子！", "error");
         return;
     }
     const ownerIdea = currentIdea;
+    const skipCover = isSkipCoverReferenceEnabled(ownerIdea);
+    const hasCover = hasIdeaCover(ownerIdea);
+    if (!skipCover && !hasCover) {
+        const ok = await customConfirm("尚未生成封面图，是否直接开始生成帧序列？<br>（将使用纯文生图渲染第 1 帧）");
+        if (!ok) return;
+    }
     if (isIdeaTaskActive(ownerIdea.id, 'frames')) {
         showToast("该创意的帧序列已在生成中，请稍候", "error");
         return;
+    }
+    if (isIdeaTaskActive(ownerIdea.id, 'videos')) {
+        showToast('该创意的视频任务正在进行中，请稍候再生成图片', 'info');
+        return;
+    }
+
+    // 生成前同步提示词的新版本，避免使用浏览器里过期的项目快照。
+    if (typeof ensureFreshPromptBlock === 'function') {
+        await ensureFreshPromptBlock(ownerIdea, '生成帧序列');
     }
 
     const btn = document.getElementById('generate-frames-btn');
@@ -3407,13 +4652,25 @@ async function generateFrames() {
         : '准备生成帧序列...';
 
     try {
+        if (ownerIdea) {
+            ownerIdea.generation_mode = 'standard';
+        }
         const body = {
             config: withCoverReference(config, ownerIdea),
             title: getIdeaSaveTitle(ownerIdea),
             display_title: ownerIdea.title,
-            prompt_block: ownerIdea.prompt_block
+            prompt_block: ownerIdea.prompt_block,
+            generation_source: ownerIdea.generation_source,
+            generation_mode: 'standard',
+            generation_mode_explicit: candidateSelectionModeIsExplicit(),
+            candidate_selection: false,
+            candidate_count: 1,
+            degraded: ownerIdea.degraded === true,
+            quality_gate: ownerIdea.quality_gate || null,
+            diagnostic_mode: ownerIdea.diagnostic_mode === true
         };
         if (targetSequences) body.target_sequences = targetSequences;
+        applyAutoVideoRequestOptions(body, ownerIdea);
 
         const response = await fetch('/api/generate_frames', {
             method: 'POST',
@@ -3445,6 +4702,482 @@ async function generateFrames() {
     }
 }
 
+async function generateFramesSelection() {
+    if (!currentIdea || !currentIdea.prompt_block) {
+        showToast("请先激发一个创意点子！", "error");
+        return;
+    }
+
+    const ownerIdea = currentIdea;
+    if (isIdeaTaskActive(ownerIdea.id, 'frames')) {
+        showToast("该创意的帧序列已在生成中，请稍候", "error");
+        return;
+    }
+    if (isIdeaTaskActive(ownerIdea.id, 'videos')) {
+        showToast('该创意的视频任务正在进行中，请稍候再生成图片', 'info');
+        return;
+    }
+
+    if (typeof ensureFreshPromptBlock === 'function') {
+        await ensureFreshPromptBlock(ownerIdea, '生成 4选1 帧序列');
+    }
+
+    const skipCover = isSkipCoverReferenceEnabled(ownerIdea);
+    const hasCover = hasIdeaCover(ownerIdea);
+    if (!skipCover && !hasCover) {
+        const ok = await customConfirm("尚未生成封面图，是否直接开始 4选1 智能帧序列生成？<br>（将使用纯文生图渲染第 1 帧）");
+        if (!ok) return;
+    }
+
+    const btn = document.getElementById('generate-frames-btn');
+    const selBtn = document.getElementById('generate-frames-selection-btn');
+    const progress = document.getElementById('frames-progress');
+    const meta = document.getElementById('frames-meta');
+    const grid = slotRenderTarget('image');
+    if (!btn || !progress || !meta || !grid) return;
+
+    const targetSequences = computeDebugTargets('frames', ownerIdea, 'image');
+
+    if (btn) btn.disabled = true;
+    if (selBtn) selBtn.disabled = true;
+    progress.style.display = 'flex';
+    meta.textContent = targetSequences
+        ? `🚀 正在启动 4选1 智能帧序列生成（调试模式：仅前 ${targetSequences.length} 帧）...`
+        : '🚀 正在启动 4选1 智能帧序列生成与 AI 鉴别管线...';
+
+    try {
+        if (ownerIdea) {
+            ownerIdea.generation_mode = 'candidate_selection';
+        }
+        // 从这个入口起过一单，就是用户对模式表过态了：同步开关与 localStorage，
+        // 否则刷新页面后开关还是关的，后续的续跑/重试会全部退回标准模式。
+        markCandidateSelectionMode(true);
+        const body = {
+            config: withCoverReference(config, ownerIdea),
+            title: getIdeaSaveTitle(ownerIdea),
+            display_title: ownerIdea.title,
+            prompt_block: ownerIdea.prompt_block,
+            generation_mode: 'candidate_selection',
+            generation_mode_explicit: true,
+            candidate_selection: true,
+            candidate_count: 4
+        };
+        if (targetSequences) body.target_sequences = targetSequences;
+        applyAutoVideoRequestOptions(body, ownerIdea);
+
+        const response = await fetch('/api/generate_frames_selection', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body)
+        });
+
+        if (!response.ok) {
+            const errText = await response.text();
+            throw new Error(`HTTP ${response.status}: ${errText}`);
+        }
+
+        const data = await response.json();
+        const taskId = data.task_id;
+
+        streamFramesProgress(taskId, ownerIdea, targetSequences);
+    } catch (e) {
+        console.error("Failed to generate frames selection:", e);
+        if (isViewingIdea(ownerIdea.id)) {
+            meta.textContent = `4选1 智能生成失败: ${e.message}`;
+            renderFramesForIdea(ownerIdea);
+            progress.style.display = 'none';
+            if (btn) btn.disabled = false;
+            if (selBtn) selBtn.disabled = false;
+        }
+        showToast(`4选1 智能生成失败: ${e.message}`, "error");
+    }
+}
+
+async function openCandidateSelectionModal(seq, frameData) {
+    const modal = document.getElementById('candidate-selection-modal');
+    if (!modal) return;
+
+    const seqNum = Number(seq);
+
+    // 1. 若外部未传 frameData，从 currentIdea.frameRun.frames 中获取
+    if (!frameData && typeof currentIdea !== 'undefined' && currentIdea && currentIdea.frameRun && currentIdea.frameRun.frames) {
+        frameData = currentIdea.frameRun.frames.find(f => Number(f.sequence) === seqNum || Number(f.slot) === seqNum) || {};
+    }
+
+    // 2. 主动从后端精准同步该帧全量候选池最新数据（兼容历史单张生成、4选1、重试与上传）
+    if (typeof currentIdea !== 'undefined' && currentIdea) {
+        const projectTitle = (typeof getIdeaSaveTitle === 'function') ? getIdeaSaveTitle(currentIdea) : (currentIdea.project_key || currentIdea.title);
+        if (projectTitle) {
+            try {
+                // 优先请求精准候选池接口 /api/get_frame_candidates
+                const resp = await fetch(`/api/get_frame_candidates?title=${encodeURIComponent(projectTitle)}&sequence=${seqNum}`);
+                if (resp.ok) {
+                    const candData = await resp.json();
+                    if (candData && Array.isArray(candData.candidates) && candData.candidates.length > 0) {
+                        if (!currentIdea.frameRun) currentIdea.frameRun = {};
+                        if (!Array.isArray(currentIdea.frameRun.frames)) currentIdea.frameRun.frames = [];
+                        let f = currentIdea.frameRun.frames.find(x => Number(x.sequence) === seqNum || Number(x.slot) === seqNum);
+                        if (!f) {
+                            f = { sequence: seqNum, slot: seqNum };
+                            currentIdea.frameRun.frames.push(f);
+                        }
+                        f.candidates = candData.candidates;
+                        if (candData.chosen_candidate_index != null) {
+                            f.chosen_candidate_index = candData.chosen_candidate_index;
+                        }
+                        if (candData.ai_evaluation) {
+                            f.ai_evaluation = candData.ai_evaluation;
+                        }
+                        if (candData.candidate_selection_reason) {
+                            f.candidate_selection_reason = candData.candidate_selection_reason;
+                        }
+                        frameData = f;
+                        if (typeof saveCurrentIdeaState === 'function') saveCurrentIdeaState();
+                    }
+                } else {
+                    // 降级回退到 /api/get_manifest
+                    const mfResp = await fetch(`/api/get_manifest?title=${encodeURIComponent(projectTitle)}`);
+                    if (mfResp.ok) {
+                        const mf = await mfResp.json();
+                        if (mf && Array.isArray(mf.frames)) {
+                            if (!currentIdea.frameRun) currentIdea.frameRun = {};
+                            currentIdea.frameRun.frames = mf.frames;
+                            frameData = mf.frames.find(f => Number(f.sequence) === seqNum || Number(f.slot) === seqNum) || {};
+                            if (typeof saveCurrentIdeaState === 'function') saveCurrentIdeaState();
+                        }
+                    }
+                }
+            } catch (e) {
+                console.warn('[Candidates] 同步最新候选池异常:', e);
+            }
+        }
+    }
+
+    const titleEl = document.getElementById('candidate-modal-title');
+    const seqEl = document.getElementById('candidate-modal-seq');
+    const chosenTagEl = document.getElementById('candidate-modal-chosen-tag');
+    const reasonEl = document.getElementById('candidate-modal-reason') || document.getElementById('candidate-modal-reasoning');
+    const gridEl = document.getElementById('candidates-modal-grid') || document.getElementById('candidate-cards-grid');
+
+    const padSeq = String(seqNum || 1).padStart(3, '0');
+    let candidates = (frameData && Array.isArray(frameData.candidates)) ? frameData.candidates : [];
+    if (!candidates.length && frameData && (frameData.url || frameData.file)) {
+        candidates = [{
+            index: 1,
+            url: frameData.url || frameData.file,
+            score: 85,
+            strengths: '基础主帧画面',
+            defects: '',
+            is_chosen: true
+        }];
+    }
+
+    const beatTag = Number(seqNum) === 1 ? '初始毛坯锚点' : `交付节拍 B${String(Number(seqNum) - 1).padStart(2, '0')}`;
+    if (seqEl) seqEl.textContent = `IMG ${padSeq} (${beatTag})`;
+    if (titleEl) {
+        titleEl.textContent = candidates.length > 4
+            ? `🎯 IMG ${padSeq} · 【${beatTag}】候选图池 (${candidates.length}张) 对比与 AI 鉴别详情`
+            : `🎯 IMG ${padSeq} · 【${beatTag}】4选1 候选图对比与 AI 鉴别详情`;
+    }
+
+    const aiEval = (frameData && frameData.ai_evaluation) || {};
+    const chosenIdx = (frameData && frameData.chosen_candidate_index) || 1;
+
+    if (chosenTagEl) {
+        chosenTagEl.textContent = `👑 当前采用: 候选 #${chosenIdx}`;
+    }
+
+    if (reasonEl) {
+        const reasonText = aiEval.selection_reason || (frameData && frameData.candidate_selection_reason) || (frameData && frameData.vlm_qa_reason) || 'AI 智能鉴别优选完成';
+        const bestIdx = aiEval.best_index || chosenIdx;
+        reasonEl.innerHTML = `${escapeHtml(reasonText)} <span style="margin-left:8px; padding:2px 8px; border-radius:10px; background:rgba(16,185,129,0.2); color:#10b981; font-weight:600;">推荐采用: 候选 #${bestIdx}</span>`;
+    }
+
+    const bmBoxEl = document.getElementById('candidate-modal-benchmark-box');
+    if (bmBoxEl) {
+        const curIdea = typeof currentIdea !== 'undefined' ? currentIdea : null;
+        const refFrames = (curIdea && (curIdea.ref_frames || (curIdea.frameRun && curIdea.frameRun.ref_frames))) || {};
+        const refRoles = (curIdea && (curIdea.ref_frame_roles || (curIdea.frameRun && curIdea.frameRun.ref_frame_roles))) || {};
+        const refUrl = refFrames[seqNum] || refFrames[String(seqNum)] || '';
+        // 过门梯这一格原片没拍过，附件只是硬切另一侧最近的一张幸存帧：
+        // 标成「黄金对标基准」会让人照着一张跨空间层的图对机位。
+        // establishing 是另一档：同空间最近的一张全景，机位构图能对、施工进度对不得。
+        const refRole = refRoles[seqNum] || refRoles[String(seqNum)] || 'benchmark';
+        const refIsEnvelope = refRole === 'envelope';
+        const refIsEstablishing = refRole === 'establishing';
+        const refRoleTag = refIsEnvelope ? '包络端点'
+            : (refIsEstablishing ? '同空间全景参考' : '黄金对标基准');
+        if (refUrl) {
+            bmBoxEl.style.display = 'block';
+            bmBoxEl.innerHTML = `
+                <div style="display:flex; align-items:center; justify-content:space-between; background:rgba(245,158,11,0.08); border:1px solid rgba(245,158,11,0.3); border-radius:8px; padding:10px 14px; gap:12px; flex-wrap:wrap;">
+                    <div style="display:flex; align-items:center; gap:12px;">
+                        <img ${typeof MediaPreview !== 'undefined' ? MediaPreview.attrs(refUrl) : `src="${escapeHtml(refUrl)}"`} style="width:48px; height:85px; object-fit:cover; border-radius:4px; border:1px solid #f59e0b; cursor:pointer;" onclick="if(window.openLightbox) openLightbox('${escapeHtml(refUrl)}')" title="点击放大参考原片节拍抽帧" />
+                        <div>
+                            <div style="font-weight:700; font-size:13px; color:#f59e0b; display:flex; align-items:center; gap:6px;">
+                                <span>🎯 参考原片节拍抽帧 (REF ${padSeq})</span>
+                                <span style="font-size:11px; background:rgba(245,158,11,0.2); padding:1px 6px; border-radius:4px; font-weight:600;">${refRoleTag}</span>
+                            </div>
+                            <div style="font-size:11.5px; color:#94a3b8; margin-top:3px; line-height:1.4;">
+                                ${refIsEnvelope
+                                    ? `原片硬切过门，没有拍过第 ${seqNum} 拍（${escapeHtml(beatTag)}）这个镜头；这只是切点一侧最近的一张帧，只用于核对场景与材质连续，不用来对机位与构图`
+                                    : (refIsEstablishing
+                                        ? `原片第 ${seqNum} 拍（${escapeHtml(beatTag)}）全程是特写，没有可对机位的全景；这是同一个空间里最近的一张全景，用来对机位站位、构图留白与尺度，不用来对施工进度`
+                                        : `作为第 ${seqNum} 拍（${escapeHtml(beatTag)}）机位透视、光照色调与施工差量的标准对标参考`)}
+                            </div>
+                        </div>
+                    </div>
+                    <button type="button" class="action-btn text-btn mini-btn" style="color:#f59e0b; border-color:rgba(245,158,11,0.5); background:rgba(245,158,11,0.1); font-weight:600; padding:4px 12px;" onclick="if(typeof openBenchmarkCompare==='function') openBenchmarkCompare({ seq: ${seqNum} }); else if(typeof openCollageViewer==='function') openCollageViewer({ idea: typeof currentIdea !== 'undefined' ? currentIdea : null, initialMode: 'compare', compareType: 'benchmark', initialFrameSeq: ${seqNum} })">
+                        ⇄ 打开分屏滑块实时对标
+                    </button>
+                </div>
+            `;
+        } else {
+            bmBoxEl.style.display = 'none';
+            bmBoxEl.innerHTML = '';
+        }
+    }
+
+    const filterBarEl = document.getElementById('candidate-model-filter-bar');
+
+    function getCandidateModelInfo(cand) {
+        const m = ((cand && cand.model) || '').toLowerCase();
+        const disp = (cand && cand.model_display) || '';
+        const uuid = (cand && cand.fx_uuid) || '';
+        const fUrl = ((cand && (cand.url || cand.file)) || '').toLowerCase();
+
+        if (m.includes('gpt') || disp.includes('GPT') || fUrl.includes('gpt')) {
+            return { key: 'gpt', label: 'GPT-2', icon: '🟣', color: '#c084fc', bg: 'rgba(168,85,247,0.22)', border: 'rgba(192,132,252,0.45)' };
+        }
+        if (m.includes('google_fx') || m.includes('fx') || disp.includes('FX') || uuid || fUrl.includes('fx_batch')) {
+            return { key: 'fx', label: 'Google FX', icon: '🔵', color: '#38bdf8', bg: 'rgba(56,189,248,0.22)', border: 'rgba(56,189,248,0.45)' };
+        }
+        if (m.includes('gemini') || disp.includes('Gemini')) {
+            return { key: 'gemini', label: 'Gemini', icon: '🟢', color: '#34d399', bg: 'rgba(16,185,129,0.22)', border: 'rgba(52,211,153,0.45)' };
+        }
+        return { key: 'other', label: disp || '标准/通用', icon: '⚪', color: '#94a3b8', bg: 'rgba(148,163,184,0.18)', border: 'rgba(148,163,184,0.35)' };
+    }
+
+    let activeModelFilter = 'all';
+
+    function renderCandidateCards(filterKey = 'all') {
+        if (!gridEl) return;
+        gridEl.innerHTML = '';
+
+        const filtered = (filterKey === 'all')
+            ? candidates
+            : candidates.filter(c => getCandidateModelInfo(c).key === filterKey);
+
+        if (!filtered.length) {
+            gridEl.innerHTML = `<div style="grid-column:1/-1; text-align:center; padding:36px 20px; color:var(--text-muted);">
+                <div style="font-size:32px; margin-bottom:10px;">🔍</div>
+                <div style="font-weight:600; font-size:14px; color:var(--text-primary); margin-bottom:6px;">该模型分类下暂无候选图</div>
+                <div style="font-size:12px;">点击「全部」可查看该帧的所有历史候选图。</div>
+            </div>`;
+            return;
+        }
+
+        const scoreGroups = [
+            ['process', '工序准确', 30],
+            ['continuity', '空间连续', 30],
+            ['realism', '材质真实', 25],
+            ['defects', '瑕疵控制', 15]
+        ];
+        const subscoreLabels = [
+            ['core_milestone', '核心节点', 12], ['physical_delta', '物理差量', 8],
+            ['state_progression', '状态演进', 6], ['actions_materials', '动作材料', 4],
+            ['camera_fidelity', '机位构图', 8], ['anchor_stability', '锚点稳定', 8],
+            ['scale_depth', '尺度景深', 6], ['previous_continuity', '前帧连续', 5],
+            ['next_reachability', '后帧衔接', 3], ['material_realism', '材质真实', 8],
+            ['lighting_consistency', '光影一致', 6], ['human_realism', '真人质感', 6],
+            ['physical_reference_fidelity', '物理/原片', 5], ['anatomy_integrity', '人物完整', 5],
+            ['image_integrity', '图像完整', 5], ['lifecycle_composition_integrity', '工具/构图', 5]
+        ];
+        const hardFlagLabels = {
+            ghost_structure_revival: '已拆结构复活', wrong_scene_or_carrier: '场景/载体错误',
+            core_process_missing: '核心工序缺失', severe_spatial_collapse: '严重空间畸变',
+            severe_anatomy: '严重人物畸变', plastic_human: '塑料/玩偶人物'
+        };
+
+        filtered.forEach(cand => {
+            const cIdx = cand.index || 1;
+            const isChosen = Number(cIdx) === Number(chosenIdx);
+            const score = cand.score != null ? cand.score : '--';
+            const strengths = cand.strengths || '';
+            const defects = cand.defects || '';
+            const mInfo = getCandidateModelInfo(cand);
+            const groups = cand.group_scores || {};
+            const subscores = cand.subscores || {};
+            const groupScoreHtml = Object.keys(groups).length ? `
+                <div style="display:grid; grid-template-columns:1fr 1fr; gap:3px 8px; margin:7px 0; color:var(--text-secondary);">
+                    ${scoreGroups.map(([key, label, max]) => `<span>${label} <b style="color:var(--text-primary);">${groups[key] ?? 0}/${max}</b></span>`).join('')}
+                </div>` : '';
+            const subscoreHtml = Object.keys(subscores).length ? `
+                <details style="margin:5px 0; color:var(--text-secondary);">
+                    <summary style="cursor:pointer; color:var(--accent-blue, #60a5fa);">查看16项评分明细</summary>
+                    <div style="display:grid; grid-template-columns:1fr 1fr; gap:2px 8px; margin-top:6px;">
+                        ${subscoreLabels.map(([key, label, max]) => `<span>${label}：${subscores[key] ?? 0}/${max}</span>`).join('')}
+                    </div>
+                </details>` : '';
+            const hardFlags = Array.isArray(cand.hard_flags) ? cand.hard_flags : [];
+            const hardFlagHtml = hardFlags.length ? `<div style="color:#f87171; margin:5px 0;"><strong>硬伤：</strong>${hardFlags.map(flag => escapeHtml(hardFlagLabels[flag] || flag)).join('、')}${cand.disqualified ? '（已淘汰）' : cand.score_cap < 100 ? `（封顶${cand.score_cap}分）` : ''}</div>` : '';
+            let fileUrl = cand.url || cand.file || '';
+            if (fileUrl && !fileUrl.startsWith('/') && !fileUrl.startsWith('http') && !fileUrl.startsWith('data:')) {
+                fileUrl = '/' + fileUrl;
+            }
+
+            const card = document.createElement('div');
+            card.className = `candidate-card ${isChosen ? 'chosen' : ''}`;
+
+            card.innerHTML = `
+                <div class="candidate-thumb-wrap" style="position:relative; aspect-ratio: 9/16; background:#0f172a; overflow:hidden; cursor:pointer;" title="点击查看大图" onclick="if(window.openLightbox) openLightbox('${escapeHtml(fileUrl)}')">
+                    <img ${typeof MediaPreview !== 'undefined' ? MediaPreview.attrs(fileUrl) : `src="${escapeHtml(fileUrl)}"`} alt="Candidate #${cIdx}" style="width:100%; height:100%; object-fit:cover;" onerror="this.onerror=null; if(window.MediaPreview) MediaPreview.setSource(this, this.getAttribute('data-media-preview-src')); else this.src='${escapeHtml(fileUrl)}';" />
+                    <div style="position:absolute; top:8px; left:8px; background:rgba(0,0,0,0.8); backdrop-filter:blur(4px); color:#fff; font-size:11px; padding:3px 7px; border-radius:4px; font-weight:bold;">
+                        #${cIdx}
+                    </div>
+                    <div style="position:absolute; top:8px; left:48px; background:${mInfo.bg}; border:1px solid ${mInfo.border}; color:${mInfo.color}; font-size:10.5px; padding:2px 7px; border-radius:4px; font-weight:700; backdrop-filter:blur(4px); display:flex; align-items:center; gap:3px;">
+                        <span>${mInfo.icon}</span><span>${escapeHtml(mInfo.label)}</span>
+                    </div>
+                    <div style="position:absolute; top:8px; right:8px; background:${isChosen ? '#10b981' : 'rgba(0,0,0,0.65)'}; backdrop-filter:blur(4px); color:#fff; font-size:11px; padding:3px 7px; border-radius:4px; font-weight:bold;">
+                        ${score} 分
+                    </div>
+                    ${isChosen ? '<div style="position:absolute; bottom:8px; left:8px; right:8px; background:linear-gradient(135deg, #10b981, #059669); color:#fff; font-size:11px; text-align:center; padding:3px 6px; border-radius:4px; font-weight:bold; box-shadow:0 2px 6px rgba(0,0,0,0.3);">👑 当前采用</div>' : ''}
+                </div>
+                <div style="padding:12px; font-size:12px; flex:1; display:flex; flex-direction:column; justify-content:space-between; gap:8px;">
+                    <div style="color:var(--text-muted, #94a3b8); line-height:1.45; font-size:11.5px;">
+                        <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:4px;">
+                            <span style="font-weight:600; color:${mInfo.color}; font-size:11px;">${mInfo.icon} ${escapeHtml(mInfo.label)} 模型生成</span>
+                        </div>
+                        ${strengths ? `<div style="color:#10b981; margin-bottom:4px;"><strong>+</strong> ${escapeHtml(strengths)}</div>` : ''}
+                        ${defects ? `<div style="color:#f87171;"><strong>-</strong> ${escapeHtml(defects)}</div>` : ''}
+                        ${groupScoreHtml}
+                        ${subscoreHtml}
+                        ${hardFlagHtml}
+                        ${!strengths && !defects ? `<div style="color:var(--text-secondary);">候选图 #${cIdx}（评分: ${score}）</div>` : ''}
+                    </div>
+                    <div style="margin-top:auto;">
+                        ${isChosen 
+                            ? `<button type="button" class="action-btn text-btn mini-btn" style="width:100%; border-color:#10b981; color:#10b981; background:rgba(16,185,129,0.1); cursor:default; font-weight:600;" disabled>✅ 当前已采用</button>`
+                            : `<button type="button" class="action-btn text-btn mini-btn" style="width:100%; color:var(--accent-orange, #f59e0b); border-color:rgba(245,158,11,0.5); font-weight:600;" onclick="switchCandidateForFrame(${seqNum}, ${cIdx})">👉 设为采用此图</button>`
+                        }
+                    </div>
+                </div>
+            `;
+            gridEl.appendChild(card);
+        });
+    }
+
+    // Render model filter tabs
+    if (filterBarEl) {
+        filterBarEl.innerHTML = '';
+        if (candidates.length > 1) {
+            const counts = { all: candidates.length, gpt: 0, fx: 0, gemini: 0, other: 0 };
+            candidates.forEach(c => {
+                const k = getCandidateModelInfo(c).key;
+                if (counts[k] != null) counts[k]++;
+            });
+
+            const filterTabs = [
+                { key: 'all', label: `🏷️ 全部 (${counts.all})`, color: 'var(--text-primary)' },
+                ...(counts.gpt > 0 ? [{ key: 'gpt', label: `🟣 GPT-2 (${counts.gpt})`, color: '#c084fc' }] : []),
+                ...(counts.fx > 0 ? [{ key: 'fx', label: `🔵 Google FX (${counts.fx})`, color: '#38bdf8' }] : []),
+                ...(counts.gemini > 0 ? [{ key: 'gemini', label: `🟢 Gemini (${counts.gemini})`, color: '#34d399' }] : []),
+                ...(counts.other > 0 ? [{ key: 'other', label: `⚪ 通用 (${counts.other})`, color: '#94a3b8' }] : []),
+            ];
+
+            if (filterTabs.length > 2) {
+                filterBarEl.style.display = 'flex';
+                filterTabs.forEach(tab => {
+                    const btn = document.createElement('button');
+                    btn.type = 'button';
+                    btn.className = `model-filter-btn ${activeModelFilter === tab.key ? 'active' : ''}`;
+                    btn.style.cssText = `padding: 4px 12px; border-radius: 16px; font-size: 12px; font-weight: 600; cursor: pointer; border: 1px solid ${activeModelFilter === tab.key ? tab.color : 'rgba(255,255,255,0.12)'}; background: ${activeModelFilter === tab.key ? 'rgba(255,255,255,0.1)' : 'transparent'}; color: ${activeModelFilter === tab.key ? tab.color : 'var(--text-secondary)'}; transition: all 0.2s ease;`;
+                    btn.textContent = tab.label;
+                    btn.onclick = () => {
+                        activeModelFilter = tab.key;
+                        filterBarEl.querySelectorAll('button').forEach(b => {
+                            b.style.background = 'transparent';
+                            b.style.borderColor = 'rgba(255,255,255,0.12)';
+                            b.style.color = 'var(--text-secondary)';
+                        });
+                        btn.style.background = 'rgba(255,255,255,0.1)';
+                        btn.style.borderColor = tab.color;
+                        btn.style.color = tab.color;
+                        renderCandidateCards(activeModelFilter);
+                    };
+                    filterBarEl.appendChild(btn);
+                });
+            } else {
+                filterBarEl.style.display = 'none';
+            }
+        } else {
+            filterBarEl.style.display = 'none';
+        }
+    }
+
+    renderCandidateCards('all');
+
+    modal.style.display = 'flex';
+    modal.classList.add('active');
+}
+
+function closeCandidateSelectionModal() {
+    const modal = document.getElementById('candidate-selection-modal');
+    if (!modal) return;
+    modal.classList.remove('active');
+    setTimeout(() => {
+        if (!modal.classList.contains('active')) {
+            modal.style.display = 'none';
+        }
+    }, 200);
+}
+
+async function switchCandidateForFrame(seq, candidateIndex) {
+    if (!currentIdea) return;
+    const ownerIdea = currentIdea;
+    const projectTitle = (typeof getIdeaSaveTitle === 'function') ? getIdeaSaveTitle(ownerIdea) : (ownerIdea.project_key || ownerIdea.title);
+
+    try {
+        const response = await fetch('/api/switch_candidate', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                title: projectTitle,
+                sequence: Number(seq),
+                candidate_index: Number(candidateIndex)
+            })
+        });
+
+        if (!response.ok) {
+            const errText = await response.text();
+            throw new Error(`HTTP ${response.status}: ${errText}`);
+        }
+
+        const data = await response.json();
+        showToast(`已成功切换 IMG ${String(seq).padStart(3, '0')} 为候选 #${candidateIndex}`, "success");
+
+        if (data.manifest && data.manifest.frames) {
+            ownerIdea.frameRun = {
+                ...(ownerIdea.frameRun || {}),
+                frames: data.manifest.frames
+            };
+            if (typeof isViewingIdea === 'function' ? isViewingIdea(ownerIdea.id) : true) {
+                renderFramesForIdea(ownerIdea);
+            }
+            if (typeof saveCurrentIdeaState === 'function') saveCurrentIdeaState();
+        }
+
+        closeCandidateSelectionModal();
+
+    } catch (e) {
+        console.error("Failed to switch candidate:", e);
+        showToast(`切换候选图失败: ${e.message}`, "error");
+    }
+}
+
+window.openCandidateSelectionModal = openCandidateSelectionModal;
+window.closeCandidateSelectionModal = closeCandidateSelectionModal;
+window.switchCandidateForFrame = switchCandidateForFrame;
 
 // Function renderFramesForIdea moved to modular JS file
 
@@ -3467,14 +5200,22 @@ async function generateVideos() {
         return;
     }
 
+    if (typeof ensureFreshPromptBlock === 'function') {
+        await ensureFreshPromptBlock(ownerIdea, '生成视频序列');
+    }
+
     // Check for frames that failed the post-render sequence consistency review
     const reviewCheck = await confirmSequenceReviewOverride(ownerIdea, null);
     if (!reviewCheck.proceed) return;
+    if (isIdeaTaskActive(ownerIdea.id, 'videos')) {
+        showToast('该创意的视频任务正在进行中，请稍候', 'info');
+        return;
+    }
 
     const btn = document.getElementById('generate-videos-btn');
     const progress = document.getElementById('videos-progress');
     const meta = document.getElementById('videos-meta');
-    const grid = document.getElementById('videos-grid');
+    const grid = slotRenderTarget('video');
     if (!btn || !progress || !meta || !grid) return;
 
     const targetSlots = computeDebugTargets('videos', ownerIdea, 'video');
@@ -3485,57 +5226,48 @@ async function generateVideos() {
         ? `准备生成视频序列（调试模式：仅前 ${targetSlots.length} 段）...`
         : '准备生成视频序列...';
 
+    let operation = null;
     try {
+        operation = beginVideoOperation(ownerIdea, targetSlots);
         const body = {
-            config,
+            config: typeof videoConfigForIdea === 'function' ? videoConfigForIdea(config, ownerIdea) : config,
             title: getIdeaSaveTitle(ownerIdea),
             display_title: ownerIdea.title,
             prompt_block: ownerIdea.prompt_block,
-            override_flagged: reviewCheck.override
+            override_flagged: reviewCheck.override,
+            merge_speed: getMergeSpeed()
         };
         if (targetSlots) body.target_slots = targetSlots;
 
-        const response = await fetch('/api/generate_videos', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(body)
-        });
-
-        if (!response.ok) {
-            const errText = await response.text();
-            throw new Error(`HTTP ${response.status}: ${errText}`);
-        }
-
-        const data = await response.json();
+        const data = await submitVideoOperation(operation, '/api/generate_videos', body);
+        if (operation.cancelRequested) { await cancelVideoOperation(ownerIdea, operation); return; }
         const taskId = data.task_id;
 
         // 同 generateFrames：不 await，交给 streamVideosProgress 在后台独立跑完。
         streamVideosProgress(taskId, ownerIdea, targetSlots);
     } catch (e) {
+        if (e.submissionPending) {
+            const message = await handleVideoSubmissionPending(ownerIdea, e);
+            if (operation && getIdeaTaskRecord(ownerIdea.id, 'videos') === operation) endIdeaTask(ownerIdea.id, 'videos');
+            settleVideoOperationView(ownerIdea);
+            if (isViewingIdea(ownerIdea.id) && meta) meta.textContent = message;
+            return;
+        }
+        if (e.uncertain && operation) {
+            if (isViewingIdea(ownerIdea.id) && meta) meta.textContent = e.message;
+            showToast(e.message, 'warning');
+            scheduleVideoOperationRecovery(ownerIdea, operation);
+            return;
+        }
+        if (operation && getIdeaTaskRecord(ownerIdea.id, 'videos') === operation) endIdeaTask(ownerIdea.id, 'videos');
         console.error("Failed to generate videos:", e);
         showToast(`视频生成失败: ${e.message}`, "error");
 
         if (isViewingIdea(ownerIdea.id)) {
             meta.textContent = `视频生成失败: ${e.message}`;
-            const placeholders = grid.querySelectorAll('.placeholder-frame-card');
-            placeholders.forEach(card => {
+            grid.querySelectorAll('.placeholder-frame-card').forEach(card => {
                 const slotMatch = card.id && card.id.match(/video-slot-(\d+)/);
-                const slotIdx = slotMatch ? parseInt(slotMatch[1]) : null;
-                if (slotIdx !== null) {
-                    card.className = 'frame-card video-failed-card';
-                    card.innerHTML = `
-                        <div class="video-failed-placeholder">
-                            <span class="error-icon">⚠️</span>
-                            <span class="error-text" title="${e.message || '生成失败'}">生成失败</span>
-                            <button class="action-btn text-btn mini-btn retry-video-btn" data-slot="${slotIdx}">重试</button>
-                        </div>
-                        <span>VID ${String(slotIdx).padStart(3, '0')}</span>
-                    `;
-                    card.querySelector('.retry-video-btn').addEventListener('click', (ev) => {
-                        ev.stopPropagation();
-                        retrySingleVideo(slotIdx);
-                    });
-                }
+                if (slotMatch) renderVideoSlotFailed(parseInt(slotMatch[1], 10), e.message);
             });
 
             progress.style.display = 'none';
@@ -3544,17 +5276,146 @@ async function generateVideos() {
     }
 }
 
+async function generateVideoChain() {
+    if (!currentIdea || !currentIdea.prompt_block) {
+        showToast("请先激发或输入包含视频提示词的创意！", "error");
+        return;
+    }
+
+    const ownerIdea = currentIdea;
+    if (isIdeaTaskActive(ownerIdea.id, 'videos') || isIdeaTaskActive(ownerIdea.id, 'video_chain')) {
+        showToast("该创意的视频生成已在进行中，请稍候", "error");
+        return;
+    }
+
+    const btn = document.getElementById('generate-video-chain-btn');
+    const videosBtn = document.getElementById('generate-videos-btn');
+    const progress = document.getElementById('videos-progress');
+    const meta = document.getElementById('videos-meta');
+    const grid = slotRenderTarget('video');
+    if (btn) btn.disabled = true;
+    if (videosBtn) videosBtn.disabled = true;
+    if (progress) progress.style.display = 'flex';
+    if (meta) meta.textContent = '准备纯视频链式生成 (第1段 T2V，后续自动截取尾帧 I2V)...';
+
+    const targetSlots = typeof computeDebugTargets === 'function' ? computeDebugTargets('videos', ownerIdea, 'video') : null;
+
+    let operation = null;
+    try {
+        operation = beginVideoOperation(ownerIdea, targetSlots);
+        const body = {
+            config,
+            title: getIdeaSaveTitle(ownerIdea),
+            display_title: ownerIdea.title,
+            prompt_block: ownerIdea.prompt_block,
+            merge_speed: typeof getMergeSpeed === 'function' ? getMergeSpeed() : 4
+        };
+        if (targetSlots) body.target_slots = targetSlots;
+
+        const data = await submitVideoOperation(operation, '/api/generate_video_chain', body);
+        if (operation.cancelRequested) { await cancelVideoOperation(ownerIdea, operation); return; }
+        const taskId = data.task_id;
+
+        streamVideosProgress(taskId, ownerIdea, targetSlots);
+        showToast("已启动纯视频链式生成通道！", "success");
+    } catch (e) {
+        if (e.submissionPending) {
+            const message = await handleVideoSubmissionPending(ownerIdea, e);
+            if (operation && getIdeaTaskRecord(ownerIdea.id, 'videos') === operation) endIdeaTask(ownerIdea.id, 'videos');
+            settleVideoOperationView(ownerIdea);
+            if (isViewingIdea(ownerIdea.id) && meta) meta.textContent = message;
+            return;
+        }
+        if (e.uncertain && operation) {
+            if (isViewingIdea(ownerIdea.id) && meta) meta.textContent = e.message;
+            showToast(e.message, 'warning');
+            scheduleVideoOperationRecovery(ownerIdea, operation);
+            return;
+        }
+        if (operation && getIdeaTaskRecord(ownerIdea.id, 'videos') === operation) endIdeaTask(ownerIdea.id, 'videos');
+        console.error("Failed to generate video chain:", e);
+        showToast(`纯视频链生成失败: ${e.message}`, "error");
+
+        if (isViewingIdea(ownerIdea.id)) {
+            if (meta) meta.textContent = `纯视频链生成失败: ${e.message}`;
+            if (grid) {
+                grid.querySelectorAll('.placeholder-frame-card').forEach(card => {
+                    const slotMatch = card.id && card.id.match(/video-slot-(\d+)/);
+                    if (slotMatch) renderVideoSlotFailed(parseInt(slotMatch[1], 10), e.message);
+                });
+            }
+            if (progress) progress.style.display = 'none';
+            if (btn) btn.disabled = false;
+            if (videosBtn) videosBtn.disabled = false;
+        }
+    }
+}
+
+function getMergeSpeed() {
+    const select = document.getElementById('merge-speed-select');
+    const speed = Number(select && select.value);
+    return [1, 1.5, 2, 3, 4].includes(speed) ? speed : 4;
+}
+
+// 成片速度按浏览器持久化：选了几倍，之后的自动合并/手动合并都用几倍，刷新后不回到 4 倍。
+const MERGE_SPEED_STORAGE_KEY = 'spark_merge_speed';
+
+function initMergeSpeedControl() {
+    const select = document.getElementById('merge-speed-select');
+    if (!select) return;
+    let stored = null;
+    try { stored = localStorage.getItem(MERGE_SPEED_STORAGE_KEY); } catch (_) {}
+    if (stored && Array.from(select.options).some(o => o.value === stored)) select.value = stored;
+    select.addEventListener('change', () => {
+        try { localStorage.setItem(MERGE_SPEED_STORAGE_KEY, select.value); } catch (_) {}
+    });
+}
+
+function mergeSpeedLabel(speed = getMergeSpeed()) {
+    return Number(speed) === 1 ? '无加速' : `${Number(speed)}倍速`;
+}
+
+// 成片首帧烧录封面的档位。默认 'frame'（只占一帧：肉眼看不见，平台取缩略图时拿到
+// 的却已经是封面）。选择按浏览器持久化，与合并速率同款。
+const COVER_BURN_STORAGE_KEY = 'spark_merge_cover_burn';
+
+function getCoverBurn() {
+    const select = document.getElementById('merge-cover-burn-select');
+    const value = select && select.value;
+    return ['frame', '0.5', '1', 'off'].includes(value) ? value : 'frame';
+}
+
+function initCoverBurnControl() {
+    const select = document.getElementById('merge-cover-burn-select');
+    if (!select) return;
+    const stored = localStorage.getItem(COVER_BURN_STORAGE_KEY);
+    if (stored && Array.from(select.options).some(o => o.value === stored)) select.value = stored;
+    select.addEventListener('change', () => {
+        try { localStorage.setItem(COVER_BURN_STORAGE_KEY, select.value); } catch (_) {}
+    });
+}
+
 async function mergeVideos(force = false) {
     if (!currentIdea || !currentIdea.title) {
         showToast("请先激发一个创意点子并生成视频！", "error");
         return;
     }
+    if (mergeInFlight) {
+        showToast('视频正在合并中，请稍候', 'info');
+        return;
+    }
+    // 请求等待期间可以切换创意，结果始终属于发起合并的项目。
+    const ownerIdea = currentIdea;
+    const viewingOwner = () => !!currentIdea && currentIdea.id === ownerIdea.id;
 
     const mergeBtn = document.getElementById('merge-videos-btn');
     const videosMeta = document.getElementById('videos-meta');
     if (!mergeBtn || !videosMeta) return;
 
     const originalText = mergeBtn.innerHTML;
+    const speed = getMergeSpeed();
+    const speedLabel = mergeSpeedLabel(speed);
+    const coverBurn = getCoverBurn();
     mergeBtn.disabled = true;
     // 合并不走 ideaTasksById 登记，管线条的「成片 · 合并中…」只能靠这个标志位
     mergeInFlight = true;
@@ -3564,24 +5425,29 @@ async function mergeVideos(force = false) {
         <span>${force ? '正在跳过缺口合并中...' : '正在合并中...'}</span>
     `;
     videosMeta.textContent = force
-        ? "正在跳过缺失/串片片段并按2倍速合并，请稍候..."
-        : "正在调用 FFmpeg 合并并加速视频，此过程可能需要几秒钟，请稍候...";
+        ? `正在跳过缺失/串片片段并以${speedLabel}合并，请稍候...`
+        : `正在调用 FFmpeg 以${speedLabel}合并视频，此过程可能需要几秒钟，请稍候...`;
 
     try {
         const response = await fetch('/api/merge_videos', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
-                title: getIdeaSaveTitle(currentIdea),
-                force: !!force
+                config,
+                title: getIdeaSaveTitle(ownerIdea),
+                force: !!force,
+                speed,
+                // 首帧封面：档位来自合并控件，用哪张来自「成片首帧」用途分配
+                cover_burn: coverBurn,
+                cover: coverBurn === 'off' ? null : coverRoleUrl(ownerIdea, 'video'),
             })
         });
 
         const data = await response.json().catch(() => ({}));
 
-        // 合成门禁拦截：缺失/串片片段 → 给出「重试」「强制合并」两条出路
+        // 合成门禁拦截：缺失/失败片段 → 给出「重试」「跳过缺口强制合并」两条出路
         if (response.status === 409 && data.status === 'blocked') {
-            renderMergeBlocked(data);
+            if (viewingOwner()) renderMergeBlocked(data);
             return;
         }
 
@@ -3590,28 +5456,35 @@ async function mergeVideos(force = false) {
         }
 
         if (data.status === 'ok') {
-            if (!currentIdea.frameRun) {
-                currentIdea.frameRun = {};
+            if (!ownerIdea.frameRun) {
+                ownerIdea.frameRun = {};
             }
-            currentIdea.frameRun.merged_video = data.merged_video;
-            saveCurrentIdeaState();
-
-            const existingIdx = savedIdeas.findIndex(item => item.id === currentIdea.id);
-            if (existingIdx !== -1) {
-                savedIdeas[existingIdx].frameRun = currentIdea.frameRun;
-                await saveLibrary();
-            }
-
-            renderVideosForIdea(currentIdea);
-
+            ownerIdea.frameRun.merged_video = data.merged_video;
+            // 相同倍速会覆盖同名成片，推进版本后播放器才会读取新文件。
             const mv = data.merged_video || {};
+            bustImageCache(mv.url || mv.file);
+            if (viewingOwner()) saveCurrentIdeaState();
+
+            const existingIdx = savedIdeas.findIndex(item => item.id === ownerIdea.id);
+            if (existingIdx !== -1) {
+                savedIdeas[existingIdx].frameRun = ownerIdea.frameRun;
+                await persistIdeaItem(savedIdeas[existingIdx]);
+            }
+
+            if (viewingOwner()) renderVideosForIdea(ownerIdea);
+
+            const mergedSpeedLabel = mergeSpeedLabel(mv.speed || speed);
+            // 没烧成（选了封面却没进成片）要说出来：否则用户只能等平台缩略图出来才发现
+            const coverNote = mv.cover_first_frame
+                ? `；封面已烧进首帧（${mv.cover_first_frame.seconds ? `${mv.cover_first_frame.seconds}秒` : '1 帧'}）`
+                : (coverBurn === 'off' ? '' : '；未烧录封面首帧（没有可用封面）');
             if (mv.partial) {
                 const slots = (mv.skipped_slots || []).join(', ');
-                showToast("已生成跳过缺口的合成片（2倍速）", "success");
-                videosMeta.innerHTML = `⚠️ 已合成：槽位 <b>${escapeHtml(slots)}</b> 因缺失/串片被跳过（该处为硬切），其余片段正常拼接、2倍速。建议重试这些片段后重新合并以获得完整成片。`;
+                showToast(`已生成跳过缺口的合成片（${mergedSpeedLabel}）`, "success");
+                if (viewingOwner()) videosMeta.innerHTML = `已合成：槽位 <b>${escapeHtml(slots)}</b> 无视频文件被跳过（该处为硬切），其余片段全部拼接、${mergedSpeedLabel}${escapeHtml(coverNote)}。`;
             } else {
-                showToast("视频合并并加速成功！", "success");
-                videosMeta.textContent = "视频合并已完成！";
+                showToast(`视频合并成功（${mergedSpeedLabel}）！`, "success");
+                if (viewingOwner()) videosMeta.textContent = `视频合并已完成（${mergedSpeedLabel}）${coverNote}！`;
             }
         } else {
             throw new Error(data.message || '合并失败');
@@ -3619,7 +5492,7 @@ async function mergeVideos(force = false) {
     } catch (e) {
         console.error("Failed to merge videos:", e);
         showToast(`合并视频失败: ${e.message}`, "error");
-        videosMeta.textContent = `合并视频失败: ${e.message}`;
+        if (viewingOwner()) videosMeta.textContent = `合并视频失败: ${e.message}`;
     } finally {
         mergeBtn.disabled = false;
         // innerHTML 还原后芯片里的 .step-stat 会带着合并前的旧文字回来，
@@ -3631,7 +5504,7 @@ async function mergeVideos(force = false) {
 }
 
 // 合成被门禁拦截时，在 videos-meta 区域渲染可操作面板：
-//   ① 重试缺失/串片片段并自动重合   ② 跳过这些片段直接合并（2倍速）
+//   ① 重试缺失/失败片段并自动重合   ② 按当前所选速率跳过这些片段直接合并
 function renderMergeBlocked(data) {
     const videosMeta = document.getElementById('videos-meta');
     if (!videosMeta) return;
@@ -3641,15 +5514,15 @@ function renderMergeBlocked(data) {
     const all = [...new Set([...missing, ...mismatched])].sort((a, b) => a - b);
 
     const parts = [];
-    if (missing.length) parts.push(`缺失/失败：槽位 <b>${escapeHtml(missing.join(', '))}</b>`);
+    if (missing.length) parts.push(`缺失/未生成：槽位 <b>${escapeHtml(missing.join(', '))}</b>`);
     if (mismatched.length) parts.push(`疑似串片：槽位 <b>${escapeHtml(mismatched.join(', '))}</b>`);
 
     videosMeta.innerHTML = `
         <div class="merge-blocked" style="text-align:left; line-height:1.7;">
-            <div style="color:#f6c453; margin-bottom:8px;">⚠️ 已拦截合并（避免成片硬跳/串片）：${parts.join('；')}。</div>
+            <div style="color:#f6c453; margin-bottom:8px;">⚠️ 视频片段不全，已拦截合并（避免成片缺失画面）：${parts.join('；')}。</div>
             <div style="display:flex; gap:8px; flex-wrap:wrap;">
                 <button type="button" class="action-btn text-btn" id="merge-retry-missing-btn">🔁 重试这些片段并合并 (${all.length})</button>
-                <button type="button" class="action-btn text-btn" id="merge-force-btn">⚡ 跳过缺口合并（2倍速）</button>
+                <button type="button" class="action-btn text-btn" id="merge-force-btn">⚡ 跳过缺口强制合并（${escapeHtml(mergeSpeedLabel())}）</button>
             </div>
         </div>`;
 
@@ -3664,7 +5537,7 @@ function renderMergeBlocked(data) {
 
     const forceBtn = document.getElementById('merge-force-btn');
     if (forceBtn) forceBtn.addEventListener('click', async () => {
-        const ok = await customConfirm('将跳过缺失/串片的片段，把其余可用片段按原顺序直接拼接、2倍速合成（跳过处为硬切，不再用占位帧填充）。确定继续吗？');
+        const ok = await customConfirm(`将跳过缺失的片段，把其余可用片段按原顺序直接拼接、以${mergeSpeedLabel()}合成（跳过处为硬切）。确定继续吗？`);
         if (ok) mergeVideos(true);
     });
 }
@@ -3675,7 +5548,7 @@ function renderMergeBlocked(data) {
 // Function retrySingleVideo moved to modular JS file
 
 // Generate TikTok 9:16 Video Cover using gemini-3.1-flash-image
-async function generateCover() {
+async function generateCover(options = {}) {
     if (!currentIdea) {
         showToast("请先激发一个创意点子！", "error");
         return;
@@ -3690,13 +5563,33 @@ async function generateCover() {
     const placeholderEl = document.getElementById('cover-image-placeholder');
     const displayEl = document.getElementById('cover-img-display');
     const makeBtn = document.getElementById('make-cover-btn');
+    const concBtn = document.getElementById('generate-cover-concurrent-btn');
     if (!loadingEl || !placeholderEl || !displayEl || !makeBtn) return;
+
+    // 与帧序列并发生成设置的数量一致（candidateConcurrency，默认 4）
+    const candidateConcurrency = (typeof config !== 'undefined' && config && config.candidateConcurrency)
+        ? (parseInt(config.candidateConcurrency, 10) || 4)
+        : 4;
+
+    const isConcurrent = (options && typeof options.concurrent === 'boolean')
+        ? options.concurrent
+        : (typeof isCandidateSelectionMode === 'function' && isCandidateSelectionMode());
+
+    const concurrencyCount = isConcurrent ? candidateConcurrency : 1;
 
     // Set loading state
     loadingEl.style.display = 'flex';
     placeholderEl.style.display = 'none';
     displayEl.style.display = 'none';
     makeBtn.disabled = true;
+    if (concBtn) concBtn.disabled = true;
+
+    const loadingP = loadingEl.querySelector('p');
+    if (loadingP) {
+        loadingP.textContent = isConcurrent
+            ? `正在后台并发生成 ${concurrencyCount} 张封面图...`
+            : '正在后台生成封面图...';
+    }
 
     try {
         const response = await fetch('/api/generate_cover', {
@@ -3706,8 +5599,13 @@ async function generateCover() {
                 config,
                 id: ownerIdea.id,
                 title: ownerIdea.title,
+                // 封面图跟项目打包在一起（outputs/<项目>/cover_*.webp），所以这里
+                // 必须把磁盘命名空间一起交上去——与 generateFrames 的 title 字段同源
+                project_key: getIdeaSaveTitle(ownerIdea),
                 theme: ownerIdea.theme,
-                prompt_block: ownerIdea.prompt_block
+                prompt_block: ownerIdea.prompt_block,
+                concurrent: isConcurrent,
+                count: concurrencyCount
             })
         });
 
@@ -3733,6 +5631,7 @@ async function generateCover() {
             }
             loadingEl.style.display = 'none';
             makeBtn.disabled = false;
+            if (concBtn) concBtn.disabled = false;
         }
     }
 }
@@ -3747,47 +5646,6 @@ async function generateCover() {
 // Custom Presets Management
 // =====================================================================
 // Function loadCustomPresets moved to modular JS file
-
-async function saveCustomPreset() {
-    const presetName = await customPrompt("请输入此自定义预设的名称 (例如: 极简清水舱, 脑洞自然舱):");
-    if (presetName === null) return; // User cancelled
-    const trimmedName = presetName.trim();
-    if (!trimmedName) {
-        showToast("预设名称不能为空", "error");
-        return;
-    }
-
-    // 自定义预设不再存 theme：#theme-selector 已移除，原逻辑必然取不到激活按钮、
-    // 于是每条新预设都被写死成 'hollow_oak' 这个假值，applyCustomPreset 读它也是空转。
-    const activeAnchors = Array.from(document.querySelectorAll('#anchor-selector .anchor-node.active'))
-        .map(node => node.dataset.value);
-
-    customPresets[trimmedName] = {
-        anchors: activeAnchors,
-        complexity: parseInt(document.getElementById('slider-complexity').value, 10),
-        budget: parseInt(document.getElementById('slider-budget').value, 10),
-        ratio: parseInt(document.getElementById('slider-ratio').value, 10),
-        creativity: parseInt(document.getElementById('slider-creativity').value, 10),
-        beats: parseInt(document.getElementById('slider-beats').value, 10)
-    };
-
-    localStorage.setItem('spark_custom_presets', JSON.stringify(customPresets));
-    renderCustomPresets();
-    showToast(`自定义预设 "${trimmedName}" 保存成功！`, "success");
-}
-
-async function deleteCustomPreset(name, event) {
-    if (event) event.stopPropagation();
-    if (!customPresets[name]) return;
-    
-    const confirmed = await customConfirm(`确定删除自定义预设 "${name}" 吗？`);
-    if (confirmed) {
-        delete customPresets[name];
-        localStorage.setItem('spark_custom_presets', JSON.stringify(customPresets));
-        renderCustomPresets();
-        showToast(`已删除预设 "${name}"`, "success");
-    }
-}
 
 // Function applyCustomPreset moved to modular JS file
 
@@ -3820,11 +5678,12 @@ function setupDragAndDrop() {
         }, false);
     });
 
-    const drawer = document.getElementById('library-drawer');
-    if (!drawer) return;
+    // 拖放靶区从「点子库」抽屉搬到项目工作台列表（抽屉已于 P4 删除）
+    const dropZone = document.getElementById('projects-list');
+    if (!dropZone) return;
 
     ['dragenter', 'dragover', 'dragleave', 'drop'].forEach(eventName => {
-        drawer.addEventListener(eventName, preventDefaults, false);
+        dropZone.addEventListener(eventName, preventDefaults, false);
     });
     
     function preventDefaults(e) {
@@ -3833,14 +5692,14 @@ function setupDragAndDrop() {
     }
     
     ['dragenter', 'dragover'].forEach(eventName => {
-        drawer.addEventListener(eventName, () => drawer.classList.add('dragover'), false);
+        dropZone.addEventListener(eventName, () => dropZone.classList.add('dragover'), false);
     });
-    
+
     ['dragleave', 'drop'].forEach(eventName => {
-        drawer.addEventListener(eventName, () => drawer.classList.remove('dragover'), false);
+        dropZone.addEventListener(eventName, () => dropZone.classList.remove('dragover'), false);
     });
-    
-    drawer.addEventListener('drop', handleDrop, false);
+
+    dropZone.addEventListener('drop', handleDrop, false);
     
     function handleDrop(e) {
         const dt = e.dataTransfer;
@@ -3866,35 +5725,13 @@ function handleGlobalHotkeys(e) {
         if (randBtn) randBtn.click();
     }
     
-    // Alt + L: Toggle My Library Drawer
-    if (e.altKey && e.key.toLowerCase() === 'l') {
+    // Alt + L / Alt + T：原本各自开合「点子库」与「任务列表」两个抽屉，两者合并
+    // 进项目工作台后改为跳到工作台的对应筛选——快捷键的肌肉记忆保住，落点变成
+    // 同一个页面的两档 chips。
+    if (e.altKey && (e.key.toLowerCase() === 'l' || e.key.toLowerCase() === 't')) {
         e.preventDefault();
-        const toggleLibBtn = document.getElementById('toggle-library-btn');
-        const closeLibBtn = document.getElementById('close-library-btn');
-        const libraryDrawer = document.getElementById('library-drawer');
-        
-        if (libraryDrawer) {
-            if (libraryDrawer.classList.contains('active')) {
-                if (closeLibBtn) closeLibBtn.click();
-            } else {
-                if (toggleLibBtn) toggleLibBtn.click();
-            }
-        }
-    }
-    
-    // Alt + T: Toggle Tasks Drawer
-    if (e.altKey && e.key.toLowerCase() === 't') {
-        e.preventDefault();
-        const toggleTasksBtn = document.getElementById('toggle-tasks-btn');
-        const closeTasksBtn = document.getElementById('close-tasks-btn');
-        const tasksDrawer = document.getElementById('tasks-drawer');
-        
-        if (tasksDrawer) {
-            if (tasksDrawer.classList.contains('active')) {
-                if (closeTasksBtn) closeTasksBtn.click();
-            } else {
-                if (toggleTasksBtn) toggleTasksBtn.click();
-            }
+        if (typeof openProjectsWorkbench === 'function') {
+            openProjectsWorkbench(e.key.toLowerCase() === 'l' ? 'saved' : 'running');
         }
     }
     
@@ -3929,21 +5766,15 @@ function handleGlobalHotkeys(e) {
             if (closeBtn) closeBtn.click();
         }
 
-        const beatOutlineModal = document.getElementById('beat-outline-modal');
-        if (beatOutlineModal && beatOutlineModal.classList.contains('active')) {
-            const closeBtn = beatOutlineModal.querySelector('.close-btn');
-            if (closeBtn) closeBtn.click();
+        const candModal = document.getElementById('candidate-selection-modal');
+        if (candModal && (candModal.classList.contains('active') || candModal.style.display === 'flex')) {
+            if (typeof closeCandidateSelectionModal === 'function') closeCandidateSelectionModal();
+            else { candModal.classList.remove('active'); candModal.style.display = 'none'; }
         }
 
-        // Close drawer
-        const libraryDrawer = document.getElementById('library-drawer');
-        if (libraryDrawer && libraryDrawer.classList.contains('active')) {
-            const closeLibBtn = document.getElementById('close-library-btn');
-            if (closeLibBtn) closeLibBtn.click();
-        }
-        
-        // Close delete confirmation overlays
-        document.querySelectorAll('.delete-confirm-overlay').forEach(overlay => overlay.remove());
+        // 收起项目工作台的详情栏（两个右侧抽屉与卡片删除确认浮层已随 P4 删除）
+        const detailClose = document.querySelector('#projects-detail .projects-detail-close');
+        if (detailClose) detailClose.click();
     }
 }
 
@@ -3957,7 +5788,7 @@ function handleGlobalHotkeys(e) {
 //   ① 只读状态、只写 class 与状态文字；
 //   ② 绝不去写 disabled —— 那个属性归各自的生成流程所有（generateFrames /
 //      hydrateFramesPanel / mergeVideos 都在写它），两边都写必然打架。
-// 见 docs/spark_result_minimal_layout_plan.md
+// 见 docs/plans/spark_result_minimal_layout_plan.md
 // =====================================================================
 
 const PIPELINE_STEPS = ['cover', 'frames', 'videos', 'merge'];
@@ -4002,6 +5833,7 @@ function computePipelineState(idea) {
     const framesHave = (run.frames || []).filter(f => f.url || f.file).length;
     const videosHave = (run.videos || []).filter(v => v.url || v.file).length;
     const coversHave = (idea.covers || []).length;
+    const hasCover = coversHave > 0 || !!idea.activeCoverUrl;
     const mergedOk = !!(run.merged_video && run.merged_video.status === 'success');
 
     const busy = (type) => !!(typeof isIdeaTaskActive === 'function' && isIdeaTaskActive(idea.id, type));
@@ -4011,7 +5843,7 @@ function computePipelineState(idea) {
 
     return {
         cover: {
-            done: coversHave > 0,
+            done: hasCover,
             busy: busy('cover'),
             locked: false,
             have: coversHave,
@@ -4020,9 +5852,11 @@ function computePipelineState(idea) {
         frames: {
             done: imageTotal > 0 ? framesHave >= imageTotal : framesHave > 0,
             busy: busy('frames'),
-            locked: false,
+            locked: !hasCover,
             have: framesHave,
-            stat: (busy('frames') || framesHave) ? ratio(framesHave, imageTotal) : '未生成',
+            stat: (busy('frames') || framesHave)
+                ? ratio(framesHave, imageTotal)
+                : (!hasCover ? '待封面' : '未生成'),
         },
         videos: {
             done: videoTotal > 0 ? videosHave >= videoTotal : videosHave > 0,
@@ -4090,7 +5924,13 @@ function updatePipelineBar() {
         // 跑了一半（调试限量、中途取消、部分重试）时文案改成"继续"，
         // 免得看着像要从头再来一遍
         const partial = state[next].have > 0 && (next === 'frames' || next === 'videos');
-        nextText.textContent = partial ? `继续${PIPELINE_NEXT_LABEL[next]}` : PIPELINE_NEXT_LABEL[next];
+        const isCand = isCandidateSelectionMode();
+        const framesLabel = isCand ? '4选1 生成帧序列' : PIPELINE_NEXT_LABEL['frames'];
+        const coverLabel = isCand ? '并发生成封面图' : PIPELINE_NEXT_LABEL['cover'];
+        let label = PIPELINE_NEXT_LABEL[next];
+        if (next === 'frames') label = framesLabel;
+        else if (next === 'cover') label = coverLabel;
+        nextText.textContent = partial ? `继续${label}` : label;
     }
 }
 
@@ -4099,8 +5939,71 @@ function scrollToPipelineSection(sectionId) {
     if (!sectionId) return;
     const overview = document.getElementById('tab-panel-overview');
     if (overview && !overview.classList.contains('active')) switchTab('overview');
-    const el = document.getElementById(sectionId);
+    if (sectionId === 'cover-section' && overview?.classList.contains('is-left-column-collapsed')) {
+        setResultLeftColumnCollapsed(false, true);
+    }
+    let el = document.getElementById(sectionId);
+    // 成品区在没有成片时是隐藏的，滚过去等于没动；退回到产生它的视频片段区。
+    if (sectionId === 'merged-video-container' && (!el || el.style.display === 'none')) {
+        el = document.getElementById('videos-section');
+    }
     if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
+const RESULT_LEFT_COLUMN_STORAGE_KEY = 'spark_result_left_column_collapsed';
+
+function setResultLeftColumnCollapsed(collapsed, persist = false) {
+    const overview = document.getElementById('tab-panel-overview');
+    const toggle = document.getElementById('result-left-column-toggle');
+    if (!overview || !toggle) return;
+    overview.classList.toggle('is-left-column-collapsed', collapsed);
+    toggle.setAttribute('aria-expanded', String(!collapsed));
+    const action = collapsed ? '展开' : '收起';
+    const description = `${action}封面栏`;
+    toggle.setAttribute('aria-label', description);
+    toggle.title = description;
+    toggle.querySelector('.result-left-column-toggle-icon').textContent = collapsed ? '›' : '‹';
+    toggle.querySelector('.result-left-column-toggle-label').textContent = collapsed ? '展开封面' : '收起封面';
+    if (persist) {
+        try { localStorage.setItem(RESULT_LEFT_COLUMN_STORAGE_KEY, collapsed ? '1' : '0'); } catch (_) {}
+    }
+}
+
+/** 成品区的「合并设置」：成片速度、封面首帧在视频片段区的设置弹层里，这里直达并展开它。 */
+function initMergedVideoSettingsButton() {
+    const btn = document.getElementById('merged-video-settings');
+    if (!btn) return;
+    btn.addEventListener('click', () => {
+        scrollToPipelineSection('videos-section');
+        const pop = document.getElementById('videos-settings-pop');
+        const toggle = document.querySelector('.section-tool-btn[data-pop="videos-settings-pop"]');
+        if (pop && pop.hidden && toggle) toggle.click();
+    });
+}
+
+function storedResultLeftColumnPref() {
+    try { return localStorage.getItem(RESULT_LEFT_COLUMN_STORAGE_KEY); } catch (_) { return null; }
+}
+
+/**
+ * 有成片时封面默认收起（成片才是完成态的主角），没成片时展开。
+ * 只在用户从没手动切换过（没有存档偏好）时才自动处理，且不写存档——
+ * 一旦用户自己点过开关或点过「封面」芯片，就完全按用户的选择来。
+ */
+function syncResultLeftColumnForMerged(ready) {
+    if (storedResultLeftColumnPref() !== null) return;
+    setResultLeftColumnCollapsed(!!ready);
+}
+
+function initResultLeftColumnToggle() {
+    const toggle = document.getElementById('result-left-column-toggle');
+    if (!toggle) return;
+    const stored = storedResultLeftColumnPref();
+    setResultLeftColumnCollapsed(stored === '1');
+    toggle.addEventListener('click', () => {
+        const overview = document.getElementById('tab-panel-overview');
+        setResultLeftColumnCollapsed(!overview.classList.contains('is-left-column-collapsed'), true);
+    });
 }
 
 /** 主按钮：把点击转交给"下一步"对应的那枚芯片（也就是原来的生成按钮）。 */
@@ -4110,7 +6013,7 @@ function runPipelineNext() {
     if (!action) return;
     if (action === 'download') {
         const link = document.getElementById('merged-video-download');
-        scrollToPipelineSection('videos-section');
+        scrollToPipelineSection('merged-video-container');
         if (link && link.getAttribute('href') && link.getAttribute('href') !== '#') link.click();
         return;
     }
@@ -4140,28 +6043,52 @@ function initPipelineBar() {
     const nextBtn = document.getElementById('pipeline-next-btn');
     if (nextBtn) nextBtn.addEventListener('click', runPipelineNext);
 
-    const moreBtn = document.getElementById('pipeline-more-btn');
-    const moreMenu = document.getElementById('pipeline-more-menu');
-    if (moreBtn && moreMenu) {
-        const closeMenu = () => {
-            moreMenu.hidden = true;
-            moreBtn.setAttribute('aria-expanded', 'false');
-        };
-        moreBtn.addEventListener('click', (e) => {
-            e.stopPropagation();
-            const willOpen = moreMenu.hidden;
-            moreMenu.hidden = !willOpen;
-            moreBtn.setAttribute('aria-expanded', willOpen ? 'true' : 'false');
-        });
-        // 菜单项的监听绑在按钮自己身上（冒泡先到它们），所以这里收菜单不会吞掉动作
-        moreMenu.addEventListener('click', closeMenu);
-        document.addEventListener('click', (e) => {
-            if (moreMenu.hidden) return;
-            if (moreBtn.contains(e.target) || moreMenu.contains(e.target)) return;
-            closeMenu();
-        });
-        document.addEventListener('keydown', (e) => {
-            if (e.key === 'Escape' && !moreMenu.hidden) closeMenu();
+    // 4选1 智能模式开关初始化与状态绑定
+    const candToggle = document.getElementById('pipeline-selection-checkbox');
+    const toggleLabel = document.getElementById('pipeline-selection-mode-toggle');
+    if (candToggle) {
+        const saved = localStorage.getItem('pipeline_candidate_selection_mode');
+        if (saved !== null) {
+            candToggle.checked = (saved === 'true');
+        } else if (typeof config !== 'undefined' && config.candidateSelectionMode === true) {
+            candToggle.checked = true;
+        } else {
+            candToggle.checked = false;
+        }
+        if (typeof config !== 'undefined') {
+            config.candidateSelectionMode = candToggle.checked;
+            config.candidateSelection = candToggle.checked;
+            config.generation_mode = candToggle.checked ? 'candidate_selection' : 'standard';
+        }
+        if (toggleLabel) {
+            toggleLabel.classList.toggle('is-active', candToggle.checked);
+        }
+        // 刷新页面时 loadCurrentIdeaState 已经把上一单恢复进 currentIdea：让开关
+        // 跟着这一单走，而不是拿刚从 localStorage 读出来的开关值去覆盖它。
+        if (typeof currentIdea !== 'undefined' && currentIdea) {
+            syncCandidateModeToggleFromIdea(currentIdea);
+        }
+        candToggle.addEventListener('change', () => {
+            const checked = candToggle.checked;
+            try {
+                localStorage.setItem('pipeline_candidate_selection_mode', checked ? 'true' : 'false');
+            } catch (_) {}
+            if (typeof config !== 'undefined') {
+                config.candidateSelectionMode = checked;
+                config.candidateSelection = checked;
+                config.generation_mode = checked ? 'candidate_selection' : 'standard';
+                try {
+                    localStorage.setItem('spark_config', JSON.stringify(config));
+                } catch (e) {}
+            }
+            if (typeof currentIdea !== 'undefined' && currentIdea) {
+                currentIdea.generation_mode = checked ? 'candidate_selection' : 'standard';
+                if (typeof saveCurrentIdeaState === 'function') saveCurrentIdeaState();
+            }
+            if (toggleLabel) {
+                toggleLabel.classList.toggle('is-active', checked);
+            }
+            updatePipelineBar();
         });
     }
 
@@ -4171,6 +6098,11 @@ function initPipelineBar() {
 /** section 标题栏的 ⚙ / ⓘ 弹层：同一个 section 里同时只展开一个。 */
 function initSectionPops() {
     document.querySelectorAll('.section-tool-btn[data-pop]').forEach(btn => {
+        const pop = document.getElementById(btn.dataset.pop);
+        if (pop && !pop.hidden) {
+            btn.classList.add('active');
+        }
+        if (pop) btn.setAttribute('aria-expanded', String(!pop.hidden));
         btn.addEventListener('click', (e) => {
             e.stopPropagation();
             const pop = document.getElementById(btn.dataset.pop);
@@ -4179,12 +6111,57 @@ function initSectionPops() {
             const section = btn.closest('.idea-section');
             if (section) {
                 section.querySelectorAll('.section-pop').forEach(p => { if (p !== pop) p.hidden = true; });
-                section.querySelectorAll('.section-tool-btn').forEach(b => { if (b !== btn) b.classList.remove('active'); });
+                section.querySelectorAll('.section-tool-btn').forEach(b => {
+                    if (b !== btn) {
+                        b.classList.remove('active');
+                        b.setAttribute('aria-expanded', 'false');
+                    }
+                });
             }
             pop.hidden = !willOpen;
             btn.classList.toggle('active', willOpen);
+            btn.setAttribute('aria-expanded', String(willOpen));
         });
     });
+
+    // 更多菜单共用原有按钮；选中操作、点击外部或按 Esc 后收起。
+    const menus = 'details.workspace-more, details.slot-more-actions, details.projects-more-actions';
+    document.addEventListener('click', (event) => {
+        document.querySelectorAll(menus).forEach(menu => {
+            if (!menu.contains(event.target) || event.target.closest('button, a')) menu.open = false;
+        });
+    });
+    document.addEventListener('keydown', (event) => {
+        if (event.key !== 'Escape') return;
+        const openMenus = Array.from(document.querySelectorAll(menus)).filter(menu => menu.open);
+        const focused = openMenus.find(menu => menu.contains(document.activeElement));
+        if (!focused) return;
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        openMenus.forEach(menu => { menu.open = false; });
+        focused.querySelector('summary')?.focus();
+    }, true);
+
+    const skipCoverToggle = document.getElementById('frames-skip-cover-toggle');
+    if (skipCoverToggle) {
+        const savedSkip = localStorage.getItem('frames_skip_cover_reference');
+        if (savedSkip !== null) {
+            skipCoverToggle.checked = (savedSkip === 'true');
+        }
+        if (typeof config !== 'undefined') {
+            config.skipCoverReference = skipCoverToggle.checked;
+            config.allowTextOnlyAnchor = skipCoverToggle.checked;
+        }
+        skipCoverToggle.addEventListener('change', () => {
+            try {
+                localStorage.setItem('frames_skip_cover_reference', skipCoverToggle.checked ? 'true' : 'false');
+            } catch (_) {}
+            if (typeof config !== 'undefined') {
+                config.skipCoverReference = skipCoverToggle.checked;
+                config.allowTextOnlyAnchor = skipCoverToggle.checked;
+            }
+        });
+    }
 }
 
 // =====================================================================
@@ -4235,93 +6212,12 @@ function updateActiveGenerationBanner() {
     }
 }
 
-// ==========================================================================
-// Upstream Topic Ideation Engine (P2)
-// --------------------------------------------------------------------------
-let currentIdeatedIdeas = [];
-// 缓存版本随「卡片上要展示的字段」一起变：3-beat-outline 起每条 idea 都带
-// beat_outline（节拍简介）。上一版缓存里的卡片没有这个字段，点「🔨 节拍简介」
-// 只会得到一句“没有节拍简介”——所以直接判过期，下次进页面重新激发一批。
-const IDEATION_CACHE_VERSION = '3-beat-outline';
-
-async function loadIdeationCards(force = false) {
-    const container = document.getElementById('ideation-cards-container');
-    if (!container) return;
-
-    // 灵感推荐由联网参考案例库驱动（js/trend_refs.js）：勾选了参考就直接从选中
-    // 案例取材；没勾选则后端自动联网搜索（结果沉淀回案例库）
-    const selIds = (typeof getSelectedTrendRefIds === 'function') ? getSelectedTrendRefIds() : [];
-    const selKey = selIds.slice().sort().join(',');
-
-    if (!force) {
-        const cached = localStorage.getItem('ideation_cached_ideas');
-        // 缓存与生成时勾选的联网参考集合绑定：勾选变了缓存即视为过期重新生成，
-        // 不能把按别的参考取材的灵感当成这批参考的
-        const cachedSel = localStorage.getItem('ideation_cached_trend_sel');
-        const cachedVersion = localStorage.getItem('ideation_cache_version');
-        if (cached && cachedSel === selKey && cachedVersion === IDEATION_CACHE_VERSION) {
-            try {
-                const parsed = JSON.parse(cached);
-                if (parsed && Array.isArray(parsed) && parsed.length > 0) {
-                    currentIdeatedIdeas = parsed;
-                    try {
-                        currentIdeationTrendRefs = JSON.parse(localStorage.getItem('ideation_cached_trend_refs')) || [];
-                    } catch (e2) {
-                        currentIdeationTrendRefs = [];
-                    }
-                    renderIdeationCards(parsed);
-                    return;
-                }
-            } catch (e) {
-                console.error("Failed to parse cached ideas:", e);
-            }
-        }
-    }
-
-    container.innerHTML = selIds.length > 0
-        ? `<div class="ideation-loading">正在从选中的 ${selIds.length} 条联网参考案例中取材激发灵感，请稍候...</div>`
-        : `<div class="ideation-loading">正在从案例库自动挑选参考激发灵感中，请稍候...</div>`;
-
-    try {
-        const response = await fetch('/api/ideate', {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json'
-            },
-            body: JSON.stringify({
-                config: config,
-                count: 4,
-                trend_ref_ids: selIds
-            })
-        });
-
-        const data = await response.json();
-        if (data.status === 'ok' && data.ideas) {
-            currentIdeatedIdeas = data.ideas;
-            currentIdeationTrendRefs = Array.isArray(data.trend_refs) ? data.trend_refs : [];
-            localStorage.setItem('ideation_cached_ideas', JSON.stringify(data.ideas));
-            localStorage.setItem('ideation_cached_trend_refs', JSON.stringify(currentIdeationTrendRefs));
-            localStorage.setItem('ideation_cached_trend_sel', selKey);
-            localStorage.setItem('ideation_cache_version', IDEATION_CACHE_VERSION);
-            renderIdeationCards(data.ideas);
-            // 无论走哪条来源分支，used_count 都可能变化、命中自动归档阈值的条目会从
-            // 主库消失，每次生成后都要刷新左侧列表，避免残留已归档条目可勾选
-            if (typeof loadTrendRefs === 'function') loadTrendRefs();
-        } else {
-            container.innerHTML = `<div class="ideation-error">加载失败: ${data.message || '未知错误'}</div>`;
-        }
-    } catch (e) {
-        console.error("Failed to load ideated cards:", e);
-        container.innerHTML = `<div class="ideation-error">加载失败，请检查网络或配置</div>`;
-    }
-}
-
-// Function renderIdeationCards moved to modular JS file
-
-// Function selectIdeationCard moved to modular JS file
-
-// Function composeIdeationCard moved to modular JS file
-
+// ── 上游选题激发引擎（灵感卡）已整体移除（2026-08-19）──────────────────
+// loadIdeationCards / renderIdeationPending / renderIdeationFailure /
+// getRequestedIdeationCount / getSelectedPacingSkeletonIds 等，落点是「激发维度」页
+// 的 #ideation-cards-container。那一页下线后这里没有任何入口，卡片渲染侧
+// （js/prompt_pipeline.js 的 renderIdeationCards 一线）也一并移除。
+// 后端 /api/ideate 完好未动，将来重建卡片区从那里接回来。
 // Function mapEnglishCarrierToValue moved to modular JS file
 
 /* 暗夜模式 toggle 已抽出到 js/theme_toggle.js(双前端共享,index.html 加载)*/

@@ -1,0 +1,86 @@
+<!-- 2026-09-06 从真实现场裁剪出来的新版 Flow 画布卡片骨架
+     （原件：runtime/fx_debug/<task>/<slot>_tile_lost/canvas_tiles.json，runtime/ 不入库）。
+     三种形态各一张，用来钉住"成片但没挂 <video>"的识别契约。 -->
+<div class="canvas">
+  <!-- 1) 生成中：flow-pending-tile + 百分比 -->
+  <flow-grid-tile-container class="mat-context-menu-trigger"
+      aria-label="Worker recladding farmstead fron…"
+      data-spark-tile-id="tile_pending" data-original-tile-id="tile_pending">
+    <flow-tile-container data-spark-tile-id="tile_pending">
+      <div class="container">
+        <flow-video-tile>
+          <div class="container">
+            <flow-pending-tile>
+              <div class="container">
+                <div class="header">
+                  <div class="header-leading"><mat-icon role="img" aria-hidden="true">play_circle</mat-icon></div>
+                  <div class="loading-percentage">18%</div>
+                </div>
+              </div>
+            </flow-pending-tile>
+          </div>
+        </flow-video-tile>
+      </div>
+    </flow-tile-container>
+  </flow-grid-tile-container>
+
+  <!-- 2) 已完成，但只有缩略图 + 分辨率角标，整卡没有 <video>：本次要修的形态 -->
+  <flow-grid-tile-container class="mat-context-menu-trigger"
+      aria-label="Workers installing metal roof sh…"
+      data-spark-tile-id="tile_thumb" data-original-tile-id="tile_thumb">
+    <flow-tile-container data-spark-tile-id="tile_thumb">
+      <div class="container">
+        <flow-video-tile>
+          <div class="container">
+            <img alt="Generated video thumbnail" class="thumbnail"
+                 src="https://flow-content.google/image/bdad52fb-115d-431a-8b7f-7a947dae8d53?Expires=1&amp;Signature=x">
+            <div class="pre-hover-overlay">
+              <div class="type-icon-container">
+                <mat-icon role="img" aria-hidden="true">play_circle</mat-icon>
+                <span class="resolution-badge">360p</span>
+              </div>
+            </div>
+          </div>
+        </flow-video-tile>
+      </div>
+    </flow-tile-container>
+  </flow-grid-tile-container>
+
+  <!-- 3) 已完成且 <video> 已挂上：唤醒之后应该长这样 -->
+  <flow-grid-tile-container class="mat-context-menu-trigger"
+      aria-label="Camera repositioning at farmstea…"
+      data-spark-tile-id="tile_video" data-original-tile-id="tile_video">
+    <flow-tile-container data-spark-tile-id="tile_video">
+      <div class="container">
+        <flow-video-tile>
+          <div class="container">
+            <video aria-label="Generated video"
+                   src="https://flow-content.google/video/4af7a4c7-9050-4daf-83b9-c42f8514d6c8?Expires=1&amp;Signature=y"></video>
+            <div class="pre-hover-overlay">
+              <div class="type-icon-container">
+                <mat-icon role="img" aria-hidden="true">play_circle</mat-icon>
+                <span class="resolution-badge">360p</span>
+              </div>
+            </div>
+          </div>
+        </flow-video-tile>
+      </div>
+    </flow-tile-container>
+  </flow-grid-tile-container>
+
+  <!-- 4) 参考图卡片：带 img，但绝不能被当成成片 -->
+  <flow-grid-tile-container class="mat-context-menu-trigger" aria-label="img_011.webp"
+      data-spark-tile-id="tile_image" data-original-tile-id="tile_image">
+    <flow-tile-container data-spark-tile-id="tile_image">
+      <div class="container">
+        <flow-image-tile data-spark-tile-id="tile_image_inner">
+          <div class="container">
+            <img alt="Tile displaying a user's image" class="image"
+                 src="https://flow-content.google/image/224f60f2-6143-4229-9038-1816f9984490?Expires=1"
+                 data-media-id="224f60f2-6143-4229-9038-1816f9984490">
+          </div>
+        </flow-image-tile>
+      </div>
+    </flow-tile-container>
+  </flow-grid-tile-container>
+</div>

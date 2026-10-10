@@ -1,104 +1,78 @@
-"""Autonomous staged pipelines for the restoration-prompt-composer production app.
+"""Autonomous staged pipelines for the gemini-veo-restoration-composer production app.
 
-No per-frame gating beyond IMAGE 1 in the GUI/API paths: frames 2..N render
-unconditionally as fast as possible. Cross-frame consistency review against the real
-rendered images (_sequence_consistency_review, exposed as run_sequence_consistency_review)
-is no longer run automatically after rendering — 2026-07-24: it's a manual, on-demand
-check the user triggers from the frame grid once the sequence is done, not a step any
-entry point below runs for you. The only review during rendering itself is corrective,
-not gating: periodic reality-checkpoint recalibration and a final chain-tail drift
-lookback (_checkpoint_reality_sync / _chain_drift_lookback), which rewrite drifting
-prompts in place but never block or retry a render.
+**Rendering never reviews.** 2026-08-05: every consistency/acceptance gate that used to
+run inside the render loop is gone — the anchor acceptance gate on IMAGE 1, the per-family
+anchor gate, the periodic reality-checkpoint recalibration, and the chain-tail drift
+lookback. Frames 1..N now render unconditionally, as fast as the backend allows, and no
+step below rewrites a prompt or re-renders a frame on a judge's say-so.
 
-IMAGE 1 (the "trauma state" anchor every later frame visually chains from) is the one
-exception: it goes through the real Anchor Acceptance Gate (check_anchor_frame_compliance)
-in every entry point below, since a not-raw-enough/too-clean/intervention-tainted anchor
-poisons the whole downstream chain and was previously only ever caught by the
-conversational skill path. GUI/API callers pass hard_fail_status='auto_approved_degraded'
-to render_and_gate_single_frame so a persistently unconvincing anchor never hard-blocks —
-after _MAX_ANCHOR_ATTEMPTS honest VLM-feedback retries it proceeds with the best attempt,
-flagged in the manifest, never a dead end.
+All quality review rules are retired. Legacy review entry points return an explicit
+retired result, without reading images, calling review models, or recording a pass.
+User-directed image changes and their undo snapshots remain available.
 
 Four entry points, sharing the same render/recovery machinery:
 
-- render_and_gate_single_frame: render ONE frame and run it through a caller-supplied
-  `judge`, synchronously, returning the verdict directly (no task_id/polling). The
-  conversational skill invocation (via /api/render_anchor, see server.py; an agent
-  following SKILL.md's Steps 1-11 mid-turn) and run_staged_frame_rendering both still
-  pass no `judge`/`_no_gate_judge`-style always-pass behavior where a human/agent is
-  driving and a real dead end is meaningful; run_autonomous_pipeline and
-  render_frames_for_task pass a real judge with hard_fail_status='auto_approved_degraded'
-  (never a dead end, see above).
+- render_single_frame: render ONE frame synchronously and return where it landed (no
+  task_id/polling), so a caller — including a conversational agent mid-turn via
+  /api/render_anchor — can look at it before composing anything else.
 
-- render_frames_for_task: an ALREADY-composed prompt_block in, gates+renders IMAGE 1 if
-  it isn't on disk yet, then does segmented rendering + checkpoint sync + chain-tail
-  lookback over the rest (sequence review is manual — see run_sequence_consistency_review;
-  the "关键点监修模式" human-confirmation pauses that used to live here were removed
-  2026-07-24, the pipeline never blocks waiting on a person now). Used by server.py's
-  /api/generate_frames — the main "帧序列" button's entry point.
+- render_frames_for_task: an ALREADY-composed prompt_block in, all missing frames
+  rendered out. Used by server.py's /api/generate_frames — the main "帧序列" button's
+  entry point. Does not generate video.
 
 - run_autonomous_pipeline: dimensions in, everything out. Composes IMAGE 1's prompt
-  itself (compose_anchor_and_packet), gates+renders it, refines the Drift Lock packet
-  against that render, then composes and renders the rest (compose_remaining_beats),
-  and generates video — sequence consistency review is not run automatically here
-  either; trigger it manually via run_sequence_consistency_review if wanted before
-  spending video quota. Used by server.py's /api/auto_run — the GUI/API-driven,
-  dimensions-first path.
+  itself (compose_anchor_and_packet), renders it, refines the Drift Lock packet against
+  that render, then composes and renders the rest (compose_remaining_beats), and
+  generates video. Used by server.py's /api/auto_run.
 
-- run_staged_frame_rendering: an ALREADY-composed prompt_block in, staged rendering
-  out. For the case where an agent already wrote the full IMAGE/VIDEO prompt text
-  and now wants the rest rendered. Used by server.py's /api/render_staged, which
+- run_staged_frame_rendering: an ALREADY-composed prompt_block in, rendering out. For
+  the case where an agent already wrote the full IMAGE/VIDEO prompt text and now wants
+  the rest rendered. Used by server.py's /api/render_staged, which
   scripts/generate_frames.py calls instead of the old one-shot /api/generate_frames.
-  Keeps the pre-existing no-gate/needs_human_review dead-end contract unchanged since
-  an agent is driving it.
 
 All entry points lead into the same autonomous recovery pass over any rejected/blocked
-video clip, so nothing past IMAGE 1 ever dead-ends in a manual-review state.
+video clip, so nothing ever dead-ends in a manual-review state.
 """
+import json
 import os
-import hashlib
+import shutil
 from datetime import datetime
 
 from server_common import (
-    _get_project_dir, read_manifest, write_manifest, manifest_lock, qa_gate_level,
-    IMG2IMG_CONTROL_PROMPT, GenerationCancelled,
+    _get_project_dir, read_manifest, write_manifest, manifest_lock,
+    IMG2IMG_CONTROL_PROMPT, log, reviews_disabled,
     frame_content_hash, drop_stale_review_verdicts, REAL_REVIEW_VERDICTS,
 )
 from prompt_pipeline import (
     frame_review_status, merge_review_results,
+    outline_items_by_beat, outline_delivery_log_line,
+    _merge_outline_frame_verdicts,
+    find_reference_frames_with_roles,
     compose_anchor_and_packet,
     compose_remaining_beats,
-    check_anchor_frame_compliance,
     refine_packet_from_accepted_anchor,
     fix_image_prompt_with_vlm_feedback,
     check_full_sequence_consistency,
     _verify_review_violation,
     fix_beat_from_sequence_review,
-    run_chain_tail_drift_check,
-    family_anchor_seq,
-    resolve_family_anchor,
-    extract_locked_anchor_stanza,
-    replace_locked_anchor_stanza,
-    recalibrate_anchor_stanza,
-    is_judge_unavailable_verdict,
     image_space_family,
-    is_skipped_verdict,
     clean_prompt_text,
     fix_image_clean_frame_proactive,
     fix_horizon_line,
     fix_camera_contradictions,
     prompt_slots_list,
+    prompt_block_from_output,
     _format_prompt_block,
     _parse_prompt_slots,
+    optimize_video_prompts_for_sequence,
 )
 from frame_generator import (
     generate_frame_sequence, _generate_image_edit, _image_edit_model,
     _measure_image_pixels, _chat_transport_is_full_quality, chat_transport_note,
-    CHAT_TRANSPORT,
+    update_manifest_stale_status, CHAT_TRANSPORT,
 )
 from video_generator import generate_video_sequence
 
-_MAX_ANCHOR_ATTEMPTS = 3
 _MAX_RECOVERY_ATTEMPTS = 2
 
 
@@ -125,29 +99,30 @@ def _frame_quality_gate(project_dir, sequence):
     return entry.get('quality_gate') if entry else None
 
 
-def _prompt_fingerprint(prompt):
-    """空白归一化后的提示词 sha256。锚点门通过时记入 manifest，复用旧判定前必须比对：
-    同名项目复跑/换了首帧提示词时，陈旧的 auto_approved 不得再绕过首帧门。"""
-    normalized = ' '.join((prompt or '').split())
-    return hashlib.sha256(normalized.encode('utf-8')).hexdigest()
-
-
 def _record_review_fingerprints(project_dir, title, sequences):
     """把本轮审查实际看过的帧内容哈希记进 manifest（review_frames_sha256: {seq: hash}）。
 
     每帧记的是"它参与的那两拍所涉及的帧"的哈希——帧 seq 的结论同时依赖 seq-1/seq/seq+1
-    三张图，其中任何一张被重渲，这个结论就该作废。锚点门早有 anchor_prompt_sha256 这套
-    指纹复用机制，一致性审查此前完全没有对应物：修完 IMG 005 之后，beat 4/5 的判定其实
+    三张图，其中任何一张被重渲，这个结论就该作废。修完 IMG 005 之后，beat 4/5 的判定其实
     已经作废，IMG 004 和 IMG 006 却仍挂着 sequence_reviewed_pass，前端显示的"全部审查
-    通过"从那一刻起就是假的。"""
-    hashes = {s: frame_content_hash(_frame_path(title, s)) for s in sequences}
+    通过"从那一刻起就是假的。
+
+    哈希按 sequences 的**邻域**（seq-1/seq/seq+1）算，而不是只算 sequences 自己：增量
+    审查（只重审失效的那几拍）下，边界帧的邻居这一轮没被重审，但它的结论依然依赖那张
+    邻居图。漏记的话，那张邻居图之后被重渲时这条结论不会作废——增量审查会一直认为它
+    还有效，永远不再复查。"""
+    wanted = {int(s) for s in sequences}
+    neighborhood = {s + d for s in wanted for d in (-1, 0, 1)}
+    hashes = {s: frame_content_hash(_frame_path(title, s)) for s in sorted(neighborhood)}
     with manifest_lock(project_dir):
         manifest = read_manifest(project_dir)
         if not manifest:
             return
         for frame in manifest.get('frames', []):
             seq = frame.get('sequence')
-            if seq not in hashes:
+            # 只给本轮真的审过的帧盖指纹；邻居的哈希只是拿来填进它们的 related 里，
+            # 不能顺手把邻居也标成"刚审过"
+            if seq not in wanted:
                 continue
             related = [s for s in (seq - 1, seq, seq + 1) if s in hashes and hashes[s]]
             if not related:
@@ -155,6 +130,68 @@ def _record_review_fingerprints(project_dir, title, sequences):
             frame['review_frames_sha256'] = {str(s): hashes[s] for s in related}
             frame['reviewed_at'] = datetime.now().isoformat(timespec='seconds')
         write_manifest(project_dir, manifest)
+
+
+def persist_outline_delivery_ledger(project_dir, ledger, title=None):
+    """把卡片工序交付总账落进项目 manifest —— 帧审查阶段唯一拿得到它的地方。
+
+    一致性审查是用户在帧网格上手动触发的独立入口（run_sequence_consistency_review），
+    跟合成那次运行不在同一个进程生命周期里，config['_outline_delivery_ledger'] 到不了
+    那边，必须落盘。选 manifest 而不是新开一个文件：它本来就是这条边界上的存量载体
+    （spatial_beats / spatial_contract 同款投影），两个渲染后端都刻意保留未知键。
+
+    落盘失败一律吞掉：总账在本次 run 的 result 里已经有完整一份，留痕不该拖垮出单。"""
+    if not ledger:
+        return False
+    try:
+        os.makedirs(project_dir, exist_ok=True)
+        with manifest_lock(project_dir):
+            manifest = read_manifest(project_dir) or {'title': title or '', 'frames': []}
+            manifest['outline_delivery_ledger'] = ledger
+            write_manifest(project_dir, manifest)
+        return True
+    except OSError as e:
+        print(f"[OUTLINE-AUDIT] 交付总账落盘失败（不影响本单交付）: {e}")
+        return False
+
+
+def _outline_items_for_review(project_dir):
+    """manifest 里的交付总账 → 帧审查按拍取用的工序投影（没有就返回空 dict）。"""
+    manifest = read_manifest(project_dir) or {}
+    ledger = manifest.get('outline_delivery_ledger')
+    if not isinstance(ledger, list) or not ledger:
+        return {}
+    return outline_items_by_beat(ledger)
+
+
+def _record_outline_frame_verdicts(project_dir, verdicts, skeleton=None):
+    """把画面层的逐条工序判定写回 manifest 里的那份总账，并打一行观测日志。
+
+    灰度期（prompt_pipeline._OUTLINE_FRAME_GATE_ENFORCING=False）这是这类判定的**唯一**
+    去处：不进 failures、不碰 quality_gate、不触发任何重渲。
+    · 隐蔽工序（rough-in/framing 后紧接封板）的 not_applicable 不被覆盖——那是确定性
+      结论，VLM 说"看不见"是对的观察、错的结论；
+    · 没落点（dropped）的行同样不碰：没人认领就无从谈画面交付。"""
+    if not verdicts:
+        return None
+    with manifest_lock(project_dir):
+        manifest = read_manifest(project_dir) or {}
+        ledger = manifest.get('outline_delivery_ledger')
+        if not isinstance(ledger, list) or not ledger:
+            return None
+        for row in ledger:
+            if not isinstance(row, dict) or row.get('plan_verdict') == 'dropped' \
+                    or row.get('frame_verdict') == 'not_applicable':
+                continue
+            verdict = verdicts.get(str(row.get('index')))
+            if verdict:
+                row['frame_verdict'] = verdict
+        manifest['outline_delivery_ledger'] = ledger
+        write_manifest(project_dir, manifest)
+    line = outline_delivery_log_line(ledger, skeleton)
+    if line:
+        print(line)
+    return ledger
 
 
 def invalidate_stale_review_verdicts(project_dir, on_progress=None):
@@ -179,18 +216,29 @@ def invalidate_stale_review_verdicts(project_dir, on_progress=None):
 _UNSET = object()
 
 
-def _set_manifest_quality_gate(project_dir, sequence, quality_gate, reason=None, prompt_fingerprint=None,
-                               review_issues=_UNSET):
+def _set_manifest_quality_gate(project_dir, sequence, quality_gate, reason=None,
+                               review_issues=_UNSET, respect_manual_flag=False,
+                               flag_origin=_UNSET):
     """Overwrite one frame's recorded quality_gate/vlm_qa_reason in manifest.json.
-    Needed because generate_frame_sequence's own per-frame QA never produces a real
-    verdict for frame 1 (it has no prior frame to compare motion against), so the
-    Anchor Acceptance Gate's verdict has to be written back out-of-band.
+    渲染路径本身不再产生任何判定（帧一律落 pending_manual_review），所以这里的写入方
+    只剩手动一致性审查与人工标记两条。
 
     review_issues：一致性审查的结构化违规记录（每条含 layer/beat/frames/verified，见
     prompt_pipeline.check_full_sequence_consistency）。vlm_qa_reason 只是给人看的摘要，
     '；'.join 之后哪一层检出的、涉及哪几帧、复核确认没有全丢了——修完也没法验证这一条
-    到底解决没有。默认 _UNSET＝不碰这个字段（锚点门等其它调用方与审查无关）；传 None
-    表示显式清空。"""
+    到底解决没有。默认 _UNSET＝不碰这个字段；传 None 表示显式清空。
+
+    respect_manual_flag=True（一致性审查的两个写入点专用）：该帧当前是 'manual_flagged'
+    时不夺走这个标记，只把机器判定存进 manual_flag_prev_gate（撤销人工标记时回落到最新
+    的机器结论）。
+
+    2026-07-30 修复：此前这里无条件覆盖 quality_gate，于是"用户描述了这一帧的问题 →
+    随后跑一次一致性审查 → 机器没看出那个问题"就会把 manual_flagged 洗成
+    sequence_reviewed_pass。视频门禁看的正是 quality_gate（见
+    video_generator._FLAGGED_QUALITY_GATES），那道硬拦就此消失；而 manual_issue 字段
+    还留着，帧网格照旧显示「人工标记」徽标——界面说标了、门禁说没标，是最坏的一种
+    不一致。set_manual_frame_issue 的注释早就写明两者应当并存（机器判定进
+    vlm_qa_reason，人的描述进 manual_issue），只是审查的写入端没有遵守。"""
     # read_manifest/write_manifest：同一把项目级锁 + 原子替换（读改写不再互相覆盖）
     with manifest_lock(project_dir):
         manifest = read_manifest(project_dir)
@@ -198,15 +246,24 @@ def _set_manifest_quality_gate(project_dir, sequence, quality_gate, reason=None,
             return
         for frame in manifest.get('frames', []):
             if frame.get('sequence') == sequence:
-                frame['quality_gate'] = quality_gate
+                if respect_manual_flag and frame.get('quality_gate') == 'manual_flagged':
+                    frame['manual_flag_prev_gate'] = quality_gate
+                else:
+                    frame['quality_gate'] = quality_gate
                 frame['vlm_qa_reason'] = reason
-                if prompt_fingerprint is not None:
-                    frame['anchor_prompt_sha256'] = prompt_fingerprint
                 if review_issues is not _UNSET:
                     if review_issues:
                         frame['review_issues'] = review_issues
                     else:
                         frame.pop('review_issues', None)
+                # flag_origin：这枚 flag 是谁盖的。链上守卫复审通过时要据此认领并清掉
+                # 自己这一路盖出来的 flag（见 chain_guard.guard_beat 的 pass 分支），
+                # 不能连人工标记与整套审查的结论一起洗掉。
+                if flag_origin is not _UNSET:
+                    if flag_origin:
+                        frame['flag_origin'] = flag_origin
+                    else:
+                        frame.pop('flag_origin', None)
                 break
         write_manifest(project_dir, manifest)
 
@@ -271,339 +328,227 @@ def _clear_manual_frame_issue(project_dir, sequence):
                 frame.pop('manual_issue', None)
                 frame.pop('manual_flag_prev_gate', None)
                 if frame.get('quality_gate') == 'manual_flagged':
-                    frame['quality_gate'] = 'pending_manual_review'
+                    frame['quality_gate'] = ('retired' if reviews_disabled()
+                                             else 'pending_manual_review')
                 break
         write_manifest(project_dir, manifest)
 
 
-def _retry_frame_until_pass(config, title, sequence, images, videos, judge, on_progress=None,
-                             max_attempts=_MAX_ANCHOR_ATTEMPTS):
-    """Render `sequence` from `images`/`videos` (same shape _parse_prompt_slots returns),
-    ask `judge(image_path, prompt) -> (passed, reason)`, and on failure correct that
-    slot's prompt via fix_image_prompt_with_vlm_feedback and re-render. Mutates
-    images[sequence] in place with the final prompt actually used. Shared by the frame-1
-    Anchor Acceptance Gate and the post-render autonomous recovery pass over any
-    leftover 'vlm_qa_failed' frame.
-    Returns (passed: bool, reason: str)."""
-    item = images[sequence]
-    prompt = item['body'] if isinstance(item, dict) else item
-    meta = item.get('meta', '') if isinstance(item, dict) else ''
-    reason = None
-    for attempt in range(1, max_attempts + 1):
-        images[sequence] = {'body': prompt, 'meta': meta}
-        prompt_block = _format_prompt_block(images, videos)
-        generate_frame_sequence(config, title, prompt_block, on_progress=on_progress, target_sequences=[sequence])
-        passed, reason = judge(_frame_path(title, sequence), prompt)
-        if on_progress:
-            on_progress('anchor_check', {'sequence': sequence, 'attempt': attempt, 'passed': passed, 'reason': reason})
-        if passed:
-            return True, reason
-        if attempt < max_attempts:
-            if on_progress:
-                on_progress('anchor_retry', {'sequence': sequence, 'attempt': attempt, 'reason': reason})
-            prompt = fix_image_prompt_with_vlm_feedback(config, prompt, reason)
-            # 改写后重套确定性修复（与 frame_generator 两条 VLM 改写路径同款、镜头族感知）：
-            # 裸用改写产物曾让干净帧被回填 horizon、静态相机声明被当"运动矛盾"删除。
-            _family = image_space_family(videos, sequence)
-            prompt = clean_prompt_text(prompt)
-            prompt = fix_image_clean_frame_proactive(prompt)
-            prompt = fix_horizon_line(prompt, family=_family)
-            # An IMAGE is always a still frame regardless of family — never allow
-            # moving-camera wording (bridge motion belongs only in the VIDEO prompt).
-            prompt = fix_camera_contradictions(prompt)
-    return False, reason
+def render_single_frame(config, title, sequence, prompt, meta='', on_progress=None):
+    """Render exactly one frame synchronously and return where it landed (no
+    task_id/polling), so a caller — including a conversational agent mid-turn via
+    /api/render_anchor — can look at the result before composing anything else.
 
+    2026-08-05：本函数此前是「锚帧验收门」（渲染 → VLM 判定 → 按反馈改写提示词重抽 →
+    仍不过就中止整条链）。那套门连同其余所有生成期一致性审查一并移除，这里只剩渲染：
+    帧照常落盘、manifest 记 pending_manual_review（＝没人看过），要不要复核由用户在帧
+    网格上手动决定。
 
-def render_and_gate_single_frame(config, title, sequence, prompt, meta='', judge=None, on_progress=None,
-                                 hard_fail_status='needs_human_review'):
-    """Render exactly one frame and run it through an acceptance gate synchronously,
-    returning the final verdict directly (no task_id/polling) so a caller — including a
-    conversational agent mid-turn — can decide what to do next before composing anything
-    else. Defaults to the Anchor Acceptance Gate judged purely from the prompt text
-    (no separate Drift Lock packet available); callers with a real packet/parsed_brief
-    (run_autonomous_pipeline) pass their own `judge`.
-    `hard_fail_status` controls what a still-failing verdict is recorded/returned as after
-    _MAX_ANCHOR_ATTEMPTS is exhausted: the conversational-skill/staged-script callers keep
-    the default 'needs_human_review' (a human is driving, they should see the dead end);
-    the autonomous GUI/API callers pass 'auto_approved_degraded' instead so a persistently
-    unconvincing anchor never hard-blocks the pipeline — it proceeds with the best attempt,
-    flagged in the manifest for visibility, same as any other degraded/unverified frame.
-    Returns {'status': 'auto_approved'|'auto_approved_degraded'|'needs_human_review',
-    'reason', 'prompt', 'image_path', 'project_dir'}. auto_approved_degraded 表示判定
-    服务异常被 fail-open 放行，或判定真跑过但重试耗尽仍未通过——两种情况帧都没有
-    真正过检，只是没被拦，区别只在 reason 文本。"""
-    if judge is None:
-        def judge(image_path, current_prompt):
-            return check_anchor_frame_compliance(config, image_path, current_prompt, {}, {})
-
+    Returns {'status': 'rendered', 'prompt', 'image_path', 'project_dir'}。"""
     images = {sequence: {'body': prompt, 'meta': meta}}
-    passed, reason = _retry_frame_until_pass(config, title, sequence, images, {}, judge, on_progress=on_progress)
+    generate_frame_sequence(config, title, _format_prompt_block(images, {}),
+                            on_progress=on_progress, target_sequences=[sequence])
     project_dir = _get_project_dir(title)
-    if passed:
-        status = 'auto_approved_degraded' if is_skipped_verdict(reason) else 'auto_approved'
-    else:
-        status = hard_fail_status
-    _set_manifest_quality_gate(project_dir, sequence, status, reason,
-                               prompt_fingerprint=_prompt_fingerprint(images[sequence]['body']))
     return {
-        'status': status,
-        'reason': reason,
-        'prompt': images[sequence]['body'],
+        'status': 'rendered',
+        'prompt': prompt,
         'image_path': _frame_path(title, sequence),
         'project_dir': project_dir,
     }
 
 
+def _valid_verdict_sequences(project_dir, sequences):
+    """这些帧里，哪几帧的审查结论此刻仍然成立。
 
-def _checkpoint_interval(config):
-    """检查点间隔（每 K 帧做一次现实同步）。默认 5（与 FX ≤5 连续序号一批对齐）；
-    config['realityCheckpointInterval'] 可覆盖，0/负值 = 关闭检查点机制。"""
-    try:
-        return int(config.get('realityCheckpointInterval', 5))
-    except (TypeError, ValueError):
-        return 5
+    **必须在 invalidate_stale_review_verdicts 之后调用**：作废逻辑已经把"所看帧图变过"
+    的结论清成 pending_manual_review 并摘掉 review_frames_sha256，所以此刻"还带着指纹的
+    真实结论"就等于"仍然成立的结论"，这里不再自己比一遍哈希（比第二遍就是第二套口径）。
 
-
-def _segment_progress(on_progress, offset, grand_total, first_segment):
-    """分段渲染的进度事件整流：generate_frame_sequence 每次调用都发自己的 'start' 和
-    按段内计数的 'frame' 事件，不整流的话前端进度条每段都清零重来。只放行第一段的
-    'start'（换成全局总数），'frame' 的 current 加上已完成偏移，所有 payload 的 total
-    改写为全局总数。cancel_check 探测原样透传且返回值必须回传（取消依赖它）。"""
-    if on_progress is None:
-        return None
-
-    def _cb(stage, details):
-        if stage == 'start':
-            if first_segment:
-                return on_progress('start', {'total': grand_total})
-            return None
-        if isinstance(details, dict):
-            d = dict(details)
-            if 'total' in d:
-                d['total'] = grand_total
-            if stage == 'frame' and isinstance(d.get('current'), (int, float)):
-                d['current'] = offset + d['current']
-            return on_progress(stage, d)
-        return on_progress(stage, details)
-    return _cb
+    人工标记压着机器判定时真实结论存在 manual_flag_prev_gate 里（见
+    _set_manifest_quality_gate 的 respect_manual_flag），同样算数——人工标记是给人看的
+    待办，不代表机器那一拍没审过。"""
+    wanted = {int(s) for s in sequences}
+    manifest = read_manifest(project_dir) or {}
+    out = set()
+    for frame in manifest.get('frames') or []:
+        seq = frame.get('sequence')
+        if seq not in wanted or not frame.get('review_frames_sha256'):
+            continue
+        if (frame.get('quality_gate') in REAL_REVIEW_VERDICTS
+                or frame.get('manual_flag_prev_gate') in REAL_REVIEW_VERDICTS):
+            out.add(seq)
+    return out
 
 
-def _append_manifest_list(project_dir, key, entry):
-    """向 manifest 的列表键追加一条记录（项目级锁 + 原子替换）。"""
-    with manifest_lock(project_dir):
-        manifest = read_manifest(project_dir)
-        if manifest:
-            manifest.setdefault(key, []).append(entry)
-            write_manifest(project_dir, manifest)
+def _valid_inline_beats(project_dir, rendered):
+    """这些拍里，哪几拍的链上守卫记录（inline_beat_review）此刻仍然成立。
 
+    判定依据是守卫落盘时记下的 frames_sha256（{帧序号: 内容哈希}）。
+    只有 verdict 在 ('pass', 'flagged')（unreviewed 不算审过）且两帧哈希均与磁盘实时文件一致
+    才算有效。"""
+    manifest = read_manifest(project_dir) or {}
+    frames_dir = os.path.join(project_dir, 'frames')
+    rendered_set = set(rendered)
+    live = {}
 
-def _checkpoint_reality_sync(config, title, images, videos, members, latest_seq,
-                             project_dir, on_progress=None):
-    """检查点现实同步（滚动现实校准 + 链中回望重锚定）。在一个镜头族的分段渲染
-    间隙调用，latest_seq 是刚渲染完的段尾帧。两步：
+    def _live_hash(seq):
+        if seq not in live:
+            live[seq] = frame_content_hash(os.path.join(frames_dir, f'img_{seq:03d}.webp'))
+        return live[seq]
 
-    1. 链中回望：当前族锚→链中→latest 三帧比对累积漂移（与收尾的链尾回望同一判定）。
-       检出真实漂移（排除判定服务异常的 fail-closed FAIL）时就地重锚定——把 latest
-       立为该族新基线（config['_reanchors'] 带内通道 + manifest['reanchors'] 留痕），
-       此后的逐帧漂移复查、收尾回望、下一次校准都以新基线为准。漂移无法廉价撤销，
-       继续拿旧锚当基线只会连环误杀，向前重定基线让链条后半段自洽。
-
-    2. 锚点句校准：合成期写进剩余提示词的 Locked anchors 句停留在 packet 的预想值
-       （首帧 refine 之后再没对过账）。拿 latest 真实帧核对格位/画幅占比，有明确
-       出入时把修正句整句替换进该族全部剩余提示词（fix_primary_landmarks 已保证
-       同族锚点句全同，整句替换是确定性手术）。
-
-    返回 True 若剩余提示词被改写（调用方需重排 prompt_block）。全程 fail-open，
-    任何一步失败只跳过，不拦渲染。"""
-    changed = False
-
-    # ── 1. 链中回望 + 重锚定 ──
-    head = resolve_family_anchor(config, videos, latest_seq)
-    pool = [s for s in members
-            if head <= s <= latest_seq and os.path.exists(_frame_path(title, s))]
-    if len(pool) >= 3:
-        mid = pool[len(pool) // 2]
-        tail = pool[-1]
-        if mid not in (pool[0], tail):
-            passed, reason = run_chain_tail_drift_check(
-                config,
-                _frame_path(title, pool[0]), _frame_path(title, mid), _frame_path(title, tail),
-                anchor_seq=pool[0], mid_seq=mid, tail_seq=tail,
-                anchor_is_first_frame=(pool[0] == 1),
-            )
-            if on_progress:
-                verdict = '通过' if passed else '检出累积漂移'
-                detail = f"（{reason}）" if reason and reason != 'PASS' else ''
-                on_progress('chain_drift_check', {
-                    'family_anchor': pool[0], 'mid': mid, 'tail': tail,
-                    'passed': bool(passed), 'reason': reason, 'checkpoint': True,
-                    'message': f"链中回望 IMG {pool[0]:03d}→{mid:03d}→{tail:03d}：{verdict}{detail}",
-                })
-            if not passed and not is_judge_unavailable_verdict(reason):
-                config.setdefault('_reanchors', []).append(int(tail))
-                entry = {'family_anchor': pool[0], 'new_anchor': int(tail), 'reason': reason}
-                _append_manifest_list(project_dir, 'reanchors', entry)
-                if on_progress:
-                    on_progress('reanchor', {
-                        **entry,
-                        'message': (f"检出链中累积漂移，已把 IMG {tail:03d} 立为该镜头族的"
-                                    f"新锚点基线（后续漂移复查与回望以其为准）"),
-                    })
-
-    # ── 2. 锚点句滚动校准 ──
-    remaining = [s for s in members if s > latest_seq]
-    old_stanza = None
-    for s in remaining:
-        item = images.get(s)
-        body = item['body'] if isinstance(item, dict) else (item or '')
-        old_stanza = extract_locked_anchor_stanza(body)
-        if old_stanza:
-            break
-    if not old_stanza:
-        return changed
-    new_stanza = recalibrate_anchor_stanza(config, _frame_path(title, latest_seq), old_stanza)
-    if not new_stanza:
-        return changed
-    updated = 0
-    for s in remaining:
-        item = images.get(s)
-        body = item['body'] if isinstance(item, dict) else (item or '')
-        meta = item.get('meta', '') if isinstance(item, dict) else ''
-        new_body, replaced = replace_locked_anchor_stanza(body, new_stanza)
-        if replaced:
-            images[s] = {'body': new_body, 'meta': meta}
-            updated += 1
-    if updated:
-        changed = True
-        _append_manifest_list(project_dir, 'anchor_recalibrations', {
-            'grounded_on': int(latest_seq), 'updated_slots': updated,
-            'from': old_stanza, 'to': new_stanza,
-        })
-        if on_progress:
-            on_progress('anchor_recalibrated', {
-                'grounded_on': int(latest_seq), 'updated_slots': updated, 'stanza': new_stanza,
-                'message': (f"检查点校准：以 IMG {latest_seq:03d} 真实画面为准，"
-                            f"修正了剩余 {updated} 个提示词的锁定锚点句"),
-            })
-    return changed
-
-
-def _render_frames_with_checkpoints(config, title, prompt_block, project_dir, on_progress=None):
-    """分段渲染 + 检查点现实同步。把整链渲染切成每 K 帧一段（K=_checkpoint_interval，
-    段不跨镜头族），段间做 _checkpoint_reality_sync。返回（可能被校准改写过的）
-    prompt_block，供下游恢复轮/回望/视频生成使用。
-
-    qaGateLevel=off、间隔关闭、或本次待渲染帧数不超过一段时，退回原有的单次全量
-    调用（target_sequences=None 自带断点续传跳已有帧 + 清全部血统标记的语义）。
-    分段调用显式传 target_sequences 会禁用帧级续传跳过，故段目标里只放缺失帧。"""
-    images, videos = _parse_prompt_slots(prompt_block)
-    seqs = sorted(images)
-    interval = _checkpoint_interval(config)
-    missing = {s for s in seqs if not os.path.exists(_frame_path(title, s))}
-    if interval <= 0 or not missing or qa_gate_level(config) == 'off' or len(missing) <= interval:
-        generate_frame_sequence(config, title, prompt_block, on_progress=on_progress,
-                                target_sequences=None)
-        return prompt_block
-
-    config['_reanchors'] = []
-    # 镜头族连续段（BRIDGE 处断开，检查点不跨族——锚点句与漂移基线都是族内概念）
-    runs = []
-    for seq in seqs:
-        fam = family_anchor_seq(videos, seq)
-        if runs and runs[-1][0] == fam:
-            runs[-1][1].append(seq)
-        else:
-            runs.append((fam, [seq]))
-
-    grand_total = len(missing)
-    offset = 0
-    first_segment = True
-    changed = False
-    for _fam, members in runs:
-        segments = [members[i:i + interval] for i in range(0, len(members), interval)]
-        for si, seg in enumerate(segments):
-            targets = [s for s in seg if s in missing]
-            if targets:
-                block = _format_prompt_block(images, videos)
-                generate_frame_sequence(
-                    config, title, block,
-                    on_progress=_segment_progress(on_progress, offset, grand_total, first_segment),
-                    target_sequences=targets,
-                )
-                offset += len(targets)
-                first_segment = False
-            # 段间检查点：族的最后一段交给收尾链尾回望，没渲染新帧的段没有新现实可同步
-            if si == len(segments) - 1 or not targets:
-                continue
+    inline_ok = set()
+    for frame in manifest.get('frames') or []:
+        ibr = frame.get('inline_beat_review')
+        if not isinstance(ibr, dict) or ibr.get('verdict') not in ('pass', 'flagged'):
+            continue
+        beat = ibr.get('beat')
+        if not isinstance(beat, int) or beat not in rendered_set or (beat + 1) not in rendered_set:
+            continue
+        recorded_hashes = ibr.get('frames_sha256')
+        if not isinstance(recorded_hashes, dict) or not recorded_hashes:
+            continue
+        valid = True
+        for seq_str, recorded_hash in recorded_hashes.items():
             try:
-                if _checkpoint_reality_sync(config, title, images, videos, members, seg[-1],
-                                            project_dir, on_progress=on_progress):
-                    changed = True
-            except GenerationCancelled:
-                # 取消不是"检查点异常"：吞掉它，段间检查点（含一次 VLM 调用）里点的取消
-                # 会被咽下去，循环接着渲下一段——用户看到的就是"取消了没用"。
-                # 与 _chain_drift_lookback 同一处理（见那里的同款注释）。
-                raise
-            except Exception as e:
-                print(f"[CHECKPOINT] 现实同步检查点异常（不拦截渲染）: {e}")
-    return _format_prompt_block(images, videos) if changed else prompt_block
+                seq = int(seq_str)
+            except (TypeError, ValueError):
+                valid = False
+                break
+            if _live_hash(seq) != recorded_hash:
+                valid = False
+                break
+        if valid:
+            inline_ok.add(beat)
+    return inline_ok
 
 
-def _chain_drift_lookback(config, title, prompt_block, project_dir, on_progress=None):
-    """链尾回望检查：全部帧渲染（含恢复轮）结束后，按镜头族各取 锚点/链中/链尾 三帧，
-    一次 VLM 调用比对累积漂移。逐帧质检只看相邻对，每步都合格的缓慢偏移在链尾可能已
-    很可观——这是"链尾对链头"组合唯一被比对的地方。
+def _inline_result(project_dir, inline_ok):
+    """把仍然成立的守卫记录拼成 check_full_sequence_consistency 的同形状 dict。
 
-    检测型门：结果写进 manifest['chain_drift'] 并广播 chain_drift_check 事件，任何档位
-    都不拦截视频生成（累积漂移无廉价自动修复，重渲链尾单帧修不了整条链）；off 档跳过。
-    整个过程对流水线非致命：任何异常只打日志，不中断任务。"""
-    if qa_gate_level(config) == 'off':
+    注意：global_reviewed=False, global_attempted=False，绝不伪造跨帧层的成功。"""
+    manifest = read_manifest(project_dir) or {}
+    failures = {}
+    issues = []
+    outline_per_beat = []
+    for frame in manifest.get('frames') or []:
+        ibr = frame.get('inline_beat_review')
+        if not isinstance(ibr, dict):
+            continue
+        beat = ibr.get('beat')
+        if beat not in inline_ok:
+            continue
+        ibr_issues = ibr.get('issues') or []
+        for issue in ibr_issues:
+            if issue.get('verified') is not False:
+                failures.setdefault(beat, []).append(issue.get('text'))
+            issues.append(issue)
+        # 卡片工序的画面判定：守卫过的拍在收尾那趟被跳过，逐拍层不会再产一次，
+        # 这里是它们进 _record_outline_frame_verdicts 的唯一通路（漏掉不报错，
+        # 只是交付总账的 frame_verdict 一直空着）。
+        ibr_outline = ibr.get('outline_frame_verdicts')
+        if isinstance(ibr_outline, dict) and ibr_outline:
+            outline_per_beat.append(ibr_outline)
+    return {
+        'failures': failures,
+        'issues': issues,
+        'unreviewed_beats': [],
+        'global_unreviewed_beats': [],
+        'global_reviewed': False,
+        'global_attempted': False,
+        'outline_frame_verdicts': _merge_outline_frame_verdicts(outline_per_beat),
+    }
+
+
+def _classify_review_severity(config, issues, on_progress=None):
+    """给手动整套审查的违规补上影响分级（chain / cosmetic），就地写进每条的
+    'severity'。
+
+    分级器（chain_guard.classify_chain_impact）本来只服务于生成期链上守卫的停链
+    判定，手动审查这条路一直没调过它——于是"会一路传染进后面每一帧的结构问题"
+    与"只是光影色温差一点"在前端长得一模一样，人得逐条自己读文案去判断先修哪个。
+    这里补上，纯文本分类，一次调用分完整轮。
+
+    三条边界：
+    · 已经带 severity 的不重分（链上守卫审过的拍沿用它自己的判定，见 _inline_result）；
+    · 同一条文案只送一次，多帧共用的跨帧违规不重复计费；
+    · **失败就不分级**（on_error=None）。这里的分级只用于展示、不决定任何动作，
+      一次调用失败把整单标成"会传染下游"是在编造判定；前端见到没有 severity
+      会如实不画那枚标签（见 js/review_report.js）。
+    """
+    pending = [i for i in issues if not i.get('severity')]
+    if not pending:
         return
-    try:
-        images, videos = _parse_prompt_slots(prompt_block)
-        runs = {}
-        for seq in sorted(images):
-            # resolve_family_anchor：链中重锚定过的族在重锚点处自然分段，
-            # 收尾回望的每个子链都对着自己实际生效的基线比
-            runs.setdefault(resolve_family_anchor(config, videos, seq), []).append(seq)
-        results = []
-        for anchor in sorted(runs):
-            members = [s for s in runs[anchor] if os.path.exists(_frame_path(title, s))]
-            # 少于 4 帧的族没有"链中"可言，锚点/相邻检查已覆盖
-            if len(members) < 4:
-                continue
-            head, tail = members[0], members[-1]
-            mid = members[len(members) // 2]
-            passed, reason = run_chain_tail_drift_check(
-                config,
-                _frame_path(title, head), _frame_path(title, mid), _frame_path(title, tail),
-                anchor_seq=head, mid_seq=mid, tail_seq=tail,
-                anchor_is_first_frame=(head == 1),
-            )
-            entry = {'family_anchor': head, 'mid': mid, 'tail': tail,
-                     'passed': bool(passed), 'reason': reason}
-            results.append(entry)
-            if on_progress:
-                verdict = '通过' if passed else '检出累积漂移'
-                detail = f"（{reason}）" if reason and reason != 'PASS' else ''
-                on_progress('chain_drift_check', {
-                    **entry,
-                    'message': f"链尾回望 IMG {head:03d}→{mid:03d}→{tail:03d}：{verdict}{detail}",
-                })
-        if results:
-            with manifest_lock(project_dir):
-                manifest = read_manifest(project_dir)
-                if manifest:
-                    manifest['chain_drift'] = results
-                    write_manifest(project_dir, manifest)
-    except GenerationCancelled:
-        # 取消不是"检查异常"：吞掉它会让整条流水线在用户点了取消之后继续往下跑
-        raise
-    except Exception as e:
-        print(f"[CHAIN DRIFT] 链尾回望检查异常（不拦截流程）: {e}")
+    # 按文案去重：跨帧层的一条违规会同时落在它涉及的每一帧上
+    texts = list(dict.fromkeys(i.get('text', '') for i in pending if i.get('text')))
+    if not texts:
+        return
+    # 延迟导入：chain_guard 反过来依赖本模块（_outline_items_for_review），
+    # 模块级 import 会成环
+    from chain_guard import classify_chain_impact
+    if on_progress:
+        on_progress('sequence_review', {
+            'message': f'正在给 {len(texts)} 条违规分级（会传染下游 / 仅观感）...',
+        })
+    severities = classify_chain_impact(config, texts, on_error=None)
+    if len(severities) != len(texts):
+        return  # 没分成就不分，绝不半套落盘
+    by_text = dict(zip(texts, severities))
+    for issue in pending:
+        sev = by_text.get(issue.get('text', ''))
+        if sev:
+            issue['severity'] = sev
 
 
-def _sequence_consistency_review(config, title, prompt_block, project_dir, on_progress=None):
+def _manifest_review_summary(project_dir, sequences):
+    """这段已渲染序列**此刻**的审查状态（从 manifest 现读）：
+    {'flagged': {seq: 原因}, 'unreviewed': [seq, ...]}。
+
+    增量审查下本轮只审了几拍，光按本轮结果汇总会把上几轮标出来、还没修的问题说没了。
+    人工标记压着机器判定时真实结论在 manual_flag_prev_gate 里，一并算进来。
+
+    2026-08-05 修正"未审"的口径：以前只把 sequence_review_skipped（审查跑过但失败）
+    算未审，于是 pending_manual_review——**从来没被审过**的初始态——既不进 flagged 也不进
+    unreviewed，在所有汇总里静默读作"没问题"。实测代价：某一单 12 帧里 4 帧是这个状态、
+    vlm_qa_reason 全空，而汇总报的是"审查通过"。审查是手动触发的（见
+    _sequence_consistency_review 的 2026-07-24 变更），渲染继续往后跑而审查停在第 8 帧
+    是完全正常的路径，所以这个状态很常见，不是异常。
+    现在的口径只有一条：**没有真实结论（REAL_REVIEW_VERDICTS）就是未审**——manifest 里
+    没有这一帧的记录同样算未审，而不是当它不存在。"""
+    wanted = {int(s) for s in sequences}
+    manifest = read_manifest(project_dir) or {}
+    flagged, unreviewed = {}, []
+    seen = set()
+    for frame in manifest.get('frames') or []:
+        seq = frame.get('sequence')
+        if seq not in wanted:
+            continue
+        seen.add(seq)
+        gate = frame.get('quality_gate')
+        prev = frame.get('manual_flag_prev_gate')
+        if 'sequence_review_flagged' in (gate, prev):
+            flagged[seq] = frame.get('vlm_qa_reason') or '（未记录原因）'
+        elif gate not in REAL_REVIEW_VERDICTS and prev not in REAL_REVIEW_VERDICTS:
+            unreviewed.append(seq)
+    # manifest 里根本没有记录的帧也是未审——漏记不等于通过
+    unreviewed.extend(sorted(wanted - seen))
+    return {'flagged': flagged, 'unreviewed': sorted(set(unreviewed))}
+
+
+def _beats_needing_review(rendered, valid_seqs):
+    """需要（重）审的拍号：第 b 拍看的是 IMG b 与 IMG b+1，两张里任何一张没有仍然
+    成立的结论，这一拍就得重审。
+
+    结论作废是**邻域**级的（帧 X 变了，X-1/X/X+1 的结论一起作废，见
+    _record_review_fingerprints），所以"某一拍要重审"必然意味着它的两张帧都已经失效，
+    两边不会打架。"""
+    ordered = sorted(rendered)
+    total_beats = len(ordered) - 1
+    return [b for b in range(1, total_beats + 1)
+            if ordered[b - 1] not in valid_seqs or ordered[b] not in valid_seqs]
+
+
+def _sequence_consistency_review(config, title, prompt_block, project_dir, on_progress=None,
+                                 full=False):
     """整套序列渲染完成后的一致性审查：对着真实已渲染画面统一跑一次施工顺序/SCUP
     审查（prompt_pipeline.check_full_sequence_consistency），取代原来逐帧/盲文本的
     质检门。
@@ -622,7 +567,25 @@ def _sequence_consistency_review(config, title, prompt_block, project_dir, on_pr
 
     2026-07-25：结论落盘时会连同"本轮看的是哪几张图"的内容哈希一起记下
     （_record_review_fingerprints），任何一帧此后被重渲都会让相关结论自动作废
-    （invalidate_stale_review_verdicts），不再出现修完一帧后邻帧还挂着过期"审查通过"。"""
+    （invalidate_stale_review_verdicts），不再出现修完一帧后邻帧还挂着过期"审查通过"。
+
+    2026-08-02 增量审查（full=False，默认）：只重审"结论已经失效"的那几拍，仍然成立的
+    结论原样保留、连同它们的帧一起不再送审。此前每次都是全量——十几帧的单子修完三帧
+    再审一遍，要把已经审干净的十来拍连同跨帧窗口整批重烧，几分钟起步，于是"修完就重审"
+    这个本该最顺手的动作反而没人愿意做。判定材料早就齐了（review_frames_sha256 +
+    drop_stale_review_verdicts），送审收窄的开关也早就有（only_beats / global_only_beats，
+    降级重试一直在用），这里只是把两者接上。
+
+    full=True：强制全量重审，不复用任何既有结论。跨帧层是按窗口切的（global_review_windows），
+    增量只重跑覆盖失效拍的那几个窗口——某一帧的改动理论上可能影响别的窗口里的判断，
+    这条出口就是留给"想让整链重新互相比一遍"的时候用的。"""
+    if reviews_disabled(config):
+        if on_progress:
+            on_progress('sequence_review_result', {
+                'passed': None, 'skipped': True, 'retired': True, 'reviewed_sequences': [],
+                'message': '质量门禁已退役，不再执行一致性审查。',
+            })
+        return prompt_block
     images, videos = _parse_prompt_slots(prompt_block)
     total_beats = len(images) - 1
     if total_beats <= 0:
@@ -654,16 +617,111 @@ def _sequence_consistency_review(config, title, prompt_block, project_dir, on_pr
             })
         return prompt_block
 
+    # 增量：仍然成立的结论不再重审（full=True 时全部重来）。
+    reusable = set() if full else _valid_verdict_sequences(project_dir, rendered)
+    beats_to_review = _beats_needing_review(rendered, reusable)
+    all_beats = list(range(1, len(rendered)))
+    incremental = len(beats_to_review) < len(all_beats)
+    # 本轮真正会被写结论的帧＝这几拍涉及的帧里，**结论已经失效的那些**。
+    #
+    # 减掉 reusable 这一步不是省事，是正确性：一拍被选中重审，可能只是因为它另一头
+    # 的帧变了。比如 IMG 006 被修过、IMG 005 上一轮被判过问题——beat 5（005→006）
+    # 必须重审，但 IMG 005 的"有问题"是 beat 4 判的，而 beat 4 这轮压根没跑。把
+    # 005 一起重写就会拿一个没人复查过的"通过"洗掉它身上还没修的问题。
+    #
+    # 反过来，留下的每一帧（结论已失效的那些）的**两拍都在 beats_to_review 里**
+    # ——结论作废是邻域级的，帧 X 失效必然让 beat X-1 与 beat X 一起进重审名单。
+    # 所以 frame_review_status 那套"两拍都审过才算通过"的口径原样成立，这里不需要
+    # 第二套状态推导。
+    affected = sorted({s for b in beats_to_review
+                       for s in (rendered[b - 1], rendered[b])} - reusable)
+
+    if not beats_to_review:
+        # 一拍都不用重审：如实说明，不烧任何调用、不碰 manifest。仍然要把"上几轮标出来、
+        # 还没修的问题"报出来——这一趟没发现新问题，不等于这套序列干净。
+        if on_progress:
+            state = _manifest_review_summary(project_dir, rendered)
+            tail = ''
+            if state['flagged']:
+                names = '、'.join(f'{s:03d}' for s in sorted(state['flagged']))
+                tail = f'；仍有 {len(state["flagged"])} 帧带着尚未修复的问题（IMG {names}）'
+            elif state['unreviewed']:
+                names = '、'.join(f'{s:03d}' for s in state['unreviewed'])
+                tail = f'；另有 {len(state["unreviewed"])} 帧此前未审完（IMG {names}），可用「全量重审」补齐'
+            lines = [{'text': f'全部 {len(all_beats)} 拍的结论仍然成立'
+                              f'（帧图自上次审查后没有变化），本轮未重复审查', 'cls': 'ok'}]
+            if state['flagged']:
+                lines.append({'text': f'仍有 {len(state["flagged"])} 帧带着尚未修复的问题：',
+                              'cls': 'warn'})
+                for s in sorted(state['flagged']):
+                    lines.append({'text': f'　IMG {s:03d}：{state["flagged"][s]}', 'cls': 'warn'})
+            elif state['unreviewed']:
+                names = '、'.join(f'{s:03d}' for s in state['unreviewed'])
+                lines.append({'text': f'另有 {len(state["unreviewed"])} 帧此前未审完'
+                                      f'（IMG {names}），可用「全量重审」补齐', 'cls': 'warn'})
+            on_progress('sequence_review_result', {
+                'passed': not state['flagged'] and not state['unreviewed'],
+                'partial': partial, 'reviewed_sequences': [],
+                'unreviewed_sequences': state['unreviewed'],
+                'reused_beats': len(all_beats), 'rendered_count': len(rendered),
+                'flagged_frames': [{'sequence': s, 'reason': state['flagged'][s]}
+                                   for s in sorted(state['flagged'])],
+                'lines': lines,
+                'message': (f'一致性审查：全部 {len(all_beats)} 拍的结论仍然成立'
+                            f'（帧图自上次审查后没有变化），本轮未重复审查{tail}。'),
+            })
+        return prompt_block
+
+    inline_ok = set() if full else _valid_inline_beats(project_dir, rendered)
+    local_beats = [b for b in beats_to_review if b not in inline_ok]
+
     if on_progress:
+        scope = (f'本轮只需重审 {len(local_beats)}/{len(all_beats)} 拍'
+                 f'（其余 {len(all_beats) - len(local_beats)} 拍的结论仍然成立，直接复用）'
+                 if (incremental or inline_ok) else f'本轮审查全部 {len(all_beats)} 拍')
         if partial:
             on_progress('sequence_review', {
                 'message': f'仅前 {len(rendered)}/{len(all_seqs)} 帧已渲染，'
-                           f'先对这一段做一致性审查（其余帧渲完后可再跑一次补齐）...',
+                           f'先对这一段做一致性审查（其余帧渲完后可再跑一次补齐）。{scope}...',
             })
         else:
-            on_progress('sequence_review', {'message': '正在对整套已渲染序列做一致性审查...'})
-    final_result = check_full_sequence_consistency(config, prompt_block, frame_paths,
-                                                   on_progress=on_progress)
+            on_progress('sequence_review', {'message': f'正在做一致性审查：{scope}...'})
+    # 卡片工序在**画面**上交付了没有：工序原文从 manifest 的交付总账里取，沿逐拍层
+    # 透传下去（见 prompt_pipeline.outline_frame_review_block）。老单/没落过总账的单
+    # 拿到空 dict，那一层的审查措辞与改造前逐字相同。
+    # 没有总账的单（老单/手填维度直出）连这个入参都不传，整条审查链路的调用形状
+    # 与改造前逐字相同。
+    outline_kw = {}
+    outline_items = _outline_items_for_review(project_dir)
+    if outline_items:
+        outline_kw['outline_items'] = outline_items
+
+    # 爆款对标基准：关键帧与 5 列拼图
+    ref_frame_paths, ref_frame_roles, source_collage_path = find_reference_frames_with_roles(
+        project_dir, total_beats)
+    rendered_collage_path = os.path.join(project_dir, 'frames', 'full_collage.jpg')
+    if not os.path.exists(rendered_collage_path):
+        c_name = f"{os.path.basename(os.path.normpath(project_dir))}_collage.jpg"
+        alt_c = os.path.join(project_dir, c_name)
+        if os.path.exists(alt_c):
+            rendered_collage_path = alt_c
+
+    benchmark_kw = {}
+    if ref_frame_paths:
+        benchmark_kw['ref_frame_paths'] = ref_frame_paths
+        # 过门梯那几格挂的是包络端点而非基准帧，角色必须一起传下去。
+        benchmark_kw['ref_frame_roles'] = ref_frame_roles
+    if source_collage_path and rendered_collage_path and os.path.exists(rendered_collage_path):
+        benchmark_kw['source_collage_path'] = source_collage_path
+        benchmark_kw['rendered_collage_path'] = rendered_collage_path
+
+    review_extra_kw = {**outline_kw, **benchmark_kw}
+
+    final_result = check_full_sequence_consistency(
+        config, prompt_block, frame_paths, on_progress=on_progress,
+        only_beats=(local_beats if (incremental or inline_ok) else None),
+        global_only_beats=(beats_to_review if incremental else None),
+        **review_extra_kw)
     if final_result is None:
         # 整轮彻底没跑起来（超时/网关异常）≠ 审查通过。降级重试一次：帧图压小 +
         # 超时放宽。2026-07-15 事故里这里曾直接 fail-open 放行整单。
@@ -671,13 +729,21 @@ def _sequence_consistency_review(config, title, prompt_block, project_dir, on_pr
             on_progress('sequence_review', {
                 'message': '一致性审查调用失败（超时/网关异常），压缩帧图降级重试一次...',
             })
-        final_result = check_full_sequence_consistency(config, prompt_block, frame_paths,
-                                                       degraded=True, on_progress=on_progress)
+        final_result = check_full_sequence_consistency(
+            config, prompt_block, frame_paths, degraded=True, on_progress=on_progress,
+            only_beats=(local_beats if (incremental or inline_ok) else None),
+            global_only_beats=(beats_to_review if incremental else None),
+            **review_extra_kw)
     elif final_result.get('unreviewed_beats') or not final_result.get('global_reviewed'):
         # 部分没审成：只降级重跑这几拍（外加没跑成的跨帧层），不再把已经审干净的
         # 整批重来一遍——一次网络抖动此前会让整单多烧一遍全部调用。
         retry_beats = list(final_result.get('unreviewed_beats') or [])
-        skip_global = bool(final_result.get('global_reviewed'))
+        # 跨帧层现在按窗口分批（prompt_pipeline.global_review_windows）：个别窗口没跑成
+        # 时 global_reviewed 仍是 True（其余窗口有判定），只看它就会跳过补跑，那几拍在
+        # 重试后反而被洗成"已审"——比不重试更糟。只有"跑过且一个窗口都没漏"才允许跳过；
+        # 有漏的窗口就带着 global_only_beats 精确补跑那几个窗口，不整层重来。
+        global_unreviewed = list(final_result.get('global_unreviewed_beats') or [])
+        skip_global = bool(final_result.get('global_reviewed')) and not global_unreviewed
         if on_progress:
             scope = (f"第 {'、'.join(str(b) for b in retry_beats)} 拍" if retry_beats else '')
             scope += ('' if skip_global else ('与跨帧审查' if scope else '跨帧审查'))
@@ -686,8 +752,12 @@ def _sequence_consistency_review(config, title, prompt_block, project_dir, on_pr
             })
         retry = check_full_sequence_consistency(config, prompt_block, frame_paths, degraded=True,
                                                 only_beats=retry_beats, skip_global=skip_global,
-                                                on_progress=on_progress)
+                                                global_only_beats=(global_unreviewed or None),
+                                                on_progress=on_progress, **review_extra_kw)
         final_result = merge_review_results(final_result, retry)
+
+    if final_result is not None and inline_ok:
+        final_result = merge_review_results(_inline_result(project_dir, inline_ok), final_result)
 
     if final_result is None:
         # 审查两次（常规+降级）都彻底没跑起来。如实标"未经审查"，绝不盖
@@ -701,7 +771,8 @@ def _sequence_consistency_review(config, title, prompt_block, project_dir, on_pr
                 kept += 1
                 continue
             _set_manifest_quality_gate(project_dir, seq, 'sequence_review_skipped',
-                                       '一致性审查服务不可用（降级重试仍失败），此帧未经整套序列审查')
+                                       '一致性审查服务不可用（降级重试仍失败），此帧未经整套序列审查',
+                                       respect_manual_flag=True)
         if on_progress:
             tail = f'（{kept} 帧保留了上一轮的审查结论）' if kept else ''
             on_progress('sequence_review_result', {
@@ -710,47 +781,77 @@ def _sequence_consistency_review(config, title, prompt_block, project_dir, on_pr
             })
         return prompt_block
 
+    # 卡片工序的画面判定先落账（灰度期它只到这里为止，绝不参与下面的 quality_gate）
+    _record_outline_frame_verdicts(project_dir, final_result.get('outline_frame_verdicts'))
+
     statuses = frame_review_status(rendered, final_result)
     gate_by_status = {'flagged': 'sequence_review_flagged',
                       'reviewed': 'sequence_reviewed_pass',
                       'unreviewed': 'sequence_review_skipped'}
     # 结构化违规按"归属帧"（beat+1，即该拍的到达画面）分组落盘
     issues_by_seq = {}
-    for issue in (final_result.get('issues') or []):
-        if issue.get('verified') is False:
-            continue  # 复核否决的不落盘，否则帧上会留着一堆已被推翻的指控
+    surviving = [i for i in (final_result.get('issues') or [])
+                 if i.get('verified') is not False]  # 复核否决的不落盘，否则帧上会留着一堆已被推翻的指控
+    _classify_review_severity(config, surviving, on_progress=on_progress)
+    for issue in surviving:
         issues_by_seq.setdefault(issue.get('beat', 0) + 1, []).append(issue)
-    for seq in rendered:
+    # 只写本轮真的审过的那些帧：其余帧的结论仍然成立（reusable），重新盖一遍章
+    # 只会把 reviewed_at 刷新成谎话，还会把它们上一轮的 review_issues 抹掉。
+    for seq in affected:
         status, reason = statuses.get(seq, ('unreviewed', '未参与本轮审查'))
+        # respect_manual_flag：机器没看出人已经指出来的问题，不代表那个问题不存在。
+        # 人工标记必须活过一次审查，否则视频门禁的硬拦会被静默摘掉。
         _set_manifest_quality_gate(project_dir, seq, gate_by_status[status], reason,
-                                   review_issues=issues_by_seq.get(seq) or None)
+                                   review_issues=issues_by_seq.get(seq) or None,
+                                   respect_manual_flag=True)
     # 把"本轮看的是哪几张图"钉进 manifest：之后任何一帧被重渲，
     # invalidate_stale_review_verdicts 就能据此让相关结论自动作废
     _record_review_fingerprints(project_dir, title,
-                                [s for s in rendered if statuses.get(s, ('', ))[0] != 'unreviewed'])
+                                [s for s in affected if statuses.get(s, ('', ))[0] != 'unreviewed'])
 
-    failures = final_result.get('failures') or {}
-    flagged_seqs = sorted(s for s, (st, _) in statuses.items() if st == 'flagged')
-    unreviewed_seqs = sorted(s for s, (st, _) in statuses.items() if st == 'unreviewed')
+    # 汇总说的是"这段已渲染序列此刻是什么状态"，而不是"本轮审了什么"——增量审查下
+    # 本轮只看了几拍，光报本轮结果会把上几轮标出来、还没修的问题说没了。
+    state = _manifest_review_summary(project_dir, rendered)
+    flagged_seqs = sorted(state['flagged'])
+    unreviewed_seqs = state['unreviewed']
+    reused_beats = len(all_beats) - len(beats_to_review)
 
     # 只审了连续前缀时必须说明还剩几帧没渲——否则一句"审查通过"会被读成整单通过
     partial_note = (f'（本轮只覆盖已渲染的前 {len(rendered)}/{len(all_seqs)} 帧，'
                     f'其余帧渲完后请再跑一次）' if partial else '')
+    reuse_note = f'（本轮增量重审 {len(beats_to_review)} 拍，另有 {reused_beats} 拍沿用既有结论）' \
+        if reused_beats else ''
+
+    # 收尾那几条注解（只覆盖了前缀 / 复用了几拍）：两条路径共用，各自成行
+    def _tail_lines():
+        out = []
+        if partial:
+            out.append({'text': f'本轮只覆盖已渲染的前 {len(rendered)}/{len(all_seqs)} 帧，'
+                                f'其余帧渲完后请再跑一次', 'cls': 'warn'})
+        if reused_beats:
+            out.append({'text': f'本轮增量重审 {len(beats_to_review)} 拍，'
+                                f'另有 {reused_beats} 拍的帧图未变化、沿用了既有结论', 'cls': 'ok'})
+        return out
 
     if not flagged_seqs and not unreviewed_seqs:
         if on_progress:
             on_progress('sequence_review_result', {
                 'passed': True, 'partial': partial,
-                'reviewed_sequences': rendered,
-                **({'message': f'已渲染的前 {len(rendered)} 帧一致性审查通过{partial_note}'}
-                   if partial else {}),
+                'reviewed_sequences': sorted(affected),
+                'reused_beats': reused_beats, 'rendered_count': len(rendered),
+                'flagged_frames': [], 'unreviewed_sequences': [],
+                'lines': [{'text': f'已渲染的前 {len(rendered)} 帧一致性审查通过',
+                           'cls': 'ok'}] + _tail_lines(),
+                **({'message': (f'已渲染的前 {len(rendered)} 帧一致性审查通过'
+                                f'{partial_note}{reuse_note}')}
+                   if (partial or reuse_note) else {}),
             })
         return prompt_block
 
     if on_progress:
         parts = []
         if flagged_seqs:
-            detail = '；'.join(f"IMG {s:03d}: {'；'.join(failures.get(s - 1, []))}" for s in flagged_seqs)
+            detail = '；'.join(f"IMG {s:03d}: {state['flagged'][s]}" for s in flagged_seqs)
             parts.append(f'发现 {len(flagged_seqs)} 帧存在问题（{detail}）——已保留渲染结果、'
                          f'未自动修改，请在帧网格确认后点击「修复此帧问题」')
         if unreviewed_seqs:
@@ -758,28 +859,51 @@ def _sequence_consistency_review(config, title, prompt_block, project_dir, on_pr
             parts.append(f'另有 {len(unreviewed_seqs)} 帧未审完'
                          f'（IMG {"、".join(f"{s:03d}" for s in unreviewed_seqs)}），'
                          f'已标记为「未审查」，可重跑审查补齐')
+        # 结构化播报（2026-08-25）：上面那句 message 把"几帧有问题 + 每帧原因 +
+        # 未审完 + 前缀说明 + 增量说明"拼成一根字符串塞进日志流，读的人得在一行里
+        # 自己断句。lines 把同样的内容按语义拆开，前端逐行画（message 保留原样，
+        # 老前端与服务端日志不受影响）；flagged_frames 让前端不必回头解析那根字符串。
+        lines = []
+        if flagged_seqs:
+            lines.append({'text': f'发现 {len(flagged_seqs)} 帧存在问题'
+                                  f'（已保留渲染结果，未自动修改）', 'cls': 'warn'})
+            for s in flagged_seqs:
+                lines.append({'text': f'　IMG {s:03d}：{state["flagged"][s]}', 'cls': 'warn'})
+        if unreviewed_seqs:
+            lines.append({'text': f'另有 {len(unreviewed_seqs)} 帧未审完'
+                                  f'（IMG {"、".join(f"{s:03d}" for s in unreviewed_seqs)}）'
+                                  f'，已标记为「未审查」，可重跑审查补齐', 'cls': 'warn'})
+        lines.extend(_tail_lines())
+        lines.append({'text': '逐条明细与「修复」入口在帧网格上方的「🔍 审查结论」面板里',
+                      'cls': ''})
         on_progress('sequence_review_result', {
-            'passed': False, 'beats': sorted(failures.keys()),
+            'passed': False, 'beats': sorted((final_result.get('failures') or {}).keys()),
             'unreviewed_sequences': unreviewed_seqs,
-            'partial': partial, 'reviewed_sequences': rendered,
-            'message': '一致性审查' + '；'.join(parts) + '。' + partial_note,
+            'partial': partial, 'reviewed_sequences': sorted(affected),
+            'reused_beats': reused_beats, 'rendered_count': len(rendered),
+            'flagged_frames': [{'sequence': s, 'reason': state['flagged'][s]}
+                               for s in flagged_seqs],
+            'lines': lines,
+            'message': '一致性审查' + '；'.join(parts) + '。' + partial_note + reuse_note,
         })
     return prompt_block
 
 
-def run_sequence_consistency_review(config, title, prompt_block, on_progress=None):
+def run_sequence_consistency_review(config, title, prompt_block, on_progress=None, full=False):
     """`_sequence_consistency_review` 的手动触发入口：供 server.py 的
     /api/sequence_review 调用——2026-07-24 起该审查不再被任何渲染入口自动跑，
     用户需在帧网格确认整套序列已渲染完成后手动点按钮触发。不阻塞视频生成，纯粹
-    是一个可选的人工检查工具。"""
+    是一个可选的人工检查工具。
+
+    full=True＝强制全量重审（前端的「全量重审」入口）；默认走增量，只重审结论已经
+    失效的那几拍。"""
     project_dir = _get_project_dir(title)
-    return _sequence_consistency_review(config, title, prompt_block, project_dir, on_progress=on_progress)
+    return _sequence_consistency_review(config, title, prompt_block, project_dir,
+                                        on_progress=on_progress, full=full)
 
 
 def _fix_frame_via_image_edit(config, title, sequence, new_prompt, on_progress=None):
-    """首帧修复的专用通道：generate_frame_sequence 对 seq==1 恒定走文生图（那是
-    "整链视觉基因"的推倒重来语义，见其 use_text_generation 判定），但"修复"要的是
-    纠正被指出的具体问题、保留已确认的构图——只能是图生图，拿首帧自己已渲出的图
+    """首帧定向修复通道：拿首帧自己已渲出的图
     当参考做自编辑（reference_path 与 target_path 相同；_generate_image_edit 会
     先把参考图整个读进内存再写目标文件，同路径自编辑不会读到被截断的半成品）。
     非首帧不需要这条路：seq>1 时 generate_frame_sequence 天然走图生图链式编辑，
@@ -834,6 +958,13 @@ def _fix_frame_via_image_edit(config, title, sequence, new_prompt, on_progress=N
                         frame.pop('degraded_reason', None)
                         frame.pop('actual_pixels', None)
                     break
+            # 与所有其它渲染路径同一个收尾（generate_frame_sequence 内部也调它）：
+            # 这一帧的画面已经换了，其后各帧仍派生自旧图 → stale_lineage；相邻拍的
+            # 一致性审查结论作废；已合并成片与视频清单作废。此前这条通道自己开锁写
+            # manifest、绕过了整个收尾，于是「重试首帧」会标记下游、「修复首帧」不会，
+            # 同一件事两种结果；成片也会留在清单里，看着像还对得上。
+            update_manifest_stale_status(manifest, project_dir,
+                                         regenerated_sequences=[sequence], finalize=True)
             write_manifest(project_dir, manifest)
 
     if on_progress:
@@ -842,10 +973,433 @@ def _fix_frame_via_image_edit(config, title, sequence, new_prompt, on_progress=N
     return {'sequence': sequence, 'image_path': target_path, 'project_dir': project_dir}
 
 
-def fix_frame_issue(config, title, prompt_block, sequence, on_progress=None, manual_reason=None):
+FIX_SNAPSHOT_DIR = '.frame_fixes'
+
+
+def _fix_snapshot_dir(project_dir, sequence):
+    return os.path.join(project_dir, FIX_SNAPSHOT_DIR, f'{sequence:03d}')
+
+
+def save_fix_snapshot(project_dir, title, sequence, entry, image_item, video_beat, video_item):
+    """修复前把"这一帧此刻的样子"整份存下来，供 undo_frame_fix 原样放回。
+
+    修复是**覆盖写同一个文件**（img_00N.webp），旧图此前不留档：改坏了只能盲重渲
+    碰运气，也没法拿前后两张对比着看"到底是改好了还是改坏了"。删除整拍早就有
+    .deleted_slots 快照这套东西（见 server.py 的 /api/restore_slot），修复没有。
+
+    存的是三样：帧图本体、该帧的 manifest 条目（问题描述、结构化违规、门禁结论都在
+    里面）、以及提示词里这一帧与它前一拍视频的正文——修复会同时改写这两段文本，
+    只把图片放回来而提示词留在改写后的版本，下一次重渲又会渲回"修复后"的样子。
+
+    只保留最近一次：一帧连修三轮之后，人想回到的是"上一版"，不是三轮之前的考古现场。
+    返回落盘的快照元数据（含 'at' 时间戳）。"""
+    snap_dir = _fix_snapshot_dir(project_dir, sequence)
+    shutil.rmtree(snap_dir, ignore_errors=True)
+    os.makedirs(snap_dir, exist_ok=True)
+
+    frame_path = _frame_path(title, sequence)
+    if os.path.exists(frame_path):
+        shutil.copyfile(frame_path, os.path.join(snap_dir, os.path.basename(frame_path)))
+    meta = {
+        'sequence': sequence,
+        'at': datetime.now().isoformat(timespec='seconds'),
+        # url 由渲染路径现算，与快照无关；fix_backup 指向的正是这个即将被覆盖的
+        # 快照目录，一起存回去会让撤销之后的条目宣称"还有一版可退"（其实没有了）
+        'frame': {k: v for k, v in (entry or {}).items() if k not in ('url', 'fix_backup')},
+        'image': dict(image_item or {}),
+        'video_beat': video_beat if video_item is not None else None,
+        'video': dict(video_item or {}) if video_item is not None else None,
+        # 修复前**整条链**的血统标记。撤销是按字节把旧图拷回来，链于是回到修复前的
+        # 样子，下游帧的血统当然也该回到修复前的样子——而 update_manifest_stale_status
+        # 只认 regenerated_sequences，会把 K 之后的帧一律标成 stale_lineage，等于一次
+        # 撤销就让整条下游需要重渲。这份记录让 undo_frame_fix 能原样放回去。
+        'lineage': {str(f.get('sequence')): bool(f.get('stale_lineage'))
+                    for f in ((read_manifest(project_dir) or {}).get('frames') or [])
+                    if isinstance(f, dict) and isinstance(f.get('sequence'), int)},
+    }
+    with open(os.path.join(snap_dir, 'snapshot.json'), 'w', encoding='utf-8') as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
+    return meta
+
+
+def drop_fix_snapshots(project_dir, manifest=None, sequences=None):
+    """丢掉修复快照与帧条目上的 fix_backup 记号。sequences=None ＝全部丢掉。
+
+    **槽位重新编号之后必须调用**（删除整拍、撤销删除、手动上传覆盖）：快照目录按
+    槽位号存（.frame_fixes/005/），编号一变，`fix_backup` 记号跟着 manifest 条目
+    前移到 004，而 .frame_fixes/004 里躺的是另一帧的旧图——点一下「撤销修复」就会
+    把张冠李戴的画面退回到这一格。宁可丢掉可撤销性，也不能撤销出错的图。
+
+    manifest 给了就就地摘掉记号（调用方负责写回）；没给就只清目录。"""
+    root = os.path.join(project_dir, FIX_SNAPSHOT_DIR)
+    if sequences is None:
+        shutil.rmtree(root, ignore_errors=True)
+    else:
+        for seq in sequences:
+            shutil.rmtree(_fix_snapshot_dir(project_dir, seq), ignore_errors=True)
+            shutil.rmtree(_rejected_fix_dir(project_dir, seq), ignore_errors=True)
+    if not isinstance(manifest, dict):
+        return
+    wanted = None if sequences is None else {int(s) for s in sequences}
+    for frame in manifest.get('frames') or []:
+        if wanted is None or frame.get('sequence') in wanted:
+            frame.pop('fix_backup', None)
+            # 被门禁退回的那一版同样按槽位号存，编号一变就张冠李戴，一起丢掉
+            frame.pop('rejected_fix', None)
+
+
+# ── 门禁退回的那一版 ────────────────────────────────────────────────────────
+#
+# 三联屏门禁判恶化时会自动回滚，而 undo_frame_fix 用完即删快照。门禁本身是概率判定
+# （见 frame_continuity 顶部：两条缝的口径已经放宽过一轮，但假阳性不可能归零），
+# 一次误判＝那次 4 选 1 重渲的结果被彻底丢弃，用户连"其实我想要那版"都没处说。
+# 所以回滚前先把修后那一版整份留下来，给一个「采用修后版」的出口。
+
+def _rejected_fix_dir(project_dir, sequence):
+    """刻意不放在 _fix_snapshot_dir 里面：回滚走的 undo_frame_fix 会把那个目录整个
+    rmtree 掉，放进去等于刚存就被删。"""
+    return os.path.join(project_dir, FIX_SNAPSHOT_DIR, f'{sequence:03d}_rejected')
+
+
+def stash_rejected_fix(project_dir, title, sequence, image_item, video_beat, video_item,
+                       reason, detail):
+    """门禁判恶化、即将自动回滚之前，把"修后那一版"整份留一份。
+
+    存的东西与 save_fix_snapshot 对称：帧图本体 + 这一帧与前一拍视频改写后的正文。
+    只保留最近一次；采用或再修一次即作废。返回落盘的元数据。"""
+    stash_dir = _rejected_fix_dir(project_dir, sequence)
+    shutil.rmtree(stash_dir, ignore_errors=True)
+    os.makedirs(stash_dir, exist_ok=True)
+
+    frame_path = _frame_path(title, sequence)
+    if os.path.exists(frame_path):
+        shutil.copyfile(frame_path, os.path.join(stash_dir, os.path.basename(frame_path)))
+    meta = {
+        'sequence': sequence,
+        'at': datetime.now().isoformat(timespec='seconds'),
+        'reason': reason,
+        'gate_detail': detail,
+        'image': dict(image_item or {}) if image_item is not None else None,
+        'video_beat': video_beat if video_item is not None else None,
+        'video': dict(video_item or {}) if video_item is not None else None,
+    }
+    with open(os.path.join(stash_dir, 'rejected.json'), 'w', encoding='utf-8') as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
+    return meta
+
+
+def _read_rejected_fix(project_dir, sequence):
+    path = os.path.join(_rejected_fix_dir(project_dir, sequence), 'rejected.json')
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, encoding='utf-8') as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def _mark_rejected_fix(project_dir, sequence, meta):
+    """在帧条目上留一枚"这一帧有一版被门禁退回、可以人工采用"的记号。
+
+    必须在回滚之后写：undo_frame_fix 会把整条 manifest 条目换成快照里的那份，
+    写在前面会被冲掉。"""
+    with manifest_lock(project_dir):
+        manifest = read_manifest(project_dir)
+        if not manifest:
+            return
+        for frame in manifest.get('frames', []):
+            if frame.get('sequence') == sequence:
+                frame['rejected_fix'] = {'at': meta.get('at'), 'reason': meta.get('reason'),
+                                         'gate_detail': meta.get('gate_detail')}
+                break
+        write_manifest(project_dir, manifest)
+
+
+def _drop_rejected_fix(project_dir, sequence, manifest=None):
+    """丢掉退回版与它的记号。再修一次 / 采用 / 撤销之后它都不再成立。
+
+    manifest 给了就就地摘记号（调用方负责写回），没给就自己开锁写。"""
+    shutil.rmtree(_rejected_fix_dir(project_dir, sequence), ignore_errors=True)
+    if isinstance(manifest, dict):
+        for frame in manifest.get('frames') or []:
+            if frame.get('sequence') == sequence:
+                frame.pop('rejected_fix', None)
+        return
+    with manifest_lock(project_dir):
+        mf = read_manifest(project_dir)
+        if not mf:
+            return
+        touched = False
+        for frame in mf.get('frames', []):
+            if frame.get('sequence') == sequence and 'rejected_fix' in frame:
+                frame.pop('rejected_fix', None)
+                touched = True
+        if touched:
+            write_manifest(project_dir, mf)
+
+
+def adopt_rejected_fix(title, sequence, prompt_block):
+    """人工采用被门禁退回的那一版：把修后的帧图与两段提示词正文放回去。
+
+    门禁是概率判定，判错的时候用户看得见——这是那种情况下的唯一出口。采用之前先给
+    "此刻这一版"（＝回滚后的旧图）存一份修复快照，所以采用完照样可以「撤销修复」退
+    回来，不会变成单向门。
+
+    返回 {'prompt_block': ..., 'frame': ..., 'at': 退回版的时间}。"""
+    project_dir = _get_project_dir(title)
+    stash = _read_rejected_fix(project_dir, sequence)
+    if not stash:
+        raise RuntimeError(f'IMG {sequence:03d} 没有可采用的「门禁退回版」'
+                           f'（只保留最近一次，采用或再修一次之后就没有了）')
+
+    images, videos = _parse_prompt_slots(prompt_block)
+    entry = _frame_manifest_entry(project_dir, sequence) or {}
+    video_beat = stash.get('video_beat')
+    save_fix_snapshot(project_dir, title, sequence, entry, images.get(sequence),
+                      video_beat if video_beat is not None else sequence - 1,
+                      videos.get(video_beat) if video_beat is not None else None)
+
+    stash_dir = _rejected_fix_dir(project_dir, sequence)
+    frame_path = _frame_path(title, sequence)
+    saved_image = os.path.join(stash_dir, os.path.basename(frame_path))
+    if not os.path.exists(saved_image):
+        raise RuntimeError(f'IMG {sequence:03d} 的门禁退回版缺少帧图文件，无法采用')
+    os.makedirs(os.path.dirname(frame_path), exist_ok=True)
+    shutil.copyfile(saved_image, frame_path)
+
+    if stash.get('image') and sequence in images:
+        images[sequence] = dict(stash['image'])
+    if stash.get('video') and video_beat in videos:
+        videos[video_beat] = dict(stash['video'])
+    adopted_block = _format_prompt_block(images, videos)
+
+    with manifest_lock(project_dir):
+        manifest = read_manifest(project_dir)
+        if manifest:
+            for frame in manifest.get('frames', []):
+                if frame.get('sequence') != sequence:
+                    continue
+                frame['prompt'] = _slot_body(images.get(sequence))
+                # 采用的是一版**没有经过复核**的画面：门禁拦下它的时候 reverify 根本
+                # 没跑（fix_frame_issue 在回滚分支直接 return）。落 pending_manual_review
+                # 等人看，不谎报审查通过。
+                frame['quality_gate'] = 'pending_manual_review'
+                frame['vlm_qa_reason'] = None
+                frame.pop('review_issues', None)
+                frame['fix_backup'] = {'at': datetime.now().isoformat(timespec='seconds'),
+                                       'reason': stash.get('reason') or '采用门禁退回版'}
+                frame['adopted_rejected_fix'] = {'at': stash.get('at'),
+                                                 'gate_detail': stash.get('gate_detail')}
+                break
+            _drop_rejected_fix(project_dir, sequence, manifest)
+            update_manifest_stale_status(manifest, project_dir,
+                                         regenerated_sequences=[sequence], finalize=True)
+            write_manifest(project_dir, manifest)
+
+    shutil.rmtree(stash_dir, ignore_errors=True)
+    return {'prompt_block': adopted_block,
+            'frame': _frame_manifest_entry(project_dir, sequence) or {},
+            'at': stash.get('at')}
+
+
+def _mark_fix_backup(project_dir, sequence, snapshot_at, reason):
+    """在帧条目上留一枚"这一帧有可退回的上一版"的记号，供前端画「撤销修复」按钮。
+
+    必须在重渲之后写：重渲会整体改写（generate_frame_sequence）或覆盖若干字段
+    （_fix_frame_via_image_edit）这条 manifest 条目，写在前面会被冲掉。"""
+    with manifest_lock(project_dir):
+        manifest = read_manifest(project_dir)
+        if not manifest:
+            return
+        for frame in manifest.get('frames', []):
+            if frame.get('sequence') == sequence:
+                frame['fix_backup'] = {'at': snapshot_at, 'reason': reason}
+                break
+        write_manifest(project_dir, manifest)
+
+
+def _read_fix_snapshot(project_dir, sequence):
+    path = os.path.join(_fix_snapshot_dir(project_dir, sequence), 'snapshot.json')
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, encoding='utf-8') as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def undo_frame_fix(title, sequence, prompt_block, keep_rejected=False):
+    """撤销这一帧最近一次定向修复：把快照里的帧图、manifest 条目、两段提示词正文
+    原样放回，回到修复前的状态（问题描述与结构化违规一并回来，可以重新修一次）。
+
+    只回滚这一帧涉及的槽位，**不整体还原 prompt_block**：修完 003 又修了 005 之后
+    撤销 003，整体还原会把 005 的修复一起吞掉。
+
+    与其它写帧路径共用同一个收尾（update_manifest_stale_status finalize）：相邻拍的
+    审查结论、已合并成片都要跟着作废。**血统标记例外**——撤销是按字节还原，链回到了
+    修复前的样子，所以下游的 stale_lineage 也按快照里记的原样放回，不跟着标脏。
+
+    返回 {'prompt_block': ..., 'frame': ..., 'at': 快照时间}。没有快照时报错——
+    没有可回退的版本时静默"成功"比报错更糟。"""
+    project_dir = _get_project_dir(title)
+    snap = _read_fix_snapshot(project_dir, sequence)
+    if not snap:
+        raise RuntimeError(f'IMG {sequence:03d} 没有可撤销的修复记录'
+                           f'（只保留最近一次修复的快照，撤销过一次后就没有了）')
+
+    snap_dir = _fix_snapshot_dir(project_dir, sequence)
+    frame_path = _frame_path(title, sequence)
+    saved_image = os.path.join(snap_dir, os.path.basename(frame_path))
+    if os.path.exists(saved_image):
+        os.makedirs(os.path.dirname(frame_path), exist_ok=True)
+        shutil.copyfile(saved_image, frame_path)
+
+    # 提示词：只换回这一帧自己的正文，以及修复当时被一起改写的那条视频过渡
+    images, videos = _parse_prompt_slots(prompt_block)
+    if snap.get('image') and sequence in images:
+        images[sequence] = dict(snap['image'])
+    video_beat = snap.get('video_beat')
+    if snap.get('video') and video_beat in videos:
+        videos[video_beat] = dict(snap['video'])
+    restored_block = _format_prompt_block(images, videos)
+
+    saved_entry = snap.get('frame') or {}
+    with manifest_lock(project_dir):
+        manifest = read_manifest(project_dir)
+        if manifest:
+            for idx, frame in enumerate(manifest.get('frames', [])):
+                if frame.get('sequence') != sequence:
+                    continue
+                # url 是渲染路径算出来的、与快照无关，原样留着；其余字段整条换回去，
+                # 免得"修复时新加的字段"（transport/degraded_reason…）留在原地误导人
+                restored = dict(saved_entry)
+                if frame.get('url'):
+                    restored['url'] = frame['url']
+                manifest['frames'][idx] = restored
+                break
+            # 人手点的撤销：把上一次被门禁退回的那一版也丢掉——人已经明确要回到修复
+            # 前的样子了，留着一个"采用修后版"的按钮只会让人绕回来。门禁自己的自动
+            # 回滚是例外（keep_rejected=True）：它留档的正是这一版。
+            if not keep_rejected:
+                _drop_rejected_fix(project_dir, sequence, manifest)
+            update_manifest_stale_status(manifest, project_dir,
+                                         regenerated_sequences=[sequence], finalize=True)
+            # 血统标记原样放回：撤销把旧图按字节拷了回来，下游帧派生的正是这张图，
+            # 链在修复前是什么样、现在就还是什么样。上一行的收尾按"这一帧刚重渲过"
+            # 无条件把 K 之后全标脏，对**还原**这件事是错的——同一次调用里基于哈希的
+            # drop_stale_review_verdicts 也正确地判定了"什么都没变"。
+            # 老快照没有这份记录时保持既有行为（标脏是保守的那一侧）。
+            lineage = snap.get('lineage')
+            if isinstance(lineage, dict) and lineage:
+                for frame in manifest.get('frames') or []:
+                    if not isinstance(frame, dict):
+                        continue
+                    was = lineage.get(str(frame.get('sequence')))
+                    if was is None:
+                        continue
+                    if was:
+                        frame['stale_lineage'] = True
+                    else:
+                        frame.pop('stale_lineage', None)
+            write_manifest(project_dir, manifest)
+
+    shutil.rmtree(snap_dir, ignore_errors=True)
+    return {'prompt_block': restored_block,
+            'frame': _frame_manifest_entry(project_dir, sequence) or {},
+            'at': snap.get('at')}
+
+
+def _slot_body(item):
+    return (item.get('body') if isinstance(item, dict) else item) or ''
+
+
+def _slot_meta(item):
+    return (item.get('meta', '') if isinstance(item, dict) else '') or ''
+
+
+def _measure_fix_triptych(config, title, images, videos, sequence, *, include_right=True,
+                          baseline=None):
+    """读一次三联屏的两条缝：K-1 → K（上游继承）与 K → K+1（下游通道）。
+
+    修复前后各读一次，两份读数交给 frame_continuity.compare_triptych 比对——这就是
+    「三帧联排硬性审查门禁」的实现体。此前修复只复核「原来那几条问题解决没有」
+    （_reverify_frame_issues），从不问「有没有修出新问题」：一次修复可以在消灭 A 问题
+    的同时把 K-1→K 的透视撕开，而流程一声不吭地报「✅ 均已消失」。
+
+    每条缝的 `prompt` 取**候选帧**（缝的下游那一张）的正文：changed_grid_cells 圈出的
+    是那一帧自己申报的差量区，稳定区判读要把它挖掉。取错了会把本该变的地方算成漂移。
+
+    **与前向建链同源取数**：结构化拍梯（manifest.spatial_beats）一并传下去，和
+    frame_generator 渲每一帧时调 analyze_frame 的口径一致。少了它两处都会走样——
+      · changed_grid_cells 退化成正则扫正文，扫不到就兜底成 ["B2"]，于是"除中心格外
+        整张图都算稳定区"，修复动在别处就被整片计成漂移；
+      · 只靠 spatial_beats 声明（bridge_stage / hard_cut / transition_stage）的过场帧
+        在这里认不出来，那条本来就不该像的缝会被拿去判定。
+
+    **修前 / 修后必须用同一块掩膜**：`baseline` 传上一次的读数，差量区直接复用它算出
+    的 cells。定向修复恰恰会改写候选帧 K 自己的正文，重新推断出来的 cells 与修前不同，
+    比较的就是两个不同口径的读数——档位差异可能纯粹来自掩膜位移。
+
+    过门/换机位族的那条缝不判——两张图本来就不该像（is_transition_frame）。
+    `include_right=False` 用于 Level 3 连带重渲：K+1 这一趟本来就要被盖掉，拿它当基线
+    没有意义。
+    """
+    if reviews_disabled(config):
+        return {'left': None, 'right': None, 'retired': True}
+    import frame_continuity
+    from frame_generator import _continuity_beat
+
+    mode = frame_continuity.continuity_mode(config)
+    if mode == 'off':
+        return {'left': None, 'right': None}
+
+    project_dir = _get_project_dir(title)
+    manifest = read_manifest(project_dir) or {}
+    baseline = baseline or {}
+
+    def _frame(seq):
+        path = _frame_path(title, seq)
+        return path if os.path.exists(path) else None
+
+    def _cells(seam):
+        prev = baseline.get(seam)
+        return prev.get('cells') if isinstance(prev, dict) else None
+
+    seams = {'left': None, 'right': None}
+
+    # 左缝：参考 K-1，候选 K。sequence <= 1 时 is_transition_frame 直接为真（首帧没有
+    # 上游可继承），这条缝自然落空。
+    img_k = images.get(sequence)
+    beat_k = _continuity_beat(manifest, sequence)
+    if img_k is not None and not frame_continuity.is_transition_frame(
+            sequence, _slot_meta(img_k), _slot_meta(videos.get(sequence - 1)), beat_k):
+        seams['left'] = frame_continuity.measure_seam(
+            _frame(sequence - 1), _frame(sequence),
+            prompt=_slot_body(img_k), beat=beat_k, mode=mode, cells=_cells('left'))
+
+    # 右缝：参考 K，候选 K+1。
+    img_next = images.get(sequence + 1)
+    beat_next = _continuity_beat(manifest, sequence + 1)
+    if include_right and img_next is not None and not frame_continuity.is_transition_frame(
+            sequence + 1, _slot_meta(img_next), _slot_meta(videos.get(sequence)), beat_next):
+        seams['right'] = frame_continuity.measure_seam(
+            _frame(sequence), _frame(sequence + 1),
+            prompt=_slot_body(img_next), beat=beat_next, mode=mode, cells=_cells('right'))
+
+    return seams
+
+
+def fix_frame_issue(config, title, prompt_block, sequence, on_progress=None, manual_reason=None,
+                    cascade_downstream=False, suppress_chain_guard=False):
     """人工确认修复流程的落地点：`_sequence_consistency_review` 只标记问题、不
     自动改写重渲，人工在帧网格看过 vlm_qa_reason 后点击「修复此帧问题」才会真正
-    触发这里——针对被标记的具体问题做定向提示词优化，再重渲。
+    触发这里——针对被标记的具体问题做定向提示词优化，再以 4选1 候选优选模式重渲。
+
+    cascade_downstream=True: 当修改属于透视/硬装/结构级重大变更（Level 3）时，
+    在重渲完成第 sequence 帧后，自动以新帧为底图向后链式重渲所有下游帧（sequence+1..N），
+    彻底清除下游的 stale_lineage 标记，杜绝单帧修复导致的后向断层。
 
     问题来源有两条，可并存也可单独成立：机器的一致性审查判定（vlm_qa_reason）与
     人工主动描述（manual_issue，见 set_manual_frame_issue）。manual_reason 是人在
@@ -855,22 +1409,27 @@ def fix_frame_issue(config, title, prompt_block, sequence, on_progress=None, man
 
     非首帧沿用一致性审查的定向重写（fix_beat_from_sequence_review，同时改前一拍
     的视频过渡文本，保持"过渡描述"与"到达画面"一致）；首帧没有前置视频过渡，
-    走单提示词反馈重写（fix_image_prompt_with_vlm_feedback，与锚点门重试同款）。
-    重渲一律走图生图——首帧走 _fix_frame_via_image_edit 的自编辑通道，非首帧走
-    generate_frame_sequence(target_sequences=[sequence])（seq>1 天然图生图链式
-    编辑，不需要特殊处理）。
+    走单提示词反馈重写（fix_image_prompt_with_vlm_feedback）。
+    重渲一律走 4选1 智能优选通道（run_candidate_selection_frame_sequence），一次性
+    生成 4 张候选图并由 VLM 多维度评分鉴别挑选最佳候选作为权威帧。
 
     重渲之后会对着新画面把这几条问题逐条再验一遍（_reverify_frame_issues），结果放在
     返回值的 'reverify' 里——修复流程此前是开环的，重渲完没人回答"到底修好没有"。
 
-    返回 {'prompt_block': ..., 'reason': ..., 'reverify': {...}|None}。"""
+    suppress_chain_guard=True：这一趟重渲里不跑链上守卫。**只有链上守卫的 autofix
+    分支该传**——它在拿到结果后自己会立刻对同一拍再跑一次 guard_beat 拿停链结论，
+    重渲内部那次审查是同一拍、同一对图的纯重复（check + 复核 + 分级各一整套），
+    而且两次 LLM 判定还可能互相打架。
+
+    返回 {'prompt_block': ..., 'reason': ..., 'reverify': {...}|None, 'undoable': True}。"""
     project_dir = _get_project_dir(title)
     manual_reason = (manual_reason or '').strip()
     if manual_reason:
         set_manual_frame_issue(title, sequence, manual_reason)
     entry = _frame_manifest_entry(project_dir, sequence) or {}
     manual_issue = (entry.get('manual_issue') or '').strip()
-    auto_reason = (entry.get('vlm_qa_reason') or '').strip()
+    # Historical machine verdicts are retained as records, never as new instructions.
+    auto_reason = '' if reviews_disabled(config) else (entry.get('vlm_qa_reason') or '').strip()
     # 人工描述排在前面：人看的是真实画面、指的是具体哪里不对，比机器判定更该被
     # 优先满足；两者重复时只留一份，别让改写模型对着同一句话改两遍。
     issues = [t for t in (manual_issue, auto_reason) if t]
@@ -878,7 +1437,7 @@ def fix_frame_issue(config, title, prompt_block, sequence, on_progress=None, man
         issues = issues[:1]
     if not issues:
         raise RuntimeError(f'IMG {sequence:03d} 当前没有记录待修复的问题——'
-                           f'请先在帧网格点「描述问题」写下这一帧哪里不对，或先运行一致性审查')
+                           f'请先在帧网格点「描述问题」写下要修改的内容')
     reason = '；'.join(issues)
 
     # 修复后复审要用的结构化问题清单，必须在重渲前取出：重渲会整体改写这一帧的
@@ -899,21 +1458,52 @@ def fix_frame_issue(config, title, prompt_block, sequence, on_progress=None, man
     video_beat = sequence - 1
     video_item = videos.get(video_beat) if video_beat >= 1 else None
 
+    # 动手之前先把"修复前的样子"整份存下来（帧图 + manifest 条目 + 这两段提示词），
+    # 修坏了可以一键退回去（undo_frame_fix）。修复是覆盖写同一个文件，不存就没了。
+    snapshot = save_fix_snapshot(project_dir, title, sequence, entry, image_item,
+                                 video_beat, video_item)
+    # 上一次被门禁退回的那一版就此作废：又修了一遍，"采用上次那版"已经没有意义，
+    # 留着只会让人采用到一版比当前还旧的画面。
+    _drop_rejected_fix(project_dir, sequence)
+
+    # 三联屏门禁的基线读数：必须在重渲前、也在提示词改写前取——磁盘上还是旧图、
+    # images/videos 里还是旧正文，两者对得上。换成新正文配旧图去量，差量区圈的就不是这张图
+    # 自己申报的那块，稳定区判读会把本该变的地方算成漂移。
+    #
+    # Level 3 连带重渲时不量右缝：K+1 这一趟本来就要被盖掉，拿它当基线没意义。
+    triptych_before = (None if reviews_disabled(config) else _measure_fix_triptych(
+        config, title, images, videos, sequence, include_right=not cascade_downstream))
+
     if on_progress:
         on_progress('frame_issue_fix_start', {
             'sequence': sequence, 'reason': reason,
             'message': f"🔧 正在依据问题描述优化 IMG {sequence:03d} 的提示词（{reason}）…",
         })
 
+    prev_image_item = images.get(sequence - 1)
+    prev_image_body = (prev_image_item['body'] if isinstance(prev_image_item, dict) else prev_image_item) if prev_image_item else None
+
+    succ_image_item = images.get(sequence + 1)
+    succ_image_body = (succ_image_item['body'] if isinstance(succ_image_item, dict) else succ_image_item) if succ_image_item else None
+
+    succ_video_item = videos.get(sequence)
+    succ_video_body = (succ_video_item['body'] if isinstance(succ_video_item, dict) else succ_video_item) if succ_video_item else None
+
     if video_item is not None:
         video_body = video_item['body'] if isinstance(video_item, dict) else video_item
         video_meta = video_item.get('meta', '') if isinstance(video_item, dict) else ''
         new_video_body, new_image_body = fix_beat_from_sequence_review(
-            config, video_body, image_body, issues)
+            config, video_body, image_body, issues, video_meta=video_meta,
+            preceding_image_prompt=prev_image_body,
+            succeeding_image_prompt=succ_image_body,
+            succeeding_video_prompt=succ_video_body)
         if new_video_body != video_body:
             videos[video_beat] = {'body': new_video_body, 'meta': video_meta}
     else:
-        new_image_body = fix_image_prompt_with_vlm_feedback(config, image_body, reason)
+        new_image_body = fix_image_prompt_with_vlm_feedback(
+            config, image_body, reason,
+            succeeding_image_prompt=succ_image_body)
+
 
     _family = image_space_family(videos, sequence)
     new_image_body = clean_prompt_text(new_image_body)
@@ -923,25 +1513,151 @@ def fix_frame_issue(config, title, prompt_block, sequence, on_progress=None, man
     images[sequence] = {'body': new_image_body, 'meta': image_meta}
     new_prompt_block = _format_prompt_block(images, videos)
 
-    if on_progress:
-        on_progress('frame_issue_fix_render', {
-            'sequence': sequence,
-            'message': f"🎨 正在以图生图方式重渲 IMG {sequence:03d}…",
-        })
+    is_explicitly_disabled = (
+        config.get('candidateSelection') is False
+        or config.get('candidateSelectionMode') is False
+        or config.get('candidate_selection') is False
+        or config.get('generation_mode') in ('standard', 'sequential', 'normal', 'single', 'default')
+    )
+    is_candidate_mode = not is_explicitly_disabled
 
-    if sequence == 1:
-        _fix_frame_via_image_edit(config, title, sequence, new_image_body, on_progress=on_progress)
+    target_sequences = [sequence]
+    if cascade_downstream:
+        downstream = [s for s in sorted(images.keys()) if s > sequence]
+        if downstream:
+            target_sequences.extend(downstream)
+
+    if is_candidate_mode:
+        if on_progress:
+            render_msg = (f"🎨 正在以 4选1 候选优选方式重渲 IMG {sequence:03d}，并连带重渲下游 {len(target_sequences)-1} 帧…"
+                          if len(target_sequences) > 1 else f"🎨 正在以 4选1 候选优选方式重渲 IMG {sequence:03d}…")
+            on_progress('frame_issue_fix_render', {
+                'sequence': sequence,
+                'message': render_msg,
+            })
+
+        from candidate_selection_pipeline import run_candidate_selection_frame_sequence
+        run_candidate_selection_frame_sequence(
+            config, title, new_prompt_block,
+            on_progress=on_progress,
+            target_sequences=target_sequences,
+            candidate_count=4,
+            chain_guard_review=not suppress_chain_guard,
+        )
     else:
-        generate_frame_sequence(config, title, new_prompt_block, on_progress=on_progress,
-                                target_sequences=[sequence])
+        if on_progress:
+            render_msg = (f"🎨 正在重渲 IMG {sequence:03d}，并连带重渲下游 {len(target_sequences)-1} 帧…"
+                          if len(target_sequences) > 1 else f"🎨 正在重渲 IMG {sequence:03d}…")
+            on_progress('frame_issue_fix_render', {
+                'sequence': sequence,
+                'message': render_msg,
+            })
+
+        from frame_generator import generate_frame_sequence
+        generate_frame_sequence(
+            config, title, new_prompt_block,
+            on_progress=on_progress,
+            target_sequences=target_sequences,
+            chain_guard_review=not suppress_chain_guard,
+        )
+
+    # ── 三帧联排硬性审查门禁 ──────────────────────────────────────────────────
+    #
+    # [K-1] ⇄ [修后 K] ⇄ [K+1]：两侧缝的连贯性读数拿修前基线比一次。任一侧档位
+    # 严格恶化（passed → warned/failed、warned → failed）就自动退回上一版。
+    #
+    # 为什么必须有这一道：_reverify_frame_issues 只复核「原来那几条问题解决没有」，
+    # 从不问「有没有修出新问题」。一次修复完全可以在消灭 A 问题的同时把 K-1→K 的
+    # 透视撕开，而流程一声不响地报「✅ 均已消失」。这台「越修越坏」的永动机与节拍层
+    # autofix 那一台同构，只是贵得多：帧的一次修复是 4 选 1 重渲。
+    #
+    # Level 3 连带重渲（cascade_downstream）不自动回滚：下游已经按新的 K 重渲过一轮，
+    # 而快照里只有 K 这一帧，单独退回 K 会留下一条修了一半的链（上游旧图、下游新血统），
+    # 比不回滚更坏。整链快照与整链回滚是另一件事，这里只把结论大声报出来。
+    triptych_after = (None if reviews_disabled(config) else _measure_fix_triptych(
+        config, title, images, videos, sequence, include_right=not cascade_downstream,
+        baseline=triptych_before))
+    import frame_continuity as _fc
+    if reviews_disabled(config):
+        triptych = {'verdict': 'retired', 'retired': True,
+                    'auto_rollback_available': False}
+    else:
+        triptych = _fc.compare_triptych(triptych_before, triptych_after)
+        triptych['auto_rollback_available'] = not cascade_downstream
+
+    if triptych['verdict'] == 'regressed' and not cascade_downstream:
+        detail = _fc.describe_triptych(triptych)
+        # 回滚之前先把"修后那一版"整份留下来。门禁是概率判定，判错的代价此前是把一次
+        # 真修好的 4 选 1 重渲**彻底**丢掉（undo 用完即删快照），用户连说"其实我想要
+        # 那版"的地方都没有。留一份，给一个「采用修后版」的出口。
+        stash = stash_rejected_fix(project_dir, title, sequence, images.get(sequence),
+                                   video_beat, videos.get(video_beat), reason, detail)
+        if on_progress:
+            on_progress('frame_issue_triptych_gate', {
+                'sequence': sequence, 'verdict': 'regressed', 'triptych': triptych,
+                'rejected_fix': {'at': stash.get('at')},
+                'message': (f"⛔ IMG {sequence:03d} 三联屏门禁未通过：{detail}。"
+                            f"本次修复已自动退回上一版——宁可不修，也不把链改坏。"
+                            f"修后那一版已留档，确认门禁误判可在帧网格点「采用修后版」。"),
+            })
+        restored = undo_frame_fix(title, sequence, new_prompt_block, keep_rejected=True)
+        # 记号必须写在回滚之后：undo 会把整条 manifest 条目换成快照里的那份
+        _mark_rejected_fix(project_dir, sequence, stash)
+        log('WARN', 'FRAMES',
+            f"IMG {sequence:03d} 修复后三联屏门禁判恶化，已自动回滚（修后版留档于 "
+            f"{FIX_SNAPSHOT_DIR}/{sequence:03d}_rejected）：{detail}", title=title)
+        return {'prompt_block': restored['prompt_block'], 'reason': reason,
+                'reverify': None, 'triptych': triptych, 'rolled_back': True,
+                'rejected_fix': {'at': stash.get('at'), 'reason': reason,
+                                 'gate_detail': detail},
+                'undoable': False}
+
+    if on_progress and triptych['verdict'] not in ('ok', 'retired'):
+        on_progress('frame_issue_triptych_gate', {
+            'sequence': sequence, 'verdict': triptych['verdict'], 'triptych': triptych,
+            'message': (f"⚠️ IMG {sequence:03d} 三联屏门禁：{_fc.describe_triptych(triptych)}"
+                        + ("（连带重渲不自动回滚，请人工看一眼）"
+                           if triptych['verdict'] == 'regressed' else '')),
+        })
 
     # 重渲成功才清人工描述：中途抛错时描述必须原样留在 manifest 上，否则人得重新
     # 把问题再描述一遍。
     if manual_issue:
         _clear_manual_frame_issue(project_dir, sequence)
 
+    # 重渲之后才盖"可撤销"的记号：重渲会整体改写这条 manifest 条目，写在前面会被冲掉。
+    # 中途抛错时也不该有这枚记号——那次修复没落地，没有"新版本"需要退回。
+    #
+    # 连带重渲（Level 3）不盖这枚记号，快照里也只有 K 这一帧：单独退回 K 会留下
+    # 上游旧图 + 下游新血统的半截链，正是三联屏门禁上面那段拒绝自动做的事。此前
+    # 记号照盖不误，人手点一下「撤销修复」造出来的就是同一条半截链——自动不肯做、
+    # 手动却敞着门。整链快照与整链回滚是另一件事，没有之前这里就不给出口。
+    if cascade_downstream:
+        drop_fix_snapshots(project_dir, None, [sequence])
+    else:
+        _mark_fix_backup(project_dir, sequence, snapshot.get('at'), reason)
+
+    # 自动刷新 5 列多宫格拼图大图
+    try:
+        from tools.collage import build_keyframe_collage
+        from pathlib import Path
+        all_frames = [os.path.join(project_dir, 'frames', f'img_{s:03d}.webp') for s in sorted(images.keys())]
+        existing_frames = [p for p in all_frames if os.path.exists(p)]
+        if existing_frames:
+            c_name = f"{os.path.basename(os.path.normpath(project_dir))}_collage.jpg"
+            c_path = build_keyframe_collage(existing_frames, Path(project_dir) / c_name, columns=5, tile_width=240, max_frames=0)
+            if c_path and os.path.exists(c_path):
+                with manifest_lock(project_dir):
+                    mf = read_manifest(project_dir)
+                    if mf:
+                        mf['collage_url'] = '/' + os.path.relpath(str(c_path), os.path.dirname(os.path.abspath(__file__))).replace('\\', '/')
+                        write_manifest(project_dir, mf)
+    except Exception:
+        pass
+
     verify = _reverify_frame_issues(config, title, sequence, recorded_issues, on_progress=on_progress)
-    return {'prompt_block': new_prompt_block, 'reason': reason, 'reverify': verify}
+    return {'prompt_block': new_prompt_block, 'reason': reason, 'reverify': verify,
+            'triptych': triptych, 'rolled_back': False, 'undoable': True}
 
 
 def _reverify_frame_issues(config, title, sequence, recorded_issues, on_progress=None):
@@ -956,6 +1672,8 @@ def _reverify_frame_issues(config, title, sequence, recorded_issues, on_progress
     的那几条）；全部解决则落 pending_manual_review 等人最终确认。复核本身没跑成的
     （返回 None）一律按"仍存在"保守处理，不谎报修复成功。
     返回 {'resolved': [...], 'remaining': [...]}；没有结构化问题可验时返回 None。"""
+    if reviews_disabled(config):
+        return {'retired': True, 'resolved': [], 'remaining': [], 'reviewed': False}
     issues = [i for i in (recorded_issues or []) if isinstance(i, dict) and i.get('text')]
     if not issues:
         return None
@@ -980,12 +1698,17 @@ def _reverify_frame_issues(config, title, sequence, recorded_issues, on_progress
         (resolved if verdict is False else remaining).append(issue)
 
     if remaining:
+        # flag_origin 认领这枚 flag：链上守卫的 autofix 会在本函数之后立刻对同一拍再
+        # 判一次，判过了就该把这枚 flag 收回去。没有认领标记的话，"守卫说这拍过了、
+        # 循环打印 ✅ 继续往下渲"，而 manifest 上这一帧永远挂着 flagged ——
+        # video_generator 的配对门禁认的正是这个字段，一道早该消失的门会一直拦着。
         _set_manifest_quality_gate(
             project_dir, sequence, 'sequence_review_flagged',
-            '；'.join(i['text'] for i in remaining), review_issues=remaining)
+            '；'.join(i['text'] for i in remaining), review_issues=remaining,
+            flag_origin='fix_reverify')
     else:
         _set_manifest_quality_gate(project_dir, sequence, 'pending_manual_review', None,
-                                   review_issues=None)
+                                   review_issues=None, flag_origin=None)
 
     if on_progress:
         if remaining:
@@ -1003,39 +1726,16 @@ def _reverify_frame_issues(config, title, sequence, recorded_issues, on_progress
 
 
 def render_frames_for_task(config, title, prompt_block, on_progress=None):
-    """/api/generate_frames 整单渲染的编排入口：分段渲染 + 检查点现实同步 + 收尾链尾
-    回望，与 staged/auto 流水线共享同一套机制（此前一次性端点直调
-    generate_frame_sequence，检查点/回望对主界面的帧序列按钮完全不生效）。
-    整套序列一致性审查不在此自动触发，改为用户手动点按钮
-    （见 run_sequence_consistency_review）。不做视频——保持该端点"只渲帧"的语义。
-    2026-07-24 起「关键点监修模式」（人工确认暂停）功能已整体移除，流水线全程不再
-    暂停等人工确认。
+    """/api/generate_frames 整单渲染的编排入口：把缺失的帧一次渲完，不做视频——保持
+    该端点"只渲帧"的语义。
+
+    渲染期不跑任何审查（2026-08-05：锚帧验收门、检查点现实同步、链尾漂移回望一并
+    移除）。整套序列一致性审查改由用户在帧网格上手动触发，见
+    run_sequence_consistency_review。
     返回 manifest（与 generate_frame_sequence 同约定，带 manifest/project_dir 瞬态键）。"""
     project_dir = _get_project_dir(title)
-
-    # IMAGE 1 的"够不够原始"(零干预痕迹/损伤烈度/monumental 气质) 此前从未被真正
-    # 复核过：check_anchor_frame_compliance 这套 Anchor Acceptance Gate 只接在
-    # run_autonomous_pipeline 和对话式技能路径，"激发创意"实际驱动的这条主界面
-    # 帧序列按钮此前直接分段渲染，完全绕过了它——首帧原不原始全靠合成 LLM 写的
-    # 那段 prompt 自觉，渲染结果从未被回查。这里补一道轻量复核：只对首帧、判定
-    # 沿用 qaGateLevel(off 跳过/lenient/standard)，失败用既有 VLM 反馈改写 prompt
-    # 再渲（_MAX_ANCHOR_ATTEMPTS 次），耗尽仍不过也按 auto_approved_degraded 放行、
-    # 绝不硬阻断——不影响其余帧的直出速度。
-    images, videos = _parse_prompt_slots(prompt_block)
-    if 1 in images and not os.path.exists(_frame_path(title, 1)):
-        item = images[1]
-        prompt = item['body'] if isinstance(item, dict) else item
-        meta = item.get('meta', '') if isinstance(item, dict) else ''
-        gate = render_and_gate_single_frame(
-            config, title, 1, prompt, meta=meta, on_progress=on_progress,
-            hard_fail_status='auto_approved_degraded',
-        )
-        images[1] = {'body': gate['prompt'], 'meta': meta}
-        prompt_block = _format_prompt_block(images, videos)
-
-    prompt_block = _render_frames_with_checkpoints(config, title, prompt_block, project_dir,
-                                                   on_progress=on_progress)
-    _chain_drift_lookback(config, title, prompt_block, project_dir, on_progress=on_progress)
+    generate_frame_sequence(config, title, prompt_block, on_progress=on_progress,
+                            target_sequences=None)
     manifest = read_manifest(project_dir) or {}
     manifest_path = os.path.join(project_dir, 'manifest.json')
     manifest['manifest'] = '/' + os.path.relpath(
@@ -1044,121 +1744,128 @@ def render_frames_for_task(config, title, prompt_block, on_progress=None):
     return manifest
 
 
-def _render_videos_with_recovery(config, title, prompt_block, on_progress=None):
-    """Render all videos, then run one autonomous retry pass over any slot that came
-    back rejected/blocked (e.g. a failed Google FX anchor-match) instead of leaving it
-    for a human to notice and re-trigger manually."""
-    video_result = generate_video_sequence(config, title, prompt_block, on_progress=on_progress)
-    # 'skipped_cut'（声明式硬切槽位）是预期缺失，不进恢复重试轮；'skipped_bridge_hold'
-    # 已停用（单一过门拍收编后不再有需要跳过的 HOLD 槽位），仅为兼容旧 manifest 保留
-    failed_slots = [v['slot'] for v in video_result.get('videos', [])
-                    if v.get('status') not in ('success', 'skipped_cut', 'skipped_bridge_hold')]
-    if failed_slots:
-        if on_progress:
-            on_progress('video_retry_autonomous', {'slots': failed_slots})
-        video_result = generate_video_sequence(
-            config, title, prompt_block, on_progress=on_progress, target_slots=failed_slots,
-        )
-    return video_result
+def _render_videos_with_recovery(config, title, prompt_block, on_progress=None,
+                                 project_dir=None):
+    """Keep the same pipeline alive while recovering only undelivered clips."""
+    if (config or {}).get('_defer_video_to_worker'):
+        return read_manifest(project_dir or _get_project_dir(title)) or {'videos': []}
+    from video_generation_recovery import execute_video_generation_with_recovery
+    return execute_video_generation_with_recovery(config, title, prompt_block,
+        on_progress=on_progress, generate_fn=generate_video_sequence, project_dir=project_dir)
 
 
-def _no_gate_judge(image_path, prompt):
-    """恒真判定：仅供 run_staged_frame_rendering（agent/脚本驱动的 /api/render_staged
-    路径）使用——那条路径有人/agent 在场，真判定失败时的 needs_human_review 死路是
-    有意义的终态，本函数按既有约定保持不变。run_autonomous_pipeline 已改用真实判定
-    （见下方 _image1_judge），不再依赖本函数。仍走 render_and_gate_single_frame/
-    _retry_frame_until_pass 的既有管线（manifest 回写等）。"""
-    return True, None
+def _flow_video_outcome(config, video_result, prompt_block):
+    """Report paid Flow submissions that did not deliver every expected clip."""
+    if (config or {}).get('videoProvider') != 'flow2api':
+        return {}
+    result = video_result or {}
+    rows = [row for row in result.get('videos', []) if isinstance(row, dict)]
+    _, expected = _parse_prompt_slots(prompt_block)
+    by_slot = {row.get('slot'): row for row in rows}
+    last_run = (result.get('video_generation_stats') or {}).get('last_run') or {}
+    accepted = {'success', 'skipped_cut', 'skipped_bridge_hold'}
+    failed = bool(last_run.get('failed_slots') or last_run.get('cancelled_slots')) or any(
+        by_slot.get(slot, {}).get('status') not in accepted for slot in expected)
+    failed = failed or any(
+        row.get('status') not in accepted
+        or (row.get('last_attempt') or {}).get('submission_pending')
+        or (row.get('last_attempt') or {}).get('status') in ('failed', 'cancelled')
+        for row in rows)
+    warned = (not reviews_disabled(config)
+              and any(row.get('process_warned') or row.get('anchor_mismatch_overridden')
+                      for row in rows))
+    return {'completion_state': 'partial_failed' if failed else (
+                'completed_with_warnings' if warned else 'completed'),
+            'has_failures': bool(failed), 'has_quality_warnings': bool(warned)}
 
 
 def run_autonomous_pipeline(config, dimensions, on_progress=None):
     """Runs the full staged pipeline autonomously, composing its own prompt text."""
     state = compose_anchor_and_packet(config, dimensions, on_progress=on_progress)
     title = state['title']
-
-    def _image1_judge(image_path, current_prompt):
-        return check_anchor_frame_compliance(config, image_path, current_prompt, state['packet'], state['parsed_brief'])
-
-    gate = render_and_gate_single_frame(
-        config, title, 1, state['image_1_prompt'], judge=_image1_judge, on_progress=on_progress,
-        hard_fail_status='auto_approved_degraded',
+    # IMAGE 1 先单独渲一张：下面的 refine_packet_from_accepted_anchor 要对着这张真实
+    # 画面修正 Drift Lock 数据包，剩余各拍的提示词都由修正后的包生成。渲完不做任何
+    # 判定——渲染期审查已整体移除。
+    rendered = render_single_frame(
+        config, title, 1, state['image_1_prompt'], on_progress=on_progress,
     )
-    state['image_1_prompt'] = gate['prompt']
-    state['compiled_images'][1] = gate['prompt']
 
     if on_progress:
         on_progress('packet_refine_start', {'message': '正在依据已确认的首帧修正 Drift Lock 数据包...'})
-    state['packet'] = refine_packet_from_accepted_anchor(config, gate['image_path'], state['packet'])
+    state['packet'] = refine_packet_from_accepted_anchor(
+        config, rendered['image_path'], state['packet'], state.get('parsed_brief'))
+    # Persist the auditable world/topology ledger separately from prose prompts.  Unknown manifest
+    # keys are intentionally preserved by both render backends, so later per-frame writes keep it.
+    with manifest_lock(rendered['project_dir']):
+        _manifest = read_manifest(rendered['project_dir']) or {'title': title, 'frames': []}
+        _manifest['spatial_contract'] = {
+            key: state['packet'].get(key) or state.get('parsed_brief', {}).get(key)
+            for key in ('world_lock', 'carrier_envelope', 'entrance_topology', 'space_graph',
+                        'camera_palette')
+        }
+        _manifest['spatial_beats'] = [
+            # 'space' 必须在册：复刻线的空间标签落在这个键上（reverse.normalize_beat_spaces），
+            # 而 _BEAT_KEY_ALIASES 会把 space_id 搬进去。只投影 space_id 的话，渲染层的过门
+            # 前情判定（_threshold_reveal_context）读到的每一拍都是同一个 'primary'。
+            {key: beat.get(key) for key in (
+                'index', 'space', 'space_id', 'transition_stage', 'camera_family', 'reveal_scope',
+                'light_source_state', 'operation', 'package_operations', 'milestone_name',
+                'before_state', 'after_state', 'preserve_state', 'changed_grid_cells',
+                'persistent_traces', 'hard_cut', 'bridge_stage', 'turn_direction')}
+            for beat in state.get('beat_ladder', []) if isinstance(beat, dict)
+        ]
+        write_manifest(rendered['project_dir'], _manifest)
     if on_progress:
         on_progress('packet_refined', {'message': 'Drift Lock 数据包已依据实际渲染结果修正。'})
 
-    project_dir = gate['project_dir']
-    prompt_block = compose_remaining_beats(config, state, on_progress=on_progress)
-    prompt_block = _render_frames_with_checkpoints(config, title, prompt_block, project_dir, on_progress=on_progress)
-    _chain_drift_lookback(config, title, prompt_block, project_dir, on_progress=on_progress)
-    video_result = _render_videos_with_recovery(config, title, prompt_block, on_progress=on_progress)
+    project_dir = rendered['project_dir']
+    # 合成器返回的是整份带标记文档（TITLE/THEME/PROMPTS/AUDIT），不是提示词正文。
+    prompt_block = prompt_block_from_output(
+        compose_remaining_beats(config, state, on_progress=on_progress))
+    # 卡片工序交付总账落盘：帧渲染完之后用户手动触发的一致性审查在另一个进程生命周期里，
+    # config 上那份到不了那边（见 persist_outline_delivery_ledger）
+    persist_outline_delivery_ledger(
+        project_dir, (config or {}).get('_outline_delivery_ledger'), title=title)
+    generate_frame_sequence(config, title, prompt_block, on_progress=on_progress,
+                            target_sequences=None)
+    video_result = _render_videos_with_recovery(config, title, prompt_block, on_progress=on_progress,
+                                                project_dir=project_dir)
+    outcome = _flow_video_outcome(config, video_result, prompt_block)
 
     return {
         'title': title,
-        'status': 'completed',
+        'status': 'partial_failed' if outcome.get('has_failures') else 'completed',
         'prompt_block': prompt_block,
         'prompt_slots': prompt_slots_list(prompt_block),
         'project_dir': project_dir,
         'videos': video_result,
+        **outcome,
     }
 
 
 def run_staged_frame_rendering(config, title, prompt_block, on_progress=None):
-    """Runs staged, gated rendering over an ALREADY-composed prompt_block, without
-    re-deriving any prompt text. If IMAGE 1 is already 'auto_approved' in manifest.json
-    (typically because the calling agent already gated it inline via
-    render_and_gate_single_frame / /api/render_anchor before composing the rest) AND
-    the anchor prompt fingerprint recorded at gate time matches this prompt_block's
-    IMAGE 1, this skips re-gating it — otherwise it gates it here, so this endpoint
-    alone still stages correctly and a stale same-titled manifest can't bypass the gate.
-    Returns a result dict with status='completed' or 'needs_human_review'."""
-    images, videos = _parse_prompt_slots(prompt_block)
+    """Renders an ALREADY-composed prompt_block, without re-deriving any prompt text,
+    then generates video. Frames already on disk are reused (generate_frame_sequence's
+    own resume semantics), so an agent that rendered IMAGE 1 inline via
+    /api/render_anchor before composing the rest does not pay for it twice.
+    Returns a result dict with status='completed'."""
+    images, _videos = _parse_prompt_slots(prompt_block)
     if 1 not in images:
         raise RuntimeError('未在 prompt_block 中找到 图片 1: 提示词，无法分步渲染')
 
     project_dir = _get_project_dir(title)
-
-    item = images[1]
-    prompt = item['body'] if isinstance(item, dict) else item
-    meta = item.get('meta', '') if isinstance(item, dict) else ''
-
-    # 复用旧判定的前提：不只是 manifest 记着 auto_approved，验锚时记录的提示词指纹还得与
-    # 本次 IMAGE 1 一致，且过门的锚点图还在盘上——图被清理后跳过验锚，下游会重渲一张
-    # 从未过门的新首帧接着整链构图。同名项目复跑/改过首帧提示词时旧判定作废，必须重新过门；
-    # auto_approved_degraded（判定服务异常放行）不可复用，同样重新过门。
-    # 例外：qaGateLevel=off 时锚点门本就被主动关闭，过门只会得到同样的 degraded 记录，
-    # 重新过门却会重渲一张新首帧去接旧链（帧 2..N 仍挂在旧首帧上）——正是指纹复用要防的
-    # 锚链错位。故 off 档下 degraded 记录同样可复用（指纹与图仍必须齐全）。
-    frame_1 = _frame_manifest_entry(project_dir, 1) or {}
-    _reusable_gates = ('auto_approved',) if qa_gate_level(config) != 'off' else ('auto_approved', 'auto_approved_degraded')
-    if (frame_1.get('quality_gate') in _reusable_gates
-            and frame_1.get('anchor_prompt_sha256') == _prompt_fingerprint(prompt)
-            and os.path.exists(_frame_path(title, 1))):
-        if on_progress:
-            on_progress('anchor_check', {'sequence': 1, 'attempt': 0, 'passed': True, 'reason': '此前已通过判定且提示词未变，跳过重复渲染'})
-    else:
-        gate = render_and_gate_single_frame(config, title, 1, prompt, meta=meta, judge=_no_gate_judge, on_progress=on_progress)
-        images[1] = {'body': gate['prompt'], 'meta': meta}
-        if gate['status'] not in ('auto_approved', 'auto_approved_degraded'):
-            if on_progress:
-                on_progress('needs_human_review', {'sequence': 1, 'reason': gate['reason']})
-            return {'title': title, 'status': 'needs_human_review', 'reason': gate['reason'], 'project_dir': project_dir}
-
-    prompt_block = _format_prompt_block(images, videos)
-    prompt_block = _render_frames_with_checkpoints(config, title, prompt_block, project_dir, on_progress=on_progress)
-    _chain_drift_lookback(config, title, prompt_block, project_dir, on_progress=on_progress)
-    video_result = _render_videos_with_recovery(config, title, prompt_block, on_progress=on_progress)
+    generate_frame_sequence(config, title, prompt_block, on_progress=on_progress,
+                            target_sequences=None)
+    video_result = _render_videos_with_recovery(config, title, prompt_block, on_progress=on_progress,
+                                                project_dir=project_dir)
+    outcome = _flow_video_outcome(config, video_result, prompt_block)
 
     return {
         'title': title,
-        'status': 'completed',
+        'status': 'partial_failed' if outcome.get('has_failures') else 'completed',
         'prompt_block': prompt_block,
         'prompt_slots': prompt_slots_list(prompt_block),
         'project_dir': project_dir,
         'videos': video_result,
+        **outcome,
     }

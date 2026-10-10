@@ -1,0 +1,12 @@
+# Composition chain — scripts/render_and_gate_anchor.py, scripts/save_to_library.py,
+# scripts/generate_frames.py, scripts/skill_common.py, scripts/lint_skill.py.
+#
+# Intentionally empty: every one of these uses only the Python standard library
+# (argparse / json / urllib / hashlib / unicodedata / re). That is a design constraint, not an
+# accident — these scripts run wherever the agent runs, which is not necessarily where the
+# server's virtualenv lives, so `python <script>` must work against a bare interpreter.
+#
+# Requires: Python 3.8+ (f-strings, `str.casefold`, `TimeoutError` as a builtin).
+#
+# In particular there is NO `requests` dependency. An earlier combined requirements.txt listed
+# `requests>=2.28.0` while every script used `urllib` — a declared dependency nothing imported.

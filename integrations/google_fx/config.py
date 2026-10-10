@@ -120,6 +120,10 @@ SERVER_PORT = int(_env_or_default("SERVER_PORT", "8000"))
 # 💡 AdsPower 配置
 DEFAULT_PORT = _env_or_default("ADSPOWER_PORT", "50325")
 DEFAULT_USER_ID = _env_or_default("ADSPOWER_DEFAULT_USER_ID", "")
+ADSPOWER_SILENT_MODE = _env_or_default("ADSPOWER_SILENT_MODE", "1") == "1"
+ADSPOWER_WINDOW_POSITION = _env_or_default("ADSPOWER_WINDOW_POSITION", "-10000,-10000")
+ADSPOWER_WINDOW_SIZE = _env_or_default("ADSPOWER_WINDOW_SIZE", "1280,800")
+ADSPOWER_HEADLESS = _env_or_default("ADSPOWER_HEADLESS", "0") == "1"
 
 # 💡 路径
 # 独立 AdsPower 项目过去按平台写到桌面或 N8N-main/AI_video；内置后统一回到
@@ -155,8 +159,58 @@ def get_runtime_default_user_id() -> str:
     return runtime_env_or_default("ADSPOWER_DEFAULT_USER_ID", DEFAULT_USER_ID)
 
 
+def get_runtime_adspower_silent_mode() -> bool:
+    """是否后台静默运行（默认开启；macOS 隐藏窗口，常规任务不主动前置）。"""
+    val = runtime_env_or_default("ADSPOWER_SILENT_MODE", "1").strip().lower()
+    return val in ("1", "true", "yes", "on")
+
+
+def get_runtime_adspower_window_position() -> str:
+    """返回 AdsPower 屏幕外窗口坐标，默认 '-10000,-10000'。"""
+    return runtime_env_or_default("ADSPOWER_WINDOW_POSITION", "-10000,-10000").strip()
+
+
+def get_runtime_adspower_window_size() -> str:
+    """返回 AdsPower 窗口视口尺寸，默认 '1280,800'。"""
+    return runtime_env_or_default("ADSPOWER_WINDOW_SIZE", "1280,800").strip()
+
+
+def get_runtime_adspower_headless() -> bool:
+    """返回 AdsPower 是否开启原生 Headless 模式（默认 0/False）。"""
+    val = runtime_env_or_default("ADSPOWER_HEADLESS", "0").strip().lower()
+    return val in ("1", "true", "yes", "on")
+
+
+# macOS 上 --window-position 的屏幕外坐标会被窗口服务器 clamp 回可见区域，静默模式
+# 形同虚设（详见 utils/macos_window 模块头）。这里的模式决定改用哪种 macOS 原生手段：
+#   hide  : 隐藏浏览器 app + 归还焦点（默认；AppKit 优先，UI 脚本作为兼容回退）
+#   focus : 只归还焦点，窗口留在屏幕上（零权限保底）
+#   off   : 不干预，沿用旧行为
+_ADSPOWER_MACOS_WINDOW_MODES = ("hide", "focus", "off")
+
+
+def get_runtime_adspower_macos_window_mode() -> str:
+    """返回 macOS 窗口抑制模式，默认 'hide'。非法值一律退回 'hide'。
+
+    只在 macOS 上有意义；Windows/Linux 侧调用点会先判平台再决定要不要问这个值。
+    """
+    val = runtime_env_or_default("ADSPOWER_MACOS_WINDOW_MODE", "hide").strip().lower()
+    return val if val in _ADSPOWER_MACOS_WINDOW_MODES else "hide"
+
+
 def get_runtime_google_fx_video_model() -> str:
     return runtime_env_or_default("GOOGLE_FX_VIDEO_MODEL", DEFAULT_GOOGLE_FX_VIDEO_MODEL)
+
+
+def get_runtime_google_fx_video_ref_mode() -> str:
+    """返回当前视频参考模式: 'VIDEO_FRAMES' 或 'VIDEO_REFERENCES'。"""
+    return runtime_env_or_default("GOOGLE_FX_VIDEO_REF_MODE", "VIDEO_FRAMES")
+
+
+def get_runtime_google_fx_video_resolution() -> str:
+    """返回当前 Omni 视频分辨率: '360p' 或 '720p' (默认 720p)。"""
+    val = runtime_env_or_default("GOOGLE_FX_VIDEO_RESOLUTION", "720p").strip().lower()
+    return "360p" if "360" in val else "720p"
 
 
 def get_runtime_google_fx_image_model() -> str:

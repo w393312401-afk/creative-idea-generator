@@ -1,0 +1,191 @@
+/* =====================================================================
+   顶部工作区标签栏的自定义（排序 / 隐藏）— 配套 js/nav_customize.js
+   ===================================================================== */
+
+/* 面板是绝对定位挂在标签栏上的，栏本身必须是定位上下文 */
+.mobile-nav-tabs {
+    position: relative;
+}
+
+/* 被隐藏的标签：无论是否为 active 状态，均彻底隐藏，避免由于 active 状态而意外闪现 */
+.mobile-nav-btn.nav-hidden {
+    display: none !important;
+}
+
+/* — 「⋯」入口：不参与 flex:1 的等分，固定窄条吊在最右 — */
+.nav-customize-btn {
+    flex: 0 0 auto;
+    background: transparent;
+    border: none;
+    border-radius: var(--radius-md);
+    color: var(--text-secondary);
+    padding: 10px 10px;
+    font-size: var(--fs-lg);
+    line-height: 1;
+    letter-spacing: 1px;
+    cursor: pointer;
+    opacity: 0.55;
+    transition: var(--transition-fast);
+}
+
+.nav-customize-btn:hover {
+    opacity: 1;
+    color: var(--neon-cyan);
+    background: rgba(176, 123, 82, 0.08);
+}
+
+/* — 自定义面板 — */
+.nav-customize-panel {
+    position: absolute;
+    top: calc(100% + 6px);
+    right: 0;
+    z-index: 120;
+    width: 260px;
+    max-width: calc(100vw - 24px);
+    background: rgba(var(--panel-rgb), 0.98);
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-lg);
+    box-shadow: 0 12px 32px rgba(0, 0, 0, 0.28);
+    padding: 10px;
+    backdrop-filter: blur(8px);
+}
+
+.ncp-head {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    padding: 2px 4px 8px 4px;
+}
+
+.ncp-head strong {
+    font-size: var(--fs-md);
+    color: var(--text-primary);
+}
+
+.ncp-hint {
+    font-size: var(--fs-xs);
+    color: var(--text-secondary);
+    opacity: 0.75;
+}
+
+.ncp-list {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.ncp-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 4px;
+    border-radius: var(--radius-md);
+    font-size: var(--fs-sm);
+    color: var(--text-primary);
+    cursor: grab;
+    user-select: none;
+    border: 1px solid transparent;
+}
+
+.ncp-row:hover {
+    background: rgba(176, 123, 82, 0.06);
+    border-color: rgba(176, 123, 82, 0.18);
+}
+
+.ncp-row.is-dragging {
+    opacity: 0.45;
+}
+
+.ncp-row.is-hidden .ncp-label,
+.ncp-row.is-hidden .ncp-icon {
+    opacity: 0.4;
+    text-decoration: line-through;
+}
+
+.ncp-grip {
+    color: var(--text-secondary);
+    opacity: 0.5;
+    font-size: var(--fs-sm);
+}
+
+.ncp-icon {
+    font-size: var(--fs-md);
+}
+
+.ncp-label {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.ncp-moves {
+    display: flex;
+    gap: 2px;
+}
+
+.ncp-move,
+.ncp-eye {
+    background: transparent;
+    border: none;
+    color: var(--text-secondary);
+    cursor: pointer;
+    padding: 2px 4px;
+    border-radius: var(--radius-sm);
+    font-size: var(--fs-xs);
+    line-height: 1;
+}
+
+.ncp-move:hover,
+.ncp-eye:hover {
+    color: var(--neon-cyan);
+    background: rgba(176, 123, 82, 0.12);
+}
+
+.ncp-eye {
+    font-size: var(--fs-md);
+}
+
+.ncp-foot {
+    display: flex;
+    justify-content: space-between;
+    gap: 8px;
+    margin-top: 8px;
+    padding-top: 8px;
+    border-top: 1px solid var(--border-color);
+}
+
+.ncp-foot button {
+    flex: 1;
+    padding: 6px 8px;
+    border-radius: var(--radius-md);
+    font-size: var(--fs-sm);
+    cursor: pointer;
+    border: 1px solid var(--border-color);
+    background: transparent;
+    color: var(--text-secondary);
+    transition: var(--transition-fast);
+}
+
+.ncp-foot button:hover {
+    color: var(--text-primary);
+    border-color: rgba(176, 123, 82, 0.4);
+}
+
+.ncp-foot .ncp-close {
+    background: rgba(176, 123, 82, 0.12);
+    color: var(--neon-cyan);
+    border-color: rgba(176, 123, 82, 0.3);
+}
+
+@media (max-width: 768px) {
+    .nav-customize-btn {
+        padding: 8px 6px;
+        font-size: var(--fs-base);
+    }
+
+    .nav-customize-panel {
+        width: 220px;
+    }
+}

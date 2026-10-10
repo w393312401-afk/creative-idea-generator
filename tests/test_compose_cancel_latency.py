@@ -92,7 +92,7 @@ class TestCancelEndpointImmediateFinalize:
         assert ("error", {"message": "用户取消了生成任务"}) in received
         assert stop_evt.is_set()
         # 落盘同步
-        with open(os.path.join("tasks", "1720000000000.json"), encoding="utf-8") as f:
+        with open(os.path.join(server_common.TASKS_DIR, "1720000000000.json"), encoding="utf-8") as f:
             assert json.load(f)["status"] == "cancelled"
 
     def test_fx_capable_task_is_not_force_finalized(self, monkeypatch):

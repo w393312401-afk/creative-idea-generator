@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""TBCP v4（docs/threshold_protocol_revision.md §12）单拍收编过门协议的单元测试：
+"""TBCP v4（docs/reference/threshold_protocol_revision.md §12）单拍收编过门协议的单元测试：
 
 - 两态镜头族（exterior/interior）：coaxial 与 pan 变体统一收编成单一 bridge_stage=1 拍，
   不再有 sill/vestibule 中间态
@@ -14,6 +14,7 @@ import json
 import shutil
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from prompt_pipeline import (
     beat_space_family,
@@ -30,12 +31,25 @@ from prompt_pipeline import (
     _parse_prompt_slots,
     _stage_scope_ladder_violations,
     HARD_CUT_VIDEO_PLACEHOLDER,
+    is_legacy_hard_cut_placeholder,
+    beat_is_crossing_clip,
     _beat_contract,
     fix_video_opening,
     check_video_opening,
+    check_threshold_monotonic_inheritance,
 )
 from video_generator import plan_video_slots, merge_project_videos, PartialMergeBlocked
 from frame_generator import update_manifest_stale_status
+
+
+# 每个相位的同族伴随工序，用来把夹具梯子的 package_operations 补到下限 2 道
+# （prompt_pipeline._MIN_PACKAGE_OPERATIONS）。与 deterministic_fallback_beat_ladder
+# 里的 phase_companion 同源；同族配对不会额外触发相位冲突/材料层跨越判据。
+_COMPANION = {
+    'clearing': 'demolition', 'repair': 'placement', 'rough-in': 'wiring',
+    'framing': 'insulation', 'drywall': 'paneling', 'flooring': 'painting',
+    'painting': 'priming', 'furnishing': 'lighting',
+}
 
 
 def _ladder_coaxial(n=8, t=4):
@@ -120,6 +134,23 @@ class TestImageSpaceFamily(unittest.TestCase):
         self.assertEqual(image_space_family(videos, 6), 'interior')
 
 
+class TestLegacyHardCutPlaceholder(unittest.TestCase):
+    """2026-07-30：[CUT] 槽改为真实生成的跨越片段，占位声明只作为「识别旧单」的常量保留
+    （旧单的 prompt_block 里仍是这段正文，那些单继续跳过生成）。"""
+
+    def test_placeholder_is_recognized_as_legacy(self):
+        self.assertTrue(is_legacy_hard_cut_placeholder(HARD_CUT_VIDEO_PLACEHOLDER))
+        # 前后空白/大小写不影响识别（正文经过格式化回读）
+        self.assertTrue(is_legacy_hard_cut_placeholder('\n  declared hard cut - no video clip...'))
+
+    def test_real_crossing_prompt_is_not_legacy(self):
+        body = ('Use the provided first frame and last frame as exact composition anchors. '
+                'The sealed hatch is pushed open and the camera pushes through into the interior.')
+        self.assertFalse(is_legacy_hard_cut_placeholder(body))
+        self.assertFalse(is_legacy_hard_cut_placeholder(''))
+        self.assertFalse(is_legacy_hard_cut_placeholder(None))
+
+
 class TestFamilyAnchorSeq(unittest.TestCase):
     def test_cut_counts_as_family_boundary(self):
         videos = {3: {'body': 'v', 'meta': ''}, 4: {'body': 'v', 'meta': 'CUT'},
@@ -131,6 +162,21 @@ class TestFamilyAnchorSeq(unittest.TestCase):
         videos = {4: {'body': 'v', 'meta': 'BRIDGE TURN'}, 5: {'body': 'v', 'meta': ''}}
         # The single merged crossing beat (pan variant) is the new family anchor.
         self.assertEqual(family_anchor_seq(videos, 7), 5)
+
+
+class TestCrossingClipPredicate(unittest.TestCase):
+    """视频侧「是不是跨越镜头」的唯一判据：bridge_stage==1 或 hard_cut。漏掉 hard_cut
+    就会把切入拍当普通静止施工拍处理（运镜句被删、动作正文清空）。"""
+
+    def test_bridge_and_cut_both_count(self):
+        self.assertTrue(beat_is_crossing_clip({'bridge_stage': 1}))
+        self.assertTrue(beat_is_crossing_clip({'hard_cut': True}))
+        self.assertTrue(beat_is_crossing_clip({'bridge_stage': 1, 'turn_direction': 'left'}))
+
+    def test_ordinary_beats_do_not(self):
+        self.assertFalse(beat_is_crossing_clip({'operation': 'repair', 'bridge_stage': None}))
+        self.assertFalse(beat_is_crossing_clip({'hard_cut': False}))
+        self.assertFalse(beat_is_crossing_clip(None))
 
 
 class TestThresholdVariantHelpers(unittest.TestCase):
@@ -176,7 +222,7 @@ class TestStageScopeQuota(unittest.TestCase):
     whole ladder" count to a per-operation-run rule — every run of consecutive beats
     sharing the same 'operation' must end its LAST beat with stage_scope='large' (that
     operation's own full-completion milestone), and no other beat in the run may be
-    'large'. See docs/threshold_protocol_revision.md's alignment note and
+    'large'. See docs/reference/threshold_protocol_revision.md's alignment note and
     _stage_scope_ladder_violations' docstring for why the old global-1 quota starved
     every operation but one of ever reaching a real completion beat."""
 
@@ -270,9 +316,37 @@ class TestDoorClearanceCheck(unittest.TestCase):
             'the door frame is fully behind the camera and out of frame.', family='interior')
         self.assertEqual(errs, [])
 
+    def test_silence_is_not_positive_clearance_evidence(self):
+        errs = check_interior_door_clearance(
+            'Interior stone walls, ceiling and floor fill the frame edge to edge.',
+            family='interior')
+        self.assertTrue(any('positively state' in err for err in errs))
+
+    def test_archway_portal_and_entrance_are_covered(self):
+        for label in ('arch', 'archway', 'portal', 'entrance'):
+            with self.subTest(label=label):
+                errs = check_interior_door_clearance(
+                    f'The {label} frames the room from the foreground.', family='interior')
+                self.assertTrue(errs)
+
     def test_exterior_exempt(self):
         p = 'The open doorway sits in Grid B2 with the sill line crossing the lower third.'
         self.assertEqual(check_interior_door_clearance(p, family='exterior'), [])
+
+    def test_partial_transition_is_exempt_but_establish_is_not(self):
+        common = dict(
+            i=3, video_prompt='',
+            image_prompt=('Camera pitch locked level; the archway rim and sill remain visible '
+                          'around the partial first look.'),
+            packet={}, mode='Standard', is_last=False,
+            is_threshold_or_reveal=True, family='interior')
+        partial = validate_beat_prompts(
+            **common, beat={'bridge_stage': 2, 'transition_stage': 'threshold_partial'})
+        self.assertFalse(any('Post-crossing interior IMAGE' in err for err in partial))
+
+        establish = validate_beat_prompts(
+            **common, beat={'bridge_stage': 3, 'transition_stage': 'interior_establish'})
+        self.assertTrue(any('Post-crossing interior IMAGE' in err for err in establish))
 
 
 class TestTurnVideoProcessCheck(unittest.TestCase):
@@ -304,13 +378,44 @@ class TestTurnVideoProcessCheck(unittest.TestCase):
 class TestValidateBeatPromptsVariants(unittest.TestCase):
     PACKET = {'camera_dna': '', 'primary_landmarks': [], 'frame_boundaries': {}}
 
-    def test_hard_cut_beat_skips_video_checks(self):
+    CUT_IMAGE = ('Static tripod shot inside; camera pitch locked level; the central vanishing '
+                 'axis stays centered.')
+
+    def test_hard_cut_beat_is_validated_as_a_crossing_clip(self):
+        """[CUT] 槽是真实生成的跨越片段：一条正常的过门镜头描述必须通过全套视频侧校验。"""
         beat = {'index': 4, 'operation': 'threshold', 'hard_cut': True, 'bridge_stage': None}
+        video = ('Use the provided first frame and last frame as exact composition anchors. Use '
+                 'IMAGE 4 as the actual first-frame image and IMAGE 5 as the actual last-frame '
+                 'image; every visible action must interpolate between those two frame images '
+                 'without inventing a third layout. The closed hatch is pushed open on camera and '
+                 'the camera pushes forward in one continuous coaxial move through the opening, '
+                 'settling fully inside; the frame stays completely sterile of workers throughout.')
         errs = validate_beat_prompts(
-            4, HARD_CUT_VIDEO_PLACEHOLDER,
-            'Static tripod shot inside; camera pitch locked level; the central vanishing axis stays centered.',
+            4, video, self.CUT_IMAGE,
             self.PACKET, 'Threshold', False, True, beat=beat, family='interior')
         self.assertEqual([e for e in errs if 'VIDEO' in e or 'video' in e], [])
+
+    def test_hard_cut_beat_without_any_camera_move_is_flagged(self):
+        """回归护栏：占位声明式的正文（没有锚定开场、没有运镜动作）不再被静默放行——
+        它正是"过门镜头不生成"的那种正文。"""
+        beat = {'index': 4, 'operation': 'threshold', 'hard_cut': True, 'bridge_stage': None}
+        errs = validate_beat_prompts(
+            4, HARD_CUT_VIDEO_PLACEHOLDER, self.CUT_IMAGE,
+            self.PACKET, 'Threshold', False, True, beat=beat, family='interior')
+        # 占位声明没有插值锚定开场，也没有绑定首尾帧 —— 现在会被报出来
+        self.assertTrue(any('missing required opening sentence' in e for e in errs))
+        self.assertTrue(any('must bind IMAGE 4 (first frame) to IMAGE 5' in e for e in errs))
+
+        # 一段完全静止、没有任何运镜的正文同样被报（跨越片段必须写出推进动作）
+        static_body = (
+            'Use the provided first frame and last frame as exact composition anchors. Use '
+            'IMAGE 4 as the actual first-frame image and IMAGE 5 as the actual last-frame image; '
+            'every visible action must interpolate between those two frame images without '
+            'inventing a third layout. Dust hangs in the still air and the light shifts slowly.')
+        errs = validate_beat_prompts(
+            4, static_body, self.CUT_IMAGE,
+            self.PACKET, 'Threshold', False, True, beat=beat, family='interior')
+        self.assertTrue(any('camera-translation' in e for e in errs))
 
     def test_turn_beat_allows_pan_wording(self):
         # The single threshold/bridge beat (bridge_stage=1) with turn_direction set —
@@ -386,15 +491,50 @@ class _TmpDirCase(unittest.TestCase):
 
 
 class TestPlanVideoSlotsCut(_TmpDirCase):
-    def test_cut_slot_skipped_others_generate(self):
+    def test_cut_slot_now_generates_like_any_other(self):
+        """2026-07-30：[CUT] 槽照常生成视频（正文是普通的跨越镜头描述），起止帧绑定
+        与普通拍一致。此前它被无条件跳过，成片过门处只有两张静帧硬拼。"""
+        frames = self._make_frames(4)
+        videos = {1: {'body': 'v1', 'meta': ''},
+                  2: {'body': 'the hatch is pushed open and the camera pushes through', 'meta': 'CUT'},
+                  3: {'body': 'v3', 'meta': ''}}
+        plans = plan_video_slots(videos, frames, {}, self.videos_dir)
+        self.assertEqual([p['action'] for p in plans], ['generate', 'generate', 'generate'])
+        self.assertEqual(plans[1]['start_anchor_slot'], 2)
+        self.assertTrue(plans[1]['start_frame'] and plans[1]['end_frame'])
+
+    def test_legacy_placeholder_body_now_generates_video(self):
+        """旧单遗留的占位声明正文不再跳过生成，而是清洗为可执行的跨越运镜提示词后正常生成。"""
         frames = self._make_frames(4)
         videos = {1: {'body': 'v1', 'meta': ''},
                   2: {'body': HARD_CUT_VIDEO_PLACEHOLDER, 'meta': 'CUT'},
                   3: {'body': 'v3', 'meta': ''}}
         plans = plan_video_slots(videos, frames, {}, self.videos_dir)
-        self.assertEqual([p['action'] for p in plans], ['generate', 'skip_cut', 'generate'])
-        # 切槽不因缺帧/降级被误判为 blocked
-        self.assertIn('硬切', plans[1]['reason'])
+        self.assertEqual([p['action'] for p in plans], ['generate', 'generate', 'generate'])
+        self.assertEqual(plans[1]['start_anchor_slot'], 2)
+        self.assertTrue(plans[1]['start_frame'] and plans[1]['end_frame'])
+        self.assertIn('IMAGE 1', plans[1]['prompt'])
+        self.assertIn('IMAGE 2', plans[1]['prompt'])
+        self.assertNotIn('no video clip is generated', plans[1]['prompt'])
+
+    def test_explicit_editorial_cut_now_generates_video(self):
+        """显式声明剪辑硬切的提示词同样转换为可执行的跨越运镜提示词，照常生成视频。"""
+        frames = self._make_frames(4)
+        videos = {
+            1: {'body': 'v1', 'meta': ''},
+            2: {
+                'body': ('This slot is an intentional editorial cut, not an interpolated '
+                         'transformation. No generated in-between image or camera travel.'),
+                'meta': 'CUT',
+            },
+            3: {'body': 'v3', 'meta': ''},
+        }
+        plans = plan_video_slots(videos, frames, {}, self.videos_dir)
+        self.assertEqual([p['action'] for p in plans], ['generate', 'generate', 'generate'])
+        self.assertEqual(plans[1]['start_anchor_slot'], 2)
+        self.assertTrue(plans[1]['start_frame'] and plans[1]['end_frame'])
+        self.assertIn('IMAGE 1', plans[1]['prompt'])
+        self.assertIn('IMAGE 2', plans[1]['prompt'])
 
     def test_bridge_turn_slot_not_mistaken_for_cut(self):
         frames = self._make_frames(3)
@@ -419,32 +559,42 @@ class TestMergeGateCut(_TmpDirCase):
 
     def test_skipped_cut_is_expected_gap_not_missing(self):
         self._make_frames(4)
-        # 槽位 2 是声明式硬切；槽位 3 真缺失 → 门禁只报 3，不报 2
+        # 槽位 2 是声明式硬切（旧单记录）；槽位 3 真缺失 → missing 只计 [1, 3]（槽位 1 缺少实际 mp4 文件），不计 2
         self._write_manifest(4, [
             {'slot': 1, 'status': 'success', 'file': 'videos/vid_001.mp4'},
             {'slot': 2, 'status': 'skipped_cut'},
         ])
+        # 默认 allow_partial=False 时应拦截并抛出 PartialMergeBlocked
         with self.assertRaises(PartialMergeBlocked) as ctx:
             merge_project_videos(self.tmp)
         self.assertNotIn(2, ctx.exception.missing)
         self.assertIn(3, ctx.exception.missing)
 
+        # allow_partial=True 时跳过无文件槽位合并
+        with patch('video_generator._merge_skip_missing') as mock_skip_merge:
+            merge_project_videos(self.tmp, allow_partial=True)
+            self.assertTrue(mock_skip_merge.called)
+            args = mock_skip_merge.call_args[0]
+            missing = args[4]
+            self.assertNotIn(2, missing)
+            self.assertIn(3, missing)
 
-class TestStaleLineageSegments(_TmpDirCase):
+
+class TestContinuousStaleLineage(_TmpDirCase):
     def _frames(self, metas):
         return [{'sequence': i, 'slot': i, 'meta': metas.get(i, '')} for i in sorted(set(list(metas) + list(range(1, 7))))]
 
-    def test_regen_before_cut_does_not_stale_after_cut(self):
+    def test_regen_before_cut_stales_after_cut_too(self):
         manifest = {'frames': self._frames({4: 'CUT'})}
         update_manifest_stale_status(manifest, self.tmp, regenerated_sequences=[2], finalize=True)
         by_seq = {f['sequence']: f for f in manifest['frames']}
         self.assertTrue(by_seq[3].get('stale_lineage'))
-        # 切点帧（t2i 新链头）及其后不派生自旧链，不得被标 stale
-        self.assertFalse(by_seq[4].get('stale_lineage'))
-        self.assertFalse(by_seq[5].get('stale_lineage'))
-        self.assertFalse(by_seq[6].get('stale_lineage'))
+        # CUT 仍以上一帧图生图，因此切点及其后也属于同一条派生链。
+        self.assertTrue(by_seq[4].get('stale_lineage'))
+        self.assertTrue(by_seq[5].get('stale_lineage'))
+        self.assertTrue(by_seq[6].get('stale_lineage'))
 
-    def test_regen_after_cut_stales_only_its_segment(self):
+    def test_regen_after_cut_stales_only_downstream_frames(self):
         manifest = {'frames': self._frames({4: 'CUT'})}
         update_manifest_stale_status(manifest, self.tmp, regenerated_sequences=[5], finalize=True)
         by_seq = {f['sequence']: f for f in manifest['frames']}
@@ -492,7 +642,7 @@ class TestBeatContractBridgeFlags(unittest.TestCase):
         later = self._contract(ladder, 5)
         self.assertFalse(later['is_bridge'])
         self.assertFalse(later['is_first_interior_reveal'])
-        self.assertNotIn('UNTOUCHED TRAUMA STATE', later['anchor_rule'])
+        self.assertNotIn('CONTINUITY, NOT A RESET', later['anchor_rule'])
 
     def test_pan_variant_turn_is_first_reveal_in_the_same_beat(self):
         ladder = _ladder_pan(n=6, t=3, turn_direction='right')  # single beat at 3, turn set
@@ -501,7 +651,7 @@ class TestBeatContractBridgeFlags(unittest.TestCase):
         self.assertTrue(cross['is_turn'])
         self.assertEqual(cross['family'], 'interior')
         self.assertTrue(cross['is_first_interior_reveal'])
-        self.assertIn('UNTOUCHED TRAUMA STATE', cross['anchor_rule'])
+        self.assertIn('CONTINUITY, NOT A RESET', cross['anchor_rule'])
         # The merged clip's contract text must describe the closing pan, not a
         # separate turn beat.
         self.assertIn('pan', cross['family_contract'].lower())
@@ -514,7 +664,7 @@ class TestBeatContractBridgeFlags(unittest.TestCase):
         cut = self._contract(ladder, 3)
         self.assertTrue(cut['is_cut'])
         self.assertIn('untouched pre-construction trauma', cut['anchor_rule'])
-        self.assertNotIn('UNTOUCHED TRAUMA STATE', cut['anchor_rule'])
+        self.assertNotIn('CONTINUITY, NOT A RESET', cut['anchor_rule'])
 
     def test_ordinary_interior_beat_states_door_clearance_only_once(self):
         # 2026-07-20 实机复盘：普通室内拍(非首现)的 anchor_rule 曾经和下面
@@ -526,6 +676,26 @@ class TestBeatContractBridgeFlags(unittest.TestCase):
         later = self._contract(ladder, 5)  # ordinary interior beat, not first reveal
         self.assertNotIn('DOOR CLEARANCE', later['anchor_rule'])
         self.assertEqual(later['family_contract'].count('Door clearance (mandatory)'), 1)
+
+    def test_cut_beat_contract_demands_a_real_generated_crossing_clip(self):
+        """2026-07-30 回归护栏：切入拍的 VIDEO 契约必须要求一段真实片段（普通视频提示词、
+        门在片段里被推开、绑定 IMAGE i -> i+1），不得再出现"占位声明/不生成片段"的口径。"""
+        ladder = _ladder_cut(n=6, t=3)
+        cut = self._contract(ladder, 3)
+        contract = cut['family_contract']
+        self.assertTrue(cut['is_cut'])
+        self.assertIn('a real clip IS generated for this slot', contract)
+        self.assertIn('pushed open on camera', contract)
+        self.assertIn('IMAGE 3', contract)
+        self.assertIn('IMAGE 4', contract)
+        self.assertNotIn('placeholder', contract.lower())
+        self.assertNotIn('no video clip', contract.lower())
+        # 跨越片段的三条硬条款（纯运镜/全程同一状态/一镜到底）与 bridge 同权。
+        # 2026-08-24：「全程废墟」改成「全程同一状态」——状态由这一拍自己申报。
+        self.assertIn('sterile of workers', contract)
+        self.assertIn('one state throughout', contract)
+        self.assertIn('never a generic ruin', contract)
+        self.assertIn('one unbroken take', contract.lower())
 
     def test_minimum_run_up_beat_ladder_helper_never_places_crossing_at_1_or_2(self):
         # Sanity check on the test helpers themselves — mirrors the real minimum
@@ -575,25 +745,53 @@ class TestPostRevealCleanupContract(unittest.TestCase):
         self.assertFalse(self._contract(ladder, 5)['is_post_reveal_cleanup'])  # 再往后的普通室内拍
         self.assertNotIn('Post-crossing cleanout', self._contract(ladder, 5)['family_contract'])
 
+    def test_beat_after_crossing_that_is_not_clearing_gets_no_cleanout_contract(self):
+        """2026-08-24 证据闸门：位置对了还不够，这一拍自己得真的申报清理。原片进门直接
+        开工的片子不该被扣上一份「本拍是纯清理」的契约，凭空多出一道工序。"""
+        ladder = _ladder_coaxial(n=6, t=3)
+        ladder[3]['operation'] = 'framing'
+        ladder[3]['milestone_name'] = 'stud wall framed along the north side'
+        after = self._contract(ladder, 4)
+        self.assertFalse(after['is_post_reveal_cleanup'])
+        self.assertNotIn('Post-crossing cleanout', after['family_contract'])
+
     def test_standard_mode_never_marks_a_cleanup_beat(self):
         ladder = [{'index': i, 'operation': 'repair', 'description': f'step {i}',
                    'bridge_stage': None} for i in range(1, 6)]
         for i in range(1, 6):
             self.assertFalse(self._contract(ladder, i, mode='Standard')['is_post_reveal_cleanup'])
 
-    def test_first_reveal_demands_three_categories_and_zero_intervention(self):
+    def test_first_reveal_no_longer_dictates_a_ruin(self):
+        """2026-08-24：首现帧的「必须是废墟」硬规则已删。剩下的是防倒退 + 一句
+        「状态由这一拍自己申报」，两个方向的通用模板都不许再压上去。"""
         cross = self._contract(self._ladder_with_cleanup(t=3), 3)
         self.assertTrue(cross['is_first_interior_reveal'])
-        self.assertIn('AT LEAST THREE', cross['anchor_rule'])
-        self.assertIn('ZERO INTERVENTION EVIDENCE', cross['anchor_rule'])
-        self.assertIn('UNARRANGED', cross['anchor_rule'])
+        self.assertNotIn('AT LEAST THREE', cross['anchor_rule'])
+        self.assertNotIn('ZERO INTERVENTION EVIDENCE', cross['anchor_rule'])
+        self.assertNotIn('UNARRANGED', cross['anchor_rule'])
+        self.assertIn('never impose a generic ruin', cross['anchor_rule'])
+        self.assertIn('never impose a generic tidy room', cross['anchor_rule'])
+        self.assertIn('already CLOSED', cross['anchor_rule'])
 
-    def test_crossing_clip_contract_keeps_the_interior_raw_and_the_take_unbroken(self):
+    def test_crossing_clip_holds_one_state_and_the_take_unbroken(self):
         cross = self._contract(self._ladder_with_cleanup(t=3), 3)
         fc = cross['family_contract']
-        self.assertIn('raw interior throughout', fc)
+        self.assertIn('one state throughout', fc)
+        self.assertIn('never a generic ruin', fc)
         self.assertIn('one unbroken take', fc)
-        self.assertIn('NEXT beat', fc)
+        self.assertIn('either side of it', fc)
+
+    def test_crossing_clip_with_outline_refs_remains_pure_and_sterile_of_work(self):
+        """1:1 节拍映射下，过门拍依然是 100% 纯运镜拍，严禁要求在同一个镜头内继续施工。"""
+        ladder = self._ladder_with_cleanup(t=3)
+        ladder[2]['outline_refs'] = [3]
+        ladder[2]['milestone_name'] = 'installing flooring'
+        ladder[2]['package_operations'] = ['lay', 'fasten']
+        cross = self._contract(ladder, 3)
+        fc = cross['family_contract']
+        self.assertIn('one state throughout', fc)
+        self.assertNotIn('continues into real work', fc)
+        self.assertIn('either side of it', fc)
 
 
 class TestBridgeClipWorkContentCheck(unittest.TestCase):
@@ -672,11 +870,14 @@ class TestPostCrossingCleanupLadderGate(unittest.TestCase):
                 'after_state': f'the entire stage {idx} surface is complete',
                 'completion_extent': 'the entire named zone',
                 'changed_grid_cells': ['Grid B2', 'Grid C2'],
-                'package_operations': [op],
+                # 普通施工拍要申报 2~3 道紧密工序；同族伴随工序不触发相位冲突判据。
+                'package_operations': [op, _COMPANION[op]] if op in _COMPANION else [op],
                 'primary_progress': 'coverage grows from zero to the full zone',
                 'secondary_progress': 'the staged stock drains from full to empty',
                 'persistent_traces': ['fastener marks', 'contact dust'],
                 'preserve_state': 'all earlier permanent work remains unchanged',
+                'introduced_objects': [],
+                'removed_objects': [],
             }
         ladder = [_milestone(1, 'clearing'), _milestone(2, 'repair')]
         ladder.append({'index': 3, 'operation': 'threshold', 'bridge_stage': 1,
@@ -743,7 +944,9 @@ class TestPostCrossingCleanupLadderGate(unittest.TestCase):
     def test_non_clearing_beat_after_the_crossing_is_rejected_and_fed_back(self):
         state, beat_users = self._run([self._threshold_ladder('framing'),
                                        self._threshold_ladder('clearing')])
-        self.assertEqual(state['beat_ladder'][3]['operation'], 'clearing')
+        establish = next(i for i, b in enumerate(state['beat_ladder'])
+                         if b.get('transition_stage') == 'interior_establish')
+        self.assertEqual(state['beat_ladder'][establish + 1]['operation'], 'clearing')
         # 第二次调用必须带着上一轮的结构违规回去
         self.assertIn('PRIOR STRUCTURE VIOLATIONS', beat_users[1])
         self.assertIn('"clearing" operation', beat_users[1])
@@ -751,7 +954,9 @@ class TestPostCrossingCleanupLadderGate(unittest.TestCase):
     def test_clearing_beat_after_the_crossing_is_accepted_first_try(self):
         state, beat_users = self._run([self._threshold_ladder('clearing')])
         self.assertEqual(len(beat_users), 1)
-        self.assertEqual(state['beat_ladder'][3]['operation'], 'clearing')
+        establish = next(i for i, b in enumerate(state['beat_ladder'])
+                         if b.get('transition_stage') == 'interior_establish')
+        self.assertEqual(state['beat_ladder'][establish + 1]['operation'], 'clearing')
         # 生成侧也必须把这条硬规则写进 system prompt（这里只验证它在用户可见的契约里）
         self.assertEqual(state['beat_ladder'][2]['bridge_stage'], 1)
 
@@ -789,6 +994,118 @@ class TestVideoOpeningFirstFrameIndex(unittest.TestCase):
             'axis stays centered.',
             packet, 'Threshold', False, True, beat=beat, family='interior')
         self.assertTrue([e for e in errs if 'VIDEO' in e or 'video' in e.lower()])
+
+
+class TestSealedEntryBeforeCrossing(unittest.TestCase):
+    """TBCP v7：过门前那一帧的门一律关死，三变体统一。
+
+    旧规则（PBISP peek）要求相反：门开着、室内锚点已经透过门洞可见。它是为 i2i 服务的
+    （给室内首帧一个可继承的锚点），但在 i2v 侧代价更大——半开的门递给视频模型一块低
+    分辨率、基本靠脑补的室内，模型随后把它当成插值时必须对齐的既成事实；对不上时，镜头
+    落地的室内就读作换了个世界，或者干脆没完全进去。门关死则无可对齐，揭示整个发生在
+    片段内部。
+    """
+    PACKET = {'camera_dna': '', 'primary_landmarks': [], 'frame_boundaries': {},
+              'interior_camera_dna': 'Static interior shot.',
+              'interior_primary_landmarks': [
+                  {'name': 'ribbed roof curve', 'grid': 'Grid B2', 'z_depth_scale': 'half'}]}
+
+    def _contract(self, ladder, i, mode='Threshold'):
+        return _beat_contract(i, len(ladder), ladder, mode, self.PACKET, '')
+
+    def test_beat_before_the_crossing_must_seal_its_entry(self):
+        before = self._contract(_ladder_coaxial(t=4), 3)
+        self.assertTrue(before['is_pre_bridge'])
+        self.assertIn('SEALED ENTRY (mandatory)', before['family_contract'])
+        self.assertIn('CLOSED', before['family_contract'])
+        # 没有门扇的毛坯载体：等价合规形态是洞里一片不透光的黑
+        self.assertIn('unlit darkness', before['family_contract'])
+        # 那一拍的 VIDEO 末帧就是这张闭门帧，所以它也不许在结尾开门
+        self.assertIn('SEALED ENTRY continuity in VIDEO 3', before['family_contract'])
+
+    def test_pbisp_peek_is_gone_from_the_pre_crossing_contract(self):
+        before = self._contract(_ladder_coaxial(t=4), 3)
+        self.assertNotIn('PBISP', before['family_contract'])
+        self.assertNotIn('sneak-peek', before['family_contract'])
+        self.assertNotIn('one-fifth of frame height', before['family_contract'])
+
+    def test_crossing_clip_opens_the_entry_on_camera(self):
+        for name, ladder in (('coaxial', _ladder_coaxial(t=4)),
+                             ('pan', _ladder_pan(t=4)),
+                             ('hard_cut', _ladder_cut(t=4))):
+            with self.subTest(variant=name):
+                cross = self._contract(ladder, 4)['family_contract']
+                self.assertIn('no interior preview before the opening', cross)
+                self.assertIn('pushed open on camera', cross)
+
+    def test_bridge_clip_no_longer_assumes_inherited_anchors_are_already_visible(self):
+        cross = self._contract(_ladder_coaxial(t=4), 4)['family_contract']
+        self.assertIn('become visible for the first time as the entry opens', cross)
+        self.assertNotIn('inherited interior anchors continuously scale up', cross)
+
+    def test_adaptive_ladder_opens_the_entry_but_keeps_it_unreadable(self):
+        """阶梯式过门（transition_stage）里"开门"本身就是一拍的里程碑，门当然是开的——
+        规则在这条路径上的等价形态是：开口里不许有任何可读的室内。"""
+        ladder = _ladder_coaxial(t=4)
+        ladder[3].update(transition_stage='door_hardware_open', camera_family='exterior',
+                         reveal_scope='none', light_source_state='daylight')
+        brief = {'mode': 'Threshold',
+                 'entrance_topology': {'hardware': ['door leaf', 'hinges', 'latch']}}
+        cross = _beat_contract(4, len(ladder), ladder, 'Threshold', self.PACKET, '',
+                               parsed_brief=brief)['family_contract']
+        self.assertIn('OPENED BUT UNREADABLE', cross)
+        self.assertIn('flat unlit darkness', cross)
+        # 这条路径不吃闭门契约（门在这一拍就是要打开的）
+        self.assertNotIn('SEALED ENTRY (mandatory)', cross)
+
+
+class TestThresholdMonotonicInheritance(unittest.TestCase):
+    """Scheme A: 过门时空单调继承与状态回退测试。"""
+
+    def test_reverted_ceiling_trauma_is_flagged(self):
+        bad_prompt = (
+            "Static 14mm interior shot. Ceiling cracks and damp runoff cover the upper concrete, "
+            "with water leaks from the ceiling. Coarse grey concrete sidewalls remain."
+        )
+        errors = check_threshold_monotonic_inheritance(bad_prompt, is_first_interior=True)
+        self.assertTrue(len(errors) > 0)
+        self.assertIn("reverted ceiling/roof trauma", errors[0])
+
+    def test_inherited_completed_roof_passes(self):
+        good_prompt = (
+            "Static 14mm interior shot. The ceiling overhead inherits the newly completed timber rafter "
+            "framing and clean black waterproof membrane from exterior beats with zero ceiling cracks. "
+            "Coarse grey concrete sidewalls show original moisture streaks."
+        )
+        errors = check_threshold_monotonic_inheritance(good_prompt, is_first_interior=True)
+        self.assertEqual(errors, [])
+
+    def test_reverted_floor_debris_is_flagged_when_exterior_cleared(self):
+        bad_prompt = (
+            "Static 14mm interior shot. The floor has fallen timber and rotting leaf piles scattered "
+            "across the muddy surface. The ceiling inherits timber rafters."
+        )
+        errors = check_threshold_monotonic_inheritance(
+            bad_prompt, is_first_interior=True, exterior_history=['clearing', 'roofing']
+        )
+        self.assertTrue(len(errors) > 0)
+        self.assertIn("reverted floor debris", errors[0])
+
+    def test_clean_bare_earth_floor_passes(self):
+        good_prompt = (
+            "Static 14mm interior shot. The floor is clean bare earth swept free of loose debris. "
+            "The ceiling inherits completed oak rafters. Coarse concrete walls remain."
+        )
+        errors = check_threshold_monotonic_inheritance(
+            good_prompt, is_first_interior=True, exterior_history=['clearing', 'roofing']
+        )
+        self.assertEqual(errors, [])
+
+    def test_non_first_interior_skips_check(self):
+        # 普通后续室内施工帧由 ordinary milestone check 检查，不触发过门首帧拦截
+        bad_prompt = "Static 14mm interior shot. Ceiling cracks exist."
+        errors = check_threshold_monotonic_inheritance(bad_prompt, is_first_interior=False)
+        self.assertEqual(errors, [])
 
 
 if __name__ == '__main__':

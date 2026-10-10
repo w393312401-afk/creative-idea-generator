@@ -8,17 +8,28 @@
 import os
 import time
 import re
+import hashlib
+import uuid
 import requests
+from urllib.parse import urlsplit, urlunsplit
 from playwright.sync_api import sync_playwright
 
-from ..config import MAX_WAIT_SECONDS, OUTPUT_DIR, get_runtime_max_wait_seconds
+from ..config import (
+    OUTPUT_DIR,
+    get_runtime_default_port,
+    get_runtime_default_user_id,
+    get_runtime_max_wait_seconds,
+    get_runtime_google_fx_video_ref_mode,
+)
 from ..models import VideoRequest
 from ..utils.logger import log
+from ..utils import account_binding
 from ..utils.browser import (
     random_sleep,
     clean_path,
     get_ads_ws_url,
     find_or_create_page,
+    bring_page_to_front_if_allowed,
     ensure_flow_workspace,
     download_video_via_browser,
 )
@@ -34,6 +45,8 @@ from ..ui_selectors import UI_SELECTORS, RATIO_MAP
 # 与 google_fx_image.py 的写法一致，循环 import 也随之消失。
 # L1 DOM 原语
 from .google_fx_dom import _safe_press_escape
+from ..utils.browser import flow_project_id
+from .google_fx_reference_cache import REFERENCE_UPLOAD_CACHE, reference_cache_key
 # L2 FX 页面语义
 from .google_fx_helpers import (
     _verify_and_fix_fx_config,
@@ -43,18 +56,37 @@ from .google_fx_helpers import (
     click_fx_send_button,
     _ensure_output_dir,
     _get_panel_uuids,
+    _get_panel_uuid_order,
+    _fill_prompt_text,
+    _verify_video_prompt_before_send,
     _normalize_model_name,
     wait_out_manual_intervention,
     _ManualInterventionTimeoutError,
     _find_add2_btn,
+    _open_canvas_upload_menu,
+    _find_canvas_upload_action,
+    _find_canvas_upload_file_input,
+    _describe_canvas_upload_state,
+    _canvas_upload_reload_safe,
+    _reload_canvas_for_upload_trigger,
+    _check_cancelled,
     _mount_video_prompt_refs,
     _submit_video_to_canvas,
     _inspect_all_pending_tiles,
     _scan_canvas_tiles,
     _distinct_slices,
+    _clean_alnum,
     _click_new_project_button,
     _dismiss_active_agent_mode,
     _dismiss_unexpected_overlays,
+    detect_page_credit_exhaustion,
+    is_credit_exhausted_message,
+    FLOW_HOME_URL,
+    is_flow_project_url,
+    CANVAS_BLIND_PREFIX,
+    is_flow_url,
+    snapshot_flow_tile_ids,
+    wake_flow_tile_video,
 )
 
 # 🚨 打包批量上传 (_upload_images_to_canvas_bulk) 依赖一个未经现场验证的假设：
@@ -68,46 +100,315 @@ from .google_fx_helpers import (
 # 记忆文档；确认 Flow 严格保序后，可将此常量改回 True 以恢复打包上传的速度。
 _ENABLE_BULK_CANVAS_UPLOAD = False
 
+# 采信"去重上传 UUID"之前必须等待的宽限秒数，见 _upload_image_to_canvas 第 3 步注释。
+_DEDUP_ATTRIBUTION_GRACE_SECONDS = 12
 
-def _upload_image_to_canvas(page, local_path, timeout=45, extra_known_uuids=None):
+# 上一次"已确认是本地上传"的画布图，其签名 URL 的 Expires（= 该 URL 的铸造时刻）。
+# Flow 的 flow-content 签名链接在卡片生成时铸一次，之后 <img> 懒加载复用同一条 URL，
+# 所以 Expires 是这张卡片的"出生时间"而不是"这次被请求的时间"。既然上传是按顺序做的，
+# 后传的图其 Expires 必然大于先传的图——比水位线还旧的候选一定是画布上的老卡片被重新
+# 拉取，不可能是刚传上去的这一张。只增不减，跨批次沿用。
+_LAST_CONFIRMED_UPLOAD_EXPIRES = 0.0
+
+# 某一张图归属判不出来时，等待它的卡片迟到落位的最长秒数。等不到就照常继续
+# （下一张图会重新快照画布），等到了就立刻往下走。
+_STRAGGLER_SETTLE_SECONDS = 10
+
+
+def _canvas_upload_max_wait_seconds(timeout):
+    """Only an identified pending upload can use this extra, bounded budget."""
+    try:
+        configured = int(os.getenv("GOOGLE_FX_CANVAS_UPLOAD_MAX_WAIT_SECONDS", "180"))
+    except (TypeError, ValueError):
+        configured = 180
+    return max(timeout, min(600, max(0, configured)))
+
+
+def _pending_canvas_upload_count(page, filename):
+    """Count pending cards for this exact source file; unknown DOM cannot extend a wait."""
+    try:
+        count = page.evaluate("""filename => Array.from(
+            document.querySelectorAll('flow-grid-tile-container'))
+            .filter(tile => tile.getAttribute('aria-label') === filename
+                && tile.querySelector('flow-pending-tile')).length""", filename)
+        return count if isinstance(count, int) and not isinstance(count, bool) else None
+    except Exception:
+        return None
+
+
+def _signed_url_expires(url):
+    """取签名 URL 的 Expires（秒）。取不到返回 None（该候选不参与水位线判定）。"""
+    m = re.search(r"[?&]Expires=(\d+)", url or "")
+    if not m:
+        return None
+    try:
+        return float(m.group(1))
+    except ValueError:
+        return None
+
+
+def _upload_image_to_canvas(page, local_path, timeout=45, extra_known_uuids=None, upload_state=None):
     """
     通过 Canvas Create (add_2) 按钮上传本地图片到画布，并利用网络拦截获取其 UUID。
     这是最稳定的上传方式，完全避开了弹窗裁剪流程。
     """
-    abs_path = os.path.abspath(local_path)
+    if upload_state is None:
+        upload_state = {}
+    upload_state['started'] = False
+    upload_state.pop('failure_reason', None)
+    # Recover menu/chooser races only before handing any file to the browser.
+    # A set_files exception is ambiguous: it may already have started uploading.
+    for attempt in range(2):
+        _check_cancelled()
+        try:
+            uuid = _upload_image_to_canvas_impl(
+                page, local_path, timeout, extra_known_uuids, upload_state)
+        finally:
+            # Also covers cancellation and failed native chooser handoffs.
+            _safe_press_escape(page, "Canvas 上传关闭对话框")
+        if uuid or upload_state['started']:
+            return uuid
+        _check_cancelled()
+        # Selector helpers tolerate stale DOM, including a lost browser. A
+        # read-only round trip preserves the native connection error so the
+        # runner can reconnect instead of reporting a missing upload menu.
+        page.title()
+        if attempt == 0:
+            log(f"  🔄 {os.path.basename(local_path)} 尚未开始上传，"
+                "清理菜单后重新定位上传入口（2/2）", "GoogleFX")
+            upload_state.pop('failure_reason', None)
+    return None
 
-    add2_btn = _find_add2_btn(page)
-    if not add2_btn:
-        log("  ❌ Canvas 上传: 未找到 Create (add_2) 按钮", "GoogleFX")
+
+def _upload_image_to_canvas_impl(page, local_path, timeout, extra_known_uuids, upload_state):
+    global _LAST_CONFIRMED_UPLOAD_EXPIRES
+    abs_path = os.path.abspath(local_path)
+    _check_cancelled()
+
+    if not _open_canvas_upload_menu(page):
+        upload_state['failure_reason'] = "无法打开上传菜单"
+        log("  ❌ Canvas 上传尚未开始: 无法打开上传菜单", "GoogleFX")
         return None
+
+    # assigned = 本轮已经被别的本地文件占用的 UUID。它和"画布上本来就有的 UUID"
+    # 必须分开记：前者一旦被当成本次上传的结果，就是明确的张冠李戴（两张不同的
+    # 帧图指向同一张画布图）；后者有可能是 Flow 按内容去重返回的合法结果。
+    assigned_uuids = {u for u in (extra_known_uuids or []) if u}
+    known_uuids = _get_panel_uuids(page).union(assigned_uuids)
+    filename = os.path.basename(abs_path)
+    pending_before_upload = _pending_canvas_upload_count(page, filename)
+
+    # 设置网络监听以精确捕获新上传的图片 UUID
+    captured_data = []
+    handle_response = _make_response_handler(captured_data, mode="image")
+    page.on("response", handle_response)
 
     try:
-        add2_btn.click()
-        random_sleep(1.5, 2.0)
-    except Exception as e:
-        log(f"  ❌ Canvas 上传: 点击 Create 失败: {e}", "GoogleFX")
-        return None
-
-    known_uuids = _get_panel_uuids(page)
-    if extra_known_uuids:
-        known_uuids = known_uuids.union(extra_known_uuids)
-
-    file_input = None
-    for _fi_sel in ["input[type='file']", "input[accept*='image']"]:
+        # Use the same menu-owned action that passed the readiness check.
+        # A page-wide .first can select a hidden/stale Upload control, and a
+        # global file input can belong to Start/End or another upload dialog.
+        upload_action = _find_canvas_upload_action(page, _find_add2_btn(page))
+        if upload_action is None:
+            upload_state['failure_reason'] = "上传菜单中未找到文件选择入口"
+            log("  ❌ Canvas 上传: 当前菜单的 Upload 操作已失效", "GoogleFX")
+            return None
+        chooser = None
+        phase = "点击上传入口"
         try:
-            _fi = page.locator(_fi_sel).first
-            if _fi.count() > 0:
-                file_input = _fi
+            with page.expect_file_chooser(timeout=3000) as chooser_info:
+                upload_action.click(timeout=2500)
+                phase = "等待文件选择器"
+            chooser = chooser_info.value
+        except Exception as error:
+            _check_cancelled()
+            if (isinstance(error, ConnectionError)
+                    or type(error).__name__ in ("TargetClosedError", "BrowserSessionClosedError")
+                    or "Target page" in str(error)):
+                # Let the runner restore a lost browser session; a disconnect
+                # is not evidence that the upload menu is incompatible.
+                raise
+            snapshot = _describe_canvas_upload_state(page, upload_action)
+            upload_state['failure_reason'] = (
+                f"当前上传入口未打开文件选择器 ({type(error).__name__}，卡在「{phase}」)")
+            log(f"  ⚠️ Canvas 上传尚未开始: {upload_state['failure_reason']} | {snapshot}", "GoogleFX")
+
+        if chooser is None:
+            # Native chooser never opened. Hand the file to the hidden input that
+            # belongs to this very menu, so it is still the same upload action.
+            file_input = _find_canvas_upload_file_input(page, _find_add2_btn(page))
+            if file_input is None:
+                return None
+            _check_cancelled()
+            log("  🔁 Canvas 上传: 文件选择器未弹出，改用菜单内隐藏 file input 直传", "GoogleFX")
+            upload_state['started'] = True
+            upload_state.pop('failure_reason', None)
+            file_input.set_input_files(abs_path)
+            log(f"  ✅ Canvas set_input_files: {os.path.basename(abs_path)}", "GoogleFX")
+        else:
+            _check_cancelled()
+            upload_state['started'] = True
+            chooser.set_files(abs_path)
+            log(f"  ✅ Canvas file_chooser set_files: {os.path.basename(abs_path)}", "GoogleFX")
+
+        log("  ⏳ 等待上传图片出现在画布...", "GoogleFX")
+        new_uuid = None
+        started = time.time()
+        deadline = started + timeout
+        max_deadline = started + _canvas_upload_max_wait_seconds(timeout)
+        extended_wait = False
+        ambiguity_logged = False
+        net_ambiguity_logged = False
+        stale_uuids_logged = False
+        if pending_before_upload:
+            log(f"  ⚠️ {filename} 上传前已有同名未完成卡片，本次不认领归属不明的迟到 UUID", "GoogleFX")
+        while time.time() < max_deadline:
+            _check_cancelled()
+            # 1. 优先从网络拦截中寻找新 UUID。
+            # ⚠️ 这一步以前是"拿列表里第一条没见过的 UUID 就走"，那是 2026-09-06
+            #    第二批首尾帧整体错位一帧的直接原因：画布没能新建项目、留着上一批的
+            #    成片卡片，上传 img_021 时这些老卡片的缩略图集中懒加载，一口气吐出 5
+            #    条 flow-content 响应，第一条（老卡片）被当成了 img_021。
+            #    现在按两道闸门收：① 比水位线旧的候选直接判为"老卡片重新拉取"；
+            #    ② 剩下不止一条时绝不猜——交给 DOM 路径继续等稳定。
+            dedup_candidate = None
+            net_candidates = {}
+            for timestamp, url in list(captured_data):
+                m = re.search(r'(?:name=|/image/|/video/|^)([0-9a-f\-]{30,})', url)
+                if not m:
+                    continue
+                uuid_cand = m.group(1)
+                if uuid_cand not in known_uuids:
+                    net_candidates.setdefault(uuid_cand, _signed_url_expires(url))
+                elif uuid_cand not in assigned_uuids:
+                    # 只有"画布上本来就有、且没被本轮别的文件占用"的 UUID 才有资格
+                    # 当去重候选。被占用的直接丢弃：那是别人的图。
+                    dedup_candidate = uuid_cand
+
+            stale_net = {
+                u: exp for u, exp in net_candidates.items()
+                if exp is not None and exp <= _LAST_CONFIRMED_UPLOAD_EXPIRES
+            }
+            if stale_net and not stale_uuids_logged:
+                stale_uuids_logged = True
+                log(
+                    f"  🧹 网络捕获里剔除 {len(stale_net)} 条比上次上传还旧的签名链接"
+                    f"（画布老卡片重新拉取，不是本次上传）: "
+                    f"{', '.join(u[:8] for u in sorted(stale_net))}",
+                    "GoogleFX",
+                )
+            live_net = [u for u in net_candidates if u not in stale_net]
+
+            # A CDN image response can be a video poster or an unrelated lazy
+            # load. Never establish upload ownership from network timing alone.
+            panel_uuids = set(_get_panel_uuid_order(page, filename=filename))
+            live_net = [u for u in live_net if u in panel_uuids]
+            fresh = [u for u in panel_uuids if u not in known_uuids and u not in stale_net]
+            # A pending same-name card present before set_files may finish now.
+            # Its new UUID is not proof that this attempt uploaded that image.
+            if pending_before_upload:
+                live_net = []
+                fresh = []
+            if len(live_net) == 1 and fresh == live_net:
+                new_uuid = live_net[0]
+                log(f"  🎉 通过网络捕获到新上传图片 UUID={new_uuid[:16]}...", "GoogleFX")
                 break
+            if len(live_net) > 1 and not net_ambiguity_logged:
+                net_ambiguity_logged = True
+                log(
+                    f"  ⚠️ 网络同时捕获到 {len(live_net)} 个新 UUID，无法确定 "
+                    f"{os.path.basename(abs_path)} 对应哪一个，不猜，继续等待稳定...",
+                    "GoogleFX",
+                )
+
+            # 2. 兜底通过 DOM 扫描（文档顺序）找本次新增的卡片
+            if len(fresh) == 1:
+                new_uuid = fresh[0]
+                log(f"  🎉 通过 DOM 扫描到上传图片: UUID={new_uuid[:16]}...", "GoogleFX")
+                break
+            if len(fresh) > 1 and not ambiguity_logged:
+                ambiguity_logged = True
+                # 同一次上传期间冒出多张新卡片（常见于上一张图的卡片渲染迟到）：
+                # 无法判断哪一张才是刚传上去的这一张。这里绝不猜——猜错就是把别的
+                # 帧安到这个槽位上，最后生成一段首尾帧完全对不上的视频。
+                log(
+                    f"  ⚠️ 画布同时出现 {len(fresh)} 张新图，无法确定 "
+                    f"{os.path.basename(abs_path)} 对应哪一张，继续等待稳定...",
+                    "GoogleFX",
+                )
+
+            # 3. 最后才考虑去重候选：必须等够宽限期、确认不会再有新 UUID 出现。
+            # 上传等待期间画布已有缩略图随时可能被重新拉取一次，那条响应和真正的
+            # 上传响应长得一模一样——之前无条件采信它，就是"img_002 被安上 img_001
+            # 的 UUID"这类首尾帧错乱的根因。
+            # An existing image being fetched is not proof of content dedup.
+            # Without an upload receipt/content proof, fail closed instead of
+            # assigning another local frame's UUID to this file.
+            now = time.time()
+            if now >= deadline:
+                # Slow Flow uploads can sit at 99/100% for over 45 seconds.
+                # Extend only for a unique pending card of this filename when
+                # no older same-name upload was pending before this attempt.
+                # A missing/error card or uncertain baseline keeps the normal
+                # timeout, and the original UUID attribution checks stay intact.
+                if pending_before_upload != 0 or _pending_canvas_upload_count(page, filename) != 1:
+                    break
+                if not extended_wait:
+                    extended_wait = True
+                    log(f"  ⏳ {filename} 仍在上传，延长画布确认等待（总上限 {max_deadline - started:g}s）", "GoogleFX")
+            time.sleep(min(1, max(0, max_deadline - now)))
+    finally:
+        try:
+            page.remove_listener("response", handle_response)
         except Exception:
             pass
 
-    if not file_input:
+    if new_uuid:
+        # 抬高水位线：下一张图的候选必须比这张更新，否则就是老卡片被重新拉取。
+        for _ts, _url in list(captured_data):
+            if new_uuid in _url:
+                _exp = _signed_url_expires(_url)
+                if _exp:
+                    _LAST_CONFIRMED_UPLOAD_EXPIRES = max(
+                        _LAST_CONFIRMED_UPLOAD_EXPIRES, _exp
+                    )
+                break
+
+    if not new_uuid:
+        log(
+            f"  ❌ Canvas 上传: 无法确定 {os.path.basename(abs_path)} 的画布 UUID"
+            f"（超时或归属不明），按上传失败处理",
+            "GoogleFX",
+        )
+    return new_uuid
+
+
+def _resolve_canvas_file_input(page):
+    """点击 Create (add_2) 后，定位画布上传用的 <input type=file>。返回 locator 或 None。"""
+    # 🔧 2026-07-03: 优先尝试触发上传按钮，因为即使 DOM 中已存在 input，如果不触发按钮也可能处于非激活状态。
+    upload_btn = page.locator(
+        "flow-menu-item:has-text('Upload'), flow-menu-item:has-text('上传'), "
+        "button[mat-menu-item]:has-text('Upload'), button[mat-menu-item]:has-text('上传'), "
+        ".mat-mdc-menu-panel button:has-text('Upload'), .mat-mdc-menu-panel button:has-text('上传'), "
+        ".mat-mdc-menu-item:has-text('Upload'), .mat-mdc-menu-item:has-text('上传'), "
+        "button[role='menuitem']:has-text('Upload'), button[role='menuitem']:has-text('上传'), "
+        "button:has-text('Upload'), button:has-text('上传')"
+    ).first
+    if upload_btn.is_visible(timeout=3000):
+        try:
+            upload_btn.click(force=True)
+            random_sleep(0.5, 1.0)
+        except Exception:
+            pass
+    else:
         upload_sels = [
+            "button[mat-menu-item]:has-text('Upload')", "button[mat-menu-item]:has-text('上传')",
+            ".mat-mdc-menu-item:has-text('Upload')", ".mat-mdc-menu-item:has-text('上传')",
             "button:has-text('Upload')", "button:has-text('上传')",
             "[role='button']:has-text('Upload')", "[role='button']:has-text('上传')",
             "div[class*='upload']", "label:has-text('Upload')",
             "button[aria-label*='Upload']", "button[aria-label*='上传']",
+            "button[role='menuitem']:has-text('上传')",
+            "button[role='menuitem']:has-text('Upload')",
         ]
         for _up_sel in upload_sels:
             try:
@@ -116,100 +417,13 @@ def _upload_image_to_canvas(page, local_path, timeout=45, extra_known_uuids=None
                     _el = _matches.nth(_idx)
                     if _el.is_visible(timeout=2000):
                         _el.click(force=True)
-                        random_sleep(0.5, 1.0)
+                        random_sleep(0.8, 1.5)
                         break
                 else:
                     continue
                 break
             except Exception:
                 continue
-
-        for _fi_sel in ["input[type='file']", "input[accept*='image']"]:
-            try:
-                _fi = page.locator(_fi_sel).first
-                if _fi.count() > 0:
-                    file_input = _fi
-                    break
-            except Exception:
-                pass
-
-    if not file_input:
-        log("  ❌ Canvas 上传: 未找到 file input", "GoogleFX")
-        _safe_press_escape(page, "Canvas 上传 file input 未找到")
-        return None
-
-    # 设置网络监听以精确捕获新上传的图片 UUID
-    captured_data = []
-    handle_response = _make_response_handler(captured_data, mode="image")
-    page.on("response", handle_response)
-
-    try:
-        file_input.set_input_files(abs_path)
-        log(f"  ✅ Canvas set_input_files: {os.path.basename(abs_path)}", "GoogleFX")
-
-        log("  ⏳ 等待上传图片出现在画布...", "GoogleFX")
-        new_uuid = None
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            # 1. 优先从网络拦截中寻找新 UUID
-            dedup_candidate = None
-            for timestamp, url in list(captured_data):
-                m = re.search(r'name=([0-9a-f\-]{30,})', url)
-                if m:
-                    uuid_cand = m.group(1)
-                    if uuid_cand not in known_uuids:
-                        new_uuid = uuid_cand
-                        log(f"  🎉 通过网络捕获到新上传图片 UUID={new_uuid[:16]}...", "GoogleFX")
-                        break
-                    else:
-                        dedup_candidate = uuid_cand
-            if new_uuid:
-                break
-            if dedup_candidate:
-                new_uuid = dedup_candidate
-                log(f"  🎉 通过网络捕获到去重上传图片 UUID={new_uuid[:16]}...", "GoogleFX")
-                break
-
-            # 2. 兜底通过 DOM 扫描对比 UUID 集合
-            cur_uuids = _get_panel_uuids(page)
-            new_uuids = cur_uuids - known_uuids
-            if new_uuids:
-                new_uuid = next(iter(new_uuids))
-                log(f"  🎉 通过 DOM 扫描到上传图片: UUID={new_uuid[:16]}...", "GoogleFX")
-                break
-            time.sleep(1)
-    finally:
-        page.remove_listener("response", handle_response)
-
-    _safe_press_escape(page, "Canvas 上传关闭对话框")
-    return new_uuid
-
-
-def _resolve_canvas_file_input(page):
-    """点击 Create (add_2) 后，定位画布上传用的 <input type=file>。返回 locator 或 None。"""
-    # 🔧 2026-07-03: 优先尝试触发上传按钮，因为即使 DOM 中已存在 input，如果不触发按钮也可能处于非激活状态。
-    upload_sels = [
-        "button:has-text('Upload')", "button:has-text('上传')",
-        "[role='button']:has-text('Upload')", "[role='button']:has-text('上传')",
-        "div[class*='upload']", "label:has-text('Upload')",
-        "button[aria-label*='Upload']", "button[aria-label*='上传']",
-        "button[role='menuitem']:has-text('上传')",
-        "button[role='menuitem']:has-text('Upload')",
-    ]
-    for _up_sel in upload_sels:
-        try:
-            _matches = page.locator(_up_sel)
-            for _idx in range(_matches.count()):
-                _el = _matches.nth(_idx)
-                if _el.is_visible(timeout=2000):
-                    _el.click(force=True)
-                    random_sleep(0.8, 1.5)
-                    break
-            else:
-                continue
-            break
-        except Exception:
-            continue
 
     file_input = None
     for _fi_sel in ["input[type='file']", "input[accept*='image']"]:
@@ -253,23 +467,84 @@ def _upload_images_to_canvas_bulk(page, local_paths, timeout=120):
 
     known_uuids = _get_panel_uuids(page)
 
-    file_input = _resolve_canvas_file_input(page)
-    if not file_input:
-        log("  ❌ 打包上传: 未找到 file input", "GoogleFX")
-        _safe_press_escape(page, "打包上传 file input 未找到")
-        return None
-
     captured_data = []
     handle_response = _make_response_handler(captured_data, mode="image")
     page.on("response", handle_response)
+
+    file_uploaded = False
+    file_input = None
+    upload_btn = page.locator(
+        "flow-menu-item:has-text('Upload'), flow-menu-item:has-text('上传'), "
+        "button[mat-menu-item]:has-text('Upload'), button[mat-menu-item]:has-text('上传'), "
+        ".mat-mdc-menu-panel button:has-text('Upload'), .mat-mdc-menu-panel button:has-text('上传'), "
+        ".mat-mdc-menu-item:has-text('Upload'), .mat-mdc-menu-item:has-text('上传'), "
+        "button[role='menuitem']:has-text('Upload'), button[role='menuitem']:has-text('上传'), "
+        "button:has-text('Upload'), button:has-text('上传'), "
+        "button[aria-label*='Upload'], button[aria-label*='上传']"
+    ).first
+    if upload_btn.is_visible(timeout=3500):
+        try:
+            with page.expect_file_chooser(timeout=3000) as fc_info:
+                upload_btn.click(force=True)
+            fc = fc_info.value
+            fc.set_files(abs_paths)
+            file_uploaded = True
+            log(f"  ✅ 打包 Canvas file_chooser set_files: {len(abs_paths)} 张", "GoogleFX")
+        except Exception:
+            upload_btn.click(force=True)
+        random_sleep(0.5, 1.0)
+
+    if not file_uploaded:
+        upload_sels = [
+            "button[mat-menu-item]:has-text('Upload')", "button[mat-menu-item]:has-text('上传')",
+            ".mat-mdc-menu-item:has-text('Upload')", ".mat-mdc-menu-item:has-text('上传')",
+            "button:has-text('Upload')", "button:has-text('上传')",
+            "[role='button']:has-text('Upload')", "[role='button']:has-text('上传')",
+            "div[class*='upload']", "label:has-text('Upload')",
+            "button[aria-label*='Upload']", "button[aria-label*='上传']",
+            "button[role='menuitem']:has-text('上传')",
+            "button[role='menuitem']:has-text('Upload')",
+        ]
+        for _up_sel in upload_sels:
+            try:
+                _matches = page.locator(_up_sel)
+                for _idx in range(_matches.count()):
+                    _el = _matches.nth(_idx)
+                    if _el.is_visible(timeout=2000):
+                        try:
+                            with page.expect_file_chooser(timeout=2500) as fc_info:
+                                _el.click(force=True)
+                            fc = fc_info.value
+                            fc.set_files(abs_paths)
+                            file_uploaded = True
+                            log(f"  ✅ 打包 Canvas file_chooser set_files: {len(abs_paths)} 张", "GoogleFX")
+                        except Exception:
+                            _el.click(force=True)
+                        random_sleep(0.5, 1.0)
+                        break
+                else:
+                    continue
+                break
+            except Exception:
+                continue
+
+    if not file_uploaded:
+        file_input = _resolve_canvas_file_input(page)
+        if not file_input:
+            log("  ❌ 打包上传: 未找到 file input", "GoogleFX")
+            _safe_press_escape(page, "打包上传 file input 未找到")
+            page.remove_listener("response", handle_response)
+            return None
+
     new_uuids = set()
     try:
-        try:
-            # ⭐ 核心：一次性把全部文件交给同一个 input
-            file_input.set_input_files(abs_paths)
-        except Exception as e:
-            log(f"  ⚠️ 打包 set_input_files 失败（画布可能不支持多选）: {e}", "GoogleFX")
-            return None
+        if not file_uploaded and file_input:
+            try:
+                # ⭐ 核心：一次性把全部文件交给同一个 input
+                file_input.set_input_files(abs_paths)
+            except Exception as e:
+                log(f"  ⚠️ 打包 set_input_files 失败（画布可能不支持多选）: {e}", "GoogleFX")
+                return None
 
         names = ", ".join(os.path.basename(ap) for ap in abs_paths)
         log(f"  ✅ 打包 set_input_files: 一次性提交 {len(abs_paths)} 张 ({names})", "GoogleFX")
@@ -294,16 +569,7 @@ def _upload_images_to_canvas_bulk(page, local_paths, timeout=120):
 
     # 读取本次新增图片在 DOM 中的文档顺序（== 文件列表顺序）
     try:
-        ordered = page.evaluate(r"""() => {
-            const seen = [];
-            const imgs = Array.from(document.querySelectorAll('img[src*="getMediaUrlRedirect"]'));
-            for (const img of imgs) {
-                const src = img.getAttribute('src') || '';
-                const m = src.match(/name=([0-9a-f\-]{30,})/);
-                if (m && !seen.includes(m[1])) seen.push(m[1]);
-            }
-            return seen;
-        }""")
+        ordered = _get_panel_uuid_order(page)
     except Exception as e:
         log(f"  ⚠️ 打包上传: 读取 DOM 顺序失败 ({e})，回退逐张上传", "GoogleFX")
         return None
@@ -338,22 +604,16 @@ def _generate_video_google_fx(req: VideoRequest):
             if not page:
                 raise RuntimeError("无法连接到 Google FX 浏览器页面")
 
-            page.bring_to_front()
+            bring_page_to_front_if_allowed(page)
 
-            if "labs.google" not in page.url:
-                page.goto("https://labs.google/fx/tools/flow", timeout=60000)
+            if not is_flow_url(page.url):
+                page.goto(FLOW_HOME_URL, timeout=60000, wait_until="domcontentloaded")
                 random_sleep(1, 2)
             ensure_flow_workspace(page)
 
-            # 🛠️ 0. 点击 "New project" 按钮
-            try:
-                new_project_btn = page.locator("button").filter(has_text="New project").first
-                if new_project_btn.is_visible():
-                    log("🆕 点击 'New project' 按钮...", "GoogleFX-Video")
-                    new_project_btn.click()
-                    random_sleep(3, 5)
-            except Exception as e:
-                log(f"⚠️ 点击 'New project' 失败: {e}", "GoogleFX-Video")
+            # 🛠️ 0. 新建项目（中英文 UI 共用，并验证确实进入新的项目 URL）
+            if not _click_new_project_button(page):
+                log("⚠️ 未能确认新项目已创建，将在当前页面继续", "GoogleFX-Video")
 
             # 🛠️ 1. 等待底部工具栏
             log("📍 等待底部工具栏...", "GoogleFX-Video")
@@ -378,11 +638,7 @@ def _generate_video_google_fx(req: VideoRequest):
             start_uuid = None
             end_uuid = None
             if has_start or has_end:
-                # 检查 Create 按钮是否可见。如果不可见，说明当前处于不支持画布上传的模式，需临时切换回 Image 模式
-                if not _find_add2_btn(page):
-                    log("⚙️ Create 按钮未找到，临时切换到 Image 模式以进行图片上传...", "GoogleFX-Video")
-                    _verify_and_fix_fx_config(page, model="Nano Banana 2", ratio=req.ratio, want_video=False, context_label="临时切换Image")
-
+                # 上传入口可能暂被弹层遮挡；由上传函数有限恢复，不能据此推断模式错误。
                 if has_start and img_path and os.path.exists(img_path):
                     start_uuid = _upload_image_to_canvas(page, img_path)
                     if not start_uuid:
@@ -399,15 +655,19 @@ def _generate_video_google_fx(req: VideoRequest):
                     if not end_uuid:
                         raise RuntimeError("尾帧图片上传到画布失败")
 
-            # 🛠️ 2. 验证并切换配置到 Video 模式 + 指定模型 + VIDEO_FRAMES 视频子模式
-            log("⚙️ 切换配置到 Video / 帧 模式...", "GoogleFX-Video")
+            # 🛠️ 2. 验证并切换配置到 Video 模式 + 指定模型 + 视频参考子模式
+            _video_ref_mode = get_runtime_google_fx_video_ref_mode()
+            _ref_mode_label = '帧' if _video_ref_mode == 'VIDEO_FRAMES' else '素材'
+            log(f"⚙️ 切换配置到 Video / {_ref_mode_label} 模式...", "GoogleFX-Video")
             _verify_and_fix_fx_config(
                 page,
                 model=req.model,
                 ratio=req.ratio,
                 want_video=True,
                 context_label="切换Video",
-                video_submode="VIDEO_FRAMES"
+                duration=req.duration,
+                video_submode=_video_ref_mode,
+                resolution=getattr(req, "resolution", None),
             )
 
             # 🛠️ 3. 挂载参考图到提示词框（Start -> End 顺序）
@@ -448,28 +708,14 @@ def _generate_video_google_fx(req: VideoRequest):
             if not input_el:
                 raise RuntimeError("无法找到视频提示词输入框")
 
-            # 填充提示词
-            input_el.click()
-            random_sleep(0.3, 0.5)
-            page.keyboard.press("ControlOrMeta+a")
-            random_sleep(0.1, 0.2)
-            page.keyboard.press("Backspace")
-            random_sleep(0.2, 0.3)
-
-            page.evaluate("""(text) => {
-                const editor = document.querySelector('[data-slate-editor="true"]');
-                if (editor) {
-                    editor.focus();
-                    const event = new InputEvent('beforeinput', {
-                        inputType: 'insertText',
-                        data: text,
-                        bubbles: true,
-                        cancelable: true,
-                        composed: true
-                    });
-                    editor.dispatchEvent(event);
-                }
-            }""", req.prompt)
+            # 填充提示词。
+            # 🚨 这里原本是「Ctrl+A → Backspace → 再写入」——在 Slate 编辑器里，
+            # 刚挂上的首尾帧 chip 和文本是同一棵树，全选删除会把 chip 一起删掉，
+            # 于是提交出去的是一个没有参考图的纯文本请求，Flow 安静地按文生视频
+            # 生成一段无关片段。改走与批量链同一个 _fill_prompt_text：有参考图时
+            # 只在末尾追加，不清空。
+            if not _fill_prompt_text(page, input_el, req.prompt, has_refs=prompt_has_refs):
+                raise RuntimeError("视频提示词输入失败")
             random_sleep(0.5, 0.8)
 
             log("🔍 准备生成并扫描资源...", "GoogleFX-Video")
@@ -485,6 +731,7 @@ def _generate_video_google_fx(req: VideoRequest):
             click_time = time.time()
 
             # 🛠️ 5. 点击发送
+            _verify_video_prompt_before_send(input_el, req.prompt)
             click_fx_send_button(page, input_el)
 
             log(f"📡 正在等待视频生成 (最大 {get_runtime_max_wait_seconds() * 5}s)...", "GoogleFX-Video")
@@ -565,23 +812,96 @@ _generate_video_google_fx_unlocked = _generate_video_google_fx
 
 
 class _IPBlockedError(Exception):
-    """Google 安全检测拦截（异常活动/unusual activity），冷却换号后重试。"""
+    """Google 安全验证拦截；保留现有账号故障转移路径。"""
     pass
 
 
-# 2026-07-25：把"被判异常活动就强制换 IP"统一改成换号重试。换 IP 只换出口地址，
-# 账号侧的风控评分不会跟着重置，实测换完照样被判；而频繁换 IP 反而会把 Flow 的
-# 登录 token 打失效（见 SPARK server_common 的「换号不换 IP 阶梯」）。现在递增冷却
-# 后切到号池的下一个可用账号重试，IP 轮换完全交回 MIYA_ROTATE_THRESHOLD 配置的
-# 正常节奏（开浏览器前按请求数轮换）。换号实现见 utils.account_pool.switch_to_next_account。
+class _UnusualActivityError(_IPBlockedError):
+    """生成卡片明确报告 unusual activity/异常活动，要求同账号验证换 IP。"""
+
+
+class _IPRetryRecoveryError(RuntimeError):
+    """换 IP 后无法恢复原账号/画布，停止重试并保留已经收取的结果。"""
+
+
+class _CreditExhaustedError(Exception):
+    """Google Flow 账号积分/配额耗尽，立即标记号池冷却并切换下一账号。"""
+    pass
+
+
+def _looks_like_credit_exhaustion(err) -> bool:
+    """一条异常是不是在说"积分不够了"。
+
+    helpers.py 是图片链和视频链共用的，抛不出本模块私有的 _CreditExhaustedError，
+    约定用 "INSUFFICIENT_CREDITS:" 前缀捎信号；另外 Flow 的原始报错文案本身也
+    可能直接写着 out of credits 之类的措辞。两种都认。
+    """
+    text = str(err or "")
+    return "INSUFFICIENT_CREDITS" in text or is_credit_exhausted_message(text)
+
+
+# 2026-09-26：明确的 unusual activity 卡片按用户要求保留账号和画布，强制更换并
+# 验证出口 IP 后才重试。安全验证和积分耗尽仍各自走原处理路径，不据此推断 IP 问题。
+
+
+# ── 积分预算参数 ──
+# 每段视频消耗多少积分。号池不伪造单张扣费，这个数只用于「还够不够再跑一段」的
+# 事前判断，判错的代价只是多探一次余额或早换一次号，不写进任何账目。
+# 默认 15：2026-08-24 实测样本 —— 账号 59 分连续跑成 4 段 720p/8s 后第 5 段跑不动。
+# 控制台可用 server_config.json 的 videoCreditCostPerSegment 覆盖。
+_DEFAULT_CREDIT_COST_PER_SEGMENT = 15
+# 每提交几段实读一次余额。太密会拖慢批次（每次要点开头像菜单等异步数字），
+# 太疏就退化回"整批只看开头那个快照"的老问题。
+_CREDIT_RECHECK_EVERY_SUBMITS = 3
+
+
+def _credit_cost_per_segment() -> int:
+    try:
+        from ..utils.account_pool import AI_DIR
+        import json
+        cfg_file = AI_DIR / "server_config.json"
+        if cfg_file.exists():
+            with open(cfg_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict) and data.get("videoCreditCostPerSegment"):
+                return max(1, int(data["videoCreditCostPerSegment"]))
+    except Exception:
+        pass
+    return _DEFAULT_CREDIT_COST_PER_SEGMENT
+
+
+def _unusual_activity_account_switch_after() -> int:
+    """Opt-in fallback after this many verified IP retries on one account."""
+    try:
+        from ..utils.account_pool import AI_DIR
+        import json
+        with open(AI_DIR / "server_config.json", "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return max(0, int(data.get("videoUnusualActivityAccountSwitchAfter", 0)))
+    except (OSError, ValueError, TypeError):
+        pass
+    return 0
 
 
 # ── 批量流程参数 ──
-VIDEO_CHUNK_SIZE = 5             # 每批提交的视频任务数
+VIDEO_CHUNK_SIZE = 5             # Maximum in-flight requests, replenished as each finishes.
 UPLOAD_GROUP_SIZE = 8            # 参考图分组上传：每组最多张数
-MAX_GEN_RETRIES_PER_CHUNK = 1    # 非 IP 原因失败（生成失败/超时/校验拒收）的有限重试轮数
-_IP_BACKOFF_STEP_SECS = 20       # IP 封禁重试的递增冷却步长
+MAX_GEN_RETRIES_PER_CHUNK = 5    # Default extra attempts; each slot has its own budget.
+
+
+def _video_retry_count(value):
+    if value is None:
+        value = os.environ.get('SPARK_VIDEO_RETRY_COUNT', MAX_GEN_RETRIES_PER_CHUNK)
+    if isinstance(value, bool) or isinstance(value, float) and not value.is_integer():
+        return MAX_GEN_RETRIES_PER_CHUNK
+    try:
+        return max(0, min(10, int(value)))
+    except (TypeError, ValueError, OverflowError):
+        return MAX_GEN_RETRIES_PER_CHUNK
+_IP_BACKOFF_STEP_SECS = 20       # 其他账号安全验证换号的冷却；unusual activity 换 IP 不等待
 _IP_BACKOFF_CAP_SECS = 90        # 冷却封顶
+_UNUSUAL_ACTIVITY_DRAIN_SECONDS = 30  # 拦截后有限收取在途结果，未知提交隔离而非重发
 
 # 首尾帧复用同一张图（如 HERO 展示视频：起止锚点都是帧序列最后一张完工图）在
 # path_to_uuid 缓存里的"第二份"专用键后缀。2026-07-23 实测确诊：把同一 UUID 同时
@@ -610,6 +930,52 @@ try:
 except (TypeError, ValueError):
     MAX_IP_RETRIES = 10
 
+# 打开"帧序列所在画布"后等工作区就绪的上限。等不到就判定这个画布不可用（换了
+# 账号 / 项目已删），当场退回新建项目，不把整批任务耗在一个回不去的画布上。
+_BOUND_CANVAS_READY_TIMEOUT = 20
+
+# ── 同因全灭熔断 ────────────────────────────────────────────────────────────
+# 2026-09-05 复盘：Flow 改版当天，一轮里 5 个任务报的是**逐字相同**的
+# "Generate 后未检测到新 tile"，然后系统照常进重试轮，把 6 张参考图重新上传一遍、
+# 又点了一轮 Generate（积分照扣），失败原因一个字都没变。内容问题不会让所有任务
+# 以同一句话失败，只有自动化层（选择器/DOM/域名）坏掉才会。所以这种形态一旦出现，
+# 正确的动作是**当场停手并告警**，而不是重试。
+_UI_BREAKAGE_MIN_TASKS = 2       # 少于 2 个任务不判——单个失败可能只是抽风
+
+# 连续这么多轮（每轮 5s）读不到进度、也读不到视频地址，就当场取证。
+# 给 6 轮（约 30s）的缓冲：生成初期确实有一小段既没进度条也没结果的空窗，
+# 太早取证会拍到一张没意义的中间态。
+_TILE_LOST_CAPTURE_AFTER_POLLS = 6
+
+# 属于"自动化层坏了"的失败特征。Flow 那边的内容生成失败（生成失败/审核不过）
+# 不在此列，那种照旧走正常重试。
+_UI_BREAKAGE_SIGNATURES = (
+    CANVAS_BLIND_PREFIX,        # 提交成功但读不到画布结果（余额在掉却拿不到片）
+    "未检测到新 tile",
+    "CANVAS_MOUNT_FAILED",
+    "锚点帧未就绪",
+    "找不到输入框",
+    "未找到",
+)
+
+_FAILURE_NOISE_PATTERNS = (
+    (re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I), "<uuid>"),
+    (re.compile(r"\b\w*img_\d+\.\w+", re.I), "<frame>"),
+    (re.compile(r"\d+"), "<n>"),
+)
+
+
+def _normalize_failure_message(message):
+    """抹掉失败消息里的可变部分（UUID / 帧文件名 / 数字），好判断"是不是同一个原因"。
+
+    例：`CANVAS_MOUNT_FAILED:画布卡片挂载失败 (0/2)` 与 `(1/2)` 规范化后一致；
+    而"生成失败"与"下载失败"仍然不同。
+    """
+    text = str(message or "").strip()
+    for pattern, placeholder in _FAILURE_NOISE_PATTERNS:
+        text = pattern.sub(placeholder, text)
+    return text
+
 
 class _UuidRefRequest:
     """提交画布时用的请求视图：image/end_image 换成画布 UUID，保留原始路径备查。"""
@@ -626,17 +992,12 @@ class _UuidRefRequest:
 
 
 class _ChunkRunner:
-    """单个 chunk（≤VIDEO_CHUNK_SIZE 个视频任务）的执行器（2026-07-04 重构，
-    行为与旧的单体函数一致，按相位拆分便于维护）。
+    """整批视频的滚动执行器，保留原类名以兼容既有调用方。
 
-    每轮 (_run_round)：连浏览器 → 备页 → 认领历史卡片 → 上传参考图 → 提交任务
-    → 并行等待 → 下载上报。IP 被封（unusual activity）时递增冷却 + 换号后重跑，最多
-    MAX_IP_RETRIES 次（超限则将剩余任务标记为失败，避免无限循环拖垮服务）；
-    非 IP 失败（生成失败/超时/校验拒收）允许 MAX_GEN_RETRIES_PER_CHUNK
-    轮有限重试，重试轮优先认领画布上已完成的卡片，避免重复提交烧配额。
-
-    不再在每批开始时无条件强制换 IP（2026-07-04 复盘：上一批能跑完说明当前 IP
-    是"活的好 IP"，强制轮换等于主动放弃它去抽一个未知 IP，实测造成连环封禁）。
+    正常生成复用一个浏览器会话，按需上传参考图，最多 VIDEO_CHUNK_SIZE 条在途。
+    已确认提交即时记入实际账号；每条结果保留提交时的账号和画布。
+    重连恢复在途请求，确定失败可有限重试；归属不明或超时的请求补救一次（先在原画布
+    按完整提示词找回，找不到才重提），补救后仍不确定则保留记录并停止。
     """
 
     def __init__(self, total_reqs, chunk_start, chunk, all_slices, on_progress, cancel_check):
@@ -650,14 +1011,43 @@ class _ChunkRunner:
         self.chunk_slices = {s: all_slices.get(chunk_start + s, '') for s in range(len(chunk))}
         self.completed = set()       # 已成功下载并通过校验的 sub_idx
         self.results = {}            # sub_idx -> item_result dict
-        self.project_url = None      # 本 chunk 固定使用的 Flow 项目页 URL
+        self.project_url = None      # 当前会话的 Flow 项目页 URL；任务另存提交时的画布
         # 跨轮缓存：本地路径 → 画布 UUID。参考图是项目级资产，重试轮回到同一
         # 项目页后仍在画布上，无需重复上传（之前每次 IP/失败重试都整批重传，
         # 一轮白耗 ~1 分钟且推高风控）。使用前会对照画布 DOM 逐个验证，
         # 画布上找不到的自动重新上传，验证不过不会错挂。
         self.path_to_uuid = {}
+        self._reference_scope = None
+        self._reference_scope_initialized = False
+        self._reference_keys = {}
+        # 调用方指定的"帧序列所在的那个 Flow 项目"URL（区别于本批自建的项目）。
+        # 只有确认当前页就是它时，才敢把 manifest 带来的画布 UUID 当作本画布资产
+        # 认领（见 _seed_known_canvas_uuids / _prepare_page）。
+        self.bound_project_url = None
+        self.canvas_is_bound = False
+        # 绑定画布上本来就有的卡片（帧图 + 历次视频）：重试轮认领时必须排除，
+        # 否则显式重试会认领回上一次生成的那段旧片，等于这次重试没发生。
+        self.preexisting_tile_ids = set()
+        self._preexisting_scanned = False
+        # 新建项目失败 → 本批次跑在上一次留下的画布上（历史卡片、历史图片都在）
+        self.canvas_is_dirty = False
         self.gen_retry_used = 0
+        self.gen_retry_counts = {}
+        self.submission_attempts = {}
+        self.connection_retries = 0
+        self.retry_exhausted = set()
+        self.retry_limits = {
+            index: _video_retry_count(getattr(req, 'retry_count', None))
+            for index, req in enumerate(chunk)
+        }
+        self.max_retry_count = max(self.retry_limits.values(), default=5)
+        self.max_ip_retries = min(MAX_IP_RETRIES, self.max_retry_count) if MAX_IP_RETRIES > 0 else self.max_retry_count
         self.ip_retry = 0
+        # 内容校验拒收过的画布卡片：重试轮认领时必须跳过（见 _adopt_completed_tiles）
+        self.rejected_tile_ids = set()
+        # 只统计真正点击 Generate 并取得新 tile 的请求；历史卡片认领、挂载失败和
+        # 本地拒收都不冒充新提交。用于真实额度/重试成本核算。
+        self.submitted_count = 0
         # 失败换号重试：本 chunk 已经试过（并被判过封）的号池账号，换号时排除，
         # 免得在同一批里换回刚被判异常活动的那个号。
         self.tried_accounts = set()
@@ -666,6 +1056,44 @@ class _ChunkRunner:
         # 本轮提交产生的 tile 映射（等待/早期封禁扫描用）
         self._prompts_map = {}
         self._tile_slices = {}
+        self._refs_map = {}
+        self._submitted_tiles = {}  # (project_url, sub_idx) -> tile_id，跨重试保留
+        self._submitted_tasks = {}
+        self._active_account_id = ""
+        self._ip_retry_account = None
+        self._ip_retry_project_url = None
+        self._ip_rotation_failure = None
+        # 只对本次批次、对应账号生效，不把平台拦截冒充全局代理断网。
+        self._blocked_exit_ips = {}
+        self._verified_exit_ips = {}
+        self._unusual_activity_ip_retries = {}
+        self._deferred_stop = None
+        # 本地准备失败只停止新提交；保留失败槽位跨重连，等在途任务收完再上报。
+        self._preparation_failures = {}
+        self._attempted_this_round = []
+        self._identity_recovery_at = 0
+        self._identity_session = None
+        self._unresolved_identity_subs = set()
+        # 只有异常活动收尾中隔离的已提交任务允许跳过并继续其他槽位；
+        # 提交是否发生/账号归属不明等其他情况仍然停止整批。
+        self._ip_drain_pending_subs = set()
+        self._credit_pending_subs = set()
+        # Unknown submissions only recover their original result once. A failed
+        # lookup does not authorize another paid generation.
+        self._uncertain_retried = set()
+        self._credit_exhaustion_marks = {}
+        self._unusual_activity_drain_started = None
+        # 距上次"实读余额"过去了几次提交（见 _credit_checkpoint）
+        self._submits_since_credit_check = 0
+        # 同因全灭熔断命中后的原因说明（非 None = 已熔断，停止一切重试）
+        self.ui_breakage = None
+        # "卡片跟丢了"的现场只取证一次（每个 chunk），避免刷屏和反复截图拖慢轮询
+        self._tile_lost_captured = False
+        # {tile_id: 连续判成 missing 的轮数}
+        self._missing_streak = {}
+        # {tile_id: 已经对这张卡做过几次「视频地址唤醒」}。新版 Flow 的成片卡片
+        # 默认不挂 <video>，读不到地址要主动去碰（见 wake_flow_tile_video）。
+        self._media_wake_attempts = {}
 
     # ── 小工具 ──
 
@@ -678,14 +1106,194 @@ class _ChunkRunner:
         if cancel_flag.deadline_exceeded():
             raise ConnectionError("请求超时：超出时间预算 (request budget exceeded)")
 
+    def _current_account_id(self):
+        return self._active_account_id or account_binding.resolve_account(
+            fallback=get_runtime_default_user_id())
+
+    def _reset_account_canvas(self, user_id):
+        """Drop profile-local canvas state, preserving paid submission receipts."""
+        self._active_account_id = user_id
+        self._ip_retry_account = None
+        self._ip_retry_project_url = None
+        self.project_url = None
+        self.bound_project_url = None
+        self.canvas_is_bound = False
+        self.canvas_is_dirty = False
+        self.path_to_uuid.clear()
+        self._reference_scope = None
+        self._reference_scope_initialized = False
+        self._reference_keys.clear()
+        self.preexisting_tile_ids.clear()
+        self._preexisting_scanned = False
+        self.rejected_tile_ids.clear()
+        self._confirmed_config = None
+        self._prompts_map.clear()
+        self._tile_slices.clear()
+        self._refs_map.clear()
+        self._missing_streak.clear()
+        self._media_wake_attempts.clear()
+        self._tile_lost_captured = False
+        self._identity_session = None
+        self._identity_recovery_at = 0
+        self._submits_since_credit_check = 0
+        self._deferred_stop = None
+        # completed/results and _submitted_tasks/_submitted_tiles retain their
+        # original account/project identities. In particular, an unreported
+        # request must be recovered or marked pending, never sent again.
+
+    @property
+    def max_inflight(self):
+        return 1 if account_binding.current_fixed_task_account() else VIDEO_CHUNK_SIZE
+
+    def _submission_metadata(self, req, task_info, start_uuid="", end_uuid="", submission_id=None):
+        metadata = {
+            "account_id": self._current_account_id(),
+            "project_url": self.project_url,
+            "tile_id": task_info.get("tile_id"),
+            "media_id": task_info.get("media_id"),
+            "prompt_hash": hashlib.sha256(str(req.prompt).encode("utf-8")).hexdigest(),
+            "start_uuid": start_uuid or "",
+            "end_uuid": end_uuid or "",
+            "refs": [u for u in (start_uuid, end_uuid) if u],
+            "submitted_at": task_info.get("click_time", time.time()),
+        }
+        if account_binding.current_fixed_task_account():
+            metadata['fixed_video_account'] = True
+            metadata['confirmed'] = bool(task_info.get('tile_id'))
+            if submission_id:
+                metadata['submission_id'] = submission_id
+        return metadata
+
+    def _record_submission(self, metadata):
+        """Persist at submission time; cancellation never erases spent requests."""
+        if not metadata.get("account_id") or not metadata.get("tile_id"):
+            return
+        receipt = hashlib.sha256("\0".join(str(metadata.get(k) or "") for k in (
+            "account_id", "project_url", "tile_id")).encode("utf-8")).hexdigest()
+        try:
+            from ..utils.account_pool import AccountPool
+            AccountPool().record_video_submission(
+                metadata["account_id"], receipt, _credit_cost_per_segment())
+        except Exception as exc:
+            log(f"⚠️ 提交积分记录失败: {exc}", "GoogleFX-Video")
+
+    @staticmethod
+    def _pending_tasks(submitted):
+        return [t for t in submitted if not t.get("reported")
+                and t.get("status") not in ("success", "failed")]
+
+    def _observe_during_pacing(self, page, submitted):
+        """提交检查只读 DOM 并报告失败，不能下载/唤醒/恢复卡片而干扰提示词。"""
+        self._check_cancel()
+        if self._deferred_stop:
+            raise self._deferred_stop
+        page_credit_err = detect_page_credit_exhaustion(page)
+        if page_credit_err:
+            self._set_deferred_stop(_CreditExhaustedError(page_credit_err))
+            raise self._deferred_stop
+        pending = self._pending_tasks(submitted)
+        if not pending:
+            return
+        states = _inspect_all_pending_tiles(page, [t["tile_id"] for t in pending],
+                                           self._prompts_map, slices_map=self._tile_slices,
+                                           refs_map=self._refs_map)
+        self._report_generation_failures(page, submitted, states)
+        if self._deferred_stop:
+            raise self._deferred_stop
+
+    def _report_generation_failures(self, page, submitted, states):
+        """先锁定停止提交的原因并立即报告已确认失败，再允许任何耗时成片收取。"""
+        failed = [(task, states.get(task.get("tile_id"), {}))
+                  for task in self._pending_tasks(submitted)
+                  if states.get(task.get("tile_id"), {}).get("status") == "failed"]
+        stop_err = None
+        if any(state.get("isCreditExhausted") for _, state in failed):
+            stop_err = _CreditExhaustedError("Credit exhausted: out of credits detected")
+        elif (any(state.get("isIpBlocked") for _, state in failed)
+              and not isinstance(self._deferred_stop, _CreditExhaustedError)):
+            stop_err = _UnusualActivityError("unusual activity detected")
+        elif account_binding.current_fixed_task_account() and any(
+                any(marker in str(state.get("failedText") or "").lower() for marker in (
+                    "login_required", "unauthenticated", "captcha", "security check",
+                    "unusual activity", "异常活动", "安全验证", "登录失效", "需要登录",
+                )) for _, state in failed):
+            stop_err = account_binding.FixedAccountStopError("固定视频账号登录或安全验证失败")
+        if stop_err and type(stop_err) is not type(self._deferred_stop):
+            self._set_deferred_stop(stop_err)
+            if isinstance(stop_err, _UnusualActivityError):
+                self._begin_unusual_activity_drain()
+            reason = ("平台异常活动拦截（unusual activity）" if isinstance(stop_err, _UnusualActivityError)
+                      else "账号积分耗尽" if isinstance(stop_err, _CreditExhaustedError)
+                      else "账号登录或安全验证失败")
+            action = ("保留已完成和在途记录后停止本任务" if account_binding.current_fixed_task_account()
+                      else "收取在途结果后换 IP 重试未完成片段"
+                      if isinstance(stop_err, _UnusualActivityError)
+                      else "保存可收取结果后处理重试")
+            log(f"⛔ 检测到{reason}，已立即停止继续提交；{action}", "GoogleFX-Video")
+        for task, state in failed:
+            task["status"] = "failed"
+            task["message"] = state.get("failedText") or "生成失败"
+            log(f"❌ 任务 {task['idx'] + 1} 生成失败: {task['message']}", "GoogleFX-Video")
+            # failed 任务只记结果和回调，没有浏览器下载操作。
+            self._download_and_report_task(page, task)
+
+    def _set_deferred_stop(self, stop_err):
+        """Persist exhaustion as soon as detected, before result collection."""
+        self._deferred_stop = stop_err
+        if isinstance(stop_err, _CreditExhaustedError):
+            self._mark_current_credit_exhausted(str(stop_err))
+
+    def _blocking_uncertain_subs(self):
+        return self._unresolved_identity_subs - self._ip_drain_pending_subs - self._credit_pending_subs
+
+    def _settled_uncertain(self, sub_idx):
+        """Still unconfirmed after its one attempt to recover the original result."""
+        return sub_idx in self._unresolved_identity_subs and sub_idx in self._uncertain_retried
+
+    def _begin_unusual_activity_drain(self):
+        if self._unusual_activity_drain_started is not None:
+            return
+        self._unusual_activity_drain_started = time.monotonic()
+        # Detection alone is recoverable (IP rotation / account fallback). Only the
+        # terminal stop in run() carries code=flow_unusual_activity, which tells
+        # video_generator to skip later preplanned legs.
+        self._notify(self.chunk_start, "video_warning", {
+            "code": "flow_unusual_activity_detected",
+            "message": (f"平台异常活动拦截，最多等待 {_UNUSUAL_ACTIVITY_DRAIN_SECONDS} 秒收取在途视频；"
+                        + ("固定账号任务随后停止，未确认片段保留记录"
+                           if account_binding.current_fixed_task_account()
+                           else "未确认片段将保留记录，换 IP 后只继续未完成片段")),
+        })
+
     def _notify(self, idx, stage, payload):
         if not self.on_progress:
             return None
+        if account_binding.current_fixed_task_account() and isinstance(payload, dict):
+            payload = dict(payload, fixed_video_account=True)
         try:
             return self.on_progress(idx, stage, payload)
         except ConnectionError as ce:
             log("检测到客户端已断开，中止批量生成", "GoogleFX-Video")
             raise ce
+
+    def _prepare_paid_submission(self, sub_idx):
+        """Enforce one budget across generation, account and connection recovery."""
+        self._check_cancel()
+        if sub_idx in self._unresolved_identity_subs:
+            return False
+        attempts = self.submission_attempts.get(sub_idx, 0)
+        limit = self.retry_limits[sub_idx]
+        if attempts >= limit + 1:
+            self.retry_exhausted.add(sub_idx)
+            return False
+        if attempts:
+            self._notify(self.chunk_start + sub_idx, 'video_warning', {
+                'code': 'video_auto_retry', 'retry': attempts, 'max_retries': limit,
+                'message': f'视频确认失败，正在重试（{attempts}/{limit}）',
+            })
+            self._check_cancel()
+        self.submission_attempts[sub_idx] = attempts + 1
+        return True
 
     def _manual_intervention_event(self, phase, code, reason, max_wait_secs):
         """wait_out_manual_intervention 的 on_event 回调：把登录失效/验证码等
@@ -698,22 +1306,57 @@ class _ChunkRunner:
 
     # ── 驱动循环 ──
 
+    def _preserve_fixed_pending(self, notify=True):
+        updates = []
+        for sub_idx, task in self._submitted_tasks.items():
+            if sub_idx in self.completed or task.get("reported") or task.get("status") == "failed":
+                continue
+            self._unresolved_identity_subs.add(sub_idx)
+            existing = self.results.get(sub_idx) or {}
+            identity = {key: task.get(key) for key in (
+                "account_id", "project_url", "tile_id", "media_id", "prompt_hash",
+                "start_uuid", "end_uuid", "refs", "submitted_at",
+                "submission_id", "fixed_video_account", "confirmed",
+            ) if task.get(key) is not None}
+            self.results[sub_idx] = dict(identity, **existing)
+            self.results[sub_idx].update(status="failed", submission_pending=True,
+                                         message=existing.get("message") or "原视频已提交，结果待确认")
+            updates.append((sub_idx, dict(
+                self.results[sub_idx], confirmed=existing.get('confirmed', task.get('confirmed', False)))))
+        if notify:
+            for sub_idx, details in updates:
+                self._notify(self.chunk_start + sub_idx, "request_resolved", details)
+
+    def _stop_fixed_account(self, remaining, reason):
+        """Stop without account/proxy changes or overwriting paid receipts."""
+        message = f"固定视频账号任务已停止，不自动换号或换代理: {reason}"
+        self._preserve_fixed_pending()
+        self._report_retry_stopped(
+            remaining, message, event_stage="video_warning", code="fixed_video_account_stopped",
+            preserve_platform_error=True,
+        )
+
     def run(self):
-        """跑完本 chunk（IP 封禁最多重试 MAX_IP_RETRIES 次；非 IP 失败有限重试）。
+        """跑完本 chunk，各槽位与连接恢复均按配置的额外重试次数收敛。
         返回按 sub_idx 顺序的结果列表。"""
         while True:
             remaining = [
                 (sub_idx, self.chunk[sub_idx])
                 for sub_idx in range(len(self.chunk))
-                if sub_idx not in self.completed
+                if sub_idx not in self.completed and not self._settled_uncertain(sub_idx)
+                and sub_idx not in self.retry_exhausted
             ]
             if not remaining:
                 log("✅ 本批次所有任务已完成，无需重试", "GoogleFX-Video")
                 break
 
+            if account_binding.current_fixed_task_account() and self._unresolved_identity_subs:
+                self._stop_fixed_account(remaining, "先前提交结果尚未确认，请核对原画布")
+                break
+
             if self.ip_retry > 0:
                 log(
-                    f"🔄 封禁重试第 {self.ip_retry} 次（已换号），"
+                    f"🔄 平台异常活动拦截后第 {self.ip_retry} 次重试，"
                     f"剩余 {len(remaining)} 个未完成任务...",
                     "GoogleFX-Video",
                 )
@@ -721,22 +1364,57 @@ class _ChunkRunner:
             try:
                 if self._run_round(remaining):
                     break
-            except _IPBlockedError:
-                if MAX_IP_RETRIES > 0 and self.ip_retry >= MAX_IP_RETRIES:
+            except _CreditExhaustedError as e:
+                if account_binding.current_fixed_task_account():
+                    self._mark_current_credit_exhausted(str(e))
+                    self._stop_fixed_account(remaining, str(e))
+                    break
+                if self.max_retry_count == 0:
+                    self._report_retry_stopped(remaining, str(e), event_stage='video_warning')
+                    break
+                if not self._handle_credit_exhausted(str(e)):
+                    break
+                continue
+            except _IPBlockedError as blocked_err:
+                if account_binding.current_fixed_task_account():
+                    self._stop_fixed_account(remaining, str(blocked_err))
+                    break
+                if isinstance(blocked_err, _UnusualActivityError):
+                    if self.ip_retry >= self.max_ip_retries:
+                        reason = f"换 IP / 换号已达上限 {self.max_ip_retries} 次"
+                    elif self._recover_unusual_activity():
+                        continue
+                    else:
+                        reason = self._ip_rotation_failure or "换 IP 未能恢复"
+                    message = (f"Flow 平台异常活动限制（unusual activity）：{reason}；"
+                               "已停止本批次自动提交，需核查 Flow 账号或代理后再重试")
+                    log(f"⛔ {message}", "GoogleFX-Video")
+                    self._report_retry_stopped(remaining, message,
+                                               event_stage="video_warning",
+                                               code="flow_unusual_activity",
+                                               preserve_platform_error=True)
+                    break
+                if self.ip_retry >= self.max_ip_retries:
                     log(
-                        f"⛔ IP 连续被封已达上限 {MAX_IP_RETRIES} 次，停止重试，"
+                        f"⛔ 平台异常活动拦截已达上限 {self.max_ip_retries} 次，停止重试，"
                         f"剩余 {len(remaining)} 个任务标记为失败（疑似账号风控 / security check）",
                         "Error",
                     )
-                    self._fail_remaining(
+                    self._report_retry_stopped(
                         remaining,
-                        f"IP 连续被封达上限（{MAX_IP_RETRIES} 次），疑似账号风控 "
+                        f"平台异常活动拦截达上限（{self.max_ip_retries} 次），需检查账号状态 "
                         f"(unusual activity / security check)，需人工处理",
                     )
                     break
                 self._cooldown_and_switch_account()
                 continue
+            except _IPRetryRecoveryError as recovery_err:
+                self._report_retry_stopped(remaining, str(recovery_err))
+                break
             except _ManualInterventionTimeoutError as e:
+                if account_binding.current_fixed_task_account():
+                    self._stop_fixed_account(remaining, str(e))
+                    break
                 # 登录失效/验证码/安全拦截，人工处理等待超时：只判本 chunk 剩余
                 # 任务失败并留下明确原因，不炸穿整个批次——已完成的任务保留成果，
                 # 人工处理完成后可针对失败任务单独重试。
@@ -744,20 +1422,46 @@ class _ChunkRunner:
                 self._fail_remaining(remaining, f"需要人工登录/验证但等待超时: {e}")
                 break
             except Exception as e:
+                if account_binding.current_fixed_task_account() and isinstance(e, ConnectionError):
+                    # The initial submission event already persisted pending.
+                    # A disconnected client cannot be relied on for new events.
+                    self._preserve_fixed_pending(notify=False)
+                    raise
+                if account_binding.current_fixed_task_account() and not isinstance(e, ConnectionError):
+                    self._stop_fixed_account(remaining, str(e))
+                    break
                 # TargetClosedError: 浏览器页面在多任务并发提交时意外关闭，
                 # 重建浏览器连接后即可继续。不计入 IP 重试，直接重跑一轮。
                 if "TargetClosedError" in type(e).__name__ or "Target page" in str(e):
+                    if self.connection_retries >= self.max_retry_count:
+                        self._report_retry_stopped(remaining, '浏览器重连次数已达配置上限，已停止自动重试',
+                                                   event_stage='video_warning')
+                        break
+                    self.connection_retries += 1
                     log(f"⚠️ 浏览器页面意外关闭 (TargetClosedError)，重新连接后重试...", "GoogleFX-Video")
+                    continue
+                # 🧊 helpers 层（配置校验/提交前检查）不认识本模块私有的
+                # _CreditExhaustedError，只能用 INSUFFICIENT_CREDITS 前缀捎信号；
+                # 不在这里翻译回来的话，积分耗尽会走下面的 raise 变成"致命错误"，
+                # 整批直接死，既不换号也不给号池留标记。
+                if _looks_like_credit_exhaustion(e):
+                    if self.max_retry_count == 0:
+                        self._report_retry_stopped(remaining, str(e), event_stage='video_warning')
+                        break
+                    if not self._handle_credit_exhausted(str(e)):
+                        break
                     continue
                 log(f"❌ 批量生成过程发生致命错误: {e}", "Error")
                 raise
 
         return [
-            self.results.get(sub_idx, {
+            dict({"account_id": self._current_account_id(), "project_url": self.project_url,
+                  **({'fixed_video_account': True} if account_binding.current_fixed_task_account() else {})},
+                 **self.results.get(sub_idx, {
                 "status": "failed",
                 "video_url": None,
                 "message": "未知错误：任务未被处理",
-            })
+            }))
             for sub_idx in range(len(self.chunk))
         ]
 
@@ -765,11 +1469,38 @@ class _ChunkRunner:
         """将本 chunk 尚未完成的槽位标记为失败（用于放弃重试的场景，如 IP 重试上限耗尽）。"""
         for sub_idx, _ in remaining:
             if sub_idx not in self.completed:
+                existing = self.results.get(sub_idx, {}) if account_binding.current_fixed_task_account() else {}
                 self.results[sub_idx] = {
+                    **existing,
+                    "account_id": self._current_account_id(),
+                    "project_url": self.project_url,
                     "status": "failed",
                     "video_url": None,
-                    "message": message,
+                    "message": existing.get("message") or message,
+                    **({'fixed_video_account': True} if account_binding.current_fixed_task_account() else {}),
                 }
+
+    def _report_retry_stopped(self, remaining, message, event_stage="ip_rotation_failed",
+                              code=None, preserve_platform_error=False):
+        """重试不能继续时只报告尚未完成且归属明确的任务，保留成片和待确认记录。"""
+        self._notify(self.chunk_start, event_stage, {
+            "user_id": self._current_account_id(), "retry": self.ip_retry,
+            "message": message, **({"code": code} if code else {}),
+        })
+        failed = [(s, req) for s, req in remaining
+                  if s not in self.completed and s not in self._unresolved_identity_subs]
+        to_report = []
+        for sub_idx, req in failed:
+            existing = self.results.get(sub_idx) or {}
+            if (preserve_platform_error and existing.get("status") == "failed"
+                    and "unusual activity" in str(existing.get("message") or "").lower()):
+                # The Flow card's exact wording (including whether it charged)
+                # is already in the manifest and was already reported once.
+                continue
+            to_report.append((sub_idx, req))
+        self._fail_remaining(to_report, message)
+        for sub_idx, _ in to_report:
+            self._notify(self.chunk_start + sub_idx, "video_error", self.results[sub_idx])
 
     def _run_round(self, remaining):
         """一轮完整尝试。返回 True 表示本 chunk 处理完毕（可能含最终失败的槽位），
@@ -777,43 +1508,297 @@ class _ChunkRunner:
         _IPBlockedError / ConnectionError / 其他异常原样抛给 run()；
         浏览器在 finally 中关闭（冷却重试前必须先关，下一轮会重新连浏览器）。"""
         browser = None
+        attempted = []
         try:
             with sync_playwright() as p:
-                browser, page = _connect_fx_page(p, cancel_check=self.cancel_check,
-                                                  on_event=self._manual_intervention_event)
+                try:
+                    browser, page = _connect_fx_page(p, cancel_check=self.cancel_check,
+                                                      on_event=self._manual_intervention_event)
+                except RuntimeError as exc:
+                    if str(exc).startswith("SECURITY_CHECK_ACCOUNT_SWITCH_REQUIRED:"):
+                        # run() handles _IPBlockedError only after this Playwright
+                        # context has exited, so any candidate credit probe is safe.
+                        raise _IPBlockedError(str(exc)) from exc
+                    raise
                 if not page:
                     raise RuntimeError("无法连接到 Google FX 浏览器页面")
-                page.bring_to_front()
+                bring_page_to_front_if_allowed(page)
+                connected_account = account_binding.resolve_account(
+                    fallback=get_runtime_default_user_id())
+                if self._ip_retry_account and connected_account != self._ip_retry_account:
+                    raise _IPRetryRecoveryError("换 IP 后未能重连原账号，已停止生成并保留原画布")
+                if self._active_account_id and self._active_account_id != connected_account:
+                    # Connection recovery can itself switch a security-blocked
+                    # profile before this runner's explicit rotation paths run.
+                    self._reset_account_canvas(connected_account)
+                else:
+                    self._active_account_id = connected_account
+                self._deferred_stop = None
+                self._unusual_activity_drain_started = None
+                self._attempted_this_round = []
 
                 self._confirmed_config = None
                 self._prompts_map = {}
                 self._tile_slices = {}
 
                 self._prepare_page(page)
-                adopted, remaining = self._adopt_completed_tiles(page, remaining)
-                path_to_uuid = self._upload_references(page, remaining)
-                submitted = self._submit_tasks(page, remaining, adopted, path_to_uuid)
-                self._await_generation(page, submitted)
-                self._download_and_report(page, submitted)
+                from .flow_video_identity import ProjectVideoRecovery
+                with ProjectVideoRecovery(page) as recovery:
+                    self._identity_session = recovery
+                    remaining = self._retry_uncertain_submissions(page, remaining)
+                    resuming = []
+                    fresh = []
+                    for sub_idx, req in remaining:
+                        if sub_idx in self._preparation_failures:
+                            continue
+                        existing = self._submitted_tasks.get(sub_idx)
+                        if existing and not existing.get("reported"):
+                            if (existing.get("account_id") == self._active_account_id
+                                    and existing.get("project_url") == self.project_url):
+                                resuming.append(existing)
+                            else:
+                                self._unresolved_identity_subs.add(sub_idx)
+                                self.results[sub_idx] = dict(
+                                    status="failed", video_url=None, submission_pending=True,
+                                    account_id=existing.get("account_id"),
+                                    project_url=existing.get("project_url"),
+                                    message="已提交请求仍待确认，保留原账号画布记录，不重复生成")
+                        else:
+                            fresh.append((sub_idx, req))
+                    adopted, remaining = self._adopt_completed_tiles(page, fresh)
+                    submitted = self._submit_tasks(page, remaining, resuming + adopted, {},
+                                                   prepare_references=True)
+                    attempted = list(self._attempted_this_round)
+                    self._await_generation(page, submitted)
+                    self._download_and_report(page, submitted)
         finally:
+            self._identity_session = None
             if browser:
                 try: browser.close()
                 except: pass
 
+        failed_subs = [s for s in range(len(self.chunk)) if s not in self.completed]
+        # 归属未确认的提交不再让整批停下：换 IP/换号/重试轮都会先补救它们一次
+        # （见 _retry_uncertain_submissions）。
+        if self._deferred_stop:
+            raise self._deferred_stop
+        if account_binding.current_fixed_task_account() and self._unresolved_identity_subs:
+            self._stop_fixed_account(remaining, "原视频提交结果尚未确认，请核对原画布")
+            return True
+        if self._preparation_failures:
+            log("⛔ 本地视频准备失败，已收取在途结果；剩余任务未提交，停止自动重试", "GoogleFX-Video")
+            return True
+
+        attempted_subs = {s for s, _ in attempted}
+        uncertain_retry = [s for s in failed_subs
+                           if s in self._unresolved_identity_subs and s not in self._uncertain_retried]
+        failed_subs = [s for s in failed_subs if s not in self._unresolved_identity_subs]
+        # A new ambiguity pauses submission; slots never reached are not failures.
+        unstarted = [s for s in failed_subs if s not in attempted_subs]
+        failed_subs = [s for s in failed_subs if s in attempted_subs]
+
+        # 补救重提后仍然没出卡片：大概率是共因故障（Flow 改版/积分读不到），
+        # 再重试只会继续扣点。保留收据并停止，未提交的槽位写明原因。
+        if any(self._settled_uncertain(s) for s in attempted_subs):
+            log("⛔ 已提交但未确认的片段补救后仍未确认，保留记录并停止自动重复生成，避免重复扣点",
+                'GoogleFX-Video')
+            self._fail_remaining([(s, self.chunk[s]) for s in unstarted],
+                                 "前一片段补救后仍未确认，已暂停自动提交避免重复扣点；请核对画布后重试")
+            return True
+
+        # 🚨 同因全灭熔断：本轮下场的任务全挂、且失败原因逐字相同 → 这不是内容问题，
+        # 是 Flow 改版/自动化层坏了。此时**继续重试是纯亏**：重试轮会把整批参考图
+        # 重新上传一遍，再点一轮 Generate 把积分烧掉，而失败原因一个字都不会变。
+        # 全部"点了 Generate 却没出卡片"同样命中，未确认的提交也不补救。
+        if (failed_subs or uncertain_retry) and self._check_ui_breakage(attempted):
+            self._fail_remaining([(s, self.chunk[s]) for s in failed_subs + unstarted],
+                                 self.ui_breakage)
+            return True
+
         # 🔁 非 IP 原因的失败（生成失败/等待超时/下载失败/校验拒收）允许有限重试：
         # 重试轮会先尝试"认领"画布上可能已经完成的卡片，认领不到才重新提交。
         # 复盘中 slot 6/7 就是等待超时后被直接放弃、成片缺段。
-        failed_subs = [s for s in range(len(self.chunk)) if s not in self.completed]
-        if failed_subs and self.gen_retry_used < MAX_GEN_RETRIES_PER_CHUNK:
+        retryable = []
+        for sub_idx in failed_subs:
+            used = self.gen_retry_counts.get(sub_idx, 0)
+            if used < self.retry_limits[sub_idx] and not self.results.get(sub_idx, {}).get('submission_pending'):
+                self.gen_retry_counts[sub_idx] = used + 1
+                retryable.append(sub_idx)
+            else:
+                self.retry_exhausted.add(sub_idx)
+        if retryable:
             self.gen_retry_used += 1
             log(
-                f"🔁 本批次仍有 {len(failed_subs)} 个任务未完成"
-                f"（槽位 {[self.chunk_start + s + 1 for s in failed_subs]}），"
+                f"🔁 本批次仍有 {len(retryable)} 个任务未完成"
+                f"（槽位 {[self.chunk_start + s + 1 for s in retryable]}），"
                 f"进行第 {self.gen_retry_used} 次失败重试...",
                 "GoogleFX-Video",
             )
             return False
-        return True
+        if uncertain_retry:
+            log(f"🔁 {len(uncertain_retry)} 个片段已提交但结果未确认"
+                f"（槽位 {[self.chunk_start + s + 1 for s in uncertain_retry]}），"
+                "下一轮只在画布上找回原视频；找不到时保留收据停止该片段", "GoogleFX-Video")
+            return False
+        return not unstarted
+
+    def _retry_uncertain_submissions(self, page, remaining):
+        """归属未确认的提交补救一次：仍在原账号原画布时，先按完整提示词+参考图+
+        提交时间在项目资产里找回原视频，找回即交付、不再扣点；找不到（或已换号/
+        换画布）就从未确认集合里放出来，作为新任务重新提交。"""
+        uncertain = [(s, req) for s, req in remaining if s in self._unresolved_identity_subs]
+        if not uncertain:
+            return remaining
+        if account_binding.current_fixed_task_account():
+            # Strict tasks retain original submission identities; a missing
+            # canvas result never authorizes a new paid submission.
+            return [(s, req) for s, req in remaining if s not in self._unresolved_identity_subs]
+        current = self._current_account_id()
+        receipts, requests = {}, []
+        for sub_idx, req in uncertain:
+            receipt = self.results.get(sub_idx) or {}
+            task = self._submitted_tasks.get(sub_idx) or {}
+            if receipt.get("tile_id") and task.get("tile_id") != receipt.get("tile_id"):
+                task = {}  # A previous round's task; the receipt is newer.
+            refs = (receipt.get("refs") or task.get("refs")
+                    or [u for u in (receipt.get("start_uuid"), receipt.get("end_uuid")) if u])
+            info = dict(receipt, refs=[str(u).lower() for u in refs],
+                        click_time=(receipt.get("submitted_at") or task.get("click_time")
+                                    or task.get("submitted_at") or 0))
+            receipts[sub_idx] = info
+            if info.get("account_id") == current and info.get("project_url") == self.project_url:
+                requests.append(dict(tile_id=f"uncertain-{sub_idx}", prompt=req.prompt,
+                                     refs=info["refs"], click_time=info["click_time"]))
+
+        recovered = {}
+        if requests:
+            from .flow_video_identity import recover_project_videos
+            try:
+                recovered = recover_project_videos(
+                    page, requests, self._check_cancel,
+                    **({'session': self._identity_session} if self._identity_session else {}))
+            except Exception as exc:
+                self._check_cancel()
+                log(f"⚠️ 未确认片段按项目资产找回暂不可用: {type(exc).__name__}: {exc}", "GoogleFX-Video")
+
+        for sub_idx, req in uncertain:
+            self._uncertain_retried.add(sub_idx)
+            stale = self._submitted_tasks.get(sub_idx)
+            if stale and not stale.get("reported"):
+                stale["reported"] = True  # Superseded by this recovery/retry.
+            idx = self.chunk_start + sub_idx
+            state = recovered.get(f"uncertain-{sub_idx}") or {}
+            if state.get("videoSrc"):
+                info = receipts[sub_idx]
+                log(f"♻️ 任务 {idx + 1} 已在画布上找回原视频（完整提示词+参考图核对），不重复生成",
+                    "GoogleFX-Video")
+                self._download_and_report_task(page, dict(
+                    {k: info.get(k) for k in ("account_id", "project_url", "tile_id",
+                                              "prompt_hash", "start_uuid", "end_uuid")},
+                    media_id=state.get("mediaId"), sub_idx=sub_idx, idx=idx, req=req,
+                    status="success", video_url=state["videoSrc"]))
+            if sub_idx not in self.completed:
+                log(f"⏸️ 任务 {idx + 1} 原提交结果未确认，已保留收据停止重复提交",
+                    "GoogleFX-Video")
+            else:
+                self._unresolved_identity_subs.discard(sub_idx)
+                self._ip_drain_pending_subs.discard(sub_idx)
+                self._credit_pending_subs.discard(sub_idx)
+        if self._blocking_uncertain_subs():
+            unstarted = [(s, req) for s, req in remaining
+                         if s not in self.completed and s not in self._unresolved_identity_subs]
+            self._fail_remaining(unstarted, '前一片段结果仍未确认，已暂停后续提交；请核对原画布')
+            self.retry_exhausted.update(s for s, _ in unstarted)
+            return []
+        return [(s, req) for s, req in remaining
+                if s not in self.completed and s not in self._unresolved_identity_subs]
+
+    def _capture_tile_lost(self, page, task, state=None):
+        """把"卡片跟丢了"的现场存下来（每个 chunk 只存一次）。
+
+        存的是截图 + 去样式的 page.html + DOM 元素骨架 + **画布卡片结构 dump**。
+        最后那份 canvas_tiles.json 是关键：新版结果卡片带不带稳定 id、带不带首尾帧
+        的 img、显不显示提示词、完成后的视频是 <video src> 还是 blob —— 这几个
+        问题只能看真实 DOM 才能回答，靠行为反推会一直猜。
+
+        取证绝不能影响主流程：任何异常都吞掉。
+        """
+        if self._tile_lost_captured:
+            return
+        self._tile_lost_captured = True
+        try:
+            from ..utils.forensics import capture
+            from .google_fx_diagnostics import canvas_tiles_collector
+            slot = capture(
+                page, "tile_lost",
+                f"任务 {task['idx'] + 1} 读不到生成结果"
+                f"（tile_id={task.get('tile_id')}, "
+                f"定位方式={(state or {}).get('resolvedBy')}, "
+                f"status={(state or {}).get('status')}）",
+                extra={
+                    "tile_id": task.get("tile_id"),
+                    "idx": task.get("idx"),
+                    "prompt_slice": self._tile_slices.get(task.get("tile_id"), ""),
+                    "refs": (self._refs_map or {}).get(task.get("tile_id")),
+                    # 当时那一轮读到的状态：resolvedBy 能直接分辨
+                    # "戳还在但卡片是死的" / "戳丢了靠兜底认回来" / "压根没找到"
+                    "state": state or {},
+                    # 唤醒了几次还是拿不到 <video>：区分"卡片是死的"和"我们没去碰"
+                    "media_wake_attempts": self._media_wake_attempts.get(
+                        task.get("tile_id"), 0),
+                },
+                collectors={"canvas_tiles.json": canvas_tiles_collector(max_tiles=16)},
+            )
+            if slot:
+                log(f"🔍 现场已保存: {slot}（重点看 canvas_tiles.json）", "GoogleFX-Video")
+        except Exception as e:
+            log(f"⚠️ 保存「卡片跟丢」现场失败（不影响主流程）: {type(e).__name__}: {e}",
+                "GoogleFX-Video")
+
+    def _check_ui_breakage(self, attempted):
+        """判断本轮是不是"同一个原因把所有任务一起打死了"。
+
+        触发条件（缺一不可，为的是把误报压到接近 0）：
+          1. 本轮下场提交的任务 ≥ _UI_BREAKAGE_MIN_TASKS 个（单个任务失败可能只是抽风）；
+          2. 这些任务**一个都没成**；
+          3. 失败原因规范化之后**完全相同**（数字/UUID/文件名抹掉后逐字一致）；
+          4. 这个原因属于"自动化层"故障（见 _UI_BREAKAGE_SIGNATURES），
+             而不是 Flow 那边的内容生成失败——后者本来就该照常重试。
+
+        命中即置 self.ui_breakage，由调用方停止重试；批量主流程还会据此跳过
+        剩余分批（见 generate_videos_batch_google_fx）。
+        """
+        if self.ui_breakage:
+            return self.ui_breakage
+        subs = [sub_idx for sub_idx, _ in (attempted or [])]
+        if len(subs) < _UI_BREAKAGE_MIN_TASKS:
+            return None
+        if any(s in self.completed for s in subs):
+            return None
+        signatures = {
+            _normalize_failure_message((self.results.get(s) or {}).get("message"))
+            for s in subs
+        }
+        if len(signatures) != 1:
+            return None
+        signature = signatures.pop()
+        if not signature:
+            return None
+        if not any(sig in signature for sig in _UI_BREAKAGE_SIGNATURES):
+            return None
+
+        reason = (
+            f"本轮 {len(subs)} 个任务全部失败，且失败原因逐字相同"
+            f"（{signature[:200]}）——这种形态说明是**共因**故障（Flow 改版/选择器失效，"
+            f"或输入本身就缺），不是单段内容问题。已停止重试：继续重试只会把参考图"
+            f"再传一遍、把积分再烧一轮，失败原因不会变。"
+            f"请先跑选择器探针（/api/google-fx/selector-drift）核对 UI_SELECTORS，"
+            f"重点看 canvas_tile 与 add_media_btn 两族"
+        )
+        self.ui_breakage = reason
+        log("🚨 " + reason, "Error")
+        self._notify(self.chunk_start, 'ui_breakage', {'message': reason})
+        return reason
 
     # ── 相位 1: 项目导航 + 页面就绪 ──
 
@@ -823,42 +1808,81 @@ class _ChunkRunner:
           labs.google 时才导航，而项目页 URL 同样含 labs.google —— 静默沿用旧项目
           导致画布堆满历史/其他任务的卡片，是"下载到无关视频"（跨任务串片）的
           直接温床（2026-07-04 复盘确诊）。
+          例外：调用方显式绑定了项目（bound_project_url，即本地项目的帧序列所在
+          画布）时走该项目页——那批帧已经是这个画布的资产，回到这里才能免上传
+          （串片风险由提交前的 tile 基线 + 提示词切片核对 + 下载后锚点比对兜住，
+          历史卡片另由 preexisting_tile_ids 挡在认领之外）。
         - 重试轮：回到本 chunk 固定的项目页，保留此前提交的卡片供认领复用。
         然后等待底部工具栏就绪；超时则主动刷新一次页面再等（换 IP 后页面可能
         卡在空白状态，光等不会自愈——2026-07-01 实测这样丢过整批任务）。"""
         if self.project_url:
+            navigated = True
             try:
                 if page.url != self.project_url:
-                    page.goto(self.project_url, timeout=60000)
-                    random_sleep(2, 3)
-                log("📌 已回到本批次项目页（重试轮，保留历史卡片）", "GoogleFX-Video")
+                    page.goto(self.project_url, timeout=60000, wait_until="domcontentloaded")
             except Exception as nav_err:
+                if self._ip_retry_project_url:
+                    raise _IPRetryRecoveryError("换 IP 后无法返回原画布，已停止生成并保留已有结果") from nav_err
                 log(f"⚠️ 回到项目页失败: {nav_err}，改为新建项目", "GoogleFX-Video")
+                navigated = False
+
+            if self._ip_retry_project_url and str(page.url or "") != self._ip_retry_project_url:
+                raise _IPRetryRecoveryError("换 IP 后页面未回到原画布，已停止生成并保留已有结果")
+
+            is_bound_canvas = bool(
+                navigated and self.bound_project_url
+                and self.project_url == self.bound_project_url
+            )
+            if is_bound_canvas:
+                # 绑定画布来自本地项目 manifest，可能属于号池里的另一个账号、也可能
+                # 早被删了：那种地址打得开却没有工作区，光在下面干等只会把整批任务
+                # 拖死在一个根本回不去的画布上。先确认工作区真的可用，不可用就当场
+                # 放弃绑定、退回"新建项目 + 上传参考图"的老路（慢，但一定能跑完）。
+                _dismiss_unexpected_overlays(page, "GoogleFX-Video")
+                if self._wait_toolbar_ready(page, _BOUND_CANVAS_READY_TIMEOUT):
+                    self.canvas_is_bound = True
+                    log("📌 已进入本地项目绑定的 Flow 画布（帧序列就在这张画布上）",
+                        "GoogleFX-Video")
+                else:
+                    if self._ip_retry_project_url:
+                        raise _IPRetryRecoveryError("换 IP 后原画布工作区未就绪，已停止生成并保留已有结果")
+                    log(
+                        f"⚠️ 绑定画布 {_BOUND_CANVAS_READY_TIMEOUT}s 内打不开工作区"
+                        f"（可能属于另一个账号或已被删除），改为新建项目并照旧上传参考图",
+                        "GoogleFX-Video",
+                    )
+                    navigated = False
+                    self.canvas_is_bound = False
+                    self.bound_project_url = None  # 后续轮次/分批不再重试这个画布
+            elif navigated:
+                log("📌 已回到本批次项目页（重试轮，保留历史卡片）", "GoogleFX-Video")
+
+            if not navigated:
                 self.project_url = None
 
         if not self.project_url:
-            # 新建项目 = 全新画布，上一个项目里传的参考图不在这里，缓存全部失效
-            self.path_to_uuid = {}
+            # ⚠️ 这里以前直接 `self.path_to_uuid = {}`，理由是"新建项目 = 全新画布"。
+            # 但新建项目会失败（换 UI 后按钮认不出来就失败过一整晚），失败时我们
+            # 还站在**同一张画布**上，图都还在，缓存却已经被清空了——于是每一轮
+            # 重试都把整批参考图重传一遍，越传越慢、越传越容易撞风控，一张片子
+            # 也出不来。缓存本来就不是"信得过就用"，而是要过 _verify_cached_uploads
+            # 的画布 DOM 校验才敢复用（校验不过照样重传），所以这里留着它是安全的：
+            # 真换了画布，校验一次不过就自动全量重传，最多多花几秒。
+            self.canvas_is_bound = False
             try:
-                page.goto("https://labs.google/fx/tools/flow", timeout=60000)
-                random_sleep(1, 2)
+                page.goto(FLOW_HOME_URL, timeout=60000, wait_until="domcontentloaded")
             except Exception as nav_err:
                 log(f"⚠️ 导航到 Flow 首页失败: {nav_err}", "GoogleFX-Video")
             ensure_flow_workspace(page)
             clicked_new = _click_new_project_button(page)
             if not clicked_new:
-                # 兜底：老的文本匹配方式
-                try:
-                    new_project_btn = page.locator("button").filter(has_text="New project").first
-                    if new_project_btn.is_visible():
-                        log("🆕 点击 'New project' 按钮 (文本匹配兜底)...", "GoogleFX-Video")
-                        new_project_btn.click()
-                        random_sleep(3, 5)
-                        clicked_new = True
-                except Exception as e:
-                    log(f"⚠️ 点击 'New project' 失败: {e}", "GoogleFX-Video")
-            if not clicked_new:
                 log("⚠️ 未能新建项目，将在当前页面继续（画布可能残留历史卡片）", "GoogleFX-Video")
+                # "自建的新项目画布本来就是空的"这个假设在新建失败时不成立：我们站在
+                # 上一次任务留下的画布上，上面既有历史成片（会被重试轮认领回来，用户
+                # 看到的是别的任务的片子），也有历史图片卡（懒加载时集中冒出来，会把
+                # 上传归属带偏——2026-09-06 首尾帧整体错位一帧就是这么来的）。
+                # 所以这条路径同样要拍历史卡片快照。
+                self.canvas_is_dirty = True
 
         # 🧹 导航刚完成、任何 FX 功能面板都不应处于打开状态的安全时机——
         # 顺手清理一遍可能残留的未知弹窗（Google 产品公告/条款更新提示等），
@@ -871,23 +1895,64 @@ class _ChunkRunner:
         else:
             log("⚠️ 底部工具栏等待超时（30s），尝试刷新页面后重新等待...", "GoogleFX-Video")
             try:
-                page.reload(timeout=60000)
-                random_sleep(2, 3)
+                page.reload(timeout=60000, wait_until="domcontentloaded")
             except Exception as e:
                 log(f"⚠️ 页面刷新失败: {type(e).__name__}: {e}", "GoogleFX-Video")
             self._confirmed_config = None
             if self._wait_toolbar_ready(page, 20):
                 log("✅ 刷新后底部工具栏已加载", "GoogleFX-Video")
             else:
+                if self._ip_retry_project_url:
+                    raise _IPRetryRecoveryError("换 IP 后原画布工作区仍未就绪，已停止生成并保留已有结果")
                 log("⚠️ 刷新后仍未检测到底部工具栏，继续尝试后续步骤...", "GoogleFX-Video")
 
-        # 记录本 chunk 的项目页 URL（新建项目后 URL 会带项目 id）
+        # 记录本批次的项目页 URL。判据必须是"这是一张具体画布"，不能只是
+        # "这是 Flow 的某个页面"：工作台首页/项目列表同样是 Flow 地址，可它不是
+        # 画布。把首页记成本批次项目页之后，下一个分批 goto 回去落在首页，Flow
+        # 在那里开的是另一张画布——参考图得重传、上一轮提交的卡片也认不回来，
+        # 表现就是"同一组任务每批都在开新画布"。新建项目点击失败（新版 UI 上
+        # 常态，见 _click_new_project_button 的确认逻辑）时恰恰就停在首页上。
         if not self.project_url:
             try:
-                if "labs.google" in page.url:
-                    self.project_url = page.url
+                current_url = str(page.url or "")
             except Exception:
-                pass
+                current_url = ""
+            if is_flow_project_url(current_url):
+                self.project_url = current_url
+            elif is_flow_url(current_url):
+                log(
+                    "⚠️ 当前停在 Flow 工作台首页而不是某张画布，本批次项目页留空："
+                    "记下首页会让后续分批回到首页、落进另一张画布（参考图重传、"
+                    "历史卡片认不回来）。后续分批将重新走新建项目。",
+                    "GoogleFX-Video",
+                )
+
+        self._snapshot_preexisting_tiles(page)
+
+    def _snapshot_preexisting_tiles(self, page):
+        """绑定画布首次就位时，记下画布上本来就有的卡片 id。
+
+        绑定的是帧序列所在的项目画布，上面除了帧图，还可能有这个本地项目历次
+        视频生成留下的成品卡片——提示词切片当然对得上。不排除的话，显式重试
+        （用户删掉旧片要求重生）会在重试轮把上一次那张旧卡片认领回来，用户看到
+        的还是同一段视频。自建的新项目画布本来就是空的，不受影响。"""
+        if self._preexisting_scanned or not (self.canvas_is_bound or self.canvas_is_dirty):
+            return
+        self._preexisting_scanned = True
+        tiles = _scan_canvas_tiles(page) or []
+        self.preexisting_tile_ids = {
+            tile_id
+            for tile in tiles
+            for tile_id in (tile.get('tileId'), tile.get('originalTileId'))
+            if tile_id
+        }
+        if self.preexisting_tile_ids:
+            where = "绑定画布" if self.canvas_is_bound else "未能新建、沿用下来的旧画布"
+            log(
+                f"📋 {where}上已有 {len(tiles)} 张历史卡片，重试轮认领时一律跳过"
+                f"（只认本次提交产生的卡片）",
+                "GoogleFX-Video",
+            )
 
     def _wait_toolbar_ready(self, page, max_wait_secs):
         agent_dismiss_tried = False
@@ -939,25 +2004,88 @@ class _ChunkRunner:
         从头重新提交（复盘实测 slot 1/2 各被提交了 14 次，烧配额且把账号风控
         越推越高）。重试轮先扫描画布：内容匹配（提示词切片）且带 videoSrc 的
         完成卡片直接认领复用。返回 (adopted_tasks, still_remaining)。"""
-        if not ((self.ip_retry > 0 or self.gen_retry_used > 0) and remaining):
+        if not ((self.ip_retry > 0 or self.gen_retry_used > 0 or self._uncertain_retried)
+                and remaining):
             return [], remaining
         canvas_tiles = _scan_canvas_tiles(page)
         if not canvas_tiles:
             return [], remaining
+        # 被锚点校验拒收过的卡片留在画布上，提示词切片当然还匹配得上——不排除的话
+        # 重试轮会把同一段废片重新认领、重新下载、重新被拒，整轮重试等于空转。
+        # 绑定画布上本来就有的卡片（历次生成的旧片）同理，见 _snapshot_preexisting_tiles。
+        skip_tile_ids = set(self.rejected_tile_ids) | set(self.preexisting_tile_ids)
+        if skip_tile_ids:
+            canvas_tiles = [
+                t for t in canvas_tiles
+                if t.get('tileId') not in skip_tile_ids
+                and (t.get('originalTileId') or t.get('tileId')) not in skip_tile_ids
+            ]
+
+        # 可认领 = 没失败，且（已经读到视频地址 或 看着已经是成片形态）。
+        # 只认 videoSrc 是不行的：新版 Flow 的成片卡片默认不挂 <video>，地址要交互
+        # 才唤得出来（见 wake_flow_tile_video）。只认地址的话每一轮重试都会判定
+        # "上一轮那段没做完"，于是重新提交、重新扣积分——2026-09-06 复盘里
+        # slot 反复重提的老毛病会以新形态重演。
+        def _claimable(t):
+            return (not t.get('failed')) and (t.get('videoSrc') or t.get('visiblyFinished'))
 
         adopted = []
         still_remaining = []
         used_tile_ids = set()
         for sub_idx, req in remaining:
+            wanted_uuids = [
+                str(u).lower() for u in (
+                    getattr(req, 'image_uuid', None) or self.path_to_uuid.get(getattr(req, 'image', None)),
+                    getattr(req, 'end_image_uuid', None) or self.path_to_uuid.get(getattr(req, 'end_image', None))
+                ) if u
+            ]
             slice_ = self.chunk_slices.get(sub_idx) or ''
+            prompt_clean = _clean_alnum(getattr(req, 'prompt', ''))
             match = None
-            if slice_:
+
+            # 新版成片卡片不含参考图/原提示词；重试优先使用提交时保存的身份。
+            known_id = self._submitted_tiles.get((self.project_url, sub_idx))
+            if known_id:
+                match = next((t for t in canvas_tiles
+                              if known_id in (t.get('tileId'), t.get('originalTileId'))
+                              and t.get('tileId') not in used_tile_ids
+                              and _claimable(t)), None)
+
+            # 策略 1: 基于首尾帧画布 UUID 强相关锚定（100% 精准，完全免疫文本截断）
+            if not match and wanted_uuids:
                 for t in canvas_tiles:
                     if not t.get('tileId') or t['tileId'] in used_tile_ids:
                         continue
-                    if t.get('videoSrc') and not t.get('failed') \
-                            and slice_ in (t.get('textClean') or ''):
-                        match = t  # 保留文档序最后一个匹配（最新）
+                    if _claimable(t):
+                        t_uuids = [str(u).lower() for u in t.get('imageUuids', [])]
+                        if all(u in t_uuids for u in wanted_uuids):
+                            match = t
+                            break
+
+            # 策略 2: 基于提示词切片或前缀文本兜底匹配
+            if not match:
+                for t in canvas_tiles:
+                    if not t.get('tileId') or t['tileId'] in used_tile_ids:
+                        continue
+                    if _claimable(t):
+                        t_text = t.get('textClean') or ''
+                        if slice_ and slice_ in t_text:
+                            match = t
+                            break
+
+            if match and not match.get('videoSrc'):
+                # 认得出是成片，但地址还没挂出来：就地唤醒一次（允许点开播放器，
+                # 认领只发生在重试轮开头，代价可以接受）。唤不出来就别认了——
+                # 认领本身是为了省一次生成，拿不到地址的认领只会白占一个槽位。
+                used_tile_ids.add(match['tileId'])
+                woken = wake_flow_tile_video(page, match['tileId'], allow_click=True)
+                if woken:
+                    match = dict(match, videoSrc=woken)
+                else:
+                    log(f"⚠️ 任务 {self.chunk_start + sub_idx + 1} 画布上有成片形态的历史卡片，"
+                        f"但唤不出视频地址，本轮照常重新提交", "GoogleFX-Video")
+                    match = None
+
             if match:
                 used_tile_ids.add(match['tileId'])
                 idx = self.chunk_start + sub_idx
@@ -981,6 +2109,50 @@ class _ChunkRunner:
 
     # ── 相位 3: 参考图分组上传 ──
 
+    def _load_shared_reference_uploads(self, wanted_paths):
+        """Reuse uploads across chunks and explicit retries, scoped to account/canvas.
+
+        The existing DOM check still decides whether a proposed UUID is usable.
+        A duplicate end frame needs its own asset even when its bytes match.
+        """
+        account = account_binding.resolve_account(fallback=get_runtime_default_user_id())
+        scope = None
+        if account and is_flow_project_url(self.project_url):
+            parsed = urlsplit(self.project_url)
+            project = urlunsplit((parsed.scheme, parsed.netloc, parsed.path.rstrip('/'), '', ''))
+            scope = (account, project)
+        if self._reference_scope_initialized and scope != self._reference_scope:
+            self.path_to_uuid.clear()
+            self._reference_keys.clear()
+        self._reference_scope = scope
+        self._reference_scope_initialized = True
+        changed = set()
+        for path in wanted_paths:
+            role = 'duplicate_end' if path.endswith(_DUP_END_REF_KEY_SUFFIX) else 'primary'
+            key = reference_cache_key(scope, _real_upload_path(path), role)
+            previous = self._reference_keys.get(path)
+            if REFERENCE_UPLOAD_CACHE.content_changed(key):
+                changed.add(path)
+                self.path_to_uuid.pop(path, None)
+            if previous is not None and previous != key:
+                self.path_to_uuid.pop(path, None)
+                REFERENCE_UPLOAD_CACHE.discard(previous)
+                changed.add(path)
+            self._reference_keys[path] = key
+            cached_uuid = REFERENCE_UPLOAD_CACHE.get(key) if key else None
+            if cached_uuid:
+                self.path_to_uuid[path] = cached_uuid
+        return changed
+
+    def _remember_reference_uploads(self, mapping):
+        for path, uuid in mapping.items():
+            key = self._reference_keys.get(path)
+            if key is None:
+                continue
+            # A file edited during browser upload is unsafe to cache for retry.
+            if reference_cache_key(self._reference_scope, _real_upload_path(path), key[-2]) == key:
+                REFERENCE_UPLOAD_CACHE.put(key, uuid)
+
     def _verify_cached_uploads(self, page, wanted_paths, max_wait_secs=8):
         """对照画布 DOM 验证跨轮缓存：返回 {路径: UUID}，只含缓存里有且画布上
         确实存在的条目。重试轮刚回到项目页时图片卡片可能还在异步渲染，
@@ -998,6 +2170,41 @@ class _ChunkRunner:
                 break
             time.sleep(1)
         return {p: u for p, u in wanted.items() if u in found}
+
+    def _seed_known_canvas_uuids(self, remaining, excluded_paths=()):
+        """把请求自带的"这张帧在画布上的 UUID"播种进跨轮缓存，返回播种条数。
+
+        帧序列本来就是在绑定的那个 Flow 项目画布上生成的，每张帧的画布 UUID 记在
+        manifest.frames[].fx_uuid 里（video_generator 透传成 req.image_uuid /
+        end_image_uuid）。回到同一画布时这些图仍是项目资产，直接挂载即可——此前
+        无论如何都要把同一批图整批重新上传一轮（十几张图起步 ~1 分钟，还平白多
+        一轮上传流量推高风控）。
+
+        安全性由两道既有关卡保证，这里只负责"提议"：
+        1) 只在确认当前页就是绑定画布时播种（自建新项目上这些 UUID 根本不存在）；
+        2) 播种的映射一律要过 _verify_cached_uploads 的画布 DOM 校验，画布上找不到
+           的照旧走上传——不会凭 manifest 一面之词就挂一张不在画布上的图。
+        """
+        if not self.canvas_is_bound:
+            return 0
+        seeded = 0
+        for _sub_idx, req in remaining:
+            for path_attr, uuid_attr in (("image", "image_uuid"), ("end_image", "end_image_uuid")):
+                path = clean_path(getattr(req, path_attr, "") or "")
+                uuid = str(getattr(req, uuid_attr, "") or "").strip().lower()
+                if not path or not uuid or path in self.path_to_uuid or path in excluded_paths:
+                    continue
+                if not os.path.exists(path):
+                    continue
+                self.path_to_uuid[path] = uuid
+                seeded += 1
+        if seeded:
+            log(
+                f"📎 本地项目记录了 {seeded} 张帧的画布 UUID，先按已在画布认领"
+                f"（画布校验不过的仍会重新上传）",
+                "GoogleFX-Video",
+            )
+        return seeded
 
     def _upload_references(self, page, remaining):
         """收集本轮任务的全部参考图（首/尾帧去重），分组上传到画布。
@@ -1027,27 +2234,33 @@ class _ChunkRunner:
         if not unique_images:
             return path_to_uuid
 
+        changed_paths = self._load_shared_reference_uploads(unique_images)
+        # ── 帧序列阶段就在这个画布上生成过的图：先按已有资产认领（免整轮上传）──
+        self._seed_known_canvas_uuids(remaining, excluded_paths=changed_paths)
+
         # ── 跨轮复用：先认领画布上已有的，再决定还需要传哪些 ──
         reused = self._verify_cached_uploads(page, unique_images)
+        for path in unique_images:
+            if path not in reused:
+                self.path_to_uuid.pop(path, None)
+                REFERENCE_UPLOAD_CACHE.discard(self._reference_keys.get(path))
         if reused:
             path_to_uuid.update(reused)
             unique_images = [p for p in unique_images if p not in reused]
-            log(f"♻️ 画布上已有 {len(reused)} 张参考图（跨轮复用，跳过重复上传），"
+            log(f"♻️ 画布上已有 {len(reused)} 张参考图（跨批次/重试复用，跳过重复上传），"
                 f"仍需上传 {len(unique_images)} 张", "GoogleFX-Video")
         if not unique_images:
             log("✅ 本轮参考图全部复用画布已有资产，无需上传", "GoogleFX-Video")
+            self._drop_colliding_uuid_mappings(path_to_uuid)
+            self._remember_reference_uploads(path_to_uuid)
             return path_to_uuid
 
+        wanted_total = len(path_to_uuid) + len(unique_images)
         total_images = len(unique_images)
         total_groups = (total_images + UPLOAD_GROUP_SIZE - 1) // UPLOAD_GROUP_SIZE
         log(f"📤 开始分组上传该批次共 {total_images} 张参考图（每组最多 {UPLOAD_GROUP_SIZE} 张，共 {total_groups} 组）...", "GoogleFX-Video")
 
-        if not _find_add2_btn(page):
-            log("⚙️ Create 按钮未找到，临时切换到 Image 模式以进行图片上传...", "GoogleFX-Video")
-            first_ratio = self.chunk[0].ratio if hasattr(self.chunk[0], 'ratio') else '9:16'
-            _verify_and_fix_fx_config(page, model="Nano Banana 2", ratio=first_ratio,
-                                      want_video=False, context_label="临时切换Image")
-
+        # 不用 Add 按钮的瞬时可见性猜测 Image/Video 模式；上传函数负责恢复入口。
         self._check_cancel()
 
         for group_start in range(0, total_images, UPLOAD_GROUP_SIZE):
@@ -1082,9 +2295,46 @@ class _ChunkRunner:
                     self._check_cancel()
                     real_path = _real_upload_path(img_path)
                     extra_known = set(path_to_uuid.values()) if path_to_uuid else None
-                    uuid = _upload_image_to_canvas(page, real_path, extra_known_uuids=extra_known)
+                    upload_state = {}
+                    uuid = _upload_image_to_canvas(page, real_path, extra_known_uuids=extra_known,
+                                                   upload_state=upload_state)
+                    if not uuid and upload_state.get('started') is False:
+                        # 上传入口持续失灵（菜单/选择器卡死）：画布上没有在途卡片也没有
+                        # 输入草稿时，刷新同一项目重置页面状态再试一次；有在途任务就
+                        # 不动页面，沿用下面的"尚未开始"失败语义。
+                        uuid = self._retry_upload_after_reload(
+                            page, real_path, extra_known, upload_state)
                     if not uuid:
-                        raise RuntimeError(f"图片 {os.path.basename(real_path)} 上传到画布失败")
+                        if upload_state.get('started') is False:
+                            raise RuntimeError(
+                                f"参考图 {os.path.basename(real_path)} 尚未开始上传: "
+                                f"{upload_state.get('failure_reason') or '未找到可用上传入口'}"
+                            )
+                        # 上传失败 / UUID 归属不明：不写映射，也不炸整批。缺哪张帧
+                        # 就只拦下用到那张帧的片段（见 _submit_tasks 的锚点闸门），
+                        # 其余片段照常提交；重试轮会重新上传这一张。
+                        log(
+                            f"❌ 参考图 {os.path.basename(real_path)} 未能取得可信的画布 UUID，"
+                            f"本轮不建立映射——用到这张帧的片段会被拦下重试，"
+                            f"不会退化成没有首尾帧的文生视频",
+                            "GoogleFX-Video",
+                        )
+                        # 归属判不出来，多半是这张图的卡片还没渲染完。必须等它落到画布上
+                        # 再传下一张：否则它迟到几秒才冒出来，就会被下一张图的 DOM 扫描
+                        # 当成"恰好一张新卡"吃掉，整批映射从这里开始整体错位一帧
+                        # （2026-09-06 第二批 VID 022~024 全部错位一帧就是这么来的）。
+                        _settle_from = len(_get_panel_uuids(page))
+                        for _ in range(_STRAGGLER_SETTLE_SECONDS):
+                            self._check_cancel()
+                            time.sleep(1)
+                            if len(_get_panel_uuids(page)) > _settle_from:
+                                break
+                        log(
+                            f"  🧷 已等待迟到卡片落位，画布卡片数 {_settle_from} → "
+                            f"{len(_get_panel_uuids(page))}，下一张图重新快照后再上传",
+                            "GoogleFX-Video",
+                        )
+                        continue
                     path_to_uuid[img_path] = uuid
                     # 即时写回跨轮缓存：即使本轮中途被封中止，已传的图下一轮也能复用
                     self.path_to_uuid[img_path] = uuid
@@ -1099,8 +2349,54 @@ class _ChunkRunner:
             if group_start + UPLOAD_GROUP_SIZE < total_images:
                 random_sleep(1.0, 2.0)
 
-        log("✅ 当前批次所有参考图已成功上传并就绪", "GoogleFX-Video")
+        self._drop_colliding_uuid_mappings(path_to_uuid)
+        self._remember_reference_uploads(path_to_uuid)
+        log(
+            f"✅ 当前批次参考图上传完毕（{len(path_to_uuid)}/{wanted_total} 张已建立可信映射）",
+            "GoogleFX-Video",
+        )
         return path_to_uuid
+
+    def _retry_upload_after_reload(self, page, real_path, extra_known, upload_state):
+        """上传入口两次都没能开始时，静置画布刷新一次后重试这一张图。"""
+        try:
+            project_id = flow_project_id(str(page.url or ""))
+        except Exception:
+            return None
+        if not _canvas_upload_reload_safe(page, project_id):
+            return None
+        log(f"🔄 {os.path.basename(real_path)} 上传入口持续失灵，刷新静置画布后重试一次",
+            "GoogleFX-Video")
+        if _reload_canvas_for_upload_trigger(page, project_id) is None:
+            return None
+        # 刷新会重置 Flow 的 Video/模型/比例面板，下次提交必须重新校验配置。
+        self._confirmed_config = None
+        return _upload_image_to_canvas(page, real_path, extra_known_uuids=extra_known,
+                                       upload_state=upload_state)
+
+    def _drop_colliding_uuid_mappings(self, path_to_uuid):
+        """归属自检：两张不同的本地图不允许映射到同一个画布 UUID。
+
+        起止帧复用同一张图的任务也走两个独立 UUID（见 _DUP_END_REF_KEY_SUFFIX），
+        所以映射表里的 UUID 本就应当两两不同。一旦撞车，说明某一张图的归属判错了，
+        但撞车本身分不出是哪一张错——两条都作废（并清掉跨轮缓存，免得下一轮继续
+        复用这个错误映射），让用到它们的片段走"锚点未就绪"闸门重试。"""
+        counts = {}
+        for uid in path_to_uuid.values():
+            counts[uid] = counts.get(uid, 0) + 1
+        collided = {uid for uid, n in counts.items() if n > 1}
+        if not collided:
+            return
+        for key in [k for k, uid in path_to_uuid.items() if uid in collided]:
+            path_to_uuid.pop(key, None)
+            self.path_to_uuid.pop(key, None)
+            REFERENCE_UPLOAD_CACHE.discard(self._reference_keys.get(key))
+        log(
+            f"🚨 检测到 {len(collided)} 个画布 UUID 被多张参考图共用（上传归属出错），"
+            f"已作废相关映射并清除跨轮缓存；受影响的片段会被拦下重试，"
+            f"绝不带着错误的首尾帧提交",
+            "GoogleFX-Video",
+        )
 
     # ── 相位 4: 依次提交任务（不等待生成完成） ──
 
@@ -1110,9 +2406,16 @@ class _ChunkRunner:
         若 (model, ratio) 未变则跳过——提交动作本身不会改变模式/模型，重复打开
         面板纯属浪费（2026-07-01 实测 16 段任务约浪费 80s）。会话重建/页面刷新
         时 _confirmed_config 被重置，自动恢复完整校验。"""
-        wanted = (req.model, req.ratio)
+        # ⚠️ 参考模式必须在早退判断**之前**读，并且进缓存键：它同样是现读运行时配置
+        # （控制台可热调 GOOGLE_FX_VIDEO_REF_MODE 在「帧 / 素材」之间切换）。漏掉它的话，
+        # 只要模型/比例/时长没变，切换模式后整段配置校验都会被跳过，新模式永远不生效
+        # ——正是当初把 duration 补进缓存键要修的同一类问题。
+        _video_ref_mode = get_runtime_google_fx_video_ref_mode()
+        _req_resolution = getattr(req, "resolution", None)
+        wanted = (req.model, req.ratio, req.duration, _video_ref_mode, _req_resolution)
         if self._confirmed_config == wanted:
-            log("⚙️ 本会话已确认过相同配置（模型/比例未变），跳过重复校验", "GoogleFX-Video")
+            log("⚙️ 本会话已确认过相同配置（模型/比例/时长/参考模式/分辨率未变），跳过重复校验",
+                "GoogleFX-Video")
             return
         _verify_and_fix_fx_config(
             page,
@@ -1120,15 +2423,38 @@ class _ChunkRunner:
             ratio=req.ratio,
             want_video=True,
             context_label="切换Video",
-            video_submode="VIDEO_FRAMES"
+            duration=req.duration,
+            video_submode=_video_ref_mode,
+            resolution=_req_resolution,
         )
         self._confirmed_config = wanted
 
-    def _submit_tasks(self, page, remaining, adopted, path_to_uuid):
+    def _stop_after_preparation_error(self, remaining, phase, error):
+        """为尚未提交的任务留存失败，交给正常收取阶段在在途任务结束后上报。"""
+        failed_idx = self.chunk_start + remaining[0][0]
+        message = (f"第 {failed_idx + 1} 段{phase}失败: {error}；"
+                   "本段尚未提交，已停止本批次自动重试")
+        log(f"⛔ {message}；先收取已提交视频", "GoogleFX-Video")
+        for sub_idx, req in remaining:
+            self._preparation_failures[sub_idx] = {
+                "sub_idx": sub_idx,
+                "idx": self.chunk_start + sub_idx,
+                "req": req,
+                "account_id": self._current_account_id(),
+                "project_url": self.project_url,
+                "tile_id": None,
+                "status": "failed",
+                "video_url": None,
+                "message": message,
+            }
+        return list(self._preparation_failures.values())
+
+    def _submit_tasks(self, page, remaining, adopted, path_to_uuid, prepare_references=False):
         """依次提交本轮任务到画布（不等待生成完成，仅等待新 tile 出现并用提示词
         切片核对归属）。认领的历史任务直接并入结果（状态已是 success）。
         每提交一个任务立即扫一次全部已提交 tile：账号在提交中途被封时立刻中止，
         不再浪费时间提交注定失败的剩余任务（每个提交要十几秒）。
+        参考图上传/视频配置失败时停止继续提交，先收取在途任务，再上报未提交槽位。
 
         单任务提交异常（CANVAS_MOUNT_FAILED / 找不到输入框 / Generate 后无新 tile）
         就地标记该任务失败并继续提交其余任务，不让异常捅穿到 run()——那样会把
@@ -1140,20 +2466,118 @@ class _ChunkRunner:
             submitted.append(_ad)
             self._prompts_map[_ad["tile_id"]] = _ad["req"].prompt
             self._tile_slices[_ad["tile_id"]] = self.chunk_slices.get(_ad["sub_idx"], '')
+            _ad_req = _ad["req"]
+            self._refs_map[_ad["tile_id"]] = _ad.get("refs") or [
+                str(u).lower() for u in (
+                    getattr(_ad_req, 'image_uuid', None) or self.path_to_uuid.get(getattr(_ad_req, 'image', None)),
+                    getattr(_ad_req, 'end_image_uuid', None) or self.path_to_uuid.get(getattr(_ad_req, 'end_image', None))
+                ) if u
+            ]
 
-        # 当前已有的 tile_ids 作为基线，用于识别提交后新出现的 tile
-        before_tile_ids = page.evaluate("""() => {
-            return Array.from(document.querySelectorAll('div[data-tile-id]'))
-                        .map(el => el.getAttribute('data-original-tile-id') || el.getAttribute('data-tile-id'));
-        }""")
+        if self._preparation_failures:
+            # 浏览器在收取期间断开后仍只恢复在途任务，不重试已失败的准备步骤。
+            return submitted + list(self._preparation_failures.values())
 
-        for sub_idx, req in remaining:
+        try:
+            self._observe_during_pacing(page, submitted)
+        except (_IPBlockedError, _CreditExhaustedError) as stop_err:
+            if not submitted:
+                raise
+            self._set_deferred_stop(stop_err)
+            return submitted
+        for task in submitted:
+            if task.get("status") == "success" and not task.get("reported"):
+                self._download_and_report_task(page, task)
+
+        # 本轮真正点过 Generate 的任务数（认领的历史任务不算）。积分闸门要用它
+        # 判断"现在中断会不会把已经花掉积分、正在生成的片子一起扔了"。
+        inflight_this_round = 0
+
+        # 当前已有的 tile_ids 作为基线，用于识别提交后新出现的 tile。
+        # 新版 Flow 的卡片自己没有 id，快照必须**当场盖戳**才有基线可言。
+        before_tile_ids = snapshot_flow_tile_ids(page)
+        # Pause on a new ambiguity this round; earlier settled ones never block.
+        uncertain_before = set(self._unresolved_identity_subs)
+
+        for position, (sub_idx, req) in enumerate(remaining):
+            if prepare_references or account_binding.current_fixed_task_account():
+                if len(self._pending_tasks(submitted)) >= self.max_inflight:
+                    self._await_generation(page, submitted, until_slot_available=True)
+                if self._deferred_stop or self._blocking_uncertain_subs() - uncertain_before:
+                    break
+                # Do not probe every remaining slot when the first window proves
+                # a common UI failure. Unattempted slots are not failure evidence.
+                recent = self._attempted_this_round[-VIDEO_CHUNK_SIZE:]
+                if len(recent) == VIDEO_CHUNK_SIZE and self._check_ui_breakage(recent):
+                    self._fail_remaining(remaining[position:], self.ui_breakage)
+                    break
+            try:
+                # 上一次提交后的快照可能还没显示失败；在下一张参考图上传前重查。
+                self._observe_during_pacing(page, submitted)
+            except (_IPBlockedError, _CreditExhaustedError) as stop_err:
+                self._set_deferred_stop(stop_err)
+                break
             idx = self.chunk_start + sub_idx
             log(f"🎬 正在提交第 {idx + 1}/{self.total_reqs} 段视频任务: {req.prompt[:30]}...", "GoogleFX-Video")
             self._check_cancel()
             self._notify(idx, 'video_start', {'prompt': req.prompt})
 
-            self._ensure_video_config(page, req)
+            # 🧊 批次中途重读余额。号池那边的积分是**选号那一刻**探的一个快照，
+            # 之后整批跑完都没人再看——2026-08-24 实测：14:21 探到 59 分，跑到
+            # 14:33 第 5 段时早已见底，而缓存里还写着 59，于是下一批继续派它出去。
+            # 提交时的扣减只是估算，因此隔几段实读一次并覆盖先前的预算估算。
+            credit_stop = self._credit_checkpoint(
+                page, remaining_after=len(remaining) - position)
+            if credit_stop:
+                if self._pending_tasks(submitted):
+                    # 在途请求已扣点：先在原账号收取完成再换号，失败的才换号重试。
+                    log(f"🧊 {credit_stop}；本轮已有 {inflight_this_round} 段在生成，"
+                        "停止新提交，收取在途视频后换号", "GoogleFX-Video")
+                    self._set_deferred_stop(_CreditExhaustedError(credit_stop))
+                    break
+                raise _CreditExhaustedError(credit_stop)
+
+            preparation_phase = "参考图准备" if prepare_references else "视频配置"
+            try:
+                if prepare_references:
+                    path_to_uuid = self._upload_references(page, [(sub_idx, req)])
+                    self._observe_during_pacing(page, submitted)
+                    before_tile_ids = snapshot_flow_tile_ids(page)
+                self._attempted_this_round.append((sub_idx, req))
+                preparation_phase = "视频配置"
+                self._ensure_video_config(page, req)
+            except (ConnectionError, _ManualInterventionTimeoutError):
+                raise
+            except Exception as preparation_err:
+                # 上传 helpers 用 RuntimeError 传递取消/预算超时，先重新检查请求状态。
+                self._check_cancel()
+                _check_cancelled()
+                if ("TargetClosedError" in type(preparation_err).__name__
+                        or type(preparation_err).__name__ == "BrowserSessionClosedError"
+                        or "Target page" in str(preparation_err)
+                        or str(preparation_err).startswith("MANUAL_REQUIRED:")):
+                    raise
+                stop_err = None
+                if isinstance(preparation_err, (_IPBlockedError, _CreditExhaustedError)):
+                    stop_err = preparation_err
+                elif _looks_like_credit_exhaustion(preparation_err):
+                    stop_err = _CreditExhaustedError(str(preparation_err))
+                elif str(preparation_err).startswith("SECURITY_CHECK_ACCOUNT_SWITCH_REQUIRED:"):
+                    stop_err = _IPBlockedError(str(preparation_err))
+                else:
+                    page_credit_err = detect_page_credit_exhaustion(page, deep=True)
+                    if page_credit_err:
+                        stop_err = _CreditExhaustedError(page_credit_err)
+                if stop_err:
+                    if submitted:
+                        self._set_deferred_stop(stop_err)
+                        break
+                    if stop_err is preparation_err:
+                        raise
+                    raise stop_err from preparation_err
+                submitted.extend(self._stop_after_preparation_error(
+                    remaining[position:], preparation_phase, preparation_err))
+                break
 
             _start_path = clean_path(req.image)
             _end_path = clean_path(req.end_image)
@@ -1173,14 +2597,110 @@ class _ChunkRunner:
                 "GoogleFX-Video",
             )
 
+            # 🚧 锚点闸门：声明了锚点帧的片段，必须带着锚点帧提交。
+            # Flow 对"没有参考图的视频请求"不会报错——它会安静地按纯文本生成一段
+            # 内容完全无关的片段（文生视频），一路走到下载后做锚点比对才被拒收，
+            # 白烧一次生成额度、白等十几分钟。所以帧映射不完整时就地判失败，
+            # 交给失败重试轮重新上传重来，绝不提交。
+            anchor_err = ""
+            if _start_path and not _start_uuid:
+                anchor_err = f"首帧 {os.path.basename(_start_path)} 没有可信的画布 UUID"
+            elif _end_path and not _end_uuid:
+                anchor_err = f"尾帧 {os.path.basename(_end_path)} 没有可信的画布 UUID"
+            elif _start_path and _end_path and _start_path != _end_path \
+                    and _start_uuid and _start_uuid == _end_uuid:
+                anchor_err = (
+                    f"首尾帧（{os.path.basename(_start_path)} / {os.path.basename(_end_path)}）"
+                    f"映射到了同一个画布 UUID，上传归属出错"
+                )
+            if anchor_err:
+                message = f"锚点帧未就绪，拒绝提交（避免退化成无首尾帧的文生视频）: {anchor_err}"
+                log(f"🚫 任务 {idx + 1} {message}", "GoogleFX-Video")
+                item_fail = {
+                    "sub_idx": sub_idx,
+                    "idx": idx,
+                    "req": req,
+                    "tile_id": None,
+                    "click_time": time.time(),
+                    "status": "failed",
+                    "video_url": None,
+                    "message": message,
+                    "reported": True,
+                }
+                submitted.append(item_fail)
+                self.results[sub_idx] = {"status": "failed", "video_url": None, "message": message,
+                                         "account_id": self._current_account_id(), "project_url": self.project_url}
+                self._notify(idx, 'video_error', {'message': message})
+                continue
+
+            submission_id = f"fx-{uuid.uuid4().hex}" if account_binding.current_fixed_task_account() else None
+            if not self._prepare_paid_submission(sub_idx):
+                continue
             try:
                 task_info = _submit_video_to_canvas(
                     page, _UuidRefRequest(req, _start_uuid, _end_uuid), before_tile_ids,
-                    expect_slice=self.chunk_slices.get(sub_idx)
+                    expect_slice=self.chunk_slices.get(sub_idx),
+                    **({"on_idle": lambda: self._observe_during_pacing(page, submitted)}
+                       if prepare_references else {})
                 )
-            except (_IPBlockedError, ConnectionError):
+            except (_IPBlockedError, _CreditExhaustedError) as stop_err:
+                if submitted:
+                    self._set_deferred_stop(stop_err)
+                    break
                 raise
             except Exception as submit_err:
+                ambiguous = bool(getattr(submit_err, "submission_started", False)
+                                 or CANVAS_BLIND_PREFIX in str(submit_err)
+                                 or "未检测到新 tile" in str(submit_err))
+                # A post-click error can carry both an uncertain submission and
+                # a real credit warning. Detect the warning before the generic
+                # pending path, while still protecting the paid request.
+                cancelled_or_closed = (isinstance(submit_err, ConnectionError)
+                                       or "TargetClosedError" in type(submit_err).__name__
+                                       or "Target page" in str(submit_err))
+                page_credit_err = None
+                # Fixed tasks must journal an uncertain click before any more
+                # page I/O. A second credit probe can fail after the first one
+                # already lost its browser; it cannot make this click unsubmitted.
+                if not cancelled_or_closed and not (
+                        ambiguous and account_binding.current_fixed_task_account()):
+                    page_credit_err = (str(submit_err) if _looks_like_credit_exhaustion(submit_err)
+                                       else detect_page_credit_exhaustion(page, deep=True))
+                if ambiguous:
+                    self._unresolved_identity_subs.add(sub_idx)
+                    metadata = self._submission_metadata(req, {
+                        "click_time": getattr(submit_err, "click_time", time.time())},
+                        _start_uuid, _end_uuid, submission_id=submission_id)
+                    self.results[sub_idx] = dict(metadata, status="failed", video_url=None,
+                                                 message=str(submit_err), submission_pending=True)
+                    self._notify(idx, "request_submitted", dict(metadata, confirmed=False,
+                                                               submission_pending=True))
+                    if account_binding.current_fixed_task_account():
+                        self._set_deferred_stop(account_binding.FixedAccountStopError(
+                            "原视频已提交但结果未确认，停止后续提交"))
+                        break
+                    if isinstance(submit_err, ConnectionError):
+                        raise
+                    # A lost browser still requires reconnecting to recover the
+                    # other submissions, but this uncertain one must not repeat.
+                    if "TargetClosedError" in type(submit_err).__name__ or "Target page" in str(submit_err):
+                        raise
+                    if page_credit_err:
+                        self._credit_pending_subs.add(sub_idx)
+                        self._set_deferred_stop(_CreditExhaustedError(page_credit_err))
+                        break
+                    continue
+                if isinstance(submit_err, ConnectionError):
+                    raise
+                if account_binding.current_fixed_task_account():
+                    self._set_deferred_stop(account_binding.FixedAccountStopError(str(submit_err)))
+                    break
+                if page_credit_err:
+                    stop_err = _CreditExhaustedError(page_credit_err)
+                    if self._pending_tasks(submitted):
+                        self._set_deferred_stop(stop_err)
+                        break
+                    raise stop_err
                 if "TargetClosedError" in type(submit_err).__name__ or "Target page" in str(submit_err):
                     # 浏览器页面意外关闭：不是这一个任务的问题，交给 run() 外层的
                     # TargetClosedError 恢复逻辑重建连接、整轮重跑。
@@ -1192,7 +2712,8 @@ class _ChunkRunner:
                 # 这里就地记为失败，交给已有的 gen-retry 轮次机制重新尝试，其余任务
                 # 继续正常提交。
                 log(f"❌ 任务 {idx + 1} 提交失败，标记失败等待重试: {submit_err}", "GoogleFX-Video")
-                submitted.append({
+                fail_msg = f"提交失败: {submit_err}"
+                item_fail = {
                     "sub_idx": sub_idx,
                     "idx": idx,
                     "req": req,
@@ -1200,13 +2721,24 @@ class _ChunkRunner:
                     "click_time": time.time(),
                     "status": "failed",
                     "video_url": None,
-                    "message": f"提交失败: {submit_err}",
-                })
-                self._notify(idx, 'video_error', {'message': f"提交失败: {submit_err}"})
+                    "message": fail_msg,
+                    "reported": True,
+                }
+                submitted.append(item_fail)
+                self.results[sub_idx] = {"status": "failed", "video_url": None, "message": fail_msg,
+                                         "account_id": self._current_account_id(), "project_url": self.project_url}
+                self._notify(idx, 'video_error', {'message': fail_msg})
                 continue
 
             tile_id = task_info["tile_id"]
-            submitted.append({
+            self._submitted_tiles[(self.project_url, sub_idx)] = tile_id
+            self.submitted_count += 1
+            inflight_this_round += 1
+            metadata = self._submission_metadata(
+                req, task_info, _start_uuid, _end_uuid, submission_id=submission_id)
+            self._record_submission(metadata)
+            task = {
+                **metadata,
                 "sub_idx": sub_idx,
                 "idx": idx,
                 "req": req,
@@ -1215,138 +2747,532 @@ class _ChunkRunner:
                 "status": "generating",
                 "video_url": None,
                 "message": ""
-            })
+            }
+            self._submitted_tasks[sub_idx] = task
+            submitted.append(task)
+            self._notify(idx, 'request_submitted', dict(
+                metadata, confirmed=True,
+                **({'submission_pending': True} if account_binding.current_fixed_task_account() else {}),
+            ))
             self._prompts_map[tile_id] = req.prompt
             self._tile_slices[tile_id] = self.chunk_slices.get(sub_idx, '')
+            self._refs_map[tile_id] = [
+                str(u).lower() for u in (
+                    _start_uuid, _end_uuid,
+                ) if u
+            ]
             before_tile_ids.append(tile_id)
 
-            # 🚨 提前检测 IP 被封：每提交完一个任务就扫一次已提交 tile，
+            # 🚨 提前检测 IP 被封或积分耗尽：每提交完一个任务就扫一次已提交 tile，
             # 命中立即中止本轮提交（而不是等整批提交完才发现）
             early_states = _inspect_all_pending_tiles(
-                page, [t["tile_id"] for t in submitted], self._prompts_map,
-                slices_map=self._tile_slices
+                page, [t["tile_id"] for t in self._pending_tasks(submitted)], self._prompts_map,
+                slices_map=self._tile_slices, refs_map=self._refs_map
             )
-            if any(s.get("isIpBlocked") for s in early_states.values()):
-                log(
-                    "🚨 提交过程中检测到 IP 被封（异常活动/unusual activity），"
-                    "立即停止继续提交本批剩余任务，冷却换号后重跑...",
-                    "GoogleFX-Video",
-                )
-                raise _IPBlockedError("IP blocked: unusual activity detected during submit")
+            self._report_generation_failures(page, submitted, early_states)
+            if self._deferred_stop:
+                break
+            self._wake_ready_tiles(page, submitted, early_states)
+            self._deliver_ready_tasks(page, submitted, early_states)
 
             random_sleep(1.0, 1.5)
 
-        log(f"📡 已成功提交 {len(submitted)} 个视频任务，开始并行等待生成...", "GoogleFX-Video")
+        # submitted also contains adopted results and failures that never reached
+        # Generate. Only confirmed new submissions belong in this round's count.
+        pending_count = len(self._pending_tasks(submitted))
+        log(f"📡 本轮已确认提交 {inflight_this_round} 个视频任务，"
+            f"当前 {pending_count} 个在途待收取", "GoogleFX-Video")
         return submitted
 
-    # ── 相位 5: 并行等待生成完成 ──
+    # ── 相位 5: 并行等待生成完成（流式即时交付） ──
 
-    def _await_generation(self, page, submitted):
+    # 单张卡最多唤醒几次；每次都要真去碰页面，不能无限试
+    _MEDIA_WAKE_MAX_ATTEMPTS = 8
+    # 前 N 次只 hover（零副作用），之后才允许点开播放器
+    _MEDIA_WAKE_CLICK_AFTER = 2
+
+    def _wake_ready_tiles(self, page, submitted, states):
+        """把"看着已完成、却读不到视频地址"的卡片就地唤醒，并原地补进 states。
+
+        2026-09-06 的整批失败就死在这一步的缺失上：新版 Flow 的成片卡片只有一张
+        img.thumbnail + "360p" 角标，<video> 要交互才挂上来（现场见
+        runtime/fx_debug/*/canvas_tiles.json 与 runtime/video_detection_scene.json）。
+        纯读 DOM 的轮询在这种卡上永远读不到东西，于是每一段都哑到 300s 超时判失败，
+        而视频其实早就生成好了、积分也早就扣了。
+
+        唤醒是有代价的动作（要动鼠标、可能点开浮层），所以只对确实需要的卡片做：
+        needsMediaWake 为真才碰，且每张卡有次数上限，超了就照旧走超时判定——
+        免得一张真坏掉的卡把整轮轮询拖住。
+        """
+        # Angular can replace the entire grid: every synthetic stamp disappears.
+        # Recover from full project media metadata before attempting DOM hover.
+        lost = [t for t in submitted if not t.get('reported')
+                and t.get('status') not in ('success', 'failed')
+                and (states.get(t.get('tile_id'), {}).get('status') == 'missing'
+                     or (states.get(t.get('tile_id'), {}).get('needsMediaWake')
+                         and self._media_wake_attempts.get(t.get('tile_id'), 0) >= 2))]
+        # Also during a credit stop: in-flight paid clips are drained, not dropped.
+        if lost and time.monotonic() - self._identity_recovery_at >= 30:
+            self._identity_recovery_at = time.monotonic()
+            from .flow_video_identity import recover_project_videos
+            log(f"🔗 {len(lost)} 张卡片重绘后丢失，按完整提示词和项目资产恢复归属", 'GoogleFX-Video')
+            try:
+                def on_resolved(tid, state):
+                    states[tid] = state
+                    self._deliver_ready_tasks(page, submitted, states)
+
+                recovered = recover_project_videos(page, [dict(
+                    tile_id=t['tile_id'], prompt=t['req'].prompt,
+                    refs=self._refs_map.get(t['tile_id'], []),
+                    click_time=t.get('click_time', 0)) for t in lost], self._check_cancel,
+                    on_resolved=on_resolved,
+                    **({'session': self._identity_session} if self._identity_session else {}))
+                states.update(recovered)
+            except Exception as exc:
+                self._check_cancel()
+                log(f"⚠️ 项目资产恢复暂不可用: {type(exc).__name__}: {exc}", 'GoogleFX-Video')
+        for task in submitted:
+            if task.get("reported") or task.get("status") in ("success", "failed"):
+                continue
+            tid = task.get("tile_id")
+            if not tid:
+                continue
+            state = states.get(tid) or {}
+            if not state.get("needsMediaWake"):
+                continue
+            attempts = self._media_wake_attempts.get(tid, 0)
+            if attempts >= self._MEDIA_WAKE_MAX_ATTEMPTS:
+                continue
+            self._media_wake_attempts[tid] = attempts + 1
+            allow_click = attempts >= self._MEDIA_WAKE_CLICK_AFTER
+            log(f"🫱 任务 {task['idx'] + 1} 卡片已是成片形态但没挂 <video>，"
+                f"主动唤醒视频地址（第 {attempts + 1} 次，{'hover+点开' if allow_click else '仅 hover'}）",
+                "GoogleFX-Video")
+            try:
+                src = wake_flow_tile_video(
+                    page, tid,
+                    uuid=(self._refs_map.get(tid) or [""])[0] or "",
+                    allow_click=allow_click,
+                )
+            except Exception as e:
+                log(f"⚠️ 唤醒任务 {task['idx'] + 1} 的视频地址失败（不影响主流程）: "
+                    f"{type(e).__name__}: {e}", "GoogleFX-Video")
+                continue
+            if src:
+                state = dict(state)
+                state["videoSrc"] = src
+                state["status"] = "done"
+                state["needsMediaWake"] = False
+                state["wokenBy"] = "click" if allow_click else "hover"
+                states[tid] = state
+                self._missing_streak.pop(tid, None)
+
+    def _deliver_ready_tasks(self, page, submitted, states):
+        """提交阶段也交付成片；同一快照中的其他失败不得吞掉已有成果。"""
+        for task in submitted:
+            if task.get("reported"):
+                continue
+            state = states.get(task.get("tile_id"), {})
+            if state.get("status") == "done" and state.get("videoSrc"):
+                task["status"] = "success"
+                task["video_url"] = state["videoSrc"]
+                task["media_id"] = state.get("mediaId")
+                log(f"✅ 任务 {task['idx'] + 1} 已识别成片，立即下载并交付", "GoogleFX-Video")
+                self._download_and_report_task(page, task)
+
+    def _download_and_report_task(self, page, task):
+        """单任务即时下载并上报（流式交付：哪个先做好就先交付哪个，不被其他卡住的任务阻塞）。"""
+        if task.get("reported"):
+            return
+        task["reported"] = True
+        sub_idx = task["sub_idx"]
+        idx = task["idx"]
+        req = task["req"]
+        identity = {
+            "account_id": task.get("account_id", self._current_account_id()),
+            "project_url": task.get("project_url", self.project_url),
+            "tile_id": task.get("tile_id"),
+            "prompt_hash": task.get("prompt_hash"),
+            "start_uuid": task.get("start_uuid", ""),
+            "end_uuid": task.get("end_uuid", ""),
+        }
+        if task.get('fixed_video_account') or account_binding.current_fixed_task_account():
+            identity.update(fixed_video_account=True, submission_id=task.get('submission_id'),
+                            confirmed=bool(task.get('confirmed')), submission_pending=bool(task.get('submission_pending')))
+        item_result = dict(identity, status="failed", video_url=None, message="")
+        if task.get("submission_pending"):
+            item_result["submission_pending"] = True
+        elif task.get('status') in {'success', 'failed'}:
+            item_result['submission_pending'] = False
+
+        if task.get("status") == "success" and task.get("video_url"):
+            try:
+                output_dir = req.output_path if (hasattr(req, "output_path") and req.output_path) \
+                    else os.path.join(OUTPUT_DIR, "videos")
+                if not os.path.exists(output_dir):
+                    os.makedirs(output_dir)
+                local_path = download_video_via_browser(page, task["video_url"], output_dir, f"veo3_{idx}")
+                item_result.update({"status": "success", "video_url": local_path})
+                media_id = task.get('media_id')
+                if not media_id:
+                    hit = re.search(r'/video/([0-9a-fA-F-]{36})(?:[?/#]|$)', task['video_url'])
+                    media_id = hit[1] if hit else None
+                if media_id:
+                    item_result['flow_media_id'] = media_id
+                    item_result['flow_project_url'] = identity["project_url"]
+                self.completed.add(sub_idx)
+            except ConnectionError:
+                task["reported"] = False
+                raise
+            except Exception as download_err:
+                log(f"⚠️ 下载任务 {idx + 1} 视频失败: {download_err}", "GoogleFX-Video")
+                item_result.update({"status": "failed", "message": f"下载失败: {download_err}"})
+                if account_binding.current_fixed_task_account():
+                    item_result['submission_pending'] = True
+                    self._unresolved_identity_subs.add(sub_idx)
+        else:
+            item_result.update({
+                "status": "failed",
+                "message": task.get("message") or "超时未检测到视频文件或生成失败"
+            })
+
+        self.results[sub_idx] = item_result
+
+        if item_result["status"] == "success":
+            cb_ret = self._notify(idx, 'video_done', item_result)
+            if cb_ret == 'rejected':
+                log(f"🚫 任务 {idx + 1} 下载内容未通过锚点校验，标记失败待重试", "GoogleFX-Video")
+                self.completed.discard(sub_idx)
+                if task.get("tile_id"):
+                    self.rejected_tile_ids.add(task["tile_id"])
+                item_result = {
+                    "status": "failed",
+                    "video_url": None,
+                    "message": "下载内容与锚点帧不符，已被拒收",
+                    **identity,
+                }
+                self.results[sub_idx] = item_result
+            elif not isinstance(self._deferred_stop, _UnusualActivityError):
+                # An accepted result demonstrates progress on this account.
+                # Late results drained after a fresh block do not clear it.
+                self._unusual_activity_ip_retries[identity["account_id"]] = 0
+        else:
+            self._notify(idx, 'video_error', item_result)
+
+    def _await_generation(self, page, submitted, until_slot_available=False):
         """并行轮询本轮全部已提交 tile 直到完成/失败/超时；
-        任一 tile 报 unusual activity 立即抛 _IPBlockedError。"""
+        任一 tile 报 unusual activity 立即停止继续提交，有限等待其他在途结果；
+        到期后隔离未确认提交，由 _run_round 抛出 _UnusualActivityError，
+        退出浏览器会话后验证换 IP，只继续其他可安全提交的任务。
+        流式即时交付：一旦任一任务生成成功，立即就地下载并上报，绝不让完成的视频陪跑其他仍在生成的任务；
+        单任务超时防护：单个任务超过独立等待上限时立即收敛失败，不再无休止阻塞整批。"""
         pending_tile_ids = [
             t["tile_id"] for t in submitted
-            if t["status"] not in ("success", "failed")
+            if t.get("status") not in ("success", "failed") and t.get("tile_id")
         ]
         wait_start = time.time()
         timeout_limit = get_runtime_max_wait_seconds() * 5
+        # 单任务独立超时：至少 300s（5分钟），防止单个卡死的任务一直拖着整批死等 15 分钟
+        per_task_timeout = max(get_runtime_max_wait_seconds() * 2, 300)
         poll_count = 0
+        last_overlay_at = wait_start
 
         while pending_tile_ids and (time.time() - wait_start < timeout_limit):
             self._check_cancel()
             poll_count += 1
             # 🧹 生成动辄要等几分钟，是最容易被"没人盯着的时候冒出来的弹窗"
             # 悄悄挡住画布的时段——每 30s(每 5s 一轮 x6) 顺手清一遍。
-            if poll_count % 6 == 0:
+            if time.time() - last_overlay_at >= 30:
                 _dismiss_unexpected_overlays(page, "GoogleFX-Video")
+                last_overlay_at = time.time()
             states = _inspect_all_pending_tiles(page, pending_tile_ids, self._prompts_map,
-                                                slices_map=self._tile_slices)
-
-            if any(state.get("isIpBlocked") for state in states.values()):
-                log(
-                    "🚨 检测到 IP 被封（异常活动/unusual activity），"
-                    "立即中止当前批次，冷却换号后重跑...",
-                    "GoogleFX-Video",
-                )
-                raise _IPBlockedError("IP blocked: unusual activity detected")
+                                                slices_map=self._tile_slices,
+                                                refs_map=self._refs_map)
+            # 先报告明确失败，再执行耗时的成片唤醒/下载。
+            self._report_generation_failures(page, submitted, states)
+            if not isinstance(self._deferred_stop, _CreditExhaustedError):
+                page_credit_err = detect_page_credit_exhaustion(page)
+                if page_credit_err:
+                    log(f"🧊 页面检测到积分耗尽: {page_credit_err}，停止新提交，收取在途视频后换号", "GoogleFX-Video")
+                    self._set_deferred_stop(_CreditExhaustedError(page_credit_err))
+            if account_binding.current_fixed_task_account() and self._deferred_stop:
+                # Deliver results already present in this snapshot, then retain
+                # every other paid request as pending without another submit.
+                self._deliver_ready_tasks(page, submitted, states)
+                raise self._deferred_stop
+            if isinstance(self._deferred_stop, _UnusualActivityError):
+                self._begin_unusual_activity_drain()
+            drain_expired = (isinstance(self._deferred_stop, _UnusualActivityError)
+                             and self._unusual_activity_drain_started is not None
+                             and time.monotonic() - self._unusual_activity_drain_started
+                             >= _UNUSUAL_ACTIVITY_DRAIN_SECONDS)
+            for task in submitted:
+                if task.get("status") == "success" and not task.get("reported"):
+                    self._download_and_report_task(page, task)
+            if not drain_expired:
+                self._wake_ready_tiles(page, submitted, states)
+            self._deliver_ready_tasks(page, submitted, states)
 
             still_pending = []
             for task in submitted:
-                if task["status"] in ("success", "failed"):
+                if task.get("status") in ("success", "failed"):
                     continue
-                state = states.get(task["tile_id"], {})
+                tid = task.get("tile_id")
+                if not tid:
+                    continue
+                state = states.get(tid, {})
                 status = state.get("status", "generating")
                 if status == "done":
                     video_src = state.get("videoSrc")
                     log(f"✅ 任务 {task['idx'] + 1} 生成成功! URL: {video_src[:80]}...", "GoogleFX-Video")
                     task["status"] = "success"
                     task["video_url"] = video_src
+                    # 🚀 流式交付：立即下载并上报，落盘更新 manifest，不让已完成任务等待其他任务
+                    self._download_and_report_task(page, task)
                 elif status == "failed":
                     err_msg = state.get("failedText") or "生成失败"
                     log(f"❌ 任务 {task['idx'] + 1} 生成失败: {err_msg}", "GoogleFX-Video")
                     task["status"] = "failed"
                     task["message"] = err_msg
+                    self._download_and_report_task(page, task)
                 else:
-                    still_pending.append(task["tile_id"])
+                    # Credit exhaustion only blocks new submissions. Requests
+                    # already on the canvas were paid and keep generating, so
+                    # keep polling them here; dropping them as "pending" lost
+                    # the clip for good (2026-10-01: slots 33-35, 39, 40, 48).
+                    if drain_expired:
+                        self._unresolved_identity_subs.add(task['sub_idx'])
+                        self._ip_drain_pending_subs.add(task['sub_idx'])
+                        task["status"] = "failed"
+                        task["submission_pending"] = True
+                        task["message"] = (
+                            f"异常活动拦截后收取在途结果已达 {_UNUSUAL_ACTIVITY_DRAIN_SECONDS} 秒，"
+                            "此片段结果仍待确认；已保留原账号画布和提交记录，跳过重复生成")
+                        log(f"⏸️ 任务 {task['idx'] + 1} {task['message']}", "GoogleFX-Video")
+                        self._download_and_report_task(page, task)
+                        continue
+                    # 🔍 "哑轮询"取证。
+                    # 2026-09-06 实测：真正的症状**不是**卡片找不到（status=missing），
+                    # 而是卡片找得到、却既不报进度也拿不到视频地址——于是这一轮什么
+                    # 都不打印，任务一路哑到 300s 超时，而页面上视频其实早就出来了。
+                    # 所以取证的触发条件必须按症状来：连续 N 轮"没进度 + 没视频地址"，
+                    # 不管卡片是 missing 还是 generating，都当场存现场。
+                    # （只认 missing 是上一版的错，那个条件在真实故障里根本不成立。）
+                    is_silent = (state.get("progress") is None
+                                 and not state.get("videoSrc"))
+                    if is_silent:
+                        streak = self._missing_streak.get(tid, 0) + 1
+                        self._missing_streak[tid] = streak
+                        if streak == _TILE_LOST_CAPTURE_AFTER_POLLS:
+                            log(f"🔍 任务 {task['idx'] + 1} 已连续 {streak} 轮既无进度也无视频地址"
+                                f"（status={status}, 定位方式={state.get('resolvedBy')}, "
+                                f"卡片={state.get('tileTag')}, img={state.get('imgCount')}, "
+                                f"video={state.get('videoCount')}, 文本={state.get('tileText')!r}），"
+                                f"保存现场以便离线分析新版结果卡片结构", "GoogleFX-Video")
+                            self._capture_tile_lost(page, task, state)
+                    else:
+                        self._missing_streak.pop(tid, None)
+
+                    # 单任务独立超时判定：如果单任务等待时间超过独立上限，判定超时失败，避免单个卡顿任务拖垮整批
+                    task_wait = time.time() - task.get("click_time", wait_start)
+                    if task_wait > per_task_timeout:
+                        self._unresolved_identity_subs.add(task['sub_idx'])
+                        if isinstance(self._deferred_stop, _UnusualActivityError):
+                            self._ip_drain_pending_subs.add(task['sub_idx'])
+                        elif isinstance(self._deferred_stop, _CreditExhaustedError):
+                            # Keep the receipt, but let the account switch proceed.
+                            self._credit_pending_subs.add(task['sub_idx'])
+                        task["submission_pending"] = True
+                        err_msg = f"单任务生成超时（已等待 {int(task_wait)}s > 上限 {per_task_timeout}s）"
+                        if is_silent:
+                            woke = self._media_wake_attempts.get(tid, 0)
+                            if state.get("isVisiblyFinished"):
+                                # 卡片明明是成片形态（缩略图 + 分辨率角标），唤醒也没把
+                                # <video> 唤出来——这是识别层的问题，不是 Flow 没生成，
+                                # 消息必须说清楚，别再让人以为是生成失败。
+                                err_msg += (f"；卡片已是成片形态却始终挂不出 <video>，"
+                                            f"已唤醒 {woke} 次仍读不到地址"
+                                            f"（status={status}, 定位方式={state.get('resolvedBy')}, "
+                                            f"卡片={state.get('tileTag')}, 文本={state.get('tileText')!r}）"
+                                            f"——视频八成已经生成，是识别层拿不到地址")
+                            else:
+                                err_msg += (f"；全程读不到进度/视频地址"
+                                            f"（status={status}, 定位方式={state.get('resolvedBy')}, "
+                                            f"唤醒 {woke} 次）"
+                                            f"——视频可能其实已生成，只是识别不到")
+                        # 超时是最后一次机会，无论如何都留一份现场
+                        self._capture_tile_lost(page, task, state)
+                        log(f"⏰ 任务 {task['idx'] + 1} {err_msg}，判定失败，不再阻塞整批", "GoogleFX-Video")
+                        task["status"] = "failed"
+                        task["message"] = err_msg
+                        self._download_and_report_task(page, task)
+                        continue
+
+                    still_pending.append(tid)
                     progress = state.get("progress")
                     if progress is not None:
                         log(f"⏳ 任务 {task['idx'] + 1} 正在生成: {progress}%", "GoogleFX-Video")
 
             pending_tile_ids = still_pending
+            if (until_slot_available and len(pending_tile_ids) < self.max_inflight
+                    and not self._deferred_stop):
+                return
             if pending_tile_ids:
-                time.sleep(5)
+                near_done = any((s.get("progress") or 0) >= 95 or s.get("needsMediaWake")
+                                for s in states.values())
+                time.sleep(1 if near_done else 2)
 
-    # ── 相位 6: 下载 + 上报（SPARK 侧锚点校验可拒收） ──
+        # 兜底：处理由于整体超时仍然处于 pending 的任务
+        for task in submitted:
+            if not task.get("reported"):
+                if task.get("status") not in ("success", "failed"):
+                    task["status"] = "failed"
+                    task["submission_pending"] = True
+                    self._unresolved_identity_subs.add(task['sub_idx'])
+                    if isinstance(self._deferred_stop, _CreditExhaustedError):
+                        self._credit_pending_subs.add(task['sub_idx'])
+                    if isinstance(self._deferred_stop, _UnusualActivityError) and task.get("tile_id"):
+                        self._ip_drain_pending_subs.add(task['sub_idx'])
+                    task["message"] = task.get("message") or (
+                        "当前账号已停止提交，原结果仍待确认；已保留提交记录，不重复生成"
+                        if isinstance(self._deferred_stop, _CreditExhaustedError)
+                        else f"批次生成超时（等待超过 {int(timeout_limit)}s）")
+                self._download_and_report_task(page, task)
+
+    # ── 相位 6: 下载 + 上报兜底（SPARK 侧锚点校验可拒收） ──
 
     def _download_and_report(self, page, submitted):
-        """依次下载生成成功的视频并逐个上报。SPARK 侧回调对下载内容做锚点校验，
-        返回 'rejected'（首尾帧与锚点图不符=串片）时撤销完成标记，
-        让该槽位进入失败重试轮重新生成。"""
+        """对 submitted 中尚未上报的任务进行最终上报兜底。已在轮询中即时交付的跳过。"""
         for task in submitted:
-            sub_idx = task["sub_idx"]
-            idx = task["idx"]
-            req = task["req"]
-            item_result = {"status": "failed", "video_url": None, "message": ""}
+            if not task.get("reported"):
+                self._download_and_report_task(page, task)
 
-            if task["status"] == "success" and task["video_url"]:
-                try:
-                    output_dir = req.output_path if (hasattr(req, "output_path") and req.output_path) \
-                        else os.path.join(OUTPUT_DIR, "videos")
-                    if not os.path.exists(output_dir):
-                        os.makedirs(output_dir)
-                    local_path = download_video_via_browser(page, task["video_url"], output_dir, f"veo3_{idx}")
-                    item_result.update({"status": "success", "video_url": local_path})
-                    self.completed.add(sub_idx)
-                except Exception as download_err:
-                    log(f"⚠️ 下载任务 {idx + 1} 视频失败: {download_err}", "GoogleFX-Video")
-                    item_result.update({"status": "failed", "message": f"下载失败: {download_err}"})
-            else:
-                item_result.update({
-                    "status": "failed",
-                    "message": task["message"] or "超时未检测到视频文件或生成失败"
-                })
+    # ── 异常活动强制换 IP / 其他安全验证处理 ──
 
-            self.results[sub_idx] = item_result
+    def _recover_unusual_activity(self):
+        """Try a bounded number of same-profile exits, then an eligible account."""
+        threshold = _unusual_activity_account_switch_after()
+        current = self._current_account_id()
+        retries = self._unusual_activity_ip_retries.get(current, 0)
+        if threshold > 0:
+            if current:
+                self.tried_accounts.add(current)
+            if retries >= threshold:
+                self.ip_retry += 1
+                return self._switch_unusual_activity_account(
+                    f"原账号验证换 IP {retries} 次后仍被平台拦截")
+        if self._rotate_ip_immediately():
+            self._unusual_activity_ip_retries[current] = retries + 1
+            return True
+        if threshold > 0:
+            # The failed rotation already consumed this recovery attempt.
+            return self._switch_unusual_activity_account(self._ip_rotation_failure)
+        return False
 
-            if item_result["status"] == "success":
-                cb_ret = self._notify(idx, 'video_done', item_result)
-                if cb_ret == 'rejected':
-                    log(f"🚫 任务 {idx + 1} 下载内容未通过锚点校验，标记失败待重试", "GoogleFX-Video")
-                    self.completed.discard(sub_idx)
-                    item_result = {
-                        "status": "failed",
-                        "video_url": None,
-                        "message": "下载内容与锚点帧不符，已被拒收"
-                    }
-                    self.results[sub_idx] = item_result
-            else:
-                self._notify(idx, 'video_error', item_result)
+    def _switch_unusual_activity_account(self, reason):
+        """Keep paid receipts; never cycle back to this batch's rejected profiles."""
+        from ..utils.account_pool import switch_to_next_account
+        from .google_fx_credit import min_usable_credit
 
-    # ── IP 封禁处理 ──
+        self._check_cancel()
+        _check_cancelled()
+        current = self._current_account_id()
+        if current:
+            self.tried_accounts.add(current)
+        minimum = max(_credit_cost_per_segment(), min_usable_credit())
+        self._notify(self.chunk_start, "account_switching", {
+            "previous": current or None, "reason": "unusual_activity",
+            "retry": self.ip_retry, "message": reason,
+        })
+        chosen = switch_to_next_account(exclude=set(self.tried_accounts), min_credit=minimum)
+        self._check_cancel()
+        _check_cancelled()
+        if not chosen:
+            self._ip_rotation_failure = (
+                f"{reason}；号池没有其他已确认积分可用的账号，已停止重试，"
+                "保留已完成视频及待确认提交")
+            log(f"⛔ {self._ip_rotation_failure}", "GoogleFX-Video")
+            return False
+        user_id = chosen["user_id"]
+        self.tried_accounts.add(user_id)
+        self._reset_account_canvas(user_id)
+        self._ip_rotation_failure = None
+        log(f"🔄 平台持续异常活动拦截，已切换账号 {current} → {user_id}，"
+            "新建画布继续未完成片段", "GoogleFX-Video")
+        self._notify(self.chunk_start, "account_switched", {
+            "previous": current or None, "user_id": user_id,
+            "name": chosen.get("name") or "", "reason": "unusual_activity",
+            "retry": self.ip_retry,
+        })
+        return True
+
+    def _rotate_ip_immediately(self):
+        """明确的 unusual activity：不冷却，直接验证换 IP 后再恢复未完成任务。"""
+        current = self._current_account_id()
+        self._ip_rotation_failure = None
+        self._check_cancel()
+        _check_cancelled()
+        self.ip_retry += 1
+        blocked_ips = self._blocked_exit_ips.setdefault(current, set())
+        previous_exit = self._verified_exit_ips.get(current)
+        if previous_exit:
+            blocked_ips.add(previous_exit)
+        log(f"🔄 平台异常活动拦截，立即为原账号更换并验证出口 IP"
+            f"（第 {self.ip_retry} 次换 IP）", "GoogleFX-Video")
+        self._notify(self.chunk_start, "ip_rotating", {
+            "user_id": current, "reason": "unusual_activity",
+            "retry": self.ip_retry, "blocked_ip_count": len(blocked_ips),
+        })
+
+        try:
+            if not current:
+                raise RuntimeError("无法确认当前视频账号")
+            from ..utils.proxy_rotator import ProxyRotator
+            rotation = ProxyRotator().rotate_proxy_verified(
+                user_id=current, port=get_runtime_default_port(), cancel_check=self._check_cancel,
+                excluded_ips=set(blocked_ips))
+            self._check_cancel()
+            _check_cancelled()
+            old_ip = str(rotation.get("old_ip") or "").strip()
+            new_ip = str(rotation.get("new_ip") or "").strip()
+            if old_ip:
+                blocked_ips.add(old_ip)
+            if not rotation.get("success"):
+                raise RuntimeError(rotation.get("message") or "未能确认出口 IP 已变化")
+            if not old_ip or not new_ip:
+                raise RuntimeError("缺少旧新出口 IP，无法确认切换")
+            if new_ip in blocked_ips:
+                raise RuntimeError("出口 IP 未变化或已被本任务拦截")
+        except ConnectionError:
+            raise
+        except Exception as rotation_err:
+            self._check_cancel()
+            _check_cancelled()
+            self._ip_rotation_failure = f"强制换 IP 验证失败，已停止重试，避免原 IP 重放: {rotation_err}"
+            log(f"⛔ {self._ip_rotation_failure}", "GoogleFX-Video")
+            return False
+
+        # 保留项目、缓存、卡片与提交收据。只在原账号重连后恢复原画布，不能回落新建。
+        self._active_account_id = current
+        self._verified_exit_ips[current] = new_ip
+        account_binding.set_task_account(current)
+        self._ip_retry_account = current
+        self._ip_retry_project_url = self.project_url
+        self._confirmed_config = None
+        self._deferred_stop = None
+        log(f"✅ 原账号 {current} 出口 IP 已验证变化，重连原画布后仅重试未完成视频", "GoogleFX-Video")
+        self._notify(self.chunk_start, "ip_rotated", {
+            "user_id": current,
+            "old_ip": old_ip,
+            "new_ip": new_ip,
+            "reason": "unusual_activity",
+            "retry": self.ip_retry,
+            "blocked_ip_count": len(blocked_ips),
+        })
+        return True
 
     def _cooldown_and_switch_account(self):
-        """被判异常活动：递增冷却 + 换号后重试（不再强制换 IP，理由见
-        _IPBlockedError 上方注释）。
+        """其他安全验证：保留递增冷却 + 换号的既有处理路径。
 
         冷却保留：立刻按相同节奏重放大概率再次触发（2026-07-01 实测同一 chunk
         连续被封 2 次），所以按重试次数递增等待（20s/40s/60s... 封顶 90s），给
@@ -1354,7 +3280,7 @@ class _ChunkRunner:
         换号：切到号池里的下一个可用账号，下一轮 _run_round 重连浏览器时自然落到
         新 profile 上。没号可换（池子为空/都被排除）就只冷却后原地重试。"""
         self.ip_retry += 1
-        log(f"🔄 被判异常活动，第 {self.ip_retry} 次冷却换号重试...", "GoogleFX-Video")
+        log(f"🔄 账号安全验证拦截，第 {self.ip_retry} 次冷却换号重试...", "GoogleFX-Video")
         backoff_secs = min(_IP_BACKOFF_STEP_SECS * self.ip_retry, _IP_BACKOFF_CAP_SECS)
         log(f"🕐 冷却等待 {backoff_secs}s 后再重试，避免立即被再次判定异常...", "GoogleFX-Video")
         for _ in range(backoff_secs):
@@ -1363,12 +3289,13 @@ class _ChunkRunner:
 
         from ..config import get_runtime_default_user_id
         from ..utils.account_pool import switch_to_next_account
-        current = (get_runtime_default_user_id() or "").strip()
+        current = self._current_account_id()
         if current:
             self.tried_accounts.add(current)
         chosen = switch_to_next_account(exclude=self.tried_accounts)
         if chosen:
             self.tried_accounts.add(chosen["user_id"])
+            self._reset_account_canvas(chosen["user_id"])
             # 透出给 SPARK：换号后本批次的积分记账/后续换号要跟着换目标账号，
             # 前端也需要知道"这一批中途换号了"。
             self._notify(self.chunk_start, "account_switched", {
@@ -1379,21 +3306,178 @@ class _ChunkRunner:
                 "retry": self.ip_retry,
             })
 
+    def _credit_checkpoint(self, page, remaining_after):
+        """每 _CREDIT_RECHECK_EVERY_SUBMITS 段实读一次余额。
+
+        返回值：余额已经跑不动下一段时返回原因字符串（调用方据此换号或停止继续
+        提交），其余情况返回 None。
+
+        够跑一段、但不够跑完剩下这些 → 只告警，不喊停：换号是有代价的（可能压根
+        没有下一个可用号，那时 run() 会 break，剩余任务全判失败），而"能跑一段是
+        一段"不会比现在更差，真跑干了自然会在下一个 checkpoint 或提交失败诊断里
+        被接住。
+
+        探测失败（读不到数字）一律当没发生：本模块的规矩是积分数字只信真实探测，
+        绝不凭猜把账号停用。
+        """
+        self._submits_since_credit_check += 1
+        if self._submits_since_credit_check < _CREDIT_RECHECK_EVERY_SUBMITS:
+            return None
+        self._submits_since_credit_check = 0
+
+        try:
+            from .google_fx_credit import (
+                read_page_credit_via_menu, min_usable_credit, _insufficient_credit_reason,
+            )
+            from ..utils.account_pool import AccountPool
+            from ..config import get_runtime_default_user_id
+        except Exception:
+            return None
+
+        try:
+            credit = read_page_credit_via_menu(page)
+        except Exception as e:
+            # 浏览器/标签页被人工关掉不是"探测失败"，要原样上抛交给 run() 的
+            # 会话恢复逻辑，不能在这里被下面那句 return 吞掉。
+            if type(e).__name__ == "BrowserSessionClosedError":
+                raise
+            log(f"⚠️ 批次中途积分复核跳过（探测异常 {type(e).__name__}）", "GoogleFX-Video")
+            return None
+
+        if credit is None:
+            log("⚠️ 批次中途积分复核未读到余额，按原计划继续", "GoogleFX-Video")
+            return None
+
+        # 实读成功：先把数字写回号池，缓存里那个选号时的快照早就旧了。
+        try:
+            current = self._current_account_id()
+            if current:
+                AccountPool().record_measured_credit(current, credit)
+        except Exception as e:
+            log(f"⚠️ 回写实测积分失败（不影响生成）: {e}", "GoogleFX-Video")
+
+        threshold = min_usable_credit()
+        if credit < threshold:
+            # 已经低于「选号最低积分」——跑不动下一段了。返回原因，由调用方决定
+            # 是立刻换号还是先把在飞的任务收完。
+            return ("批次中途复核发现积分不足: "
+                    + _insufficient_credit_reason(
+                        credit, threshold, f"{credit} Google Flow credits"))
+
+        need = remaining_after * _credit_cost_per_segment()
+        if credit < need:
+            log(
+                f"⚠️ 积分预算告警：实读余额 {credit}，剩余 {remaining_after} 段约需 {need} "
+                f"（按每段 {_credit_cost_per_segment()} 分估）。会尽量跑到跑干为止，"
+                f"跑干后自动换号继续。",
+                "GoogleFX-Video",
+            )
+        else:
+            log(f"✅ 积分预算复核通过：实读余额 {credit}，剩余 {remaining_after} 段约需 {need}",
+                "GoogleFX-Video")
+        return None
+
+    def _handle_credit_exhausted(self, reason):
+        """积分耗尽的统一收口：标记号池冷却 + 换号。返回 True=可以继续重试剩余
+        任务，False=换不动号了，调用方应结束本 chunk。
+
+        run() 里有两条路会到这儿（原生 _CreditExhaustedError、helpers 层带
+        INSUFFICIENT_CREDITS 前缀的 RuntimeError），行为必须完全一致。"""
+        runnable = any(s not in self.completed and not self._settled_uncertain(s)
+                       for s in range(len(self.chunk)))
+        if not runnable:
+            # The last paid clips can finish after the account reaches zero.
+            # Retire it now, without opening a replacement that has no work.
+            self._mark_current_credit_exhausted(
+                reason, close_browser=not bool(self._unresolved_identity_subs))
+            self._deferred_stop = None
+            return False
+        log(f"🧊 捕获到账号积分不足: {reason}，立即换号重试剩余任务...", "GoogleFX-Video")
+        try:
+            self._cooldown_and_switch_credit_exhausted(reason=reason)
+        except Exception as switch_err:
+            log(f"⛔ 积分耗尽换号终止: {switch_err}", "GoogleFX-Video")
+            return False
+        return True
+
+    def _mark_current_credit_exhausted(self, reason=None, close_browser=False):
+        """Save exhaustion independently from whether another task needs a profile."""
+        from ..utils.account_pool import AccountPool
+        from .google_fx_credit import measured_credit_from_reason
+
+        measured = measured_credit_from_reason(reason)
+        current = self._current_account_id()
+        if current:
+            self.tried_accounts.add(current)
+            if (current not in self._credit_exhaustion_marks
+                    or (measured is not None and self._credit_exhaustion_marks[current] != measured)):
+                try:
+                    AccountPool().mark_exhausted(current, credit=measured)
+                    self._credit_exhaustion_marks[current] = measured
+                    log(f"🧊 账号 {current} 积分不足（实测 {measured if measured is not None else '未知'}），"
+                        f"已在账号池中标记为 quota_exhausted 冷却 24 小时", "GoogleFX-Video")
+                except Exception as pool_err:
+                    log(f"⚠️ 标记账号 {current} 额度不足失败: {pool_err}", "GoogleFX-Video")
+            if close_browser:
+                try:
+                    from ..utils.browser import stop_ads_browser
+                    stop_ads_browser(user_id=current)
+                except Exception as close_err:
+                    log(f"⚠️ 关闭耗尽账号 {current} 浏览器失败: {close_err}", "GoogleFX-Video")
+        return current
+
+    def _cooldown_and_switch_credit_exhausted(self, reason=None):
+        """Mark actual exhaustion, then move remaining work to another profile."""
+        from ..utils.account_pool import switch_to_next_account
+
+        current = self._mark_current_credit_exhausted(reason)
+        # Leave the original browser available for recovery of requests that
+        # were already paid for. The next round connects to the new account.
+        pending_on_current = any(self.results.get(sub_idx, {}).get("account_id") == current
+                                 for sub_idx in self._credit_pending_subs)
+        chosen = switch_to_next_account(
+            exclude=self.tried_accounts,
+            **({"stop_current": False} if pending_on_current else {}))
+        if chosen:
+            self.tried_accounts.add(chosen["user_id"])
+            self._reset_account_canvas(chosen["user_id"])
+            log(f"🔄 已自动切换到号池新账号 {chosen['user_id']}（{chosen.get('name') or '未命名'}）继续生成", "GoogleFX-Video")
+            self._notify(self.chunk_start, "account_switched", {
+                "previous": current or None,
+                "user_id": chosen["user_id"],
+                "name": chosen.get("name") or "",
+                "reason": "credit_exhausted",
+                "retry": 1,
+            })
+        else:
+            log("⛔ 号池中已无其他可用账号，无法继续换号重试", "Error")
+            remaining = [
+                (sub_idx, self.chunk[sub_idx])
+                for sub_idx in range(len(self.chunk))
+                if sub_idx not in self.completed and sub_idx not in self._unresolved_identity_subs
+            ]
+            self._fail_remaining(remaining, "号池所有可用账号积分均已耗尽，请补充积分或添加新账号")
+            raise RuntimeError("号池所有可用账号积分均已耗尽")
+
 
 def generate_videos_batch_google_fx(reqs: list, on_progress=None, cancel_check=None):
     """
     批量视频生成主流程（SPARK 图生视频的唯一入口）。
 
-    将请求按 VIDEO_CHUNK_SIZE 个一组分批，每批由一个 _ChunkRunner 执行：
-    项目导航 → （重试轮）认领历史卡片 → 分组上传参考图 → 依次提交（不等待）
-    → 并行等待 → 下载并逐个上报。
+    同一账号复用一个浏览器会话，滚动保持最多 VIDEO_CHUNK_SIZE 个请求在途。
+    按需准备参考图，空位释放后继续提交；保留提交间隔并即时下载已完成的视频。
+    重连时恢复已提交的任务；归属未确认的请求仅找回原视频一次，
+    找不到则保留收据停止重复提交。积分耗尽时先收完在途视频再换号。
 
     on_progress(idx, stage, details): stage ∈ video_start/video_done/video_error；
     video_done 的回调可返回 'rejected'（SPARK 侧锚点校验拒收）触发该槽位重试。
     cancel_check(): 返回 True 时抛 ConnectionError 中止全部任务。
 
-    IP 被封（unusual activity）时递增冷却 + 换号后只重跑未完成任务，最多 MAX_IP_RETRIES
-    次；非 IP 失败每 chunk 允许 MAX_GEN_RETRIES_PER_CHUNK 轮有限重试。
+    明确的 unusual activity 时立即为原账号验证换 IP，排除本批次已拦截的出口，
+    只重跑未完成任务；静态出口用尽后按优先级尝试机场备用节点。
+    可配置同账号换 IP 达阈值后切换其他有积分账号；默认关闭，不循环使用已拦截账号。
+    恢复次数同时受视频重试配置与 MAX_IP_RETRIES 限制；没有可用恢复路径则停止。
+    已确认失败的请求按每槽位 retry_count 额外重试，默认5次，0关闭。
     """
     results = []
 
@@ -1402,7 +3486,11 @@ def generate_videos_batch_google_fx(reqs: list, on_progress=None, cancel_check=N
     # 但 _run_with_google_fx_lock 会把 req (VideoBatchRequest) 原样传进来。
     # 这里做一次解包，提取真正的 items 列表。
     if hasattr(reqs, "items") and not isinstance(reqs, list):
+        batch_retry_count = getattr(reqs, 'retry_count', None)
         reqs = reqs.items or []
+        for request in reqs:
+            if getattr(request, 'retry_count', None) is None:
+                request.retry_count = _video_retry_count(batch_retry_count)
 
     # 规范化批量生成中每个子任务的模型名
     for r in reqs:
@@ -1419,30 +3507,18 @@ def generate_videos_batch_google_fx(reqs: list, on_progress=None, cancel_check=N
     # 供 tile 归属核对与断点认领使用。单任务 chunk 也能拿到有区分度的切片。
     all_slices = _distinct_slices({i: r.prompt for i, r in enumerate(reqs)})
 
-    for chunk_start in range(0, len(reqs), VIDEO_CHUNK_SIZE):
-        chunk = reqs[chunk_start : chunk_start + VIDEO_CHUNK_SIZE]
-        log(f"📦 开始处理第 {chunk_start // VIDEO_CHUNK_SIZE + 1} 批视频请求 ({len(chunk)} 个)...", "GoogleFX-Video")
-        runner = _ChunkRunner(
-            total_reqs=len(reqs),
-            chunk_start=chunk_start,
-            chunk=chunk,
-            all_slices=all_slices,
-            on_progress=on_progress,
-            cancel_check=cancel_check,
-        )
-        results.extend(runner.run())
-
-    successful = [r for r in results if r and isinstance(r, dict) and r.get("status") == "success" and r.get("video_url")]
-    if successful:
-        try:
-            current_uid = account_binding.resolve_account()
-            if current_uid:
-                from ..utils.account_pool import AccountPool
-                AccountPool().record_task_count(current_uid, video_count=len(successful))
-        except Exception as _e:
-            log(f"⚠️ 记录账号视频任务数失败: {_e}", "GoogleFX-Video")
-
-    return results
+    # One session owns the rolling window. Five is an in-flight cap, not a
+    # barrier requiring the slowest clip to finish before preparing the next.
+    project_url = next((str(getattr(r, "project_url", "") or "").strip()
+                        for r in reqs if str(getattr(r, "project_url", "") or "").strip()), None)
+    runner = _ChunkRunner(total_reqs=len(reqs), chunk_start=0, chunk=reqs,
+                          all_slices=all_slices, on_progress=on_progress, cancel_check=cancel_check)
+    runner.project_url = project_url
+    runner.bound_project_url = project_url
+    log(f"📦 滚动生成 {len(reqs)} 段视频，最多 {runner.max_inflight} 段同时在途", "GoogleFX-Video")
+    # Each result already carries the account and canvas captured at submission.
+    # Never overwrite them with the last account/project after a rotation.
+    return runner.run()
 
 
 def _generate_videos_batch_google_fx_unlocked(*args, **kwargs):

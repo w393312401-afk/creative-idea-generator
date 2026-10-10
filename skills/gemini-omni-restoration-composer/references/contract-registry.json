@@ -1,0 +1,129 @@
+{
+  "contract_version": "1.0",
+  "package": "gemini-omni-restoration-composer",
+  "profile": "omni",
+  "_comment": [
+    "omni 包的契约注册表。格式与 base 包同构，见那一份的 _comment。",
+    "",
+    "omni 继承 base 的全部 IMAGE 契约（OmniComposer.apply_proactive_fixes 把 IMAGE 完整",
+    "委托给 base），所以这里只登记 omni 自己新增或改写的那些。base 那份仍然生效，",
+    "inherits_from 字段记下这条继承关系。"
+  ],
+  "inherits_from": "gemini-veo-restoration-composer",
+  "contracts": [
+    {
+      "id": "omni-multishot-ladder",
+      "level": "P0",
+      "scope": "video",
+      "summary": "默认施工按片长三或四镜；完整过门、兑现与展开阶段用各自三镜。门禁检查镜头名顺序、每个边界的实际cut、可拍描述及施工/硬件返回同机位声明，拒绝明确不同相机位置、焦段或构图。用户明确单镜覆盖豁免默认梯；文字门禁不证明实际画面连续性。",
+      "source": "references/omni-multishot-language.md",
+      "enforcer": "prompt_pipeline.composers.omni:omni_video_violations"
+    },
+    {
+      "id": "omni-one-take-ban",
+      "level": "P0",
+      "scope": "video",
+      "summary": "默认多镜模式禁止一镜到底措辞，过门与兑现同样适用；原始用户明确指定single_take时只覆盖镜头语法，字数、锚点与物理因果要求继续适用。",
+      "source": "SKILL.md#Three Standing Conflict Resolutions",
+      "enforcer": "prompt_pipeline.composers.omni:omni_video_violations"
+    },
+    {
+      "id": "omni-timeline-cutmarks",
+      "level": "P2",
+      "scope": "video",
+      "summary": "兼容旧ID：当前采用自然分镜，不要求数字秒点表。归一阶段删除旧Cut this...seconds时间线；实际cut边界由omni-multishot-ladder检查。",
+      "source": "references/omni-multishot-language.md",
+      "enforcer": "prompt_pipeline.composers.omni:_inject_timeline"
+    },
+    {
+      "id": "omni-video-word-ceiling",
+      "level": "P0",
+      "scope": "video",
+      "summary": "交付VIDEO全文按空白分词实际计数：三镜和用户单镜硬顶400词，四镜硬顶455词；压缩后仍须复验结构，不能凭审核套话或trim声明通过。",
+      "source": "references/omni-output-templates.md",
+      "enforcer": "prompt_pipeline.composers.omni:omni_video_violations"
+    },
+    {
+      "id": "omni-landmark-lock-framing-loose",
+      "level": "P0",
+      "scope": "image",
+      "summary": "地标锁死、构图放松：UGC 层可以买到手持晃动与失焦，买不到主地标离框或改变画幅占比",
+      "source": "references/omni-scene-skeleton.md",
+      "enforcer": "prompt_pipeline:check_anchor_scale_lock"
+    },
+    {
+      "id": "omni-shell-envelope-consistency",
+      "level": "P0",
+      "scope": "image",
+      "summary": "跨门槛后的每张室内 IMAGE 逐字复述外壳体量签名和单一屋顶形态，开口只来自 ledger 且不得命中 denylist",
+      "source": "references/omni-restoration-continuity.md#Shell Geometry Lock",
+      "enforcer": "prompt_pipeline:check_shell_envelope_consistency"
+    },
+    {
+      "id": "omni-notation-ban-video",
+      "level": "P2",
+      "scope": "video",
+      "summary": "VIDEO正文计数写英文单词；IMAGE编号与紧贴单位的数字依运行期兼容规则豁免，旧机械时间线归一时删除。",
+      "source": "references/omni-output-templates.md",
+      "enforcer": "prompt_pipeline.composers.omni:omni_video_violations"
+    },
+    {
+      "id": "omni-notation-ban-image",
+      "level": "P2",
+      "scope": "image",
+      "summary": "IMAGE正文计数与画高比例写英文单词；IMAGE编号、兼容紧贴单位数字和运行期Grid单元格依注册例外处理，不能声称所有数字记号均已消失。",
+      "source": "references/omni-output-templates.md",
+      "enforcer": "prompt_pipeline.composers.omni:omni_image_violations"
+    },
+    {
+      "id": "omni-grid-notation-ban",
+      "level": "P2",
+      "scope": "image",
+      "summary": "记号禁用把 Grid/坐标记法也列为违规（`Grid B2`、`x-axis 0.35`）",
+      "source": "references/omni-output-templates.md",
+      "enforcer": null,
+      "gap": "与 base 的 primary-landmark-restatement / anchor-scale-lock 直接冲突：那两条要求 IMAGE 按 `<地标> at Grid A2 holding forty-five percent of frame height` 的形态逐字重述 packet，Grid 单元格是 SCUP 漂移门禁的解析锚点。omni 若剥掉 Grid，base 的两个 P0 会同时失去可校验的输入。数字部分已可安全消解（词形数字仍能被 _PERCENT_NEAR_PATTERN 解析，见 omni-notation-ban-image），Grid 部分不能——保留为登记在案的冲突，等 SCUP 支持词形坐标后再消。"
+    },
+    {
+      "id": "omni-ugc-realism-layer",
+      "level": "P2",
+      "scope": "video",
+      "summary": "默认偏 UGC 手机拍摄：真实可用光、轻微过曝、压缩噪点、不稳定构图",
+      "source": "SKILL.md#Core Job",
+      "enforcer": null,
+      "gap": "纯风格取向，靠 system prompt 里的 references 原文引导，没有确定性判定标准可写成门禁。登记为「有意不设门禁」，避免下次审计时被当成漏掉的一条。"
+    },
+    {
+      "id": "shelter-only-destiny",
+      "level": "P0",
+      "scope": "pipeline",
+      "summary": "SHELTER-ONLY：归宿必须是能住人的私人庭护所，商业/公共/工作室类一律否决",
+      "source": "references/idea-engine.md#Axis 4",
+      "enforcer": "prompt_pipeline:ideation_shelter_violations"
+    },
+    {
+      "id": "salvage-and-rebuild",
+      "level": "P0",
+      "scope": "pipeline",
+      "summary": "旧物再生（DIY 内核）：每条选题必须申报一件被拆下来、回到室内变成别的东西的原生旧构件，并在节拍清单里真的做这道工序",
+      "source": "references/idea-engine.md#Axis 4",
+      "enforcer": "prompt_pipeline:ideation_salvage_violations"
+    },
+    {
+      "id": "used-topic-ledger-dedup",
+      "level": "P0",
+      "scope": "pipeline",
+      "summary": "历史选题台账去重：twist 根级去重，换个壳子套同一个 twist 算变体不算新选题",
+      "source": "references/idea-engine.md#2.3",
+      "enforcer": "prompt_pipeline:ideation_twist_root_violations"
+    },
+    {
+      "id": "carrier-family-quota",
+      "level": "P1",
+      "scope": "pipeline",
+      "summary": "载体家族配额：一批里天然原位壳体（岩洞/化石/冰洞/活体树干）不超过三分之一",
+      "source": "references/idea-engine.md#2.3b",
+      "enforcer": "prompt_pipeline:ideation_family_quota_violations"
+    }
+  ]
+}

@@ -19,10 +19,12 @@ server.log.*
 server.pid
 out.txt
 stderr_crash.txt
+server_boot_error.txt
 packet_cache.json
 process_brief_cache.json
 compose_checkpoints.json
 search_snippet_cache.json
+artifacts/
 *.json.tmp
 # 写前备份轮换(如 library.json.bak / packet_cache.json.bak-YYYYMMDD)
 *.bak
@@ -30,6 +32,10 @@ search_snippet_cache.json
 
 # ── 用户数据(默认不提交)──
 library.json
+# 拆分存储形态的创意库(library/index.json + library/items/<id>.json),
+# 与 library.json 同属用户数据;library.json.pre-split 是迁移前的原文件备份
+library/
+library.json.pre-split
 library.rebuilt.json
 topic_ledger.json
 trend_refs.json
@@ -42,7 +48,26 @@ tasks.json
 scratch/
 scratch_*
 
+# ── 仓库根的媒体探针产物 ──
+# ffmpeg 手工核对(音频瞬态检测、脉冲测试)会在仓库根落下 test_*.wav 之类的中间文件。
+# 这类文件没有任何代码引用,却极易失控:实测出现过 4.0GB 的 test_audio.wav 和 2.6GB 的
+# test_pulse.wav 一直挂在未跟踪列表里,离一次 `git add -A` 只差一步。
+# 仓库里没有任何被跟踪的 .wav,整类忽略是安全的。
+*.wav
+
+# ── 一次性事故恢复留底(整份 manifest/创意库/媒体快照,体积大且是用户内容)──
+.recovery/
+
 # ── 工具 / 编辑器目录 ──
 .claude/
 .gemini/
 .pytest_cache/
+.DS_Store
+
+# ── Python 虚拟环境:体积 200M+ 且含平台专属二进制(.pyd/.exe),
+# Mac/Win 双机同步时互不可用。用 requirements.txt / pyproject.toml 重建。──
+.venv/
+venv/
+
+# ── Claude 提示词包生成任务（beat_pack）：每个任务一个目录，含中间产物与交付文件 ──
+beat_packs/

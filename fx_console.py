@@ -1,14 +1,8 @@
-"""Google FX 服务管理中心的后端支撑：配置白名单 + 版本栈。
+"""Google FX 服务管理中心的后端支撑：配置白名单与运行配置存储。
 
 从 server.py 拆出来的原因：配置项从 6 个扩到二十来个之后，"哪些能热改、
-哪些要重启、改了写哪个环境变量、怎么回滚" 这套规则本身就有足够的体量和测试面，
+哪些要重启、改了写哪个环境变量" 这套规则本身就有足够的体量和测试面，
 塞在 HTTP 路由旁边会淹没在 4000 行里。
-
-版本栈（替代原来的单步回滚）：每次成功保存都往 runtime/fx_config_versions.jsonl
-追加一条完整快照，于是可以列版本、看 diff、回滚到任意版本、以及回滚之后重做。
-原实现是"在审计里找最近一条 config.update 然后套用它的 before"——只能退一步，
-第二次点击会重复套用同一份 before（看起来像又退了一步，实际是空操作），
-而且没有任何前进的路。
 """
 
 import json
@@ -32,6 +26,44 @@ FX_CONFIG_SPEC = {
         'type': 'integer', 'min': 1, 'max': 65535, 'default': 50325, 'hot': True,
         'group': '连接', 'label': 'AdsPower 本地 API 端口',
     },
+    'adsPowerSilentMode': {
+        'type': 'bool', 'default': True, 'hot': True, 'env': 'ADSPOWER_SILENT_MODE',
+        'group': '连接', 'label': '后台静默运行（生成期间不主动切到前台）',
+    },
+    # macOS 上"屏幕外坐标"会被系统 clamp 回可见区域，静默模式挡不住抢焦点，得改用
+    # app 级隐藏。优先用 AppKit，失败时才回退需要「辅助功能」权限的 UI 脚本。
+    'adsPowerMacWindowMode': {
+        'type': 'enum', 'options': ['hide', 'focus', 'off'],
+        'default': 'hide', 'hot': True, 'env': 'ADSPOWER_MACOS_WINDOW_MODE',
+        'group': '连接', 'label': 'macOS 窗口处理（hide=隐藏窗口／focus=仅归还焦点／off=不干预）',
+    },
+    # ── 并发（见 docs/plans/multi_project_concurrency_plan.md）──────────
+    # 同时占用浏览器的任务数。1 = 串行（旧行为）；>1 时每个任务独占一个 AdsPower 环境。
+    # 每个环境都是完整的 Chromium，先从 2 起步并观察内存。
+    'fxMaxConcurrent': {
+        'type': 'integer', 'min': 1, 'max': 4, 'default': 1, 'hot': True,
+        'env': 'SPARK_FX_MAX_CONCURRENT',
+        'group': '并发', 'label': '浏览器并发数（1=串行；>1 时不同项目可同时出片，每个任务独占一个环境）',
+    },
+    'flow2apiVideoConcurrency': {
+        'type': 'integer', 'min': 1, 'max': 10, 'default': 3, 'hot': True,
+        'env': 'SPARK_FLOW2API_VIDEO_CONCURRENCY',
+        'group': '并发', 'label': 'Flow2API 视频并发数（1=串行；账号与额度由 Flow2API 管理）',
+    },
+    'videoRetryCount': {
+        'type': 'integer', 'min': 0, 'max': 10, 'default': 5, 'hot': True,
+        'env': 'SPARK_VIDEO_RETRY_COUNT',
+        'group': '视频', 'label': '每轮视频失败重试次数（持续生成开启后，轮次用完会等待恢复并继续）',
+    },
+    'videoContinuousGeneration': {
+        'type': 'bool', 'default': True, 'hot': True,
+        'group': '视频', 'label': '持续完成视频（自动核对、退避补跑，全部完成后再结束）',
+    },
+    'fxEgressPolicy': {
+        'type': 'enum', 'options': ['hard', 'warn'], 'default': 'hard', 'hot': True,
+        'env': 'SPARK_FX_EGRESS_POLICY',
+        'group': '并发', 'label': '同出口冲突（hard=拒绝同出口账号同时运行／warn=仅告警）',
+    },
     'googleFxImageModel': {
         'type': 'enum', 'options': list(GOOGLE_FX_IMAGE_MODELS),
         'default': 'Nano Banana 2', 'hot': True, 'group': '模型', 'label': '图片模型',
@@ -43,19 +75,53 @@ FX_CONFIG_SPEC = {
         'default': 'Veo 3.1 - Lite [Lower Priority]', 'hot': True,
         'group': '模型', 'label': '视频模型',
     },
+    'videoProvider': {
+        'type': 'enum', 'options': ['google_fx', 'flow2api'], 'default': 'google_fx',
+        'hot': True, 'group': '模型', 'label': '视频生成服务',
+    },
     'videoDuration': {
-        'type': 'enum', 'options': ['', '4', '6', '8', '10'], 'default': '', 'hot': True,
+        'type': 'enum', 'options': ['4', '6', '8', '10'], 'default': '10', 'hot': True,
         'group': '模型', 'label': 'Omni 视频时长（秒）',
     },
+    'videoResolution': {
+        'type': 'enum', 'options': ['720p', '360p'], 'default': '720p', 'hot': True,
+        'group': '模型', 'label': 'Omni 视频分辨率（720p / 360p）',
+    },
+    'videoRefMode': {
+        'type': 'enum', 'options': ['VIDEO_FRAMES', 'VIDEO_REFERENCES'],
+        'default': 'VIDEO_FRAMES', 'hot': True,
+        'group': '模型', 'label': '视频参考模式（帧 / 素材）',
+    },
 
-    # ── 号池与换号 ──────────────────────────────────────
+    # ── 号池与浏览器复用 ─────────────────────────────────
     'googleFxIpRotateRequests': {
         'type': 'integer', 'min': 1, 'max': 100, 'default': 5, 'hot': True,
-        'group': '号池', 'label': '换号节拍（每 N 个请求换一个号）',
+        'group': '号池', 'label': '旧版换号节拍（已停用，仅保留原值）',
+        'inactive': True,
+        'hint': '优先复用已打开且额度足够的浏览器；额度不足后周期停用 24 小时，关闭该浏览器并换号继续。',
     },
     'videoAccountPoolMinCredit': {
-        'type': 'integer', 'min': 0, 'max': 100000, 'default': 1, 'hot': True,
-        'group': '号池', 'label': '选号最低积分',
+        'type': 'integer', 'min': 0, 'max': 100000, 'default': 15, 'hot': True,
+        'group': '号池', 'label': '选号最低积分（低于此值周期停用 24 小时）',
+    },
+    'googleFxAccountStrategy': {
+        'type': 'enum', 'options': ['credit_desc', 'expiration_asc', 'rotation'],
+        'default': 'credit_desc', 'hot': True, 'group': '号池',
+        'label': '需要新开环境时的选号策略（积分最多 / 重置日期最早 / 均衡使用）',
+    },
+    'googleFxPriorityUserIds': {
+        'type': 'account_list', 'default': [], 'hot': True, 'group': '号池',
+        'label': '优先级浏览器实例（多选，留空=全池）',
+    },
+    # 'account' 类型的候选项来自号池（前端用 /api/account-pool 的结果渲染下拉），
+    # 不写进 spec 的 options：号池是会变的运行时数据，固化进配置 schema 只会过期。
+    'googleFxSequenceUserId': {
+        'type': 'account', 'default': '', 'hot': True, 'group': '号池',
+        'label': '序列首选浏览器环境（留空=自动复用/选号）',
+    },
+    'googleFxSequenceUserLock': {
+        'type': 'bool', 'default': False, 'hot': True, 'group': '号池',
+        'label': '优先指定默认环境（即使已有其他可用浏览器，额度不足仍换号）',
     },
 
     # ── 超时与预算 ──────────────────────────────────────
@@ -136,6 +202,30 @@ FX_CONFIG_SPEC = {
 _DIRECT_ENV_KEYS = {key: spec['env'] for key, spec in FX_CONFIG_SPEC.items() if spec.get('env')}
 
 
+def normalize_flow2api_video_concurrency(value):
+    """Normalize file/environment values using the public concurrency limits."""
+    spec = FX_CONFIG_SPEC['flow2apiVideoConcurrency']
+    if isinstance(value, bool) or isinstance(value, float) and not value.is_integer():
+        return spec['default']
+    try:
+        count = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return spec['default']
+    return max(spec['min'], min(spec['max'], count))
+
+
+def normalize_video_retry_count(value):
+    """Extra attempts after a settled video failure; zero disables resubmission."""
+    spec = FX_CONFIG_SPEC['videoRetryCount']
+    if isinstance(value, bool) or isinstance(value, float) and not value.is_integer():
+        return spec['default']
+    try:
+        count = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return spec['default']
+    return max(spec['min'], min(spec['max'], count))
+
+
 def bool_to_env(value):
     return '1' if value else '0'
 
@@ -170,6 +260,9 @@ def validate_patch(patch):
         if key == 'googleFxImageModel' and is_legacy_google_fx_image_model(value):
             value = normalize_google_fx_image_model(value)
         if spec['type'] == 'integer':
+            if key in {'flow2apiVideoConcurrency', 'videoRetryCount'} and (
+                    isinstance(value, bool) or isinstance(value, float) and not value.is_integer()):
+                raise ValueError(f'{key} 必须是整数')
             try:
                 value = int(value)
             except (TypeError, ValueError):
@@ -180,6 +273,23 @@ def validate_patch(patch):
             if isinstance(value, str):
                 value = value.strip().lower() in ('1', 'true', 'yes', 'on')
             value = bool(value)
+        elif spec['type'] == 'account':
+            # AdsPower user_id 是一串短标识；这里只做形态校验，不去号池里核对存在性——
+            # 校验一次配置不该打 AdsPower 本地 API，而且账号可能是刚加进池子的。
+            value = str(value or '').strip()
+            if len(value) > 64:
+                raise ValueError(f'{key} 不是合法的 AdsPower 环境编号')
+        elif spec['type'] == 'account_list':
+            if isinstance(value, str):
+                items = [u.strip() for u in value.split(',') if u.strip()]
+            elif isinstance(value, (list, tuple, set)):
+                items = [str(u).strip() for u in value if str(u).strip()]
+            else:
+                items = []
+            for item in items:
+                if len(item) > 64:
+                    raise ValueError(f'{key} 包含非法的 AdsPower 环境 ID: {item}')
+            value = items
         elif value not in spec['options']:
             raise ValueError(f'{key} 不是允许的选项')
         clean[key] = value
@@ -188,54 +298,31 @@ def validate_patch(patch):
     high = clean.get('googleFxPacingMaxSeconds')
     if low is not None and high is not None and low > high:
         raise ValueError('提交最小间隔不能大于最大间隔')
+    # 「锁定默认环境」而没指定环境是个空承诺：保存后行为仍是自动选号，但界面上
+    # 那个勾是打上的，用户会以为序列被钉住了。两个字段同时提交时直接拦下来。
+    if (clean.get('googleFxSequenceUserLock')
+            and 'googleFxSequenceUserId' in clean
+            and not clean['googleFxSequenceUserId']):
+        raise ValueError('勾选「锁定默认环境」前请先选择序列生成默认浏览器环境')
     return clean
 
 
 class FxConfigStore:
-    """FX 运行配置的读写与版本栈。
+    """FX 运行配置的读写存储。
 
-    宿主注入四个协作对象，避免本模块反向依赖 server：
+    宿主注入协作对象，避免本模块反向依赖 server：
       config          —— 活的 SERVER_CONFIG dict（原地更新，其它模块持有同一引用）
       config_file     —— server_config.json 路径
       apply_overrides —— server_common.apply_google_fx_runtime_overrides
       audit           —— FX_CONTROL.audit
     """
 
-    def __init__(self, config, config_file, versions_file, apply_overrides, audit):
+    def __init__(self, config, config_file, versions_file=None, apply_overrides=None, audit=None):
         self._config = config
         self._config_file = str(config_file)
-        self._versions_file = str(versions_file)
-        self._cursor_file = str(versions_file) + '.cursor'
-        self._apply_overrides = apply_overrides
-        self._audit = audit
+        self._apply_overrides = apply_overrides or (lambda _c: None)
+        self._audit = audit or (lambda *a, **kw: None)
         self._lock = threading.Lock()
-
-    # ── 游标 ──────────────────────────────────────────
-    # 回滚/重做需要知道"当前停在版本栈的哪一格"。光比对"配置内容和当前不同的最近
-    # 一条"是不够的：回滚本身也会追加一条版本记录，于是第二次回滚会把刚被退掉的
-    # 那一版当成"最近的不同版本"又装回去（来回跳，永远退不到第三格）。
-
-    def _read_cursor(self):
-        try:
-            with open(self._cursor_file, 'r', encoding='utf-8') as handle:
-                return json.load(handle).get('version_id')
-        except Exception:
-            return None
-
-    def _write_cursor(self, version_id):
-        try:
-            os.makedirs(os.path.dirname(self._cursor_file), exist_ok=True)
-            tmp = self._cursor_file + '.tmp'
-            with open(tmp, 'w', encoding='utf-8') as handle:
-                json.dump({'version_id': version_id}, handle)
-            os.replace(tmp, self._cursor_file)
-        except Exception:
-            pass
-
-    def _chronological(self):
-        rows = self.versions(500)
-        rows.reverse()
-        return rows
 
     # ── 读 ────────────────────────────────────────────
 
@@ -244,6 +331,9 @@ class FxConfigStore:
                    for key, spec in FX_CONFIG_SPEC.items()}
         current['googleFxImageModel'] = normalize_google_fx_image_model(
             current.get('googleFxImageModel'))
+        current['flow2apiVideoConcurrency'] = normalize_flow2api_video_concurrency(
+            current.get('flow2apiVideoConcurrency'))
+        current['videoRetryCount'] = normalize_video_retry_count(current.get('videoRetryCount'))
         return current
 
     def migrate_deprecated_values(self, actor='system'):
@@ -262,72 +352,20 @@ class FxConfigStore:
                 for key, spec in FX_CONFIG_SPEC.items()}
 
     def versions(self, limit=30):
-        rows = []
-        try:
-            with open(self._versions_file, 'r', encoding='utf-8') as handle:
-                for line in handle:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        rows.append(json.loads(line))
-                    except Exception:
-                        continue
-        except FileNotFoundError:
-            return []
-        except Exception:
-            return []
-        rows.reverse()
-        return rows[:max(1, min(int(limit), 200))]
+        return []
 
-    def diff_against_current(self, version_id):
-        target = next((row for row in self.versions(200) if row.get('id') == version_id), None)
-        if target is None:
-            raise KeyError('找不到这个配置版本')
-        current = self.current()
-        changes = {}
-        for key, value in (target.get('config') or {}).items():
-            if key in FX_CONFIG_SPEC and current.get(key) != value:
-                changes[key] = {'current': current.get(key), 'target': value}
-        return {'version': target, 'changes': changes}
+    def ensure_baseline(self, actor='system'):
+        return None
 
     # ── 写 ────────────────────────────────────────────
 
-    def _append_version(self, config, action, actor, note=''):
-        row = {
-            'id': datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ'),
-            'at': datetime.now(timezone.utc).astimezone().isoformat(),
-            'action': action,
-            'actor': actor,
-            'note': note,
-            'config': dict(config),
-        }
-        try:
-            os.makedirs(os.path.dirname(self._versions_file), exist_ok=True)
-            with open(self._versions_file, 'a', encoding='utf-8') as handle:
-                handle.write(json.dumps(row, ensure_ascii=False, default=str) + '\n')
-        except Exception:
-            pass
-        return row
-
-    def ensure_baseline(self, actor='system'):
-        """版本文件为空时先记一条基线，否则第一次"回滚"没有落脚点。"""
-        if self.versions(1):
-            return None
-        return self._append_version(self.current(), 'baseline', actor,
-                                    note='服务启动时记录的基线配置')
-
-    def save(self, patch, actor='local', action='config.update', note='', cursor_id=None):
+    def save(self, patch, actor='local', action='config.update', note=''):
         clean = validate_patch(patch)
         with self._lock:
             before = {key: self._config.get(key, FX_CONFIG_SPEC[key]['default'])
                       for key in clean}
             if all(before[key] == clean[key] for key in clean):
-                # 没有实际变化就不要污染版本栈——否则"回滚一步"会退到一个同样的版本。
-                if cursor_id:
-                    self._write_cursor(cursor_id)
-                return {'config': self.current(), 'changed': {}, 'version': None,
-                        'cursor': cursor_id or self._read_cursor()}
+                return {'config': self.current(), 'changed': {}, 'version': None, 'versions': []}
             updated = dict(self._config)
             updated.update(clean)
             tmp = self._config_file + '.tmp'
@@ -338,55 +376,5 @@ class FxConfigStore:
             self._config.update(updated)
             self._apply_overrides(self._config)
             apply_direct_env(self.current())
-            version = self._append_version(self.current(), action, actor, note)
-            # 普通保存把游标推到新版本；回滚/重做由调用方指定游标落在目标版本上，
-            # 这样连续回滚才能一格一格往前走。
-            self._write_cursor(cursor_id or version['id'])
-        self._audit(action, details={'before': before, 'after': clean,
-                                    'version_id': version['id']}, actor=actor)
-        return {'config': self.current(), 'changed': clean, 'version': version,
-                'cursor': cursor_id or version['id']}
-
-    def restore(self, version_id=None, actor='local', direction='back'):
-        """回滚/重做到某个版本。
-
-        version_id 给定时直接跳到那一版。否则按 direction 沿版本栈移动一格：
-          back    —— 游标往前（更早）找最近一个配置内容不同的版本
-          forward —— 游标往后（更晚）找最近一个配置内容不同的版本
-        """
-        history = self._chronological()
-        if not history:
-            raise ValueError('还没有任何配置版本记录')
-        current = self.current()
-
-        if version_id:
-            target = next((row for row in history if row.get('id') == version_id), None)
-            if target is None:
-                raise KeyError('找不到这个配置版本')
-        else:
-            cursor = self._read_cursor()
-            index = next((i for i, row in enumerate(history) if row.get('id') == cursor), None)
-            if index is None:
-                # 没有游标（老数据/刚升级）：从最后一条与当前等价的版本起步
-                index = next((i for i in range(len(history) - 1, -1, -1)
-                              if (history[i].get('config') or {}) == current), len(history) - 1)
-            step = 1 if direction == 'forward' else -1
-            target = None
-            probe = index + step
-            while 0 <= probe < len(history):
-                if (history[probe].get('config') or {}) != current:
-                    target = history[probe]
-                    break
-                probe += step
-            if target is None:
-                raise ValueError(
-                    '没有可回滚的更早版本' if direction != 'forward'
-                    else '没有可重做的更新版本')
-
-        patch = {key: value for key, value in (target.get('config') or {}).items()
-                 if key in FX_CONFIG_SPEC}
-        if not patch:
-            raise ValueError('目标版本没有可应用的字段')
-        return self.save(patch, actor=actor, action='config.restore',
-                         note=f'恢复到版本 {target["id"]}（{target.get("action")}）',
-                         cursor_id=target['id'])
+        self._audit(action, details={'before': before, 'after': clean}, actor=actor)
+        return {'config': self.current(), 'changed': clean, 'version': None, 'versions': []}

@@ -1,0 +1,41 @@
+==============================================================================
+SLOT 4  gate=sequence_review_flagged
+  判废原因: IMAGE 4 画面中出现了多处异常的字母叠加渲染标记（A、A、C）
+------------------------------------------------------------------------------
+BEFORE:
+Static tripod shot, wide 18mm lens feel, camera height 1.2m, camera pitch locked level, central vanishing axis centered along the longitudinal interior of the cylindrical steel tanker hull; door frame and entrance are behind camera. Flaking iron scale lies scattered along the floor contour in Grid C2, mixed with a thick layer of dried grey mineral sludge crusting the curved lower belly. Directional entry daylight spills from the open end-cap hatch behind the camera across the raw floor, supplemented by a single portable halogen work tripod standing unlit near Grid B3; lighting phase: temporary work light active; physical constraints believable; no active human presence or machinery. Locked anchors: cylindrical steel hull ribbed wall contour at Grid B1 holding 65 percent of frame height, curved rear dome end-cap bulkhead at Grid A2 holding 40 percent of frame height, cast-iron circular manhole ring opening at Grid C2 holding 30 percent of frame height.
+
+AFTER:
+Static tripod shot, wide 18mm lens feel, camera height 1.2m, camera pitch locked level, central vanishing axis centered along the longitudinal interior of the cylindrical steel tanker hull; door frame and entrance are behind camera. Flaking iron scale lies scattered along the floor contour across the lower centre of the frame, mixed with a thick layer of dried grey mineral sludge crusting the curved lower belly. Directional entry daylight spills from the open end-cap hatch behind the camera across the raw floor, supplemented by a single portable halogen work tripod standing unlit near the mid-right of the frame; lighting phase: temporary work light active; physical constraints believable; no active human presence or machinery. Locked anchors: cylindrical steel hull ribbed wall contour along the mid-left of the frame holding about two thirds of the frame height, curved rear dome end-cap bulkhead across the upper centre of the frame holding about two fifths of the frame height, cast-iron circular manhole ring opening across the lower centre of the frame holding about a third of the frame height.
+
+  残留记号: 无
+
+==============================================================================
+SLOT 5  gate=sequence_review_flagged
+  判废原因: IMAGE 4 和 IMAGE 5 为跨越门槛后的室内镜头，但画面底部露出了罐体入口边缘及罐体外的地面，未实现室内空间完全填满画面边缘（违反 DOOR-FRAME CLEARANCE 规则）
+------------------------------------------------------------------------------
+BEFORE:
+Static tripod shot, wide 18mm lens feel, camera height 1.2m, camera pitch locked level, central vanishing axis centered along the longitudinal interior of the cylindrical steel tanker hull; door frame and entrance are behind camera. Scene inherits all interior landmarks and camera geometry from previous frame. Relative Positioning Lock: this scene forms the interior hull deep cleanout complete anchor, where 100 percent of interior hull floor is cleared and swept bare across Grid A2, B2, and C2. The cleared floor plate exhibits wire brush scratch marks on interior steel floor and pitted corrosion stains on cleaned steel plate, while exactly four sealed black steel disposal drums filled with scraped rust scale stand neatly lined along Grid C3 as the secondary progress tally. Preserved unchanged: exterior concrete saddles complete; interior walls remain pitted steel awaiting framework, with curved steel wall ribs at Grid B1 and rear dome bulkhead at Grid A2 untouched; lighting phase: temporary work light active, with twin portable halogen work tripods casting bright neutral white light down the central axis; physical constraints believable; no active human presence or machinery. Locked anchors: cylindrical steel hull ribbed wall contour at Grid B1 holding 65 percent of frame height, curved rear dome end-cap bulkhead at Grid A2 holding 40 percent of frame height, cast-iron circular manhole ring opening at Grid C2 holding 30 percent of frame height.
+
+AFTER:
+Static tripod shot, wide 18mm lens feel, camera height 1.2m, camera pitch locked level, central vanishing axis centered along the longitudinal interior of the cylindrical steel tanker hull; door frame and entrance are behind camera. Scene inherits all interior landmarks and camera geometry from previous frame. Relative Positioning Lock: this scene forms the interior hull deep cleanout complete anchor, where the entire interior hull floor is cleared and swept bare down the centre column of the frame. The cleared floor plate exhibits wire brush scratch marks on interior steel floor and pitted corrosion stains on cleaned steel plate, while exactly four sealed black steel disposal drums filled with scraped rust scale stand neatly lined in the lower right of the frame as the secondary progress tally. Preserved unchanged: exterior concrete saddles complete; interior walls remain pitted steel awaiting framework, with curved steel wall ribs along the mid-left of the frame and rear dome bulkhead across the upper centre of the frame untouched; lighting phase: temporary work light active, with twin portable halogen work tripods casting bright neutral white light down the central axis; physical constraints believable; no active human presence or machinery. Locked anchors: cylindrical steel hull ribbed wall contour along the mid-left of the frame holding about two thirds of the frame height, curved rear dome end-cap bulkhead across the upper centre of the frame holding about two fifths of the frame height, cast-iron circular manhole ring opening across the lower centre of the frame holding about a third of the frame height.
+
+  残留记号: 无
+
+==============================================================================
+canonical anchor clause (packet 仍存 grid/percent，只改渲染):
+Locked anchors: cylindrical steel hull ribbed wall contour along the mid-left of the frame, rising to about two thirds of the frame height; curved rear dome end-cap bulkhead across the upper centre of the frame, rising to about two fifths of the frame height; cast-iron circular manhole ring opening across the lower centre of the frame, rising to about a third of the frame height.
+
+边界样例:
+  The polished floor in Grid C1-C3 shows reflections.
+    -> The polished floor across the lower third of the frame shows reflections.
+  cleared across Grid A2, B2, and C2 completely.
+    -> cleared down the centre column of the frame completely.
+  worker enters from the Grid C1 edge and exits.
+    -> worker enters from the lower left edge of the frame and exits.
+  100 percent of interior hull floor is cleared, exactly four drums along Grid C3.
+    -> the entire interior hull floor is cleared, exactly four drums in the lower right of the frame.
+  exposed area grows from 10 percent to 90 percent.
+    -> exposed area grows from a narrow strip to most of it.
+  no grid notation here at all, plain prose.
+    -> no grid notation here at all, plain prose.

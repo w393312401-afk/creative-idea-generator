@@ -1,0 +1,223 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>并发作战板 · 原型</title>
+<style>
+  :root {
+    --bg: #F5F1E8; --panel: #FBF8F1; --card: #FFFFFF; --ink: #2E2A24; --muted: #7A7367;
+    --line: rgba(46,42,36,.12); --primary: #B07B52;
+    --warn: #B7791F; --warn-bg: rgba(183,121,31,.12);
+    --bad: #B4443A; --bad-bg: rgba(180,68,58,.10); --ok: #5E7A4E;
+    --bar-l: 42%; --bar-s: 52%;
+    --r-sm: 6px; --r-md: 8px; --r-lg: 12px;
+    --fs-xs: 11px; --fs-sm: 12px; --fs-md: 13px; --fs-base: 14px; --fs-xl: 18px;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #1E1B17; --panel: #26221D; --card: #2D2923; --ink: #EDE6DA; --muted: #A39B8D;
+      --line: rgba(237,230,218,.14); --primary: #D1A27A;
+      --warn: #E0AE5B; --warn-bg: rgba(224,174,91,.14);
+      --bad: #E27D72; --bad-bg: rgba(226,125,114,.14); --ok: #9DB88B;
+      --bar-l: 52%; --bar-s: 45%;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink); font: var(--fs-base)/1.5 -apple-system, "PingFang SC", "Noto Sans SC", sans-serif; }
+  .wrap { max-width: 1120px; margin: 0 auto; padding: 20px 16px 48px; }
+  h1 { font-size: var(--fs-xl); margin: 0; }
+  h2 { font-size: var(--fs-base); margin: 0 0 10px; display: flex; align-items: center; gap: 8px; }
+  h2 small { font-weight: 400; color: var(--muted); font-size: var(--fs-sm); }
+  .note { color: var(--muted); font-size: var(--fs-sm); margin: 4px 0 0; }
+  .head { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 14px; margin-bottom: 14px; }
+  .spacer { flex: 1; }
+  .pill { display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px; border-radius: 999px; border: 1px solid var(--line); background: var(--panel); font-size: var(--fs-sm); }
+  .pill.full { border-color: var(--warn); color: var(--warn); background: var(--warn-bg); }
+  .meter { display: inline-flex; gap: 3px; }
+  .meter i { width: 14px; height: 8px; border-radius: 2px; background: var(--primary); }
+  .meter i.off { background: var(--line); }
+  .meter i.stall { background: var(--warn); }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: var(--r-lg); padding: 14px 16px; margin-bottom: 14px; }
+  .legend { display: flex; flex-wrap: wrap; gap: 6px 12px; font-size: var(--fs-sm); }
+  .dot { width: 10px; height: 10px; border-radius: 3px; display: inline-block; background: hsl(var(--h) var(--bar-s) var(--bar-l)); margin-right: 5px; vertical-align: -1px; }
+
+  /* 泳道 */
+  .lanes { overflow-x: auto; }
+  .lane-grid { min-width: 640px; }
+  .axis, .lane { display: grid; grid-template-columns: 168px 1fr; align-items: center; }
+  .axis { font-size: var(--fs-xs); color: var(--muted); padding-bottom: 4px; }
+  .ticks { position: relative; height: 16px; }
+  .ticks span { position: absolute; transform: translateX(-50%); white-space: nowrap; }
+  .ticks span:first-child { transform: none; } .ticks span:last-child { transform: translateX(-100%); color: var(--primary); font-weight: 600; }
+  .lane { border-top: 1px solid var(--line); min-height: 52px; }
+  .who { padding: 6px 10px 6px 0; font-size: var(--fs-sm); line-height: 1.35; }
+  .who b { font-size: var(--fs-md); }
+  .who .sub { color: var(--muted); font-size: var(--fs-xs); }
+  .track { position: relative; height: 52px;
+    background: repeating-linear-gradient(90deg, transparent 0 calc(33.333% - 1px), var(--line) calc(33.333% - 1px) 33.333%); }
+  .track::after { content: ""; position: absolute; right: 0; top: 0; bottom: 0; width: 2px; background: var(--primary); }
+  .idle { position: absolute; inset: 8px 8px 8px 0; border: 1px dashed var(--line); border-radius: var(--r-sm); color: var(--muted); font-size: var(--fs-xs); display: flex; align-items: center; padding-left: 10px; }
+  .bar { position: absolute; top: 8px; height: 36px; border-radius: var(--r-sm); padding: 0 10px; display: flex; flex-direction: column; justify-content: center; color: #fff; font-size: var(--fs-xs); line-height: 1.25; overflow: hidden; white-space: nowrap;
+    background: hsl(var(--h) var(--bar-s) var(--bar-l)); }
+  .bar b { font-size: var(--fs-sm); }
+  .bar.done { opacity: .45; }
+  .bar.run::before { content: ""; position: absolute; right: 8px; top: 50%; width: 7px; height: 7px; margin-top: -3.5px; border-radius: 50%; background: #fff; animation: pulse 1.4s ease-in-out infinite; }
+  .bar.stall { outline: 2px solid var(--warn); outline-offset: 1px; }
+  .bar.stall::before { content: "!"; position: absolute; right: 8px; top: 8px; font-weight: 700; background: var(--warn); color: #fff; width: 16px; height: 16px; border-radius: 50%; text-align: center; line-height: 16px; font-size: var(--fs-xs); }
+  .unavail { position: absolute; inset: 8px 8px 8px 0; border-radius: var(--r-sm); color: var(--muted); font-size: var(--fs-xs); display: flex; align-items: center; padding-left: 10px;
+    background: repeating-linear-gradient(135deg, transparent 0 6px, var(--line) 6px 7px); }
+  @keyframes pulse { 50% { opacity: .25; } }
+  @media (prefers-reduced-motion: reduce) { .bar.run::before { animation: none; } }
+
+  /* 矩阵 */
+  .scroll { overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; min-width: 640px; font-size: var(--fs-sm); }
+  th, td { border-top: 1px solid var(--line); padding: 8px 8px; text-align: left; vertical-align: middle; }
+  th { color: var(--muted); font-weight: 500; font-size: var(--fs-xs); border-top: 0; }
+  td.proj { white-space: nowrap; font-weight: 600; }
+  .chip { display: inline-flex; align-items: center; gap: 4px; padding: 2px 8px; border-radius: 999px; font-size: var(--fs-xs); border: 1px solid var(--line); white-space: nowrap; }
+  .chip.done { color: var(--ok); }
+  .chip.run { border-color: hsl(var(--h) var(--bar-s) var(--bar-l)); }
+  .chip.wait { border-style: dashed; color: var(--muted); }
+  .chip.lock { background: repeating-linear-gradient(135deg, transparent 0 5px, var(--line) 5px 6px); }
+  .chip.stall { border-color: var(--warn); color: var(--warn); background: var(--warn-bg); }
+  .chip.todo { color: var(--muted); border-color: transparent; }
+
+  /* 雷达 */
+  .item { display: grid; grid-template-columns: 22px 1fr auto; gap: 4px 10px; align-items: start; padding: 10px 0; border-top: 1px solid var(--line); }
+  .item:first-of-type { border-top: 0; }
+  .ico { font-size: 16px; line-height: 1.4; text-align: center; }
+  .item .msg { font-size: var(--fs-md); }
+  .item .why { grid-column: 2; color: var(--muted); font-size: var(--fs-xs); }
+  .tag { display: inline-block; font-size: var(--fs-xs); padding: 0 6px; border-radius: 4px; background: var(--line); color: var(--muted); margin-left: 4px; }
+  .acts { display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
+  button { font: inherit; font-size: var(--fs-xs); padding: 3px 10px; border-radius: var(--r-sm); border: 1px solid var(--line); background: var(--card); color: var(--ink); cursor: pointer; }
+  button:hover { border-color: var(--primary); }
+  button.danger { color: var(--bad); border-color: var(--bad); background: var(--bad-bg); }
+  .item.stalled .msg { color: var(--warn); }
+
+  /* 资源条 */
+  .res { display: flex; flex-wrap: wrap; gap: 8px; }
+  .acct { display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px; border: 1px solid var(--line); border-radius: var(--r-md); background: var(--card); font-size: var(--fs-sm); }
+  .acct .eg { font-size: var(--fs-xs); color: var(--muted); border-left: 1px solid var(--line); padding-left: 6px; }
+  .acct.off { opacity: .55; }
+  .egress-a { box-shadow: inset 3px 0 0 hsl(190 50% 45%); } .egress-b { box-shadow: inset 3px 0 0 hsl(275 45% 55%); } .egress-c { box-shadow: inset 3px 0 0 hsl(130 40% 45%); }
+  @media (max-width: 768px) { .wrap { padding: 14px 16px 40px; } .item { grid-template-columns: 22px 1fr; } .item .acts { grid-column: 2; justify-content: flex-start; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <div class="head">
+    <h1>并发作战板</h1>
+    <span class="pill full" title="名额已满，新任务排队">浏览器
+      <span class="meter"><i></i><i></i><i class="stall"></i></span> 3 / 3</span>
+    <span class="pill">出口策略 hard · 单项目上限 1</span>
+    <span class="pill">⚠ 心跳超时 1</span>
+    <span class="pill">无主浏览器 0</span>
+    <span class="spacer"></span>
+    <span class="note">原型 · 示意数据，非真实状态</span>
+  </div>
+
+  <div class="card">
+    <h2>A　账号泳道 <small>谁占着哪个浏览器 · 最近 30 分钟 · 颜色 = 项目</small></h2>
+    <div class="legend" style="margin-bottom:10px">
+      <span><i class="dot" style="--h:190"></i>校车改造</span>
+      <span><i class="dot" style="--h:275"></i>荒岛视频</span>
+      <span><i class="dot" style="--h:130"></i>秋日修复</span>
+      <span><i class="dot" style="--h:330"></i>老屋修复</span>
+    </div>
+    <div class="lanes"><div class="lane-grid">
+      <div class="axis"><span></span><div class="ticks"><span style="left:0">−30m</span><span style="left:33.3%">−20m</span><span style="left:66.6%">−10m</span><span style="left:100%">现在</span></div></div>
+
+      <div class="lane">
+        <div class="who"><b>#70</b> · 积分 988<div class="sub">出口 …a · 租约 L_8f2a</div></div>
+        <div class="track"><div class="bar run" style="--h:190;left:13%;width:86%"><b>校车改造 · 视频</b>3 / 8 镜头 · 占用 26m</div></div>
+      </div>
+
+      <div class="lane">
+        <div class="who"><b>#69</b> · 积分 1050<div class="sub">出口 …b · 租约 L_91c3</div></div>
+        <div class="track">
+          <div class="bar done" style="--h:275;left:2%;width:46%"><b>荒岛视频 · 帧</b>已完成</div>
+          <div class="bar run" style="--h:275;left:53%;width:46%"><b>荒岛视频 · 视频</b>1 / 6 镜头 · 14m</div>
+        </div>
+      </div>
+
+      <div class="lane">
+        <div class="who"><b>#64</b> · 积分 1050<div class="sub">出口 …c · 租约 L_a07e</div></div>
+        <div class="track"><div class="idle" style="right:32%">空闲 · 可接单</div>
+          <div class="bar run stall" style="--h:130;left:70%;width:29%"><b>秋日修复 · 帧</b>14 / 20 · 心跳 3m20s 无更新</div></div>
+      </div>
+
+      <div class="lane">
+        <div class="who"><b>#66</b> · 积分 51<div class="sub">低于选号阈值</div></div>
+        <div class="track"><div class="unavail">不可用 · 积分不足，不参与调度</div></div>
+      </div>
+    </div></div>
+    <p class="note">条末脉冲点 = 运行中；琥珀描边 + ! = 疑似卡死（不会自动处理）；虚线框 = 空闲；斜纹 = 不可用。右端实线 = 现在。</p>
+  </div>
+
+  <div class="card">
+    <h2>B　项目 × 阶段 <small>每个项目走到哪了 · 点击单元格查看该任务日志</small></h2>
+    <div class="scroll"><table>
+      <tr><th>项目</th><th>选题</th><th>合成</th><th>帧</th><th>视频</th><th>剪辑</th><th>交付</th></tr>
+      <tr><td class="proj"><i class="dot" style="--h:190"></i>校车改造</td>
+        <td><span class="chip done">✓ 完成</span></td><td><span class="chip done">✓ 完成</span></td><td><span class="chip done">✓ 完成</span></td>
+        <td><span class="chip run" style="--h:190">▶ 3 / 8</span></td><td><span class="chip todo">—</span></td><td><span class="chip todo">—</span></td></tr>
+      <tr><td class="proj"><i class="dot" style="--h:275"></i>荒岛视频</td>
+        <td><span class="chip done">✓ 完成</span></td><td><span class="chip done">✓ 完成</span></td><td><span class="chip done">✓ 完成</span></td>
+        <td><span class="chip run" style="--h:275">▶ 1 / 6</span></td><td><span class="chip todo">—</span></td><td><span class="chip todo">—</span></td></tr>
+      <tr><td class="proj"><i class="dot" style="--h:130"></i>秋日修复</td>
+        <td><span class="chip done">✓ 完成</span></td><td><span class="chip done">✓ 完成</span></td>
+        <td><span class="chip stall">! 14 / 20 · 卡死？</span></td>
+        <td><span class="chip lock" title="帧阶段占用中，视频需等待（R2）">🔒 等帧完成</span></td><td><span class="chip todo">—</span></td><td><span class="chip todo">—</span></td></tr>
+      <tr><td class="proj"><i class="dot" style="--h:330"></i>老屋修复</td>
+        <td><span class="chip done">✓ 完成</span></td><td><span class="chip done">✓ 完成</span></td><td><span class="chip done">✓ 完成</span></td>
+        <td><span class="chip wait">⏳ 排队 · 等名额</span></td><td><span class="chip todo">—</span></td><td><span class="chip todo">—</span></td></tr>
+    </table></div>
+  </div>
+
+  <div class="card">
+    <h2>C　等待与冲突 <small>谁在等谁、为什么 · 每条带规则编号</small></h2>
+    <div class="item stalled">
+      <div class="ico">⚠</div>
+      <div class="msg">「秋日修复·帧」心跳 3m20s 无更新，占着账号 #64 <span class="tag">stalled</span></div>
+      <div class="acts"><button>查看日志</button><button>取消任务</button><button class="danger">强制释放…</button></div>
+      <div class="why">强制释放会关闭环境 #64 的浏览器并回收租约，需二次确认；系统不会自动执行。 <span class="tag">R9</span></div>
+    </div>
+    <div class="item">
+      <div class="ico">⏳</div>
+      <div class="msg">「老屋修复·视频」等待浏览器名额 — 当前 3 / 3，已排队 2m05s，第 1 位</div>
+      <div class="acts"><button>提优先级</button><button>取消</button></div>
+      <div class="why">最早可能在「荒岛视频·帧」或「校车改造·视频」释放后获得名额。 <span class="tag">R12</span></div>
+    </div>
+    <div class="item">
+      <div class="ico">🔒</div>
+      <div class="msg">「秋日修复」重渲请求被拒：该项目帧阶段已有任务在写（持有者 frames_17909…）</div>
+      <div class="acts"><button>跳到持有者</button></div>
+      <div class="why">同一项目同一阶段只允许一个写者，避免互相覆盖 manifest，不排队、立即返回。 <span class="tag">R2</span></div>
+    </div>
+    <div class="item">
+      <div class="ico">🌐</div>
+      <div class="msg">候选账号 #61 已被跳过：出口与运行中的 #69 相同</div>
+      <div class="acts"><button>改绑代理</button></div>
+      <div class="why">同出口多账号同时在线会触发关联风控；直连账号同一时刻最多 1 个。 <span class="tag">R5</span></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>D　资源条 <small>账号与出口 · 左侧色条相同 = 同一出口</small></h2>
+    <div class="res">
+      <span class="acct egress-a">#70 · 占用 <i class="dot" style="--h:190;margin:0"></i><span class="eg">出口 …a</span></span>
+      <span class="acct egress-b">#69 · 占用 <i class="dot" style="--h:275;margin:0"></i><span class="eg">出口 …b</span></span>
+      <span class="acct egress-c">#64 · 占用 <i class="dot" style="--h:130;margin:0"></i><span class="eg">出口 …c</span></span>
+      <span class="acct off">#66 · 积分不足 51</span>
+      <span class="acct off egress-b">#61 · 空闲（出口与 #69 相同，暂不可选）</span>
+      <span class="acct off">#68 · 冷却至明日 14:06</span>
+    </div>
+  </div>
+
+</div>
+</body>
+</html>

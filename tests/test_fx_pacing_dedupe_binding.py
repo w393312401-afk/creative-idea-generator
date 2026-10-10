@@ -136,6 +136,22 @@ def test_resolve_account_priority_order(monkeypatch):
         account_binding.install_pin_resolver(None)
 
 
+def test_bound_task_account_restores_outer_account_on_success_and_error():
+    outer = account_binding.set_task_account('outer')
+    try:
+        with account_binding.bound_task_account('actual'):
+            assert account_binding.resolve_account(fallback='default') == 'actual'
+        assert account_binding.current_task_account() == 'outer'
+
+        with pytest.raises(RuntimeError):
+            with account_binding.bound_task_account('failing-leg'):
+                assert account_binding.current_task_account() == 'failing-leg'
+                raise RuntimeError('boom')
+        assert account_binding.current_task_account() == 'outer'
+    finally:
+        account_binding.reset_task_account(outer)
+
+
 # ── S6 写盘失败上报 ──────────────────────────────────────────────────────────
 
 def test_state_write_failure_is_raised_not_swallowed(tmp_path, monkeypatch):
